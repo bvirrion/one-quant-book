@@ -1,0 +1,465 @@
+\chapter{FX Spot Microstructure}\label{ch:m2:fx-spot-microstructure}
+
+On 15 December 2010 a client of a large bank's electronic FX platform wrote
+to it: ``we have noticed that there were over 300 rejected orders with you
+today and the reason is `NACK', could you pls have a look at them''. Two days
+later, with no answer, it wrote again: ``We kept receiving top of the book
+rates from you and hitting your rate, but we got rejected by you 9 times out of
+10''. The New York State Department of Financial Services quoted both messages
+five years later, in the consent order by which Barclays paid USD~150 million,
+and found no evidence that the bank had ever replied. The rejections came from
+a practice called \omterm{def:m2:fx-spot-microstructure:lastlook}{last look}: the bank held each order for a few tens or
+hundreds of milliseconds and refused it if the price had moved against the
+bank in the meantime. This chapter is about the machinery of electronic FX
+spot: how prices are streamed to clients, why the price a client gets depends
+on who it is, how \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} works and what it costs
+(\cref{fig:m2:fx-spot-microstructure:timeline}), how dealers skew and
+internalise, and the code of conduct the market wrote for itself.
+
+\section{Streaming prices and tiered liquidity}
+
+\begin{definition}[Streaming quote, liquidity tier]\label{def:m2:fx-spot-microstructure:stream}
+A \emph{streaming quote}\index{streaming quote} is a bid and an ask, for given
+sizes, that a liquidity provider publishes continuously to a client or a
+platform and updates many times a second; the client trades by sending a
+request at a displayed price. A \emph{liquidity tier}\index{liquidity tier} is
+the set of spreads and sizes a provider shows to a group of clients, set by its
+view of their flow.
+\end{definition}
+
+Electronic spot FX is mostly traded on streams. A dealer's pricing engine takes
+in the \omterm{def:m2:the-fx-market:venue}{primary venues}, other platforms and its own flow, forms a view of the
+mid, and publishes to each client a price around it: tight for clients whose
+trades rarely precede price moves, wider for the others, and sometimes wider
+again when markets are fast. Principal trading firms stream too, directly to
+banks and on platforms (\cref{ch:m2:the-fx-market}). A client with access to
+many streams sees the best bid and ask across them, aggregated, and sends its
+request to whoever shows the best price.
+
+The dealer's problem is that a stream is a free option. It shows a price for a
+few milliseconds, and anyone who knows the market has moved before the stream
+has caught up can trade on the stale side. The spread is the dealer's
+protection against uninformed noise; tiers, \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} and skews are its
+protection against the rest.
+
+\section{Adverse selection}
+
+A market maker's worst clients are those who trade just before the price moves
+their way, the adverse selection of One Quant Book 1, chapter 1. In FX spot the
+purest form is latency arbitrage: a fast firm sees the price move on one venue
+and hits the stale quotes of slower providers elsewhere before they update. A
+provider measures its clients with \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs}.
+
+\begin{definition}[Mark-out]\label{def:m2:fx-spot-microstructure:markout}
+The \emph{mark-out}\index{mark-out} of a trade at horizon $H$ is the provider's
+profit from marking the position at the mid $H$ after the trade: the
+half-spread earned minus the move of the mid in the client's favour over $H$.
+Averaged over a client's trades at several horizons, from milliseconds to
+minutes, it measures how informed the client's flow is.
+\end{definition}
+
+A client whose trades have \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs} close to the half-spread at every horizon is
+uninformed; its flow is valuable, and it gets the best tier. A client whose
+\omterm{def:m2:fx-spot-microstructure:markout}{mark-outs} turn negative within a second is trading on information the provider
+did not have; it is shown wider prices, slower confirmations, or nothing.
+
+\section{Last look and hold times}
+
+\begin{definition}[Last look, hold time, reject rate]\label{def:m2:fx-spot-microstructure:lastlook}
+\emph{Last look}\index{last look} is a practice by which a liquidity provider
+receiving a trade request at its quoted price has a final opportunity, a short
+window after the request arrives, to accept or reject it. The \emph{hold
+time}\index{hold time} is the length of that window; the \emph{reject
+rate}\index{reject rate} is the share of requests rejected. The price check can
+be \emph{asymmetric}, rejecting only requests whose price has moved in the
+client's favour beyond a threshold, or \emph{symmetric}, rejecting moves beyond
+it in either direction.
+\end{definition}
+
+The provider's argument for \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} is that it can quote tighter if it may
+refuse the trades that arrive on stale prices. The client's objection is that a
+rejected request leaves it with the market risk it wanted to shed, at a worse
+price, and that an asymmetric check lets the provider keep the trades in which
+the price moved its way and refuse the others.
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,x=1.3cm]
+\draw[thick,-{Stealth}] (0,0) -- (10.4,0) node[right,font=\footnotesize] {time};
+\foreach \x/\l in {0/quote sent,2.2/request arrives,6.6/decision} {\draw (\x,0.12) -- (\x,-0.12); \node[below,font=\footnotesize,align=center] at (\x,-0.15) {\l};}
+\fill[omThm!15] (2.2,0.2) rectangle (6.6,1.0);
+\node[omThm,font=\footnotesize] at (4.4,0.6) {hold time: the provider holds the option};
+\draw[omDef,thick,-{Stealth}] (6.6,1.25) -- (7.6,1.85) node[right,font=\footnotesize] {accept: trade at the quoted price};
+\draw[omProp,thick,-{Stealth}] (6.6,1.25) -- (7.6,0.65) node[right,font=\footnotesize] {reject: client keeps its risk};
+\draw[gray,decorate,decoration={brace,amplitude=4pt,mirror}] (0,-0.9) -- (2.2,-0.9);
+\node[gray,font=\footnotesize] at (1.1,-1.3) {latency};
+\end{tikzpicture}
+
+\omcaption{The life of a request under \omterm{def:m2:fx-spot-microstructure:lastlook}{last look}. The quote reaches the client,
+the client's request reaches the provider after a latency, and the provider
+decides at the end of the \omterm{def:m2:fx-spot-microstructure:lastlook}{hold time} whether to trade at the price it quoted.
+During the hold the provider, not the client, holds the choice. Schematic.}\label{fig:m2:fx-spot-microstructure:timeline}
+\end{omfigure}
+
+\begin{proposition}[What an asymmetric window takes]\label{prop:m2:fx-spot-microstructure:transfer}
+Let the price move in the client's favour during the \omterm{def:m2:fx-spot-microstructure:lastlook}{hold time} $h$ by
+$X \sim N(0, \sigma^2 h)$, independent of the request, as it is for an
+uninformed client. An asymmetric check with threshold $\theta$ rejects when
+$X > \theta$, and the client gives up, per request,
+\[
+\mathbb{E}\bigl[X\,\mathbf 1\{X > \theta\}\bigr] \;=\; \sigma\sqrt{h}\;\varphi\!\left(\frac{\theta}{\sigma\sqrt h}\right).
+\]
+A symmetric check rejects $|X| > \theta$ and takes nothing in expectation
+(\cref{fig:m2:fx-spot-microstructure:tails}).
+\end{proposition}
+
+\begin{proof}
+For $X = sZ$ with $s = \sigma\sqrt h$, $\mathbb{E}[sZ\mathbf 1\{Z > \theta/s\}] =
+s\varphi(\theta/s)$. Under the symmetric check the rejected region is symmetric
+about zero, so the rejected moves average to zero.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=left,width=6.4cm,height=4.4cm,
+  xlabel={move in the client's favour (bp)},yticklabels={},ytick=\empty,
+  tick label style={font=\small},label style={font=\small},
+  xmin=-0.35,xmax=0.35,ymin=0,ymax=4.4,domain=-0.35:0.35,samples=120,
+  title={asymmetric},title style={font=\small}]
+\addplot[fill=omProp!35,draw=none,domain=0.05:0.35] {exp(-0.5*(x/0.1)^2)/(0.1*sqrt(2*pi))} \closedcycle;
+\addplot[omThm,very thick] {exp(-0.5*(x/0.1)^2)/(0.1*sqrt(2*pi))};
+\draw[gray,dashed] (axis cs:0.05,0) -- (axis cs:0.05,4.2);
+\node[omProp,font=\scriptsize,align=center] at (axis cs:0.22,2.6) {rejected\\30.9\%};
+\end{axis}
+\begin{axis}[at={(left.east)},anchor=west,xshift=1.0cm,width=6.4cm,height=4.4cm,
+  xlabel={move in the client's favour (bp)},yticklabels={},ytick=\empty,
+  tick label style={font=\small},label style={font=\small},
+  xmin=-0.35,xmax=0.35,ymin=0,ymax=4.4,domain=-0.35:0.35,samples=120,
+  title={symmetric},title style={font=\small}]
+\addplot[fill=omProp!35,draw=none,domain=0.05:0.35] {exp(-0.5*(x/0.1)^2)/(0.1*sqrt(2*pi))} \closedcycle;
+\addplot[fill=omProp!35,draw=none,domain=-0.35:-0.05] {exp(-0.5*(x/0.1)^2)/(0.1*sqrt(2*pi))} \closedcycle;
+\addplot[omThm,very thick] {exp(-0.5*(x/0.1)^2)/(0.1*sqrt(2*pi))};
+\draw[gray,dashed] (axis cs:0.05,0) -- (axis cs:0.05,4.2);
+\draw[gray,dashed] (axis cs:-0.05,0) -- (axis cs:-0.05,4.2);
+\node[omProp,font=\scriptsize,align=center] at (axis cs:0.22,2.6) {rejected\\61.7\%};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The move of the price during a 100-millisecond hold, for an
+uninformed request (standard deviation 0.1 basis points), and the requests
+rejected with a 0.05-basis-point threshold (shaded). The asymmetric check rejects
+only the right tail, whose mean the client loses; the symmetric one rejects both
+tails, which cancel. Illustrative.}\label{fig:m2:fx-spot-microstructure:tails}
+\end{omfigure}
+
+The symmetric check still costs the client something, the fills it loses, but it
+does not select against it. This is the distinction regulators drew. In the New
+York order, Barclays had compared the price at the start and at the end of a
+hold of tens to hundreds of milliseconds and rejected the orders that had become
+unprofitable to it; it made the check
+symmetric in September and October 2014, and one platform, with 7\% of its
+volume, stayed asymmetric until August 2015.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=left,width=6.4cm,height=5cm,xmode=log,log basis x=10,
+  xlabel={hold time (ms)},ylabel={reject rate (\%)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=8,xmax=600,ymin=0,ymax=105,grid=major,grid style={gray!25},
+  xtick={10,25,50,100,200,500},xticklabels={10,25,50,100,200,500},
+  legend columns=2,legend style={font=\footnotesize,at={(1.1,-0.32)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.2pt] table[x=hold,y=rej_inf_asym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\addplot[omProp,thick,dashed,mark=o,mark size=1.4pt] table[x=hold,y=rej_inf_sym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\addplot[omDef,very thick,mark=*,mark size=1.2pt] table[x=hold,y=rej_uninf_asym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\addplot[omDef,thick,dashed,mark=o,mark size=1.4pt] table[x=hold,y=rej_uninf_sym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\legend{informed asymmetric,informed symmetric,uninformed asymmetric,uninformed symmetric}
+\end{axis}
+\begin{axis}[at={(left.east)},anchor=west,xshift=1.4cm,width=6.4cm,height=5cm,xmode=log,log basis x=10,
+  xlabel={hold time (ms)},ylabel={mark-out (bp)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=8,xmax=600,ymin=0.35,ymax=0.6,grid=major,grid style={gray!25},
+  xtick={10,25,50,100,200,500},xticklabels={10,25,50,100,200,500},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=hold,y=mo_asym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\addplot[omThm,thick,dashed,mark=o,mark size=1.4pt] table[x=hold,y=mo_sym]{figdata/markets-2/15-fx-spot-microstructure/hold.csv};
+\draw[gray,dashed] (axis cs:8,0.3785) -- (axis cs:600,0.3785);
+\node[font=\scriptsize,gray,anchor=north east] at (axis cs:590,0.3785) {no last look};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A simulated EURUSD stream with 10\% informed requests. Left: \omterm{def:m2:fx-spot-microstructure:lastlook}{reject
+rates} by \omterm{def:m2:fx-spot-microstructure:lastlook}{hold time} for informed and uninformed clients under an asymmetric and
+a symmetric check with the same 0.05 basis-point threshold. Right: the
+provider's one-second \omterm{def:m2:fx-spot-microstructure:markout}{mark-out} per filled request (solid asymmetric, dashed
+symmetric). Both checks stop most informed requests; only the asymmetric one
+turns longer holds into more profit, taken from uninformed clients.
+Illustrative parameters; data: the chapter's tutorial.}\label{fig:m2:fx-spot-microstructure:hold}
+\end{omfigure}
+
+\Cref{fig:m2:fx-spot-microstructure:hold} shows both effects on a simulated
+stream. Informed requests, which arrive after a move of 0.2 basis points the
+quote has not caught up with, are almost all rejected by either check at short
+holds. Uninformed requests are rejected more by the symmetric check, which
+refuses moves either way, but that costs them nothing on average; the asymmetric
+check rejects fewer of them and its \omterm{def:m2:fx-spot-microstructure:markout}{mark-out} rises with the hold, because every
+extra millisecond gives the price more time to move in the client's favour and
+be refused.
+
+\begin{example}[The cost of a window]\label{ex:m2:fx-spot-microstructure:window}
+With the stream's volatility, 0.1 basis points over 100 milliseconds, an
+asymmetric check with a threshold of 0.05 basis points and a 100-millisecond
+hold takes $0.1\,\varphi(0.5) = 0.0352$ basis points per request from uninformed
+clients; with no threshold, 0.0399. On USD~2 billion of requests a day this is
+about USD~7\,041 a day, USD~1.76 million over 250 trading days. The symmetric
+check with the same threshold rejects 62\% of the requests and takes nothing on
+average.
+\end{example}
+
+\section{Skewing and internalisation}
+
+\begin{definition}[Quote skewing]\label{def:m2:fx-spot-microstructure:skew}
+\emph{Quote skewing}\index{quote skewing} is moving a stream's bid and ask
+together, off the provider's estimate of the mid, to attract trades that reduce
+its inventory: a provider long euros lowers both prices so that clients buy
+euros from it and fewer sell to it (\cref{fig:m2:fx-spot-microstructure:skew}).
+\end{definition}
+
+A large provider that receives thousands of client requests a minute can
+internalise much of its risk (One Quant Book 1, chapter 10): a sale by one
+client is offset by a purchase by another, and only the residual needs to be
+hedged on a venue. Skewing makes the netting happen sooner, at the cost of a
+small concession on price, and every hedge the provider does not send to a venue
+is information it does not reveal. The inventory models behind skews, which
+trade off expected spread against the risk of holding a position, are those of
+One Quant Book 1 and of the market-making games of
+\cref{ch:m2:market-making-games}.
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,y=1.1cm]
+\draw[gray,dashed] (-0.3,0) node[left,font=\footnotesize] {provider's mid} -- (9.6,0);
+\foreach \x/\t/\s in {1.5/flat inventory/0,5/long EUR~20 million/-0.35,8.5/short EUR~20 million/0.35} {
+  \draw[omDef,very thick] (\x-0.6,{\s+0.5}) -- (\x+0.6,{\s+0.5}) node[right,font=\footnotesize] {ask};
+  \draw[omThm,very thick] (\x-0.6,{\s-0.5}) -- (\x+0.6,{\s-0.5}) node[right,font=\footnotesize] {bid};
+  \node[font=\footnotesize,align=center] at (\x,-1.45) {\t};
+}
+\draw[omProp,thick,-{Stealth}] (5,-0.05) -- (5,-0.32);
+\draw[omProp,thick,-{Stealth}] (8.5,0.05) -- (8.5,0.32);
+\end{tikzpicture}
+
+\omcaption{\omterm{def:m2:fx-spot-microstructure:skew}{Quote skewing}. With no position the provider quotes symmetrically
+around its mid; long euros, it lowers both prices, so that buyers come to it and
+sellers go elsewhere; short, it raises them. The spread is unchanged, the
+centre moves. Schematic.}\label{fig:m2:fx-spot-microstructure:skew}
+\end{omfigure}
+
+\section{The global code of conduct}
+
+\begin{definition}[FX Global Code]\label{def:m2:fx-spot-microstructure:code}
+The \emph{FX Global Code}\index{FX Global Code} is a set of principles of good
+practice for the wholesale FX market, maintained by the Global Foreign Exchange
+Committee of central banks and private-sector participants. It is not law:
+participants adhere by signing a statement of commitment.
+\end{definition}
+
+The Code arrived in 2017, two years after the enforcement cases over the
+fixing of \cref{ch:m2:fixings-and-flows}, and \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} is among its most
+argued-over sections. Principle~17, as updated in
+December 2024, requires providers that use \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} to be transparent about it:
+to say whether and how price changes in either direction affect the decision,
+how long it takes and why they use it. It defines \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} as a risk control, to
+check that a request is valid and that its price is still consistent with the
+market, and forbids using it to gather information or to trade on the request
+during the window, whether by adjusting prices or by hedging. In August 2021
+the Committee published templates on which providers disclose their practices.
+
+\begin{remark}[What the Code leaves open]\label{rem:m2:fx-spot-microstructure:open}
+The Code does not ban asymmetric checks, nor does it set \omterm{def:m2:fx-spot-microstructure:lastlook}{hold times}. It asks
+providers to disclose them and clients to read the disclosures; the pressure
+that remains is competitive. Clients measure their fill ratios, \omterm{def:m2:fx-spot-microstructure:lastlook}{hold times} and
+\omterm{def:m2:fx-spot-microstructure:markout}{mark-outs} by provider, as the tutorial does, and route their requests
+accordingly.
+\end{remark}
+
+\begin{dated}{2026-09}{The Code today}\label{dat:m2:fx-spot-microstructure:code}
+The \omterm{def:m2:fx-spot-microstructure:code}{FX Global Code}'s current text is dated December 2024; its Principle~17 on
+\omterm{def:m2:fx-spot-microstructure:lastlook}{last look} is as summarised above. The Global Foreign Exchange Committee, set up
+in May 2017 to maintain it, published in August 2021 a guidance paper on \omterm{def:m2:fx-spot-microstructure:lastlook}{last
+look} and standard templates on which liquidity providers disclose their
+practices. Adherence remains voluntary, by statement of commitment.
+\end{dated}
+
+\section{Tutorial: last-look transaction-cost analysis}\label{tut:m2:fx-spot-microstructure:tca}
+
+\begin{tutorial}
+\textbf{Goal.} Simulate a stream with informed and uninformed clients, apply
+asymmetric and symmetric last-look checks, and measure \omterm{def:m2:fx-spot-microstructure:lastlook}{reject rates}, fill ratios
+and \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs} as a function of the \omterm{def:m2:fx-spot-microstructure:lastlook}{hold time}. \textbf{End state:}
+\cref{fig:m2:fx-spot-microstructure:hold}, \cref{ex:m2:fx-spot-microstructure:window}
+and the numbers of the weekend problem.
+\begin{tutsteps}
+\item \textbf{The check and the stream}: each request's move during the hold
+and after it.
+\omcode{code/firm/lastlook/firm_lastlook.py}{24}{43}{The last-look check and a simulated stream of requests.}\label{lst:m2:fx-spot-microstructure:sim}
+\item \textbf{The analysis}: fill ratio, \omterm{def:m2:fx-spot-microstructure:lastlook}{reject rates} by client type, \omterm{def:m2:fx-spot-microstructure:markout}{mark-out},
+and the closed form of \cref{prop:m2:fx-spot-microstructure:transfer}.
+\omcode{code/firm/lastlook/firm_lastlook.py}{46}{69}{Transaction-cost analysis and the expected transfer.}\label{lst:m2:fx-spot-microstructure:tca}
+\item \textbf{Run} \texttt{lastlook\_demo.by\_hold} for each policy,
+\texttt{lastlook\_demo.window()} and \texttt{fig\_lastlook.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the informed clients' fixed edge by a
+random one, and find the \omterm{def:m2:fx-spot-microstructure:lastlook}{hold time} at which a symmetric check has rejected 90\%
+of them; then plot the uninformed clients' fill ratio at that hold.
+\end{tutorial}
+
+\section{Build: the last-look analyser}\label{bld:m2:fx-spot-microstructure:lastlook}
+
+\begin{build}
+\bfield{Purpose} The miniature firm both takes and gives liquidity in FX spot:
+as a taker it must know what each provider's \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} costs it; as a maker it
+must be able to show its clients that its own check is symmetric and short.
+\bfield{Interface} \texttt{check(move, threshold, policy)};
+\texttt{simulate(n, sigma, hold, threshold, policy, informed\_share, edge,
+horizon, seed)} returning \texttt{Request} records; \texttt{tca(requests,
+half)}; \texttt{expected\_transfer(sigma, hold, threshold, policy)}.
+\bfield{Rules} Moves in basis points, positive in the client's favour;
+Brownian mid; policies \texttt{none}, \texttt{asymmetric}, \texttt{symmetric};
+seeded simulation.
+\bfield{Acceptance tests} \texttt{code/firm/lastlook/tests/}: the policies'
+definitions; no \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} fills everything; the simulated asymmetric transfer
+within 2\% of the closed form; informed requests rejected far more often than
+uninformed ones.
+\bfield{Stretch} Read real fill and reject records (a FIX log) and compute each
+provider's hold-time distribution and \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs}; test statistically whether a
+provider's rejects depend on the direction of the move.
+\end{build}
+
+\begin{omsources}
+\item New York State Department of Financial Services, Consent Order, In the
+Matter of Barclays Bank PLC, November 2015.
+\item Global Foreign Exchange Committee, \emph{FX Global Code}, updated
+December 2024; press release on last-look guidance and disclosure templates,
+August 2021.
+\item Bank for International Settlements, \emph{Quarterly Review}, December
+2022, box on the fragmented spot market.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:m2:fx-spot-microstructure:1}
+A provider sells a client EUR~1 million at 1.1464 when the mid is 1.1463. One
+second later the mid is 1.1465. Give the provider's one-second \omterm{def:m2:fx-spot-microstructure:markout}{mark-out} in
+dollars and in basis points.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m2:fx-spot-microstructure:2}
+Give the standard deviation of the price move over holds of 25, 100 and 400
+milliseconds at 0.01 basis points per square-root millisecond.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m2:fx-spot-microstructure:3}
+What must a provider that uses \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} disclose under Principle~17, and what
+must it not do during the window?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m2:fx-spot-microstructure:4}
+Give the transfer per request of an asymmetric check at a 25-millisecond hold
+and zero threshold, and compare it with the 100-millisecond hold.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m2:fx-spot-microstructure:5}
+A provider long EUR~20 million skews its EURUSD stream by 0.1 pip. Which way,
+and why may this be cheaper than hedging on a \omterm{def:m2:the-fx-market:venue}{primary venue}?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m2:fx-spot-microstructure:6}
+Why does a symmetric check reject more uninformed requests than an asymmetric
+one with the same threshold, yet cost them less?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m2:fx-spot-microstructure:7}
+\emph{Coding.} From \texttt{by\_hold}, give the informed and uninformed \omterm{def:m2:fx-spot-microstructure:lastlook}{reject
+rates} at 100 milliseconds under each policy, and the \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m2:fx-spot-microstructure:8}
+\emph{Find the flaw.} ``Our \omterm{def:m2:fx-spot-microstructure:lastlook}{reject rate} is only 5\%, so our \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} costs
+our clients nothing.'' Correct it.
+\end{exercise}
+
+\section{Problem: The Asymmetric Window}
+
+\begin{problem}[{Weekend problem --- what a last-look window takes from a client}]\label{pb:m2:fx-spot-microstructure:1}
+An asset manager sends USD~2 billion of EURUSD requests a day to a provider
+that uses \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} with a 100-millisecond hold and a 0.05-basis-point
+threshold. The mid moves 0.01 basis points per square-root millisecond, the
+half-spread is 0.4 basis points, and the manager's flow is uninformed.
+
+\medskip\noindent\textbf{Part I --- The window.}
+\begin{enumerate}
+\item Give the standard deviation of the move over the hold.
+\item Under an asymmetric check, what share of requests is rejected?
+\item Under a symmetric check with the same threshold?
+\item Give the transfer per request under each.
+\item Give the asymmetric transfer with no threshold.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- In money.}
+\begin{enumerate}[resume]
+\item Give the daily cost of the asymmetric window.
+\item Give it over 250 trading days.
+\item How does it compare with the half-spread the manager pays?
+\item Give the cost with a 25-millisecond hold and no threshold.
+\item Why does the cost grow with the square root of the hold?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- What the manager sees.}
+\begin{enumerate}[resume]
+\item Which statistics reveal an asymmetric check?
+\item Why is a low \omterm{def:m2:fx-spot-microstructure:lastlook}{reject rate} not enough?
+\item What should the manager ask the provider, citing the Code?
+\item What else does a rejection cost, beyond the transfer?
+\item Why might the manager still prefer a provider with \omterm{def:m2:fx-spot-microstructure:lastlook}{last look}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item What did the New York order find wrong with Barclays's check?
+\item Is a symmetric check fair to the client?
+\item How does a firm-price, no-last-look stream protect itself instead?
+\item State the \emph{named result}: what the asymmetric window takes from the
+manager each year.
+\item In one sentence: what does a last-look window cost a client?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader, developer}]\label{iq:m2:fx-spot-microstructure:1}
+What is \omterm{def:m2:fx-spot-microstructure:lastlook}{last look}, and why do liquidity providers use it?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:m2:fx-spot-microstructure:2}
+How would you tell, from your fills, whether a provider's \omterm{def:m2:fx-spot-microstructure:lastlook}{last look} is
+asymmetric?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:m2:fx-spot-microstructure:3}
+What is a \omterm{def:m2:fx-spot-microstructure:markout}{mark-out}, and how do you use \omterm{def:m2:fx-spot-microstructure:markout}{mark-outs} to tier clients?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:m2:fx-spot-microstructure:4}
+You are long EUR~50 million from client flow. Do you skew, hedge, or wait?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{bank, trader}]\label{iq:m2:fx-spot-microstructure:5}
+What does the \omterm{def:m2:fx-spot-microstructure:code}{FX Global Code} require of \omterm{def:m2:fx-spot-microstructure:lastlook}{last look}, and what does it not
+require?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:m2:fx-spot-microstructure:6}
+Design a pricing engine that streams EURUSD to a thousand clients in several
+tiers and applies a symmetric last-look check, within a latency budget of tens
+of microseconds.
+\end{interviewq}

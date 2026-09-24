@@ -1,0 +1,456 @@
+\chapter{Reading Market Data}\label{ch:m1:reading-market-data}
+
+Before lunch an exchange has sent one firm tens of millions of messages about
+thousands of instruments. Each says that an order was added, reduced,
+executed or removed, in a few dozen bytes. None says what the best bid is:
+that is for the receiver to work out, by applying every message, in order, to
+a book it maintains itself. If one message is lost, the book is wrong until
+the end of the day, silently. If one trade report is a typing error, a price
+of 10.01 in a stock worth 100, the day's low, its volatility, its
+volume-weighted average price and every signal computed from them are wrong,
+also silently. Every result in the rest of this series stands on a table of
+prices; this chapter is about how that table is made, and about the defects
+it inherits.
+
+\section{Three levels of data}
+
+\begin{definition}[Level 1, level 2, level 3]\label{def:m1:reading-market-data:levels}
+\emph{Level 1}\index{level 1} data is the best bid and offer with their
+sizes, and the last trade. \emph{Level 2}\index{level 2} data is the book
+aggregated by price: for each price level, the total size (and sometimes
+the number of orders), to some depth or in full: the \omterm{def:m1:matching-algorithms-and-implied-spreads:mbo}{market-by-price} feed of
+\cref{def:m1:matching-algorithms-and-implied-spreads:mbo}. \emph{Level
+3}\index{level 3} data is every order individually, with its identifier and
+every event in its life: the \omterm{def:m1:matching-algorithms-and-implied-spreads:mbo}{market-by-order} feed, from which the other two
+can be computed and which alone gives queue positions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  col/.style={draw=omDef,rounded corners=2pt,minimum width=3.9cm,minimum height=3.3cm,align=left,fill=omDef!4,font=\footnotesize\ttfamily,inner sep=5pt}]
+\node[col] (l3) at (0,0) {ref side  size  price\\1001 B \ \ \ 300 \ 99.99\\1002 B \ \ \ 200 \ 99.99\\1004 B \ \ \ 100 \ 99.98\\1003 S \ \ \ 500 100.01\\1005 S \ \ \ 100 100.02};
+\node[col] (l2) at (4.6,0) {side  size  price  n\\B \ \ \ \ 500 \ 99.99 \ 2\\B \ \ \ \ 100 \ 99.98 \ 1\\S \ \ \ \ 500 100.01 \ 1\\S \ \ \ \ 100 100.02 \ 1};
+\node[col] (l1) at (9.2,0) {bid \ 99.99 x 500\\ask 100.01 x 500\\last 100.01 x 100};
+\node[font=\small\bfseries,above=2pt of l3] {Level 3: orders};
+\node[font=\small\bfseries,above=2pt of l2] {Level 2: prices};
+\node[font=\small\bfseries,above=2pt of l1] {Level 1: top};
+\draw[-{Stealth[length=2mm]},thick] (l3.east) -- (l2.west);
+\draw[-{Stealth[length=2mm]},thick] (l2.east) -- (l1.west);
+\end{tikzpicture}
+
+\omcaption{One book at three levels of detail. Each level can be computed
+from the one to its left and never the reverse: a vendor's one-second bars
+are \omterm{def:m1:reading-market-data:levels}{level 1} sampled; they cannot be turned back into a
+book.}\label{fig:m1:reading-market-data:levels}
+\end{omfigure}
+
+\begin{definition}[Sequence number]\label{def:m1:reading-market-data:seq}
+A \emph{sequence number}\index{sequence number} is a counter that the
+publisher increments with each message on a channel. A receiver that sees a
+jump has lost messages and must recover them, from a retransmission service
+or a snapshot, before its book can be trusted again.
+\end{definition}
+
+A \omterm{def:m1:reading-market-data:levels}{level 3} feed is a stream of \emph{differences}. The state is on the
+receiver's side, which makes the protocol compact and makes every receiver
+responsible for correctness. \omterm{def:m1:us-equity-market-structure:sip}{Direct feeds} are published on two redundant
+network paths; the receiver takes whichever copy of each \omterm{def:m1:reading-market-data:seq}{sequence number}
+arrives first and notices when neither does.
+
+\begin{dated}{2026-09}{One wire format}\label{dat:m1:reading-market-data:itch}
+The order-by-order equity feed whose version 5.0 specification is used as
+this chapter's model encodes all integers big-endian; prices as integers
+with four implied decimal places; timestamps as nanoseconds since midnight
+in six bytes; and instruments by a two-byte \emph{locate} code assigned for
+the day, at the same offset in every message. An add-order message has 36
+bytes: type, locate, tracking number, timestamp, an eight-byte order
+reference, side, shares, an eight-character symbol and the price. An
+execution has 31 bytes and refers to the order only by its reference, as do
+the cancel (23 bytes) and the delete (19 bytes): the price of a trade is not
+in the execution message, it is wherever the receiver stored the order.
+\end{dated}
+
+\section{Trades, quotes and condition codes}
+
+\begin{definition}[Trade condition]\label{def:m1:reading-market-data:condition}
+A \emph{trade condition}\index{trade condition} (or sale condition) is a code
+attached to a trade report that says what kind of trade it was and how it
+may be used: a regular trade; an opening or closing auction print; an \omterm{def:m1:us-equity-market-structure:lots}{odd
+lot}; a trade reported late or out of sequence; a trade at an average or
+derived price; a correction or a cancellation of an earlier report. The
+consolidated tapes and each exchange define which conditions update the last
+price, the high and low, and the volume.
+\end{definition}
+
+A tape is not a list of prices at which one could have traded. An
+out-of-sequence report carries a price from minutes ago. An average-price
+trade matches no quote that ever existed. A cancelled trade did not happen;
+its cancellation arrives as a later message that a careless loader ignores.
+An auction print is one price for a large share of the day's volume. Off-exchange
+trades (\cref{ch:m1:retail-flow-and-wholesaling}) are reported after the
+fact, seconds late, with a timestamp that may be the reporter's.
+Before any statistic is computed from trades, a rule must say which
+conditions are in.
+
+\begin{method}[Cleaning a tape]\label{met:m1:reading-market-data:clean}
+\begin{enumerate}
+\item Apply corrections and cancellations, matching them to the original
+reports.
+\item Keep or drop each condition explicitly, by purpose: all executed
+volume for a volume total; only regular, in-sequence trades for a last
+price, a high or a low; auctions separately.
+\item Flag prints far from the prevailing quote or from a rolling median;
+inspect before deleting: a flash crash is data, a decimal error is not.
+\item Record what was removed and why. The rule is part of the result.
+\end{enumerate}
+\end{method}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=4.8cm,
+  xlabel={trade number},ylabel={price},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=16,ymin=0,ymax=115,grid=major,grid style={gray!25},
+  scatter/classes={1={mark=*,omDef,mark size=1.8pt},0={mark=x,omThm,mark size=3.5pt,very thick}},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[scatter,only marks,scatter src=explicit symbolic] table[x=seq,y=price,meta=kept]{figdata/markets-1/28-reading-market-data/badtick.csv};
+\legend{kept,removed by the filter}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Fifteen trade reports in one stock. The automatic filter removes
+two, the print at 10.01 and a cancelled trade that looks perfectly normal;
+the late report at 99.80 passes it. With all fifteen the volume-weighted
+average price is 98.40; the true figure is near 100. Data: the weekend
+problem.}\label{fig:m1:reading-market-data:badtick}
+\end{omfigure}
+
+\section{Timestamps}
+
+\begin{definition}[Exchange and receive timestamps]\label{def:m1:reading-market-data:ts}
+The \emph{exchange timestamp}\index{exchange timestamp} is written by the
+publisher's matching engine or gateway when the event occurs. The
+\emph{receive timestamp}\index{receive timestamp} is written by the
+recipient's capture system when the message arrives. The first orders events
+within one venue; only the second says what the recipient could have known,
+and when.
+\end{definition}
+
+A backtest that uses \omterm{def:m1:reading-market-data:ts}{exchange timestamps} assumes the firm learned of each
+event at the instant it happened. The difference, tens of microseconds in
+the same building and milliseconds between cities, is the whole of some
+strategies' edge (One Quant Book 10). Two venues' exchange clocks are not
+the same clock: comparing their timestamps to decide which quote moved
+first is valid only to the accuracy of their synchronisation.
+
+\begin{dated}{2026-09}{How accurate clocks must be}\label{dat:m1:reading-market-data:clocks}
+\emph{European Union.} The regulatory technical standard on clock
+synchronisation requires members of a trading venue that use high-frequency
+algorithmic techniques to keep their business clocks within 100
+microseconds of UTC and to timestamp with a granularity of a microsecond or
+better. \emph{United States.} The consolidated audit trail plan requires
+exchanges to keep their clocks within 100 microseconds of the national
+standards institute's time, and \omterm{def:m1:the-sell-side:sell-side}{broker-dealers} within 50 milliseconds (one
+second for clocks used only for manual events).
+\end{dated}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=4.6cm,
+  xlabel={mean latency jitter (microseconds)},ylabel={out of order (\%)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=5200,ymin=0,ymax=36,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=jitter_us,y=inversions_pct]{figdata/markets-1/28-reading-market-data/reorder.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The chapter's sample feed, replayed with a receive time equal to
+the exchange time plus 200 microseconds plus an exponential jitter. Sorting
+by receive time misorders 1\% of messages at a jitter of 100 microseconds and
+a third at 5 milliseconds. Within one feed, order by \omterm{def:m1:reading-market-data:seq}{sequence number}, never
+by either clock. Data: the tutorial.}\label{fig:m1:reading-market-data:reorder}
+\end{omfigure}
+
+\section{Symbology and reference data}
+
+\begin{definition}[Symbology and reference data]\label{def:m1:reading-market-data:refdata}
+\emph{Symbology}\index{symbology} is the set of identifiers under which one
+instrument is known: exchange ticker, vendor codes, national and
+international security numbers, a feed's numeric code for the day.
+\emph{Reference data}\index{reference data} is everything about the
+instrument that is not a price: identifiers and their history, listing venue,
+currency, tick size, lot size, multiplier, expiry, corporate actions,
+trading calendar.
+\end{definition}
+
+A ticker is not an identifier. Tickers are reused after delistings, changed
+on mergers, and differ by venue and by vendor; a feed's locate code is valid
+for one day. Research tables must be keyed by a permanent internal
+identifier, with every external symbol mapped to it by date range. The
+commonest silent error in equity research, after look-ahead, is a
+time series that is two different companies joined at the date one took the
+other's ticker. The builds of chapters~\ref{ch:m1:shares-corporate-actions-indices},
+\ref{ch:m1:futures-contracts-and-exchanges} and
+\ref{ch:m1:option-contracts-and-exchanges} are this chapter's \omterm{def:m1:reading-market-data:refdata}{reference data}.
+
+\section{From raw feed to research table}
+
+\begin{definition}[Normalisation]\label{def:m1:reading-market-data:norm}
+\emph{Normalisation}\index{normalisation} is the conversion of each venue's
+native messages into one internal representation: common message types,
+integer prices in a common unit, a common clock field, permanent instrument
+identifiers, explicit condition flags.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,
+  xlabel={seconds since the first message},ylabel={price},
+  tick label style={font=\small},label style={font=\small},
+  ymin=99.945,ymax=100.065,grid=major,grid style={gray!25},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/fixed zerofill,/pgf/number format/precision=2},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omDef,thick,const plot] table[x=seconds,y=bid]{figdata/markets-1/28-reading-market-data/l1.csv};
+\addplot[omThm,thick,const plot] table[x=seconds,y=ask]{figdata/markets-1/28-reading-market-data/l1.csv};
+\addplot[only marks,mark=*,mark size=1.2pt,black] table[x=seconds,y=price]{figdata/markets-1/28-reading-market-data/tape.csv};
+\legend{best bid,best ask,trades}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:m1:reading-market-data:levels}{Level 1} and the tape, rebuilt from 640 messages of the chapter's
+binary sample by the build's decoder and book. Every execution of a displayed
+order prints at the bid or at the ask, which is how its aggressor is known;
+the prints between them are trades against hidden orders. Data: the
+chapter's build.}\label{fig:m1:reading-market-data:l1}
+\end{omfigure}
+
+The pipeline has four stages, and research should know which one its table
+came from. \emph{Capture}: every packet, with a hardware \omterm{def:m1:reading-market-data:ts}{receive timestamp},
+written unmodified. \emph{Decode and normalise}: the build below.
+\emph{Book building}: apply messages in sequence, detect gaps, emit \omterm{def:m1:reading-market-data:levels}{level 2}
+and \omterm{def:m1:reading-market-data:levels}{level 1} as derived streams. \emph{Tables}: trades with conditions and
+aggressor side; quotes; bars, which are a lossy summary chosen for a
+purpose. Each stage must be replayable from the one before, bit for bit:
+when a result looks wrong, the question ``is it the data?'' must have an
+answer.
+
+\section{Tutorial: a binary feed into a book and a tape}\label{tut:m1:reading-market-data:decode}
+
+\begin{tutorial}
+\textbf{Goal.} Decode a framed binary order-by-order feed, maintain the book,
+produce \omterm{def:m1:reading-market-data:levels}{level 1} and a tape with aggressor side, and measure what receive-time
+jitter does to message order. \textbf{End state:} the three data figures of
+this chapter, from \texttt{code/firm/feed/data/sample.itch} (2\,020 messages,
+65\,842 bytes).
+\begin{tutsteps}
+\item \textbf{Framing and header.} Length prefix, type, then the fields every
+message shares. A length that does not fit the type is an error, not a
+hint.
+\omcode{code/firm/feed/firm_feed.py}{58}{74}{Python: frame, check, read the common header.}\label{lst:m1:reading-market-data:py}
+\item \textbf{The same in C++}, over a span of bytes, without copies.
+\omcode{code/firm/feed/cpp/firm_feed.hpp}{47}{59}{C++: the decode loop's framing and header.}\label{lst:m1:reading-market-data:cpp}
+\item \textbf{And in Rust}, as an iterator that yields a result per message
+and stops after the first error.
+\omcode{code/firm/feed/rust/src/lib.rs}{53}{79}{Rust: one step of the decoder.}\label{lst:m1:reading-market-data:rs}
+\item \textbf{The book.} An execution carries no price: it is looked up.
+\omcode{code/firm/feed/firm_feed.py}{146}{168}{Applying one message to the book and the tape.}\label{lst:m1:reading-market-data:apply}
+\end{tutsteps}
+\textbf{What to change next.} Drop one add-order message from the sample and
+watch the errors the book records, and how long it takes before an execution
+refers to the missing order. Then add a replace message (cancel and add
+with a new reference, losing priority) to all three decoders.
+\end{tutorial}
+
+\section{Build: the feed normaliser}\label{bld:m1:reading-market-data:feed}
+
+\begin{build}
+\bfield{Purpose} The entry point of all market data into the miniature
+firm: the simulated exchange of One Quant Book 10 publishes this format, the
+strategies of Book 11 consume the book, and the research tables of Book 7 are
+written from the tape.
+\bfield{Interface} Python: \texttt{encode(msg)}, \texttt{decode(buffer)},
+\texttt{Book.apply(msg)}, \texttt{Book.best(locate)}, \texttt{Book.depth(locate,
+side, n)}, \texttt{Book.trades}, \texttt{Book.errors}, \texttt{summary(book,
+locate)}. C++20 (header only): \texttt{firm::feed::decode(span, callback)},
+\texttt{Book}, \texttt{Summary}. Rust: \texttt{decode(\&[u8])} returning an
+iterator of results, \texttt{Book}, \texttt{Summary}.
+\bfield{Rules} Big-endian integers, prices in ten-thousandths, 48-bit
+nanosecond timestamps, two-byte length framing. A truncated frame or a
+length inconsistent with the type stops decoding with an error. The book
+never guesses: an unknown order reference, an over-execution, a duplicate
+add or a timestamp that goes backwards is recorded and counted. The three
+implementations must produce the same summary on the shared sample.
+\bfield{Acceptance tests} \texttt{code/firm/feed/tests/} (round trip, garbage,
+a book by hand, recorded errors, reproducibility of the sample);
+\texttt{cpp/firm\_feed\_test.cpp} and the Rust crate's tests (the shared
+sample's summary, truncation, a bad length, an unknown order).
+\bfield{Stretch} \omterm{def:m1:reading-market-data:seq}{Sequence numbers} with gap detection and A/B line
+arbitration; a snapshot message for recovery; a benchmark of messages per
+second in each language (One Quant Book 13 starts from there).
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{Nasdaq TotalView-ITCH 5.0} specification (revision of 28
+April 2023).
+\item Commission Delegated Regulation (EU) 2017/574 (clock synchronisation,
+``RTS 25'').
+\item CAT NMS Plan, frequently asked questions on clock synchronisation
+(R1); FINRA Rule 6820.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:1}
+From the \omterm{def:m1:reading-market-data:levels}{level 3} view of \cref{fig:m1:reading-market-data:levels} an execution
+of 300 shares arrives for order 1001, then a cancel of 100 shares for order
+1002. Give levels 2 and 1 afterwards. At what price did the trade print and
+who was the aggressor?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:2}
+A price field contains the four bytes \texttt{00 0F 41 DC} (hexadecimal),
+big-endian, with four implied decimals. Give the price. What would a
+little-endian reader make of it?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:3}
+The chapter's sample has 1\,102 adds, 311 executions, 114 cancels, 473 deletes
+and 20 hidden trades. Verify the file's size from the message lengths and
+the framing.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:4}
+A timestamp of six bytes counts nanoseconds since midnight. What is the
+largest time of day it can hold? Why is four bytes not enough, and what is
+gained over eight?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:5}
+Venue A timestamps a quote change at 10:00:00.000\,150 and venue B at
+10:00:00.000\,190. Both venues' clocks are within 100 microseconds of UTC.
+Can you say which moved first? What would you need?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:6}
+A receiver sees \omterm{def:m1:reading-market-data:seq}{sequence numbers} 5\,001, 5\,002, 5\,004 on line A and 5\,001,
+5\,003, 5\,004 on line B. What does it do? Now both lines skip 5\,003: what
+must happen before the book is used again, and what may the strategy do
+meanwhile?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m1:reading-market-data:7}
+\emph{Coding.} With \texttt{receive\_times} and \texttt{inversions} on the
+sample, reproduce the out-of-order percentages at jitters of 100 and 1\,000
+microseconds. Then halve the message rate (keep every second message) and
+explain the change.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m1:reading-market-data:8}
+\emph{Find the flaw.} A researcher downloads one-minute bars for 3\,000
+tickers over fifteen years, keyed by ticker, computes each stock's daily low
+as the minimum of the bars' lows, and finds that buying stocks that fell more
+than 50\% intraday and recovered by the close is hugely profitable. Name
+three data defects, from this chapter, that could produce the result.
+\end{exercise}
+
+\section{Problem: The Bad Tick}
+
+\begin{problem}[{Weekend problem --- fifteen prints and a benchmark}]\label{pb:m1:reading-market-data:1}
+A desk must report the volume-weighted average price of a stock from 09:30:00
+to 09:32:00 as the benchmark of a client order. The tape (sequence, time,
+price, shares, condition; the conditions are this book's labels):
+
+\begin{center}\footnotesize
+\begin{tabular}{rlrrl@{\qquad}rlrrl}
+\toprule
+1 & 09:30:00 & 100.02 & 12\,000 & open & 9 & 09:30:52 & 100.09 & 300 & cancelled \\
+2 & 09:30:04 & 100.05 & 300 & & 10 & 09:31:03 & 100.11 & 600 & \\
+3 & 09:30:09 & 100.04 & 50 & \omterm{def:m1:us-equity-market-structure:lots}{odd lot} & 11 & 09:31:10 & 99.80 & 5\,000 & late \\
+4 & 09:30:15 & 100.07 & 500 & & 12 & 09:31:18 & 100.12 & 200 & \\
+5 & 09:30:21 & 100.06 & 200 & & 13 & 09:31:25 & 100.13 & 700 & \\
+6 & 09:30:30 & 10.01 & 400 & & 14 & 09:31:40 & 100.12 & 100 & \\
+7 & 09:30:31 & 100.08 & 400 & & 15 & 09:31:55 & 100.15 & 900 & \\
+8 & 09:30:40 & 100.10 & 1\,000 & & & & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip\noindent\textbf{Part I --- The naive number.}
+\begin{enumerate}
+\item Give total shares and the volume-weighted average price of all fifteen
+prints.
+\item Give the period's low from all prints.
+\item By how many basis points does the naive average differ from 100.05?
+\item What would a volatility estimate from these prints do?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Print by print.}
+\begin{enumerate}[resume]
+\item Print 6: what is it, how would a filter catch it, and how would you
+confirm?
+\item Print 9: why does an outlier filter not catch it, and what does?
+\item Print 11 was executed at 09:24 and reported at 09:31. Should it be in
+the benchmark of an order that started at 09:30?
+\item Print 3 is an \omterm{def:m1:us-equity-market-structure:lots}{odd lot}. In or out?
+\item Print 1 is the opening auction. The client's order was entered at
+09:30:02. In or out?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The corrected numbers.}
+\begin{enumerate}[resume]
+\item Excluding the erroneous, the cancelled and the late prints, give the
+number excluded, the shares, and the average price.
+\item Excluding the auction as well, give the average price of continuous
+trading.
+\item Give the corrected low and high.
+\item The client's order bought 2\,000 shares at an average of 100.09. Give
+its slippage in basis points against each of the two corrected benchmarks.
+\item Which benchmark is right?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item The exchange later breaks print 6. How does that reach your database,
+and what must your loader do?
+\item Why should the cleaning rule be fixed before looking at the order's
+result?
+\item A vendor's ``cleaned'' bars already exclude some conditions. What must
+you obtain from the vendor?
+\item Where in the four-stage pipeline does each of the defects of Part II
+get handled?
+\item State the \emph{named result}: the number of prints to exclude and the
+corrected volume-weighted average price.
+\item In one sentence: what is a trade report?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher, trader}]\label{iq:m1:reading-market-data:1}
+What is the difference between \omterm{def:m1:reading-market-data:levels}{level 1}, \omterm{def:m1:reading-market-data:levels}{level 2} and \omterm{def:m1:reading-market-data:levels}{level 3} market data?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:m1:reading-market-data:2}
+How do you build an order book from an order-by-order feed? What data
+structures?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:m1:reading-market-data:3}
+Your feed handler detects a gap in \omterm{def:m1:reading-market-data:seq}{sequence numbers}. What happens next?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:m1:reading-market-data:4}
+Which timestamp do you use in a backtest, and what goes wrong if you choose
+the other?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:m1:reading-market-data:5}
+You are given a trades file. What do you check before computing anything?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:m1:reading-market-data:6}
+Design the storage of a firm's captured market data so that any research
+result can be reproduced five years later.
+\end{interviewq}

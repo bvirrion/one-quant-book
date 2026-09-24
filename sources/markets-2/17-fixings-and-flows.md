@@ -1,0 +1,32 @@
+# 17. Fixings and Flows — brief and source ledger
+
+## Brief
+
+- **Hook.** At 15:59:30 London time the chat rooms go quiet; at 16:00:00 the fix is struck; at 16:02 the price is back where it started.
+- **Sections.** The benchmark fix; Month-end and index rebalancing flows; Option expiries and the cuts; The fixing scandal and what changed.
+- **Defines.** benchmark fix, fixing window, fixing order, month-end rebalancing, option cut, banging the close.
+- **Uses (defined earlier).** benchmark, currency pair, FX Global Code, tracking error.
+- **Tutorial.** Estimate a month-end hedge-rebalancing flow from equity returns and a hedge ratio.
+- **Build.** `firm.fixflow`: month-end flow estimator.
+- **Weekend problem.** Guaranteed at the fix — named result: the dealer's expected P&L on a fixing order with and without pre-hedging.
+- **Facts to verify.** WM/Reuters 4pm fix, window lengthened to 5 min in 2015; FCA Nov 2014 fines (amounts, banks); CFTC/DOJ FX actions 2014-2015 (outcomes); 10am NY cut, 3pm Tokyo cut; ECB reference rate 14:15 CET.
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | FCA, 12 Nov 2014: fines totalling GBP 1,114,918,000 on Citibank (225,575,000), HSBC (216,363,000), JPMorgan (222,166,000), RBS (217,000,000), UBS (233,814,000) for failing to control G10 spot FX; between 1 Jan 2008 and 15 Oct 2013 traders shared confidential client information and attempted to manipulate G10 spot FX rates, including in collusion; largest fines ever by the FCA; industry-wide remediation programme; Barclays investigation continued | FCA press release, 12 Nov 2014 | https://www.fca.org.uk/news/press-releases/fca-fines-five-banks-%C2%A311-billion-fx-failings-and-announces-industry-wide-remediation-programme | 2026-09-23 | "fines totalling £1,114,918,000 ($1.7 billion) on five banks" | §4 |
+| F2 | CFTC, 12 Nov 2014: over USD 1.4 billion of penalties (Citibank 310m, JPMorgan 310m, RBS 290m, UBS 290m, HSBC 275m); traders coordinated in private chat rooms, disclosed confidential customer orders and positions, to attempt to manipulate FX benchmarks, primarily the 4 p.m. WM/R fix | CFTC press release 7056-14 | https://www.cftc.gov/PressRoom/PressReleases/7056-14 | 2026-09-23 | "coordinated their trading with traders at other banks in their attempts to manipulate the FX benchmark rates" | §4 |
+| F3 | DOJ, 20 May 2015: Citicorp, JPMorgan, Barclays and RBS agree to plead guilty to conspiring to fix prices and rig bids for USD and EUR, criminal fines totalling more than USD 2.5 billion (Citicorp 925m, Barclays 650m plus 60m for breaching its LIBOR NPA, JPMorgan 550m, RBS 395m); between Dec 2007 and Jan 2013 euro-dollar traders, self-described members of "The Cartel", used an exclusive chat room and coded language to manipulate the 1:15 p.m. ECB fix and the 4:00 p.m. WM/Reuters fix, and withheld bids or offers to protect each other's positions; UBS pleaded guilty for LIBOR (USD 203m) | US Department of Justice press release, 20 May 2015 | https://www.justice.gov/sites/default/files/atr/legacy/2015/05/20/314165.pdf | 2026-09-23 | "self-described members of "The Cartel" - used an exclusive electronic chat room and coded language to manipulate benchmark exchange rates" | hook; §4 |
+| F4 | FSB Foreign Exchange Benchmarks final report, 30 Sep 2014: recommended widening the WM/Reuters fixing window from one minute; WM extended it on 15 Feb 2015 from 1 to 5 minutes for all currencies, from 2.5 minutes before to 2.5 minutes after the hour (or half hour); 4pm UK time closing spot rates | FSB final report (search excerpt); WM/Reuters presentation to the ECB FX Contact Group, 12 Nov 2015 | https://www.ecb.europa.eu/paym/groups/pdf/fxcg/2015/1211/2015-11-12_WM_presentation.pdf | 2026-09-23 | "15th February 2015 - extended the fixing calculation window from 1 minute to 5 minutes for all currencies" | def; §1; §4 |
+| F5 | ECB euro reference rates published around 16:00 CET each working day, from a concertation around 14:10 CET; published for information only, use for transactions strongly discouraged | ECB, euro foreign exchange reference rates | https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html | 2026-09-23 | "Using the rates for transaction purposes is strongly discouraged." | §1 |
+| F6 | The two most common FX option expiries are 10:00 New York (NY cut) and 15:00 Tokyo (Tokyo cut) | FOREX.com glossary, "Option expiry date/price" (search excerpt); CME Group page on expiration time (search excerpt: "The 10:00 a.m. New York time expiry is an industry convention of the over-the-counter FX options market") | https://www.forex.com/en-uk/glossary/option-expiry-date-price/ | 2026-09-23 | "The two most common option expiries are 10:00am ET ... and 3:00pm Tokyo time" | def option cut; §3 |
+| F8 | FX Global Code on Fixing Orders: understand risks; do not inappropriately share information or attempt to influence the rate, by collusion or otherwise; do not intentionally influence the benchmark fixing rate to benefit from it; follow the FSB recommendations (transparent pricing consistent with the risk; internal procedures); acceptable: transacting over time before, during or after the window if not intended to harm the client. Principle 11: pre-hedge only as principal, fairly and transparently; pre-hedging is managing the risk of anticipated client orders, designed to benefit the client; communicate practices; agents should not pre-hedge | GFXC, FX Global Code, updated Dec 2024, Principles 10-11 | https://www.globalfxc.org/uploads/fx_global.pdf | 2026-09-23 | "A Market Participant should only Pre-Hedge Client orders when acting as a Principal, and should do so fairly and with transparency." | §4 |
+| F7 | Rest-of-world holdings of US corporate equities (market value) USD 22.2 trillion in 2026 Q2 (USD 18.9 trillion in Q1) | Federal Reserve Z.1 via FRED BOGZ1LM263064105Q | https://fred.stlouisfed.org/graph/fredgraph.csv?id=BOGZ1LM263064105Q | 2026-09-23 | 22,210,667 (USD million) | §2; dat:m2:fixings-and-flows:size |
+
+## EXCLUDED
+
+- Brief hook (chat rooms quiet at 15:59:30, price back at 16:02): a scene; replaced by the DOJ facts (F3).
+- The share of foreign holdings of US equities that is currency-hedged: no official figure fetched; the chapter's hedge ratios are illustrative.
+- Evidence on price patterns around the fix after 2015 (GFXC 2019 presentation, NBER working paper): not fetched in full; not used.
+
