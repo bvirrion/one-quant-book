@@ -64,10 +64,10 @@ about 20 pages of front and back matter per book.
 |---|---|---|---|---|
 | 1 | One Quant Book 1 — Markets I: The Ecosystem and Exchange-Traded Markets | 31 | 374 (written) | `outline/markets.md` |
 | 2 | One Quant Book 2 — Markets II: Rates, FX and Credit | 31 | 363 (written) | `outline/markets.md` |
-| 3 | One Quant Book 3 — Markets III: Commodities, Energy and Crypto | 29 | ~386 | `outline/markets.md` |
-| 4 | One Quant Book 4 — Quantitative Methods | 29 | ~406 | `outline/methods-derivatives.md` |
-| 5 | One Quant Book 5 — Derivatives and Volatility | 28 | ~386 | `outline/methods-derivatives.md` |
-| 6 | One Quant Book 6 — Rates, Credit, XVA and Risk | 29 | ~372 | `outline/methods-derivatives.md` |
+| 3 | One Quant Book 3 — Markets III: Commodities, Energy and Crypto | 29 | 332 (written) | `outline/markets.md` |
+| 4 | One Quant Book 4 — Quantitative Methods | 29 | 351 (written) | `outline/methods-derivatives.md` |
+| 5 | One Quant Book 5 — Derivatives and Volatility | 28 | 348 (written) | `outline/methods-derivatives.md` |
+| 6 | One Quant Book 6 — Rates, Credit, XVA and Risk | 29 | 314 (written) | `outline/methods-derivatives.md` |
 | 7 | One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios | 29 | ~398 | `outline/research-strategies.md` |
 | 8 | One Quant Book 8 — Strategies I: Equities and Futures | 29 | ~388 | `outline/research-strategies.md` |
 | 9 | One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks | 29 | ~382 | `outline/research-strategies.md` |
@@ -84,6 +84,11 @@ about 20 pages of front and back matter per book.
 Total: 524 chapters, about 7,070 pages, and about 300 strategy files
 (231 in Books 8–9, 75 in Book 11). Books 6 and 13 have the most headroom;
 Books 1, 2 and 18 run slightly over 400.
+
+Measured (2026-09-24): Books 1–6 are written, 2,082 pages against the
+outline's 2,390 for them (−13 %). Written books run 10.8–12.4 pages a chapter
+all-in; the per-chapter figures above overstate by 1–3 pages wherever they
+exceed 12, so the series total will land nearer 6,200 than 7,070.
 
 ## Reading paths
 

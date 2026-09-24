@@ -1,0 +1,349 @@
+\chapter{Build: A Risk Engine}\label{ch:rc:build-a-risk-engine}
+
+At six in the morning the risk report must be on the desk heads' screens: every trade repriced under
+every scenario, the P\&L summed desk by desk, VaR and \omterm{def:rc:market-risk-measures:es}{expected shortfall} at every node, every limit
+breach flagged. Between the end-of-day market data and that deadline sits a batch that has to fit its
+window every night; in a 2011 survey of banks by McKinsey, average VaR run times ranged from 2 to 15 hours,
+and longer under stress. This last chapter builds the firm's \omterm{def:rc:build-a-risk-engine:engine}{risk engine} on top of the pricing library of
+Book~5 and the measures of \cref{ch:rc:market-risk-measures}, and asks the question every such engine
+faces: how much exactness can the deadline afford?
+
+\section{Architecture: market data, scenarios, revaluation, aggregation}
+
+\begin{definition}[Risk engine, risk data aggregation]\label{def:rc:build-a-risk-engine:engine}
+A \emph{risk engine}\index{risk engine} is the system that turns the firm's positions and market data
+into its risk measures: it builds scenarios, revalues the positions under them, aggregates the results
+along the firm's structure, and reports them against limits. \emph{Risk data aggregation}\index{risk data aggregation}
+is, in the Basel Committee's words, defining, gathering and processing risk data according to the bank's
+risk reporting requirements to enable it to measure its performance against its risk tolerance or appetite.
+\end{definition}
+
+The engine has four stages (\cref{fig:rc:build-a-risk-engine:arch}). A market-data snapshot fixes today's
+curves, spots and volatilities. Scenario generators turn history (or stress designs, chapter~22) into
+shifts of named \omterm{def:rc:market-risk-measures:factor}{risk factors}. Revaluation turns each position and scenario into a P\&L, through the
+pricing library, so that the \omterm{def:rc:build-a-risk-engine:engine}{risk engine} never prices anything itself. Aggregation sums the P\&L along
+the \omterm{def:rc:build-a-risk-engine:hierarchy}{risk hierarchy} and computes the measures. The P\&L array, scenarios by trades, is the engine's
+central object: every report is a function of it.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,box/.style={draw,rounded corners,minimum height=1cm,align=center,text width=2.3cm}]
+\node[box,fill=omThm!10] (md) at (0,1.4) {market-data snapshot};
+\node[box,fill=omThm!10] (tr) at (0,0) {trades and\\hierarchy};
+\node[box,fill=omThm!10] (hi) at (0,-1.4) {history and\\stress designs};
+\node[box] (sc) at (3.4,-1.4) {scenario\\generation};
+\node[box] (rv) at (3.4,0.7) {revaluation:\\full, grid,\\delta--gamma};
+\node[box,fill=omDef!10] (pl) at (6.8,0) {P\&L array\\scenarios $\times$ trades};
+\node[box] (ag) at (10.2,0.7) {aggregation\\by node};
+\node[box] (rp) at (10.2,-1.0) {VaR, ES, Euler,\\limits, reports};
+\node[box,dashed] (pr) at (3.4,2.5) {pricing library\\(Book~5)};
+\draw[->,thick] (md) -- (rv);
+\draw[->,thick] (tr) -- (rv);
+\draw[->,thick] (hi) -- (sc);
+\draw[->,thick] (sc) -- (rv);
+\draw[<->,thick,dashed] (pr) -- (rv);
+\draw[->,thick] (rv) -- (pl);
+\draw[->,thick] (pl) -- (ag);
+\draw[->,thick] (ag) -- (rp);
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:rc:build-a-risk-engine:engine}{risk engine}'s stages. Revaluation calls the pricing library through its fixed interface;
+everything downstream works on the array of P\&L by scenario and trade. Schematic.}\label{fig:rc:build-a-risk-engine:arch}
+\end{omfigure}
+
+Book~5's library knows market data, instruments, models and engines, and exposes \texttt{price},
+\texttt{sensitivities}, \texttt{reprice} and \texttt{price\_batch} over immutable snapshots bumped by
+named \omterm{def:rc:market-risk-measures:factor}{risk factors}. This book adds its rates instruments to it: a \omterm{def:rc:curve-construction:pillar}{pillar} zero curve that bumps \omterm{def:rc:curve-construction:pillar}{pillar} by
+\omterm{def:rc:curve-construction:pillar}{pillar}, swaps, and swaptions under the normal model of chapter~4, registered with the library's
+\texttt{register} so that its generic calls price them like any other instrument.
+
+\omcode{code/firm/riskengine/firm_riskengine.py}{131}{149}{The swaption engine and the registration of the rates instruments with the pricing library.}\label{lst:rc:build-a-risk-engine:register}
+
+\section{Scenario generation}
+
+Each \omterm{def:rc:stress-testing-and-scenarios:historical}{historical scenario} is a set of bumps on named \omterm{def:rc:market-risk-measures:factor}{risk factors}: here the Treasury curve's eight
+\omterm{def:rc:curve-construction:pillar}{pillars} (par yields treated as zero rates, a simplification) and the euro--dollar spot rate. The
+engine's test market is that of 23 September 2026: rates from 4.49\% at one year to 5.40\% at thirty,
+EUR/USD at 1.1411. It builds 250 one-day scenarios from the most recent year and 250 overlapping
+ten-day scenarios; the ten-day moves reach 48 basis points on a \omterm{def:rc:curve-construction:pillar}{pillar} and 2.8\% on the exchange rate.
+Filtered or stressed scenarios (chapters~21 and~22) plug in at the same place.
+
+\section{Revaluation: full, grid and sensitivity-based}
+
+\begin{definition}[Full revaluation, revaluation grid]\label{def:rc:build-a-risk-engine:reval}
+\emph{Full revaluation}\index{full revaluation} reprices every position with its pricing model in every
+scenario. A \emph{revaluation grid}\index{revaluation grid} reprices each position on a small grid of shifts
+of each \omterm{def:rc:market-risk-measures:factor}{risk factor} it depends on, once, and computes each scenario's P\&L by interpolating on the grid and
+adding the factors' contributions.
+\end{definition}
+
+\omterm{def:rc:build-a-risk-engine:reval}{Full revaluation} costs one pricing call per trade and scenario; the engine runs it through the
+library's \texttt{price\_batch}, which marks a failing trade instead of stopping the run. The grid costs a fixed number per trade
+and factor, whatever the number of scenarios; the \omterm{def:rc:market-risk-measures:dg}{delta--gamma approximation} of chapter~21 costs two per
+trade and factor. The grid captures each factor's nonlinearity over the whole range of moves; like the
+diagonal \omterm{def:rc:market-risk-measures:dg}{delta--gamma approximation}, it drops the cross effects between factors.
+
+\omcode{code/firm/riskengine/firm_riskengine.py}{206}{222}{Grid revaluation: seven points per factor, spanning the largest scenario move.}\label{lst:rc:build-a-risk-engine:grid}
+
+\begin{example}[Cost and error on a 1,000-trade book]\label{ex:rc:build-a-risk-engine:methods}
+The test book holds 600 swaps, 200 swaptions and 200 EUR/USD options, 89 of them expiring within a
+month (71 sold). \omterm{def:rc:build-a-risk-engine:reval}{Full revaluation} under 250 scenarios takes 251\,000 pricing calls, the grid 50\,200 and
+delta--gamma 17\,400. With one-day scenarios, the grid's 99\% VaR is within 1.59\% of \omterm{def:rc:build-a-risk-engine:reval}{full revaluation} at
+every node and delta--gamma within 0.74\%. With ten-day scenarios, delta--gamma overstates the short-dated
+FX desk's VaR by 18.45\%, and both approximations miss the rate options' VaR by more than 8.6\%
+(\cref{fig:rc:build-a-risk-engine:errors}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=6pt,
+  symbolic x coords={Firm,Rates,FX,Swaps,Rate options,FX short,FX long},xtick=data,
+  x tick label style={font=\footnotesize,rotate=25,anchor=north east},
+  ylabel={10-day VaR error (\%)},
+  tick label style={font=\small},label style={font=\small},
+  ymin=-5,ymax=20,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=node,y=grid]{figdata/rates-credit-risk/29-build-a-risk-engine/errors_10d.csv};
+\addplot[fill=omThm!60,draw=omThm] table[x=node,y=dg]{figdata/rates-credit-risk/29-build-a-risk-engine/errors_10d.csv};
+\addplot[fill=gray!50,draw=gray] table[x=node,y=plan]{figdata/rates-credit-risk/29-build-a-risk-engine/errors_10d.csv};
+\legend{grid,delta--gamma,revaluation plan}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Relative error of the ten-day 99\% VaR against \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}, by node of the hierarchy.
+Delta--gamma fails on the short-dated options, whose gamma changes over a ten-day move; both approximations
+fail on the swaptions, whose value depends on the product of moves at different \omterm{def:rc:curve-construction:pillar}{pillars}; the plan that
+revalues the swaptions in full stays within 0.76\% everywhere. Data: the chapter's tutorial, on US Treasury
+yields and ECB reference rates.}\label{fig:rc:build-a-risk-engine:errors}
+\end{omfigure}
+
+The two failures have different causes (\cref{fig:rc:build-a-risk-engine:fx}). The short-dated FX
+options depend on one factor, and their P\&L over a 2.8\% move is far from a parabola: the grid, which
+reprices at the move's size, follows it; the Taylor expansion does not. The swaptions depend on the
+forward swap rate, a combination of several \omterm{def:rc:curve-construction:pillar}{pillars}, and their convexity lives in the cross products of
+\omterm{def:rc:curve-construction:pillar}{pillar} moves that no per-factor method sees.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,
+  xlabel={10-day EUR/USD move (\%)},ylabel={desk P\&L (USD million)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend cell align=left,legend style={font=\footnotesize,at={(0.5,0.04)},anchor=south},
+  table/col sep=comma]
+\addplot[only marks,mark=o,mark size=1.4pt,draw=gray] table[x=move,y=full]{figdata/rates-credit-risk/29-build-a-risk-engine/fx_short.csv};
+\addplot[only marks,mark=x,mark size=1.4pt,draw=omDef] table[x=move,y=grid]{figdata/rates-credit-risk/29-build-a-risk-engine/fx_short.csv};
+\addplot[only marks,mark=+,mark size=1.4pt,draw=omThm] table[x=move,y=dg]{figdata/rates-credit-risk/29-build-a-risk-engine/fx_short.csv};
+\legend{full revaluation,grid,delta--gamma}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{P\&L of the short-dated FX desk (mostly sold options) in each ten-day scenario, against the
+scenario's EUR/USD move. The grid sits on the \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}; the delta--gamma parabola overstates the
+losses of large moves. Data: the chapter's tutorial.}\label{fig:rc:build-a-risk-engine:fx}
+\end{omfigure}
+
+\begin{method}[A revaluation plan]\label{met:rc:build-a-risk-engine:plan}
+Measure each approximation's error against \omterm{def:rc:build-a-risk-engine:reval}{full revaluation} node by node, on the scenarios that matter
+(the longest horizon, the stressed period). Assign each desk the cheapest method within the error budget,
+\omterm{def:rc:build-a-risk-engine:reval}{full revaluation} where none is, and re-run the comparison when the book or the scenarios change.
+\end{method}
+
+\omcode{code/firm/riskengine/firm_riskengine.py}{245}{256}{A revaluation plan: each trade revalued by the method of its deepest planned node.}\label{lst:rc:build-a-risk-engine:plan}
+
+\section{Aggregation, hierarchies and limits}
+
+\begin{definition}[Risk hierarchy, risk limit]\label{def:rc:build-a-risk-engine:hierarchy}
+A \emph{risk hierarchy}\index{risk hierarchy} is the tree along which positions and their risk are
+aggregated: trades into books, books into desks, desks into business lines and the firm. A
+\emph{risk limit}\index{risk limit} is a ceiling on a risk measure (VaR, a sensitivity, a stress loss) at a
+node of the hierarchy, whose breach triggers escalation.
+\end{definition}
+
+VaR and ES are not additive: each node's measure comes from its own P\&L vector, the sum of its trades'
+columns of the P\&L array. That is why the engine keeps the array, not per-desk numbers. Euler contributions
+(chapter~20) split a node's ES among its children so that the parts add up: each child's average loss in the
+parent's worst scenarios.
+
+\begin{example}[Ten-day risk by node]\label{ex:rc:build-a-risk-engine:report}
+With \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}, the firm's ten-day 99\% VaR is USD~53.53 million and its 97.5\% ES 50.89 million.
+The FX business's own ES is 14.63 million, but its Euler contribution to the firm's is only 3.56 million,
+against 47.34 million for rates: the firm's tail is a rates tail. The short-dated FX desk's VaR, 14.58 million,
+breaches its limit of 12 million, and the engine flags it.
+\end{example}
+
+\omcode{code/firm/riskengine/cpp/firm_riskengine.hpp}{49}{72}{The C++20 kernel: VaR, ES and Euler contributions of a node's P\&L vector (the Rust twin is line for line the same).}\label{lst:rc:build-a-risk-engine:kernel}
+
+\begin{dated}{2026-09}{Risk data aggregation}\label{dat:rc:build-a-risk-engine:bcbs239}
+The Basel Committee's principles for effective \omterm{def:rc:build-a-risk-engine:engine}{risk data aggregation} and risk reporting (known as
+BCBS~239, January 2013) set fourteen principles, eleven for banks (governance, data architecture,
+accuracy, completeness, timeliness, adaptability, and five on reports) and three for supervisors. Global
+systemically important banks designated in 2011 or 2012 were to comply by January 2016. The Committee's
+latest progress report (November 2023) assessed 31 such banks: only two were fully compliant with all the
+principles, and no principle was fully implemented across all banks; its newsletter of January 2026 named
+data lineage, governance and cross-border data as continuing challenges. The ECB's guide of May 2024
+recalled that none of 25 significant institutions reviewed in 2016 fully followed the principles, and set
+seven key areas of supervisory expectations.
+\end{dated}
+
+\section{Testing a risk engine}
+
+A \omterm{def:rc:build-a-risk-engine:engine}{risk engine} is tested as a chain. The pricing library carries its own acceptance tests. The rates
+instruments are tested against closed forms (a swap at the par rate is worth zero, payer minus receiver
+swaption is the forward swap). The approximations are tested against \omterm{def:rc:build-a-risk-engine:reval}{full revaluation} on small moves, where
+they must agree. The kernel is tested on a fixture shared by its Python, C++20 and Rust versions, and on
+the identity that Euler contributions add up to the parent's ES. Counting pricing calls turns the deadline
+into a number the tests can check.
+
+\section{Tutorial: one night's run}\label{tut:rc:build-a-risk-engine:tutorial}
+
+\begin{tutorial}
+\textbf{Goal.} Run the engine on the 1,000-trade book under one-day and ten-day \omterm{def:rc:stress-testing-and-scenarios:historical}{historical scenarios}; report
+VaR, ES and Euler contributions by node; compare full, grid and delta--gamma revaluation for cost and
+error; build a revaluation plan. \textbf{End state:} the numbers of
+\cref{ex:rc:build-a-risk-engine:methods,ex:rc:build-a-risk-engine:report} and the three charts.
+\begin{tutsteps}
+\item \textbf{Market and book}: \texttt{market()}, \texttt{book()}.
+\item \textbf{Scenarios}: \texttt{scenarios(1)}, \texttt{scenarios(10)}.
+\item \textbf{Revaluation}: \texttt{revaluations(h)}, P\&L arrays and pricing calls per method.
+\item \textbf{Reports}: \texttt{reports(h)}, \texttt{errors(h)}, \texttt{euler()}, \texttt{limits()};
+\texttt{fig\_rc\_riskengine.py}.
+\end{tutsteps}
+\textbf{What to change next.} Add a parallel-shift grid for the swaptions; use stressed scenarios from
+2020 or 2022; run the kernel in C++ on the P\&L array written to disk.
+\end{tutorial}
+
+\section{Build: the risk engine}\label{bld:rc:build-a-risk-engine:riskengine}
+
+\begin{build}
+\bfield{Purpose} The firm's overnight risk run: scenarios, revaluation through the pricing library,
+aggregation along the hierarchy, VaR, ES, Euler contributions and limits.
+\bfield{Interface} \texttt{PillarCurve}, \texttt{IRSwap}, \texttt{Swaption}, \texttt{NormalRates}
+(registered with the pricing library); \texttt{Trade}; \texttt{historical\_scenarios};
+\texttt{full\_revaluation}, \texttt{grid\_revaluation}, \texttt{delta\_gamma\_revaluation},
+\texttt{planned\_revaluation}, \texttt{Counter}; \texttt{aggregate}, \texttt{risk\_report},
+\texttt{euler\_es}, \texttt{check\_limits}; C++20 and Rust kernels.
+\bfield{Rules} Prices come only from the pricing library; the P\&L array is kept; every approximation is
+measured against \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}; one failing trade never stops the run.
+\bfield{Acceptance tests} \texttt{code/firm/riskengine/tests/}, \texttt{cpp/}, \texttt{rust/}: closed forms of the
+rates instruments, \omterm{def:rc:curve-construction:pillar}{pillar} bumps, call counts of each method, agreement on small moves, plans, limits, and the
+shared kernel fixture.
+\bfield{Stretch} \omterm{def:rc:rates-risk:crossgamma}{Cross-gamma} or parallel-shift grids; incremental runs for new trades; parallel revaluation;
+stressed and filtered scenarios; lineage from each number back to its trades and data.
+\end{build}
+
+\begin{omsources}
+\item Basel Committee on Banking Supervision, \emph{Principles for effective risk data aggregation and risk
+reporting}, January 2013.
+\item Basel Committee on Banking Supervision, \emph{Progress in adopting the Principles for effective risk data
+aggregation and risk reporting}, November 2023.
+\item Basel Committee on Banking Supervision, Newsletter No~36 on risk data aggregation, January 2026.
+\item European Central Bank, \emph{Guide on effective risk data aggregation and risk reporting}, May 2024.
+\item US Department of the Treasury, Daily Treasury Par Yield Curve Rates; European Central Bank, euro foreign
+exchange reference rates (data).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rc:build-a-risk-engine:1}
+Count the pricing calls of full, grid (seven points) and delta--gamma revaluation for one swap and one FX
+option under 250 scenarios, and check the book's totals.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rc:build-a-risk-engine:2}
+Why does the grid's cost not depend on the number of scenarios?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rc:build-a-risk-engine:3}
+Why must the engine keep the P\&L array rather than each desk's VaR?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:build-a-risk-engine:4}
+How large is the diversification between rates and FX in the firm's ten-day ES?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:build-a-risk-engine:5}
+Why does delta--gamma revaluation overstate the short-dated desk's losses on large moves?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:build-a-risk-engine:6}
+Why does no per-factor method capture the swaptions' ten-day risk, and how would you fix it cheaply?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rc:build-a-risk-engine:7}
+\emph{Coding.} Count the calls of the revaluation plan and check them against the plan's composition.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rc:build-a-risk-engine:8}
+\emph{Find the flaw.} ``The grid passed the error test last year, so it stays.''
+\end{exercise}
+
+\section{Problem: the six o'clock deadline}
+
+\begin{problem}[{Weekend problem --- the six o'clock deadline}]\label{pb:rc:build-a-risk-engine:1}
+The firm's real book holds 50,000 trades like the test book's, the batch may use 16 cores from two to six in
+the morning, and one pricing call costs 20 milliseconds on average (assumptions). The risk measure is the
+ten-day 99\% VaR under 250 scenarios, and every node's VaR must be within 2\% of \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}.
+
+\medskip\noindent\textbf{Part I --- Cost.}
+\begin{enumerate}
+\item Give the pricing calls of each method on the test book.
+\item Convert them into hours for the real book.
+\item Which methods fit the window?
+\item What does the grid's cost depend on, and the \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}'s?
+\item How many scenarios could \omterm{def:rc:build-a-risk-engine:reval}{full revaluation} afford in the window?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Error.}
+\begin{enumerate}[resume]
+\item Give the worst node error of each approximation at one day.
+\item And at ten days.
+\item Which desk breaks delta--gamma, and why?
+\item Which desk breaks the grid, and why?
+\item Why does the error grow with the horizon?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The plan.}
+\begin{enumerate}[resume]
+\item Build a plan within the budget from the node errors.
+\item Give its cost in calls and in hours.
+\item Give its worst node error.
+\item Could the plan use delta--gamma for the long-dated FX options? Why is that safe?
+\item What must be monitored for the plan to stay valid?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Which limit breaches does the report show?
+\item What does the Euler split tell the firm about its tail?
+\item What would BCBS~239's timeliness and accuracy principles ask of this run?
+\item State the \emph{named result}: the hours and worst VaR error of full, grid, delta--gamma and planned
+revaluation, and the cheapest method within the 2\% budget.
+\item Why is the cheapest method within budget not a fixed choice?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{risk}]\label{iq:rc:build-a-risk-engine:1}
+Describe the architecture of a \omterm{def:rc:build-a-risk-engine:engine}{risk engine}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:rc:build-a-risk-engine:2}
+How would you make an overnight VaR run on 50,000 trades fit a four-hour window?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk, researcher}]\label{iq:rc:build-a-risk-engine:3}
+Compare \omterm{def:rc:build-a-risk-engine:reval}{full revaluation}, grids and sensitivity-based revaluation.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:rc:build-a-risk-engine:4}
+Why are VaR numbers not additive across desks, and how do you allocate them?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk}]\label{iq:rc:build-a-risk-engine:5}
+How do you test a \omterm{def:rc:build-a-risk-engine:engine}{risk engine}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{bank, risk}]\label{iq:rc:build-a-risk-engine:6}
+What does BCBS~239 require, and why do banks struggle to comply?
+\end{interviewq}

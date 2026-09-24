@@ -1,0 +1,29 @@
+# 1. Curve Construction — brief and source ledger
+
+## Brief
+
+- **Hook.** A rates desk changes its curve interpolation over a weekend; on Monday no market price has moved, yet the book shows a profit of 180 thousand dollars and every hedge ratio has shifted.
+- **Sections.** Choosing the instruments; Calibration: bootstrap and global fit; Interpolation and the forward curve; The front end: futures, turns and meeting dates; Hedging consequences of an interpolation.
+- **Defines.** pillar, instantaneous forward rate, curve calibration, flat-forward interpolation, monotone convex interpolation, interpolation locality, Nelson--Siegel curve.
+- **Uses (defined earlier).** par swap rate (B2.9), overnight index swap (B2.9), annuity (B2.9), zero-coupon rate (B2.3), DV01 (B2.3), overnight-rate future (B2.8), convexity adjustment (B2.8), IMM date (B2.8), turn (B2.2), implied policy path (B2.8), cubic spline (B4.28).
+- **Tutorial.** Build the same SOFR curve from deposits, futures and swaps with four interpolations (linear zero, flat forward, natural cubic on zeros, monotone convex); plot the forward curves and the bucketed DV01 of an off-pillar swap under each.
+- **Build.** `firm.curvebuild`: multi-instrument curve builder with pluggable interpolators, global Newton calibration and its Jacobian; imports `firm.curve` (Book 2), never edits it.
+- **Weekend problem.** The Monday profit — named result: the P&L and the change in hedge notionals produced on a USD 5 billion swap book by switching from linear-zero to monotone-convex interpolation.
+- **Facts to verify.** Hagan and West 2006, monotone convex method (paper); Nelson-Siegel 1987 and Svensson 1994 (papers); Fed (Gürkaynak-Sack-Wright 2007) and ECB published curve-fitting methods; SOFR futures and swaps as the dollar curve's instruments (CME volume, dated); year-end turn size evidence (public).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | US Treasury's official par yield curve uses a monotone convex method, which replaced the quasi-cubic Hermite spline method on 6 December 2021; inputs are indicative bid-side quotes for the most recently auctioned bills (4-52 weeks), notes (2-10 years) and bonds (20, 30 years) obtained by the New York Fed at or near 3:30 pm | US Treasury, Treasury Yield Curve Methodology | https://home.treasury.gov/policy-issues/financing-the-government/interest-rate-statistics/treasury-yield-curve-methodology | 2026-09-24 | "The monotone convex method for deriving the official Treasury yield curve replaced the previous quasi-cubic hermite spline method as of December 6, 2021." | dat:rc:curve-construction:published |
+| F2 | ECB publishes two euro-area government yield curves (AAA-rated central-government bonds; all central-government bonds) every TARGET business day at 12:00 CET | ECB, Euro area yield curves | https://www.ecb.europa.eu/stats/financial_markets_and_interest_rates/euro_area_yield_curves/html/index.en.html | 2026-09-24 | "every TARGET business day at noon (12:00 CET)"; "One sample contains 'AAA-rated' euro area central government bonds" | dat:rc:curve-construction:published |
+| F3 | ECB AAA curve is a Svensson model, continuous compounding, yield-error minimisation; parameters on 2026-09-22: beta0 1.6305742011, beta1 0.6958329015, beta2 2.5849118333, beta3 6.6621862503, tau1 1.0632472342, tau2 14.4455604467; published spot rates 1y 2.96792071, 5y 3.2169356314, 10y 3.4527398521, 30y 3.717737327 (per cent) | ECB Data Portal, series YC.B.U2.EUR.4F.G_N_A.SV_C_YM.{BETA0..TAU2, SR_1Y, SR_5Y, SR_10Y, SR_30Y} | https://data-api.ecb.europa.eu/service/data/YC/B.U2.EUR.4F.G_N_A.SV_C_YM.BETA0?lastNObservations=1&format=csvdata | 2026-09-24 | series title: "Government bond, nominal, all issuers whose rating is triple A - Svensson model - continuous compounding - yield error minimisation"; values as downloaded; the chapter's code reproduces the four spot rates from the six parameters to 1e-6 | ex:rc:curve-construction:ecb, fig:rc:curve-construction:svensson, dat:rc:curve-construction:published |
+| F4 | ESCB statistics may be reused free of charge provided the source is quoted and the statistics are not modified | ECB, Policy regarding the reuse of ESCB statistics | https://www.ecb.europa.eu/stats/ecb_statistics/governance_and_quality_framework/html/usage_policy.en.html | 2026-09-24 | "may be reused free of charge on the condition that the source is quoted" | data/rates-credit-risk/LICENSES.md, figure caption |
+| F5 | Hagan and West introduced the monotone convex interpolation and quality criteria (fit, arbitrage-freeness, smoothness, locality, stability of forwards, consistency of hedges) | P. S. Hagan and G. West, "Interpolation Methods for Curve Construction", Applied Mathematical Finance 13(2), 89-129, 2006 | https://www.tandfonline.com/doi/abs/10.1080/13504860500396032 | 2026-09-24 | abstract: "introduces a monotone convex method ... locality of interpolation scheme, stability of forward rate and consistency of hedging strategies" | def:rc:curve-construction:monotone, omsources |
+| F6 | Nelson and Siegel (1987) parsimonious yield-curve model; Svensson (1994) extension with a second hump | C. R. Nelson and A. F. Siegel, Journal of Business 60(4), 473-489, 1987; L. E. O. Svensson, NBER Working Paper 4871, 1994 | https://ideas.repec.org/a/ucp/jnlbus/v60y1987i4p473-89.html ; https://www.nber.org/papers/w4871 | 2026-09-24 | bibliographic records | def:rc:curve-construction:ns, omsources |
+
+## EXCLUDED
+
+- The SOFR curve of the chapter (deposits, futures, swaps) and its convexity adjustments are illustrative, not market data. Re-checked 2026-09-24: illustrative by design.
+- Year-end turn sizes: not sourced; the text describes the mechanism only. Re-checked 2026-09-24: not searched, the text makes no quantitative claim about turns.
+

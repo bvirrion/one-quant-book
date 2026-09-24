@@ -1,0 +1,385 @@
+\chapter{Monte Carlo}\label{ch:qm:monte-carlo}
+
+The overnight batch values 40\,000 path-dependent trades with 100\,000 paths each. The \omterm{def:qm:estimation:estimator}{standard error} on the book is 80\,000 dollars, and the risk manager wants it under 20\,000 by tomorrow.
+Monte Carlo error falls like one over the square root of the number of paths, so a factor of four in error is a factor of sixteen in paths, and sixteen times the machines is not on offer. The
+alternative is to make each path worth more. This chapter builds the \omterm{def:qm:estimation:estimator}{estimator} and its generators, then the variance-reduction techniques that change the constant (\omterm{def:qm:monte-carlo:vr}{antithetic variates},
+\omterm{def:qm:monte-carlo:vr}{control variates}, stratification, \omterm{def:qm:monte-carlo:is}{importance sampling}), the low-discrepancy points that change the rate, and the discretisation and multilevel methods that decide what a path costs.
+
+\section{Estimators and generators}
+
+\begin{definition}[Monte Carlo method, variance reduction]\label{def:qm:monte-carlo:mc}
+The \emph{Monte Carlo method}\index{Monte Carlo method} estimates $\mu = \E[f(X)]$ by the average $\hat\mu_n = \frac1n\sum_{i=1}^nf(X_i)$ of independent draws. \emph{Variance
+reduction}\index{variance reduction} is any change of \omterm{def:qm:estimation:estimator}{estimator} that keeps $\E[\hat\mu_n] = \mu$ (or makes the bias negligible) and lowers its variance at equal cost.
+\end{definition}
+
+\begin{proposition}[Error and cost of the Monte Carlo estimator]\label{prop:qm:monte-carlo:clt}
+If $\sigma^2 = \Var(f(X)) < \infty$, then $\sqrt n(\hat\mu_n - \mu) \Rightarrow \mathcal N(0, \sigma^2)$, so $\hat\mu_n \pm 1.96\,s_n/\sqrt n$ is an asymptotic 95\% interval. If one draw costs $c$, the
+cost of reaching \omterm{def:qm:estimation:estimator}{standard error} $\epsilon$ is $c\sigma^2/\epsilon^2$: of two \omterm{def:qm:estimation:estimator}{unbiased estimators}, the better is the one with the smaller product of variance and cost per draw.
+\end{proposition}
+
+\begin{proof}
+The first statement is the central limit theorem for independent identically distributed draws, with Slutsky's lemma for the estimated $s_n$. The second: $\sigma/\sqrt n = \epsilon$ needs $n =
+\sigma^2/\epsilon^2$ draws.
+\end{proof}
+
+The rate $n^{-1/2}$ does not depend on the dimension, which is why Monte Carlo prices 64-date averages and 30-asset baskets that no grid can reach; the constant $\sigma^2c$ is where the work
+is. On the batch's representative trade, an arithmetic-average call on 64 fixings of a \omterm{def:qm:stochastic-differential-equations:gbm}{geometric Brownian motion} ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, one year), $2^{14}$ paths give
+6.495 with a \omterm{def:qm:estimation:estimator}{standard error} of 0.077; the price is 6.4788.
+
+\begin{definition}[Pseudo-random and counter-based generators, inverse transform sampling]\label{def:qm:monte-carlo:prng}
+A \emph{pseudo-random number generator}\index{pseudo-random number generator} is a deterministic recurrence $s_{k+1} = F(s_k)$, $u_k = G(s_k)$ whose outputs pass statistical tests of
+independent uniformity; the Mersenne Twister (Matsumoto and Nishimura, 1998) and PCG (O'Neill, 2014; NumPy's default) are examples. A \emph{counter-based generator}\index{counter-based
+generator} computes $u = G_k(c)$ directly from a counter $c$ and a key $k$ with a bijection $G_k$, so that any draw can be produced without its predecessors; Philox (Salmon, Moraes, Dror
+and Shaw, 2011) is one. \emph{Inverse transform sampling}\index{inverse transform sampling} turns a uniform $U$ into a draw $F^{-1}(U)$ of the distribution function $F$.
+\end{definition}
+
+A \omterm{def:qm:monte-carlo:prng}{counter-based generator} is what makes a distributed batch reproducible. The engine gives path $j$ of trade $i$ the counter $(b, j, i, 0)$ for its $b$-th block of four numbers, so
+the path's numbers do not depend on how the paths are split among machines, on the order in which they run, or on how many there are: rerunning one path to debug a trade reproduces it bit for
+bit. The kit's Philox4x64-10 reproduces NumPy's implementation block for block, in Python, C++20 and Rust (the C++ version is listed in \cref{tut:qm:monte-carlo:asian}). Normals come from the inverse transform with
+Acklam's rational approximation of $\Phi^{-1}$ (relative error below $1.15 \times 10^{-9}$), which, unlike Box--Muller, maps one uniform to one normal: the property low-discrepancy points need.
+
+\section{Variance reduction and importance sampling}
+
+\begin{definition}[Antithetic variates, control variate, stratified sampling]\label{def:qm:monte-carlo:vr}
+\emph{Antithetic variates}\index{antithetic variates} pair each draw $Z$ with $-Z$ (each uniform $U$ with $1 - U$) and average $\frac12(f(Z) + f(-Z))$. A \emph{control variate}\index{control
+variate} is a variable $C$ with known mean, used in $\hat\mu_\beta = \frac1n\sum_i(Y_i - \beta(C_i - \E C))$. \emph{Stratified sampling}\index{stratified sampling} partitions the space of an input into
+strata of known probability $p_s$ and draws a fixed number $n_s = np_s$ in each.
+\end{definition}
+
+\begin{proposition}[Optimal control-variate coefficient]\label{prop:qm:monte-carlo:cv}
+$\Var(Y - \beta(C - \E C))$ is minimised at $\beta^* = \Cov(Y, C)/\Var(C)$, where it equals $(1 - \rho^2)\Var(Y)$ with $\rho = \mathrm{Corr}(Y, C)$.
+\end{proposition}
+
+\begin{proof}
+$\Var(Y - \beta C) = \Var Y - 2\beta\Cov(Y, C) + \beta^2\Var C$ is a quadratic in $\beta$ minimised at $\beta^*$; substituting gives $\Var Y - \Cov(Y, C)^2/\Var C = (1 - \rho^2)\Var Y$.
+\end{proof}
+
+For the average-price call, the geometric average $G = (\prod_kS_{t_k})^{1/64}$ is lognormal and its call has a closed form (Kemna and Vorst, 1990): 6.1793. Its payoff has correlation 0.99941 with the
+arithmetic payoff's, so $1 - \rho^2 = 0.0012$ and, with $\beta = 1.04$ estimated from the same paths, the variance falls by a factor of 853 at the same number of paths. Antithetic pairs do much less:
+the two payoffs of a pair have correlation $-0.43$, a factor of 1.8 at equal payoff evaluations. Stratification is the idea behind the next section: it removes the variance between strata, and a
+low-discrepancy point set stratifies every coordinate, and many of their products, at once.
+
+\begin{definition}[Importance sampling]\label{def:qm:monte-carlo:is}
+\emph{Importance sampling}\index{importance sampling} draws $X$ from a density $g$ instead of $f$ and averages $h(X)f(X)/g(X)$, the payoff times the likelihood ratio (a \omterm{def:qm:probability-at-speed:change}{Radon--Nikodym derivative});
+it is unbiased whenever $g > 0$ where $hf \ne 0$.
+\end{definition}
+
+\begin{proposition}[Zero-variance importance density]\label{prop:qm:monte-carlo:zero}
+For $h \ge 0$ with $\mu = \E_f[h(X)] > 0$, the density $g^* = hf/\mu$ makes $h(X)f(X)/g^*(X) = \mu$ for every draw: the \omterm{def:qm:estimation:estimator}{estimator} has zero variance.
+\end{proposition}
+
+\begin{proof}
+Substitute: $hf/g^* = hf\mu/(hf) = \mu$ wherever $h > 0$, and $g^*$ puts no mass where $h = 0$.
+\end{proof}
+
+The optimal density needs the answer, but it says where to look: sample in proportion to where the payoff lives. For a digital paying if $S_T > 250$ (probability $1.21 \times 10^{-4}$, the
+normal driver above $z^* = 3.67$), 100\,000 plain draws produce six hits and a relative \omterm{def:qm:estimation:estimator}{standard error} of 20\%. Shifting the driver's mean to $\theta$ and weighting each draw by $e^{-\theta Z +
+\theta^2/2}$ brings it to 0.64\% at $\theta = 3.8$, a variance factor of about 1\,000 (\cref{fig:qm:monte-carlo:is}); shifting too far makes it worse again, as the weights of the few draws that
+matter explode.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=4.8cm,xlabel={mean shift $\theta$ of the normal driver},ylabel={relative standard error},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=5,ymin=3e-3,ymax=0.5,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=theta,y=relse]{figdata/methods/26-monte-carlo/is.csv};
+\draw[omThm,dashed,thick] (axis cs:3.67,3e-3) -- (axis cs:3.67,0.5) node[pos=0.85,right,font=\footnotesize]{$z^* = 3.67$};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:qm:monte-carlo:is}{Importance sampling} for a digital paying if $S_T > 250$ ($S_0 = 100$, $\sigma = 25\%$, one year; probability $1.21 \times 10^{-4}$): relative \omterm{def:qm:estimation:estimator}{standard error} of 100\,000 draws against the
+mean shift of the normal driver. Data: the chapter's tutorial, seeded.}\label{fig:qm:monte-carlo:is}
+\end{omfigure}
+
+\section{Low-discrepancy sequences}
+
+\begin{definition}[Low-discrepancy sequence, Sobol sequence, quasi-Monte Carlo]\label{def:qm:monte-carlo:qmc}
+The star discrepancy $D_n^*$ of points $x_1, \dots, x_n$ in $[0, 1)^d$ is the largest difference, over boxes $[0, a)$, between the fraction of points in the box and its volume. A \emph{low-discrepancy
+sequence}\index{low-discrepancy sequence} has $D_n^* = O((\log n)^d/n)$. The \emph{Sobol sequence}\index{Sobol sequence} (Sobol, 1967) is a base-2 low-discrepancy sequence built coordinate by
+coordinate from primitive polynomials and direction numbers, by exclusive-or of binary digits. \emph{Quasi-Monte Carlo}\index{quasi-Monte Carlo} replaces the random draws of Monte Carlo by such
+points.
+\end{definition}
+
+\begin{proposition}[Koksma--Hlawka inequality]\label{prop:qm:monte-carlo:kh}
+For $f$ of bounded variation $V(f)$ in the sense of Hardy and Krause, $\bigl|\frac1n\sum_if(x_i) - \int_{[0,1)^d}f\bigr| \le V(f)\,D_n^*$.
+\end{proposition}
+
+The bound gives \omterm{def:qm:monte-carlo:qmc}{quasi-Monte Carlo} a rate close to $1/n$ for smooth integrands of moderate effective dimension, but it is a worst-case bound that cannot be estimated from the points. Randomisation
+restores an error estimate.
+
+\begin{definition}[Randomised quasi-Monte Carlo, Brownian bridge construction]\label{def:qm:monte-carlo:rqmc}
+\emph{Randomised quasi-Monte Carlo}\index{randomised quasi-Monte Carlo} randomises a low-discrepancy set so that each point is uniform while the set keeps its structure, and estimates the error
+from independent replicates. The kit uses Owen's nested uniform scrambling (1995): each binary digit of each coordinate is flipped by a random bit attached to the node of the binary tree that its
+leading digits define. The \emph{Brownian bridge construction}\index{Brownian bridge construction} assigns the first coordinate to $W_T$, the next to $W_{T/2}$ given its ends, and so on
+down the levels, so that the first coordinates, where low-discrepancy points are best, carry most of the variance of the path.
+\end{definition}
+
+\Cref{fig:qm:monte-carlo:points} shows why: 256 scrambled Sobol points in two dimensions put exactly one point in each of 256 dyadic boxes of every shape, where independent draws leave gaps
+and clusters. On the average-price call with $2^{14}$ paths and 32 independent scrambles, scrambled Sobol points with the increments in time order reduce the variance by a factor of about 34; with
+the \omterm{def:qm:monte-carlo:rqmc}{Brownian bridge construction} by about 2\,500; with the bridge and the \omterm{def:qm:monte-carlo:vr}{control variate} together by about 37\,000, a \omterm{def:qm:estimation:estimator}{standard error} 190 times smaller at the same number of paths. The error also
+falls faster than $n^{-1/2}$: fitted slopes between $-0.7$ and $-0.8$ from $2^6$ to $2^{15}$ paths (\cref{fig:qm:monte-carlo:cost}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=l,width=5.6cm,height=5.6cm,title={Philox},title style={font=\small},xmin=0,xmax=1,ymin=0,ymax=1,
+  tick label style={font=\scriptsize},xtick={0,0.5,1},ytick={0,0.5,1},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.9pt,omThm] table[x=px,y=py]{figdata/methods/26-monte-carlo/points.csv};
+\end{axis}
+\begin{axis}[at={(l.east)},anchor=west,xshift=1cm,width=5.6cm,height=5.6cm,title={scrambled Sobol},title style={font=\small},xmin=0,xmax=1,ymin=0,ymax=1,
+  tick label style={font=\scriptsize},xtick={0,0.5,1},ytick={0,0.5,1},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.9pt,omDef] table[x=sx,y=sy]{figdata/methods/26-monte-carlo/points.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{256 points in the unit square: independent Philox uniforms and the first two coordinates of Owen-scrambled Sobol points. Data: the chapter's tutorial,
+seeded.}\label{fig:qm:monte-carlo:points}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=11cm,height=6cm,xlabel={number of paths},ylabel={standard error of the price},
+  tick label style={font=\small},label style={font=\small},xmin=50,xmax=45000,ymin=1e-4,ymax=3,grid=major,grid style={gray!25},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=n,y=plain]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omThm!50,very thick,mark=o,mark size=1.6pt] table[x=n,y=rqmcinc]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[black,very thick,mark=square*,mark size=1.4pt] table[x=n,y=cv]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omDef!60,very thick,mark=triangle*,mark size=1.8pt] table[x=n,y=rqmcbridge]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omDef,very thick,mark=diamond*,mark size=1.8pt] table[x=n,y=rqmccv]{figdata/methods/26-monte-carlo/cost.csv};
+\legend{plain Monte Carlo,{RQMC, time order},control variate,{RQMC, bridge},{RQMC, bridge + control}}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:qm:estimation:estimator}{Standard error} of the average-price call (64 fixings) against the number of paths: plain Monte Carlo and the \omterm{def:qm:monte-carlo:vr}{control variate} (slope $-\frac12$), and scrambled Sobol points (16
+independent scrambles) with increments in time order, with the \omterm{def:qm:monte-carlo:rqmc}{Brownian bridge construction}, and with the bridge and the \omterm{def:qm:monte-carlo:vr}{control variate}. Data: the chapter's tutorial,
+seeded.}\label{fig:qm:monte-carlo:cost}
+\end{omfigure}
+
+\section{Discretisation and multilevel methods}
+
+\begin{definition}[Strong and weak orders of convergence, Milstein scheme]\label{def:qm:monte-carlo:order}
+A scheme with step $h$ has \emph{strong order of convergence}\index{strong order of convergence} $\gamma$ if $\E|X_T^h - X_T| \le Ch^\gamma$, and \emph{weak order of convergence}\index{weak order of
+convergence} $\beta$ if $|\E g(X_T^h) - \E g(X_T)| \le Ch^\beta$ for smooth $g$. The \emph{Milstein scheme}\index{Milstein scheme} for $dX = a(X)\,dt + b(X)\,dW$ adds to the Euler--Maruyama step the
+term $\frac12b(X)b'(X)((\Delta W)^2 - h)$.
+\end{definition}
+
+\begin{proposition}[Orders of Euler and Milstein]\label{prop:qm:monte-carlo:orders}
+Under Lipschitz and growth conditions (and smoothness of $a$, $b$ for Milstein), the \omterm{def:qm:stochastic-differential-equations:euler}{Euler--Maruyama scheme} has strong order $\frac12$ and weak order 1, and the \omterm{def:qm:monte-carlo:order}{Milstein scheme} strong order 1
+(Kloeden and Platen, 1992).
+\end{proposition}
+
+\begin{proof}[Idea]
+The Euler step misses the double stochastic integral $\int\!\!\int dW\,dW = \frac12((\Delta W)^2 - h)$, of size $h$ with mean zero, times $bb'$; these errors add like a random walk over $1/h$
+steps, $h\sqrt{1/h} = h^{1/2}$ pathwise, while their means cancel, leaving an $O(h)$ bias in law. Milstein keeps that term, and the next missing terms are of order $h^{3/2}$ per step.
+\end{proof}
+
+A price needs the weak order; a hedge simulated along the path, or a multilevel \omterm{def:qm:estimation:estimator}{estimator}, needs the strong one. On a \omterm{def:qm:stochastic-differential-equations:gbm}{geometric Brownian motion} with $\sigma = 50\%$, driven by the same increments as the
+exact solution, the fitted strong slopes are 0.49 for Euler and 0.89 for Milstein, and the weak error of the mean is exactly $X_0|(1 + \mu h)^n - e^{\mu T}|$, slope 1.00
+(\cref{fig:qm:monte-carlo:orders}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={time step $h$ (years)},ylabel={error},x dir=reverse,
+  tick label style={font=\small},label style={font=\small},xmin=0.003,xmax=0.6,ymin=3e-4,ymax=20,grid=major,grid style={gray!25},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=h,y=euler]{figdata/methods/26-monte-carlo/orders.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.4pt] table[x=h,y=milstein]{figdata/methods/26-monte-carlo/orders.csv};
+\addplot[black,very thick,mark=triangle*,mark size=1.8pt] table[x=h,y=weak]{figdata/methods/26-monte-carlo/orders.csv};
+\legend{strong error (Euler),strong error (Milstein),weak error of the mean}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Strong error $\E|X_T^h - X_T|$ of the Euler and \omterm{def:qm:monte-carlo:order}{Milstein schemes} (20\,000 paths of a \omterm{def:qm:stochastic-differential-equations:gbm}{geometric Brownian motion}, $\mu = 5\%$, $\sigma = 50\%$, $X_0 = 100$, one year) and the exact weak error of
+the mean, against the time step. Data: the chapter's tutorial, seeded.}\label{fig:qm:monte-carlo:orders}
+\end{omfigure}
+
+\begin{definition}[Multilevel Monte Carlo]\label{def:qm:monte-carlo:mlmc}
+\emph{Multilevel Monte Carlo}\index{multilevel Monte Carlo} (Giles, 2008) writes the finest-level expectation as a telescoping sum $\E P_L = \E P_0 + \sum_{l=1}^L\E[P_l - P_{l-1}]$, where $P_l$ is the
+payoff computed with step $h_l = 2^{-l}T$, and estimates each term independently, with $P_l$ and $P_{l-1}$ in each correction computed from the same Brownian path.
+\end{definition}
+
+\begin{proposition}[Complexity of multilevel Monte Carlo]\label{prop:qm:monte-carlo:giles}
+If the bias of $P_l$ is $O(2^{-\alpha l})$, the variance of the correction $V_l = O(2^{-\beta l})$ and its cost $C_l = O(2^{\gamma l})$, with $\alpha \ge \frac12\min(\beta, \gamma)$, then a mean square error
+$\epsilon^2$ costs $O(\epsilon^{-2})$ if $\beta > \gamma$, $O(\epsilon^{-2}(\log\epsilon)^2)$ if $\beta = \gamma$ and $O(\epsilon^{-2 - (\gamma - \beta)/\alpha})$ if $\beta < \gamma$; standard Monte Carlo costs
+$O(\epsilon^{-2 - \gamma/\alpha})$.
+\end{proposition}
+
+\begin{proof}[Idea]
+Minimising the cost $\sum_lN_lC_l$ subject to the variance constraint $\sum_lV_l/N_l = \epsilon^2/2$ gives $N_l \propto\sqrt{V_l/C_l}$ and a total cost
+\[2\epsilon^{-2}\Bigl(\sum_l\sqrt{V_lC_l}\Bigr)^2;\]
+the sum is dominated by the coarsest levels
+if $\beta > \gamma$, by the finest if $\beta < \gamma$, and grows like $L \sim \log\epsilon^{-1}$ if they are equal. The finest level $L$ is set by the bias, $2^{-\alpha L} \sim \epsilon$.
+\end{proof}
+
+The strong order sets $\beta$: Milstein on a Lipschitz payoff gives $\beta = 2 > \gamma = 1$, and the corrections' variances in the tutorial fall by a factor of about four per level
+(0.23, 0.060, 0.016, 0.0045, 0.0012, 0.00030, 0.000079). For a European call ($\alpha = 1$), the driver listed in \cref{tut:qm:monte-carlo:asian} reaches a root mean square error of 0.005 with 7 levels
+at a cost of $3.2 \times 10^7$ time steps, where standard Monte Carlo at the same finest step would need $3.0 \times 10^9$: a factor of 94, which grows as $\epsilon$ falls (8, 20, 45, 94 for
+$\epsilon$ from 0.04 to 0.005; \cref{fig:qm:monte-carlo:mlmc}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={target root mean square error $\epsilon$},ylabel={cost (time steps)},x dir=reverse,
+  tick label style={font=\small},label style={font=\small},xmin=0.004,xmax=0.05,ymin=1e5,ymax=1e10,grid=major,grid style={gray!25},
+  xtick={0.005,0.01,0.02,0.04},xticklabels={0.005,0.01,0.02,0.04},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=eps,y=standard]{figdata/methods/26-monte-carlo/mlmc.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=eps,y=mlmc]{figdata/methods/26-monte-carlo/mlmc.csv};
+\legend{standard Monte Carlo (Milstein),multilevel Monte Carlo}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Cost of pricing a European call ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, one year) to a target root mean square error: \omterm{def:qm:monte-carlo:mlmc}{multilevel Monte Carlo} with Milstein corrections against standard
+Monte Carlo at the same finest step. Data: the chapter's tutorial, seeded.}\label{fig:qm:monte-carlo:mlmc}
+\end{omfigure}
+
+\section{Tutorial: sixteen times fewer machines}\label{tut:qm:monte-carlo:asian}
+
+\begin{tutorial}
+\textbf{Goal.} Value the batch's representative trade five ways and measure each \omterm{def:qm:estimation:estimator}{estimator}'s variance at equal paths. \textbf{End state:} the factors 1.8, 853, 34, 2\,500 and 37\,000 and
+\cref{fig:qm:monte-carlo:cost}.
+\begin{tutsteps}
+\item \textbf{Counter-based uniforms.} Philox4x64-10 in C++20, reproducing NumPy's \texttt{Philox} block for block.
+\omcode{code/firm/mcengine/cpp/firm_mcengine.hpp}{113}{124}{Philox4x64-10: ten rounds of two wide multiplications (C++20).}\label{lst:qm:monte-carlo:philox}
+\item \textbf{Scrambled Sobol points.} Gray-code Sobol points from Joe and Kuo's direction numbers, and Owen's scrambling by hashed tree nodes.
+\omcode{code/firm/mcengine/firm_mcengine.py}{268}{297}{Sobol points and nested uniform scrambling (Python).}\label{lst:qm:monte-carlo:sobol}
+\item \textbf{\omterm{def:qm:estimation:estimator}{Estimators}.} Run \texttt{table()} in \texttt{qm\_mc.py}: plain, antithetic, \omterm{def:qm:monte-carlo:vr}{control variate}, and scrambled Sobol with and without the bridge (32 scrambles of $2^{14}$ points); then
+\texttt{error\_vs\_cost()}.
+\item \textbf{Multilevel.} Run \texttt{mlmc\_study()}; the driver is below.
+\omcode{code/firm/mcengine/firm_mcengine.py}{384}{412}{Giles's multilevel Monte Carlo driver (Python).}\label{lst:qm:monte-carlo:mlmc}
+\end{tutsteps}
+\textbf{What to change next.} Put the strike at 130 and watch the \omterm{def:qm:monte-carlo:vr}{control variate}'s factor fall with the correlation; replace the bridge by a principal-component construction; price a barrier with
+the bridge crossing probability of chapter~2 inside the multilevel driver.
+\end{tutorial}
+
+\section{Build: the Monte Carlo engine, stage three}\label{bld:qm:monte-carlo:mcengine}
+
+\begin{build}
+\bfield{Purpose} Make each path worth more and every path reproducible: the generators, point sets and \omterm{def:qm:estimation:estimator}{estimators} that the firm's pricing and risk batches call.
+\bfield{Interface} \texttt{philox4x64}, \texttt{philox\_uniforms(n, dim, seed, stream, first\_path)}; \texttt{sobol\_points}, \texttt{owen\_scramble}; \texttt{norm\_ppf};
+\texttt{bridge\_from\_normals}; \texttt{asian\_payoffs}, \texttt{geometric\_asian\_price}, \texttt{control\_variate}; \texttt{mlmc(sampler, eps)}. C++20 and Rust twins of \texttt{philox4x64},
+\texttt{sobol\_point} (eight dimensions) and \texttt{owen\_scramble}.
+\bfield{Rules} Counters, not sequential state, identify paths; every estimate is reported with its \omterm{def:qm:estimation:estimator}{standard error} (from replicates for \omterm{def:qm:monte-carlo:rqmc}{randomised quasi-Monte Carlo}, never from within one point
+set); unscrambled Sobol points are never used for error bars; direction numbers carry their licence.
+\bfield{Acceptance tests} \texttt{code/firm/mcengine/\{tests,cpp,rust\}}: Philox against NumPy's; splitting paths reproduces them; Joe and Kuo's published first points; identical scrambled integers in
+the three languages; the net property after scrambling; $\Phi^{-1}$ against the standard library to $10^{-8}$; bridge covariance; the geometric closed form against simulation and against
+Black--Scholes for one fixing; the multilevel driver on a sampler with a known answer.
+\bfield{Stretch} Joe and Kuo's full 21\,201 dimensions; a principal-component path construction; conditional Monte Carlo for barriers; adjoint Greeks along the paths (chapter~28).
+\end{build}
+
+\begin{omsources}
+\item N.~Metropolis and S.~Ulam, ``The Monte Carlo method'', \emph{Journal of the American Statistical Association} 44, 1949; P.~P.~Boyle, ``Options: a Monte Carlo approach'', \emph{Journal of
+Financial Economics} 4, 1977.
+\item P.~Glasserman, \emph{Monte Carlo Methods in Financial Engineering}, Springer, 2003.
+\item J.~K.~Salmon, M.~A.~Moraes, R.~O.~Dror and D.~E.~Shaw, ``Parallel random numbers: as easy as 1, 2, 3'', SC11, 2011; M.~Matsumoto and T.~Nishimura, \emph{ACM TOMACS} 8, 1998; M.~E.~O'Neill,
+PCG, Harvey Mudd College report HMC-CS-2014-0905, 2014.
+\item I.~M.~Sobol', \emph{USSR Computational Mathematics and Mathematical Physics} 7, 1967; S.~Joe and F.~Y.~Kuo, \emph{SIAM Journal on Scientific Computing} 30, 2008 (direction numbers
+\texttt{new-joe-kuo-6.21201}); A.~B.~Owen, ``Randomly permuted $(t, m, s)$-nets and $(t, s)$-sequences'', 1995; B.~Moskowitz and R.~E.~Caflisch, \emph{Mathematical and Computer Modelling} 23, 1996.
+\item A.~G.~Z.~Kemna and A.~C.~F.~Vorst, \emph{Journal of Banking and Finance} 14, 1990.
+\item M.~B.~Giles, ``Multilevel Monte Carlo path simulation'', \emph{Operations Research} 56, 2008; P.~E.~Kloeden and E.~Platen, \emph{Numerical Solution of Stochastic Differential Equations},
+Springer, 1992; G.~N.~Milstein, \emph{Theory of Probability and its Applications} 19, 1975.
+\item P.~J.~Acklam, ``An algorithm for computing the inverse normal cumulative distribution function'' (web note, 2004).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:1}
+A batch has \omterm{def:qm:estimation:estimator}{standard error} 80\,000 dollars with 100\,000 paths. How many paths reach 20\,000, and what variance-reduction factor does the same at 100\,000 paths?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:2}
+A \omterm{def:qm:monte-carlo:vr}{control variate} has correlation 0.9 with the payoff. What is the variance factor? And with 0.99?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:3}
+Why do \omterm{def:qm:monte-carlo:vr}{antithetic variates} help a monotone payoff and not an even function of $Z$ such as $Z^2$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:4}
+Show that proportional stratification never increases the variance: with strata $s$ of probability $p_s$ and conditional variances $\sigma_s^2$, the stratified variance is $\frac1n\sum_sp_s\sigma_s^2 \le
+\sigma^2/n$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:5}
+For $P(Z > z^*)$ with $Z$ standard normal, compute the second moment of the importance-sampling \omterm{def:qm:estimation:estimator}{estimator} with the shift $\theta$, and show that it is minimised near $\theta = z^*$ for large $z^*$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:6}
+Derive the Milstein step for \omterm{def:qm:stochastic-differential-equations:gbm}{geometric Brownian motion} and show that it is the second-order expansion of the exact step $X e^{(\mu - \sigma^2/2)h + \sigma\Delta W}$ in $\Delta W$.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:monte-carlo:7}
+\emph{Coding.} Compute the variance factor of the \omterm{def:qm:monte-carlo:vr}{control variate} at strikes 80, 100 and 130, and explain the trend.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:monte-carlo:8}
+\emph{Find the flaw.} ``We moved the batch to Sobol points, 100\,000 per trade, and report the \omterm{def:qm:estimation:estimator}{standard error} $s/\sqrt n$ from the points as before; it fell by a factor of ten.''
+\end{exercise}
+
+\section{Problem: Sixteen Times Fewer Machines}
+
+\begin{problem}[{Weekend problem --- a factor of four in error, without sixteen times the paths}]\label{pb:qm:monte-carlo:1}
+The representative trade is an arithmetic-average call on 64 fixings ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, one year), valued with $2^{14}$ paths; the batch needs a factor of four in \omterm{def:qm:estimation:estimator}{standard error}.
+
+\medskip\noindent\textbf{Part I --- The plain \omterm{def:qm:estimation:estimator}{estimator}.}
+\begin{enumerate}
+\item What are the plain estimate, its \omterm{def:qm:estimation:estimator}{standard error} and the reference price?
+\item What variance factor does the target require?
+\item What does the cost-variance product say about comparing \omterm{def:qm:estimation:estimator}{estimators}?
+\item Why does the \omterm{def:qm:monte-carlo:prng}{counter-based generator} make the batch reproducible across machines?
+\item Why is the inverse transform, rather than Box--Muller, used to feed low-discrepancy points?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- \omterm{def:qm:monte-carlo:mc}{Variance reduction}.}
+\begin{enumerate}[resume]
+\item What factor do antithetic pairs give, and why so little?
+\item What is the \omterm{def:qm:monte-carlo:vr}{control variate}, its closed-form value, its correlation and its factor?
+\item What is the optimal coefficient, and what was estimated?
+\item Where does \omterm{def:qm:monte-carlo:is}{importance sampling} help, and by how much on the deep out-of-the-money digital?
+\item Why does too large a shift make it worse?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Points and paths.}
+\begin{enumerate}[resume]
+\item What factor do scrambled Sobol points give with the increments in time order, and with the bridge?
+\item Why does the bridge matter so much?
+\item What do the two together give, and what is the error's slope in the number of paths?
+\item How is the error of \omterm{def:qm:monte-carlo:rqmc}{randomised quasi-Monte Carlo} estimated?
+\item What do the strong and weak orders measure, and what are their fitted values here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item What does \omterm{def:qm:monte-carlo:mlmc}{multilevel Monte Carlo} save on the European call at $\epsilon = 0.005$, and why?
+\item Would the factor of 37\,000 hold across the batch?
+\item What must the batch log so that one trade's paths can be regenerated?
+\item State the \emph{named result}: the variance-reduction factor of the \omterm{def:qm:monte-carlo:vr}{control variate} plus \omterm{def:qm:monte-carlo:rqmc}{randomised quasi-Monte Carlo} on the representative trade, against the 16 required.
+\item In one sentence: where does the work of a Monte Carlo engine go?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, developer}]\label{iq:qm:monte-carlo:1}
+How does the Monte Carlo error scale with the number of paths and with the dimension?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:monte-carlo:2}
+Name three variance-reduction techniques and when each works.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:qm:monte-carlo:3}
+How do you make a distributed Monte Carlo batch reproducible regardless of the number of machines?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:monte-carlo:4}
+Why might \omterm{def:qm:monte-carlo:qmc}{quasi-Monte Carlo} do badly on a 250-step path, and what fixes it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, risk}]\label{iq:qm:monte-carlo:5}
+How would you estimate the probability of a loss beyond a very high threshold by simulation?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:qm:monte-carlo:6}
+Explain \omterm{def:qm:monte-carlo:mlmc}{multilevel Monte Carlo} and why the strong order of the scheme matters for it.
+\end{interviewq}

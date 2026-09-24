@@ -8,6 +8,10 @@ bad = 0
 files = sorted(glob.glob("figdata/**/*.csv", recursive=True))
 for path in files:
     rows = [ln.rstrip("\n") for ln in open(path, encoding="utf8") if ln.strip()]
+    if len(rows) < 2:  # empty, or header only: nothing for pgfplots to draw
+        print(f"EMPTY    {path}: {len(rows)} line(s)")
+        bad += 1
+        continue
     n = rows[0].count(",")
     for i, ln in enumerate(rows[1:], start=2):
         if ln.count(",") != n:

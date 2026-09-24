@@ -23,7 +23,7 @@ figdata:
 
 # make gates                 -> every written book
 # make gates BOOK=markets-2   -> one book
-BOOK ?= markets-1 markets-2
+BOOK ?= markets-1 markets-2 markets-3 methods derivatives rates-credit-risk
 gates:
 	for b in $(BOOK); do tools/gates.sh book $$b || exit 1; done
 

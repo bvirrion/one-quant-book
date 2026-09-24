@@ -10,25 +10,31 @@ eighteen English-only LaTeX books covering quantitative finance end to end
 HFT, machine learning, low-latency software, networks, platforms, the firm,
 the industry, interviews).
 
-**Status (2026-09-24): Books 1 and 2 are written; Books 3–18 are outline only.**
-*One Quant Book 1 — Markets I: The Ecosystem and Exchange-Traded Markets*
-(`one_quant_book_01_markets_1.tex`, slug `markets-1`, label prefix `m1`):
-31 chapters, 374 pages, 121 figures, 78 listings included from tested files,
-49 dated boxes, 165 web-verified ledger rows, 1,647 term links.
-*One Quant Book 2 — Markets II: Rates, FX and Credit*
-(`one_quant_book_02_markets_2.tex`, slug `markets-2`, label prefix `m2`):
-31 chapters in six Parts (money and bonds, swaps and beyond, FX, credit,
-access, craft), 363 pages, 126 figures, 73 listings, 37 dated boxes, 226
-web-verified ledger rows, 1,388 term links; three running-project components
-in C++20 and Rust as well as Python (`bond`, `cds`, `pblimits`).
-Both books: gates 0 errors / 0 undefined / 0 overfull, `tools/gates.sh book
-markets-1` and `markets-2` green (the series-wide "defined twice" check covers
-both), `make test-code` green (670 Python tests, seven C++20 and seven Rust
-builds), `make figdata` reproduces every chart CSV. Uncommitted.
-The bootstrap exists: `styles/onequant.sty`, `Makefile`, `tools/` (gates,
-term linker, figure cropper, code and CSV checks, `omcode_ends.py`), `.venv`,
-CI. The running project lives in `code/firm/` (61 components). Working notes:
-`sources/markets-1/PROGRESS.md`, `sources/markets-2/PROGRESS.md`.
+**Status (2026-09-24): Books 1–6 are written; Books 7–18 are outline only.**
+Books 1–2 are committed; Books 3–6 (and the batch's fixes to shared files and
+Books 1–2) are uncommitted. Books 3–6 were written in one parallel batch, one agent per
+book (`sources/BATCH_BOOKS_3-6.md`; series definition map
+`sources/SERIES_DEFINITIONS.md`; cross-book code interface
+`code/firm/INTERFACES.md`).
+
+| # | Entry file | Slug / prefix | Ch. | Pages | Figures | Listings | Dated | Ledger | Links |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 Markets I | `one_quant_book_01_markets_1.tex` | `markets-1` / `m1` | 31 | 374 | 121 | 78 | 49 | 165 | 1,714 |
+| 2 Markets II: Rates, FX, Credit | `one_quant_book_02_markets_2.tex` | `markets-2` / `m2` | 31 | 363 | 126 | 73 | 37 | 226 | 1,388 |
+| 3 Markets III: Commodities, Energy, Crypto | `one_quant_book_03_markets_3.tex` | `markets-3` / `m3` | 29 | 332 | 109 | 56 | 79 | 277 | 1,267 |
+| 4 Quantitative Methods | `one_quant_book_04_methods.tex` | `methods` / `qm` | 29 | 351 | 118 | 59 | 0 | 253 | 1,739 |
+| 5 Derivatives and Volatility | `one_quant_book_05_derivatives.tex` | `derivatives` / `dv` | 28 | 348 | 113 | 70 | 9 | 154 | 1,378 |
+| 6 Rates, Credit, XVA and Risk | `one_quant_book_06_rates_credit_risk.tex` | `rates-credit-risk` / `rc` | 29 | 314 | 107 | 55 | 32 | 160 | 824 |
+
+All six: gates 0 errors / 0 undefined / 0 overfull, `make gates` green (the
+series-wide "defined twice" check: 1,646 terms, none twice), `make test-code`
+green (1,775 Python tests, 19 C++20 and 20 Rust builds, 391 listing ranges), `make figdata` reproduces every chart CSV. Book 4 ch. 1 prints the series
+notation (`CONTRIBUTING.md`, "Series notation"). The running project in
+`code/firm/` has 174 components; Book 5's `pricing` library (Python, core in
+C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
+`styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
+code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas, no scipy), CI.
+Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 ## Commands
 
@@ -37,7 +43,7 @@ make                          # build the book(s) into build/
 make test-code                # ruff + pytest + g++ -std=c++20 + cargo + listing ranges + chart CSVs
 make figdata                  # regenerate every chart CSV (must leave no diff)
 tools/gates.sh chapter markets-2/NN-slug
-tools/gates.sh book markets-2 # all chapters + duplicate labels + terms defined twice + problem numbering + links + log
+tools/gates.sh book markets-2 # (any slug) all chapters + duplicate labels + terms defined twice + problem numbering + links + log
 python3 tools/link_defined_terms.py --book 2 --unwrap --apply && python3 tools/link_defined_terms.py --book 2 --apply
 OQB_BOOK=2 .venv/bin/python tools/figcrop.py "Figure 23.4." out.png   # then READ the image (default book 1)
 .venv/bin/python tools/omcode_ends.py markets-2/23                   # first/last line of every listing
@@ -57,7 +63,9 @@ OQB_BOOK=2 .venv/bin/python tools/figcrop.py "Figure 23.4." out.png   # then REA
 ## Rules that never change
 
 - Never create git commits; leave the working tree for the user.
-- No subagents when writing a book.
+- Subagents: at most one per book, at most four books written per batch
+  (user rule, 2026-09-24); never one agent per chapter. The main session
+  makes every shared-file edit and reconciles the batch.
 - A model's memory is not a source: every checkable external fact goes
   through the source ledger; volatile facts live in `dated` boxes.
 - A practice is attributed to a named firm only with a citable public source.

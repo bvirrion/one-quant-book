@@ -1,0 +1,29 @@
+# 7. Implied Volatility and Its Surface — brief and source ledger
+
+## Brief
+
+- **Hook.** Before October 1987 the implied volatilities of index options were nearly flat in strike; after it, low strikes have traded above high strikes every day since.
+- **Sections.** The surface as the market's price list; Smile phenomenology by asset class; Sticky strike, sticky delta and what the desk assumes; Static no-arbitrage conditions; The risk-neutral density.
+- **Defines.** volatility surface, log-moneyness, total implied variance, sticky strike, sticky delta, static arbitrage, butterfly arbitrage, calendar arbitrage, risk-neutral density, Breeden--Litzenberger formula.
+- **Uses (defined earlier).** implied volatility, at-the-money, volatility skew, term structure of volatility (Book 1 ch. 25), risk reversal, butterfly (Book 2 ch. 19), normal volatility (Book 2 ch. 13), state price, state-price density (ch. 1), Black model (ch. 3), vega (ch. 4).
+- **Tutorial.** From a synthetic multi-expiry chain compute implied volatilities and total variance in log-moneyness, test the butterfly and calendar conditions, extract the risk-neutral density by finite differences and plot it.
+- **Build.** `firm.volsurface`: implied-volatility surface object (expiry x log-moneyness grid, interpolation in total variance, arbitrage report) — the `VolSurface` of the pricing library.
+- **Weekend problem.** The crash premium — named result: the risk-neutral probability of a fall of more than 20% in three months under a flat and under a skewed surface with the same at-the-money volatility, and their ratio.
+- **Facts to verify.** Rubinstein 1994 JF 'Implied binomial trees' (smile emergence after 1987); Jackwerth-Rubinstein 1996 JF; Derman 1999 'Regimes of volatility' (sticky strike, sticky delta); Breeden-Litzenberger 1978 J. Business; Carr-Madan 2005 static-arbitrage conditions; smile shapes by asset class (FX, commodities, rates; references).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Prior to the October 1987 crash the S&P index-option volatility surface was fairly flat; since then it has been skewed; the smile appeared after the crash, connected to the discovery that a giant market could drop 20% or more in a day or two; representative pre-1987 data from Rubinstein (1994) | E. Derman, The Volatility Smile, lecture 1 (Columbia, 2008), PDF via pdftotext | https://emanuelderman.com/wp-content/uploads/2013/09/smile-lecture1.pdf | 2026-09-24 | "Prior to the stock market crash of October 1987, the volatility surface of index options was indeed fairly flat"; "a giant market could drop by 20% or more in a day or two" | hook; §2; iq 1 |
+| F2 | Rubinstein, "Implied binomial trees", JF 49 (1994) 771-818: S&P 500 implied volatilities before and after 1987 | Wiley record | https://onlinelibrary.wiley.com/doi/abs/10.1111/j.1540-6261.1994.tb00079.x | 2026-09-24 | bibliographic record (search summary: vol. 49, pp. 771-818) | omsources |
+| F3 | Derman, "Regimes of volatility", Risk, April 1999: sticky strike, sticky delta (moneyness), sticky implied tree regimes of S&P 500 implied volatility | author's page | https://emanuelderman.com/regimes-of-volatility-risk-april-1999/ | 2026-09-24 | "three distinct rules for how S&P 500 implied vols move with the index, each appropriate to a market regime" (search summary) | §3; omsources |
+| F4 | Breeden and Litzenberger, J. Business 51(4) (1978) 621-651: state prices from the second derivative of call prices | IDEAS/RePEc | https://ideas.repec.org/a/ucp/jnlbus/v51y1978i4p621-51.html | 2026-09-24 | "derived explicitly from a second partial derivative of its call-option pricing function" | def density; omsources |
+| F5 | Carr and Madan, Finance Research Letters 2(3) (2005) 125-130: absence of call-spread, butterfly and calendar-spread arbitrage is sufficient to exclude static arbitrage | NYU PDF / ScienceDirect record | https://engineering.nyu.edu/sites/default/files/2018-09/CarrFinResearchLetters2005.pdf | 2026-09-24 | "the absence of call spread, butterfly spread and calendar spread arbitrages is sufficient to exclude all static arbitrages" (search summary) | §4; omsources |
+| F6 | Individual equity options' risk-neutral distributions are far less negatively skewed than the market index's (OEX and 30 stocks), RFS 16(1) (2003) 101-143 | Bakshi, Kapadia, Madan (OUP record) | https://academic.oup.com/rfs/article-abstract/16/1/101/1615098 | 2026-09-24 | "individual risk-neutral distributions differ from that of the market index by being far less negatively skewed" | §2; ex 6 |
+| F7 | Inverse leverage effect (volatility higher after positive shocks) in more than half of 19 commodities' daily spot prices; crude oil the exception with a leverage effect; Journal of Commodity Markets 22 (2021) | Chen and Mu, "Asymmetric volatility in commodity markets" (IDEAS record) | https://ideas.repec.org/a/eee/jocoma/v22y2021ics2405851320300167.html | 2026-09-24 | "An inverse leverage effect ... is found in more than half of the daily spot prices"; "Only crude oil exhibits a leverage effect" (search summary of the abstract) | §2 |
+| F8 | Butterfly arbitrage condition: g(k) = (1 - k w'/(2w))^2 - (w'^2/4)(1/w + 1/4) + w''/2; a slice is free of butterfly arbitrage iff g >= 0 and lim d+ = -infinity (Lemma 2.2); calendar condition in total variance (section 2.1); Quantitative Finance 14(1) (2014) 59-71 | Gatheral and Jacquier, "Arbitrage-free SVI volatility surfaces", arXiv 1204.0646 (PDF via pdftotext) | https://arxiv.org/abs/1204.0646 | 2026-09-24 | "Lemma 2.2. A slice is free of butterfly arbitrage if and only if g(k) >= 0 for all k in R and lim d+(k) = -infinity" | prop static; code |
+
+## EXCLUDED
+
+- The illustrative shapes of the currency and commodity smiles in the figure carry no numbers from a source.

@@ -1,0 +1,32 @@
+# 3. Refined Products and Cracks — brief and source ledger
+
+## Brief
+
+- **Hook.** A US Gulf Coast refinery buys crude and sells gasoline and diesel; the 3-2-1 crack on the screen is its margin before costs, and it can lock it for a year in three futures.
+- **Sections.** The refinery and its product slate; Gasoline, distillates and fuel oil; Crack spreads and refining margins; Regional arbitrage and the arbitrage window; Seasonality and specifications.
+- **Defines.** product slate, crack spread, 3-2-1 crack spread, gross refining margin, middle distillates, Reid vapour pressure, arbitrage window, marine fuel sulphur cap.
+- **Uses (defined earlier).** futures contract, calendar spread, contract multiplier, basis, physical market, netback, price differential, benchmark crude, commodity swap.
+- **Tutorial.** Build crack-spread series from EIA spot prices (WTI, New York Harbor RBOB and ULSD), converting cents per gallon to dollars per barrel, and show their seasonality.
+- **Build.** `firm.cracks`: crack and margin calculator (unit conversions, product-slate weights, hedge in CL/RB/HO contracts); uses `firm.crude`.
+- **Weekend problem.** Hedging a refinery's summer — named result: the number of CL, RB and HO contracts that lock a 3-2-1 margin on a stated throughput for a quarter, and the locked margin per barrel.
+- **Facts to verify.** NYMEX RBOB and NY Harbor ULSD contract specifications (42,000 gallons); ICE Low Sulphur Gasoil specification (100 tonnes) and barrel-per-tonne conversion; IMO 2020 0.50% sulphur limit effective 1 January 2020; US refinery yields (EIA: share of gasoline, distillate); US and world refining capacity (EIA/IEA); EPA summer Reid vapour pressure limits and dates; 42 gallons per barrel.
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | One 42-gallon barrel of crude refined in US refineries yields about 19 to 20 gallons of motor gasoline and 11 to 13 gallons of ultra-low-sulfur distillate fuel oil; yields vary month to month | EIA, FAQ "How many gallons of gasoline and diesel fuel are made from one barrel of oil?" | https://www.eia.gov/tools/faqs/faq.php?id=327&t=9 | 2026-09-24 | "about 19 to 20 gallons of motor gasoline"; "11 to 13 gallons of ultra-low sulfur distillate fuel oil" | §1; fig slate |
+| F2 | IMO 2020: from 1 January 2020 the global limit on sulphur in ships' fuel oil fell to 0.50% m/m from 3.50%; ECA limit 0.10% since 1 January 2015; carriage ban from 1 March 2020 | IMO, "IMO 2020 - cutting sulphur oxide emissions" | https://www.imo.org/en/mediacentre/hottopics/pages/sulphur-2020.aspx | 2026-09-24 | "From 1 January 2020, the limit for sulphur in fuel oil used on board ships operating outside designated emission control areas is reduced to 0.50% m/m" (search excerpt of the IMO page) | def imo |
+| F3 | RBOB futures: 42,000 gallons, tick $0.0001/gal ($4.20) | Ironbeam (FCM) specification page | https://www.ironbeam.com/knowledge-base/rbob-gasoline-futures-rb-contract-specifications/ | 2026-09-24 | "42,000 gallons of RBOB gasoline"; "$4.20 per tick" | §2 |
+| F4 | NY Harbor ULSD futures (HO): 42,000 US gallons (1,000 barrels), ULSD in New York Harbor | MetroTrade specification page (search summary of NYMEX ch. 150) | https://help.metrotrade.com/kb/ny-harbor-ulsd-heating-oil-futures-ho-contract-specifications | 2026-09-24 | "The contract unit for NY Harbor ULSD futures is 42,000 U.S. gallons (1,000 U.S. barrels)" | §2 |
+| F5 | ICE Low Sulphur Gasoil: lots of 100 metric tonnes; 118.35 cubic metres per lot at density 0.845 kg/l; delivery ARA | ICE product page | https://www.ice.com/products/34361119/Low-Sulphur-Gasoil-Futures | 2026-09-24 | "One or more lots of 100 metric tonnes"; "118.35 cubic metres per lot being the equivalent of 100 metric tonnes" | §2; exo 2 |
+| F6 | EPA summer gasoline (1 June-15 September) RVP not above 9.0 psi, 7.8 psi in some areas | US EPA, "Gasoline Reid Vapor Pressure" | https://www.epa.gov/gasoline-standards/gasoline-reid-vapor-pressure | 2026-09-24 | "gasoline RVP may not exceed 9.0 pounds per square inch during the summer season"; "from June 1 to September 15" | def rvp; §5 |
+| F7 | US operable atmospheric distillation capacity 18.2 million b/cd on 1 January 2026, down over 250,000 b/cd (about 1%); 130 operable refineries vs 301 in 1982 | EIA, Today in Energy, "U.S. refining capacity decreased during 2025"; Refinery Capacity Report | https://www.eia.gov/todayinenergy/detail.php?id=67807 | 2026-09-24 | "18.2 million barrels per calendar day (b/cd) on January 1, 2026" (search excerpt) | dat:m3:refined-products-and-cracks:capacity |
+| F8 | Russia supplied 50% of Europe's diesel imports in 2022; EU banned seaborne imports of Russian diesel in early 2023 | EIA, Today in Energy, "Summer diesel margins tighten with European supply shift" | https://www.eia.gov/todayinenergy/detail.php?id=66125 | 2026-09-24 | "accounting for 50% in 2022"; "In early 2023, the European Union implemented a ban on seaborne imports of diesel fuel" | §3 |
+| F9 | Monthly averages Jul 2006-Aug 2026 of WTI, NYH conventional gasoline, NYH ULSD, USGC gasoline; 3-2-1 crack mean 21.20, max Aug 2026 65.61, May 2022 62.68, min Nov 2009 5.51; NYH-USGC gasoline mean 6.0 c/gal, negative 35 of 242 months | FRED series DCOILWTICO, DGASNYH, DDFUELNYH, DGASUSGULF (EIA), data/markets-3/products_monthly.csv | https://fred.stlouisfed.org/graph/fredgraph.csv?id=DDFUELNYH | 2026-09-24 | downloaded series | figs; ex; exo 7; problem |
+| F10 | NYMEX Rulebook ch. 191 (RBOB): contract unit 42,000 US gallons (1,000 barrels); maximum RVP after ethanol blending 15.0 psi Jan-Feb, 13.5 March, 7.4 April to 15 September, 13.5 16 Sep-October, 15.0 Nov-Dec. Ch. 150 (NY Harbor ULSD): contract unit 42,000 US gallons | CME Group, NYMEX Rulebook chapters 191 and 150 (Internet Archive copies) | https://web.archive.org/web/2025/https://www.cmegroup.com/content/dam/cmegroup/rulebook/NYMEX/1a/191.pdf | 2026-09-24 | "The contract unit to be delivered by the seller shall be 42,000 U.S. gallons (1,000 U.S. barrels)"; "March 13.5"; "April 7.4"; "September 1-15 7.4" | section on seasons; section on the contracts |
+
+## EXCLUDED
+
+- CME's own RBOB and HO rulebook chapters (191, 150): not fetchable by script; the unit is taken from clearing-member pages. **restored → F10 (Internet Archive copies of the rulebook PDFs).**
+- Grade switch dates of the RBOB contract to summer grade (the exact month): not verified; the text says "in the spring". **restored → F10 (RVP schedule by delivery month).**

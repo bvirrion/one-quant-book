@@ -1,0 +1,557 @@
+\chapter{Curve Construction}\label{ch:rc:curve-construction}
+
+On a Friday evening a rates desk replaces the interpolation of its dollar
+curve: zero rates had been joined by straight lines, and from Monday they will
+be joined by the method the US Treasury itself adopted in 2021. Every input
+quote on Monday morning is exactly where it was on Friday, every input
+instrument still reprices to the last decimal, and yet the desk's book of
+seven \omterm{def:rc:curve-construction:pillar}{off-pillar} swaps, five billion dollars of notional, shows a loss of
+90 thousand dollars, and the hedge the risk system asks for on the fifteen-year
+swap has grown by two thirds. Nothing in the market moved; the curve between
+the quotes did. A curve is a model, fitted to a handful of prices and used to
+value everything between them. This chapter builds one from the instruments
+up, and measures what each choice costs in value and in hedges. One Quant Book
+2, chapter 9, bootstrapped a single overnight-swap curve with one
+interpolation; here the curve takes deposits, futures and swaps together, is
+solved globally, and is interpolated in four ways.
+
+\section{Choosing the instruments}
+
+\begin{definition}[Pillar, instantaneous forward rate]\label{def:rc:curve-construction:pillar}
+A \emph{pillar}\index{pillar} of a curve is a date at which the curve carries a
+free parameter, here the continuously compounded zero rate $z(T)$, so that
+$P(T)=e^{-z(T)T}$; the curve between pillars is fixed by an interpolation rule.
+The \emph{instantaneous forward rate}\index{instantaneous forward rate} seen at
+$t$ for time $T$ is
+\[
+f(t,T) = -\frac{\partial}{\partial T}\ln P(t,T),
+\qquad
+P(t,T)=\exp\Bigl(-\int_t^T f(t,u)\,du\Bigr),
+\]
+the rate at which one can lock in, at $t$, borrowing over $[T, T+dT]$.
+\end{definition}
+
+\begin{definition}[Curve calibration]\label{def:rc:curve-construction:calibration}
+\emph{Curve calibration}\index{curve calibration} is the solution for the
+\omterm{def:rc:curve-construction:pillar}{pillar} parameters of a curve such that a chosen set of instruments, each
+priced on the curve, reproduces its market quote. With one \omterm{def:rc:curve-construction:pillar}{pillar} per
+instrument it is a square system of equations; the general notion of
+calibration, fitting a model's parameters to prices, is treated in One Quant
+Book 4, chapter 24.
+\end{definition}
+
+The instruments are chosen for liquidity and so that each maturity is covered
+once. At the front of a dollar curve sit overnight fixings and short
+overnight-index deposits; then three-month SOFR futures, whose reference
+quarters tile the first one or two years; then par OIS swaps
+(One Quant Book 2, chapters 8 and 9). The rule is \emph{no overlaps}: if four
+futures already fix the forwards to December 2027, a one-year swap maturing in
+September 2027 adds a second, slightly different price for a period the curve
+has already priced. Two quotes for one period cannot both be matched unless
+they agree; the builder either drops one or fits both in a least-squares sense
+and gives up exact repricing. \Cref{fig:rc:curve-construction:instruments}
+shows the chapter's choice.
+
+\begin{omfigure}
+\begin{tikzpicture}[x=4.4cm,y=1cm,font=\small,
+  bar/.style={draw=omDef,fill=omDef!15,thick,minimum height=0.36cm},
+  lab/.style={font=\footnotesize,anchor=west}]
+\draw[->,thick] (0,-1.2) -- (2.25,-1.2) node[right] {years};
+\foreach \x/\l in {0/0,0.5/0.5,1/1,1.5/1.5,2/2} {\draw (\x,-1.28) -- (\x,-1.12); \node[below,font=\footnotesize] at (\x,-1.28) {\l};}
+% deposits
+\draw[bar] (0,2.55) rectangle (0.082,2.85); \node[lab] at (0.10,2.70) {1M deposit};
+\draw[bar] (0,2.05) rectangle (0.249,2.35); \node[lab] at (0.27,2.20) {3M deposit};
+% futures
+\foreach \a/\b/\n in {0.2137/0.463/F1,0.463/0.7123/F2,0.7123/0.9616/F3,0.9616/1.211/F4}
+  {\draw[draw=omThm,fill=omThm!15,thick] (\a,1.05) rectangle (\b,1.45); \node[font=\footnotesize] at ({(\a+\b)/2},1.25) {\n};}
+\node[lab] at (1.24,1.25) {SOFR futures (IMM quarters)};
+% swaps
+\draw[draw=omProp,fill=omProp!15,thick] (0,0.05) rectangle (2.0027,0.45); \node[font=\footnotesize] at (1.0,0.25) {2Y par OIS swap};
+\node[lab,align=left] at (2.03,0.25) {then 3Y, 4Y, 5Y, 7Y,\\10Y, \dots, 30Y};
+\draw[dashed,gray,thick] (0,-0.75) rectangle (1.0,-0.45); \node[lab,gray] at (1.03,-0.6) {1Y swap: not used, overlaps F1--F4};
+% pillars
+\foreach \x in {0.082,0.249,0.463,0.7123,0.9616,1.211,2.0027} {\fill[omExo] (\x,-1.2) circle (1.6pt);}
+\end{tikzpicture}
+
+\omcaption{The instruments of the chapter's dollar curve over its first two
+years, and their \omterm{def:rc:curve-construction:pillar}{pillars} (dots on the axis, one at each instrument's
+maturity). The futures start on the third Wednesday of December 2026 and tile
+five quarters; the one-year swap would price a period the futures already
+price, and is left out.}\label{fig:rc:curve-construction:instruments}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Published curves}\label{dat:rc:curve-construction:published}
+The US Treasury's official daily par yield curve has been built with a
+monotone convex method since 6 December 2021, replacing a quasi-cubic Hermite
+spline; its inputs are indicative bid-side quotes for the most recently
+auctioned bills, notes and bonds, collected by the New York Fed near 15:30.
+The ECB publishes two euro-area government curves, from AAA-rated bonds and
+from all central-government bonds, every TARGET business day at 12:00 CET,
+each as the six parameters of a Svensson model
+(\cref{def:rc:curve-construction:ns}) and the rates they imply.
+\end{dated}
+
+\section{Calibration: curve bootstrapping and the global fit}
+
+Each instrument's quote is a function of the discount factors up to its
+maturity. A deposit from spot to $T$ at simple rate $R$ (ACT/360) requires
+$P(T) = 1/(1+R\delta)$; a future on the quarter $[T_1,T_2]$, once its
+convexity adjustment is removed (One Quant Book 2, chapter 8), fixes
+$P(T_1)/P(T_2) = 1+F\delta$; a par swap fixes $P(T_0)-P(T_n)=K\,\sum_i
+\delta_iP(t_i)$. With $n$ instruments and $n$ \omterm{def:rc:curve-construction:pillar}{pillars} the system
+$m_i(z_1,\dots,z_n)=q_i$ is square.
+
+\begin{proposition}[When curve bootstrapping works]\label{prop:rc:curve-construction:triangular}
+If the interpolation is \emph{local}, in the sense that the curve on
+$[T_{j-1},T_j]$ depends only on the \omterm{def:rc:curve-construction:pillar}{pillars} $j-1$ and $j$, and each instrument
+$i$ has maturity $T_i$, then $\partial m_i/\partial z_j = 0$ for $j>i$: the
+Jacobian is lower triangular, and the system can be solved one \omterm{def:rc:curve-construction:pillar}{pillar} at a
+time, each a one-dimensional root search. This is curve bootstrapping. Linear
+interpolation of zero rates and of log discount factors are local; a cubic
+spline is not, and the monotone convex method is local except through the
+forwards it estimates at the two neighbouring \omterm{def:rc:curve-construction:pillar}{pillars}.
+\end{proposition}
+\begin{proof}
+Instrument $i$ only reads discount factors at dates up to $T_i$; under a local
+rule these depend only on \omterm{def:rc:curve-construction:pillar}{pillars} $1,\dots,i$.
+\end{proof}
+
+\begin{method}[Global curve calibration by Newton's method]\label{met:rc:curve-construction:newton}
+Start from $z^{(0)}_j=q_j$. At each step compute the residuals $r_i = m_i(z)
+- q_i$ and the Jacobian $J_{ij}=\partial m_i/\partial z_j$ by finite
+differences; update $z \leftarrow z - J^{-1}r$; stop when $\max_i|r_i|<10^{-12}$.
+The same code serves every interpolation, local or not, and the final Jacobian
+is kept: it converts sensitivities to \omterm{def:rc:curve-construction:pillar}{pillar} rates into sensitivities to
+quotes (\cref{ch:rc:rates-risk}).
+\end{method}
+
+\omcode{code/firm/curvebuild/firm_curvebuild.py}{256}{284}{Global calibration of all pillar zero rates by Newton's method.}\label{lst:rc:curve-construction:calibrate}
+
+On the seventeen instruments of \cref{fig:rc:curve-construction:instruments}
+Newton's method converges in three iterations for all four interpolations,
+to residuals below $10^{-15}$. Speed is not the point here; what the global
+form buys is that the interpolation can be changed without changing the solver.
+
+\section{Interpolation and the forward curve}
+
+Every interpolation reprices the inputs; they differ in what they say between
+\omterm{def:rc:curve-construction:pillar}{pillars}, and the forward curve is where the differences show.
+
+\begin{proposition}[Forwards from zero rates]\label{prop:rc:curve-construction:fwd}
+With $y(T) = z(T)T = -\ln P(T)$, the instantaneous forward is $f(0,T) =
+y'(T) = z(T) + T z'(T)$. The average forward over a \omterm{def:rc:curve-construction:pillar}{pillar} interval is fixed by
+the two \omterm{def:rc:curve-construction:pillar}{pillars} alone: $\bar f_j = (y_j - y_{j-1})/(T_j-T_{j-1})$, the
+\emph{discrete forward}.
+\end{proposition}
+
+\begin{definition}[Flat-forward interpolation]\label{def:rc:curve-construction:flatfwd}
+\emph{Flat-forward interpolation}\index{flat-forward interpolation} makes
+$\ln P(T)$ linear between \omterm{def:rc:curve-construction:pillar}{pillars}: the instantaneous forward is constant on
+each interval and equal to its discrete forward, and jumps at the \omterm{def:rc:curve-construction:pillar}{pillars}.
+\end{definition}
+
+Linear interpolation of zero rates looks smoother on a zero-rate chart and is
+worse on a forward chart: by \cref{prop:rc:curve-construction:fwd} the forward
+is $z + Tz'$, and $z'$ jumps at each \omterm{def:rc:curve-construction:pillar}{pillar}, multiplied by $T$. At the
+chapter's two-year \omterm{def:rc:curve-construction:pillar}{pillar} ($z = 3.2883\%$) the zero curve falls on its left
+and rises on its right; the forward jumps from $2.964\%$ to $3.331\%$, a
+37-basis-point step made by the rule, not by the market. A natural cubic
+spline through the zero rates (One Quant Book 4, chapter 28) removes the
+jumps but, being a global fit, lets a change at one \omterm{def:rc:curve-construction:pillar}{pillar} ripple through
+all of them.
+
+\begin{definition}[Monotone convex interpolation]\label{def:rc:curve-construction:monotone}
+\emph{Monotone convex interpolation}\index{monotone convex interpolation}
+(Hagan and West, 2006) builds the forward curve directly. On each interval
+it keeps the discrete forward $\bar f_j$, estimates the instantaneous forward
+$f_j$ at each \omterm{def:rc:curve-construction:pillar}{pillar} as the time-weighted average of the two adjacent discrete
+forwards, and fills the interval with $f(T)=\bar f_j + G(x)$,
+$x=(T-T_{j-1})/(T_j-T_{j-1})$, where $G$ is a quadratic, or a quadratic joined
+to a constant, with $G(0)=f_{j-1}-\bar f_j$, $G(1)=f_j-\bar f_j$ and
+$\int_0^1G=0$, chosen from four cases so that $G$ never overshoots its end
+values. The forward curve is continuous, reproduces every discrete forward,
+and stays within the range of the neighbouring forwards.
+\end{definition}
+
+\omcode{code/firm/curvebuild/firm_curvebuild.py}{123}{138}{The four cases of the monotone convex interpolant on one interval.}\label{lst:rc:curve-construction:mc}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,
+  xlabel={maturity $T$ (years)},ylabel={$f(0,T)$ (\%)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=30,ymin=2.9,ymax=4.75,grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[gray,thick] table[x=t,y=lz]{figdata/rates-credit-risk/01-curve-construction/forwards.csv};
+\addplot[omDef,thick] table[x=t,y=ff]{figdata/rates-credit-risk/01-curve-construction/forwards.csv};
+\addplot[omProp,thick,dashed] table[x=t,y=cs]{figdata/rates-credit-risk/01-curve-construction/forwards.csv};
+\addplot[omThm,very thick] table[x=t,y=mc]{figdata/rates-credit-risk/01-curve-construction/forwards.csv};
+\legend{linear zero,flat forward,cubic on zeros,monotone convex}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Four instantaneous forward curves from the same seventeen quotes;
+every one reprices every input exactly. Linear zero rates give a sawtooth;
+flat forwards give steps; the cubic spline and the monotone convex curve are
+continuous and nearly coincide at this scale: they differ in how they respond
+to a change of one quote (\cref{fig:rc:curve-construction:locality}).
+Data: the chapter's illustrative dollar curve and
+tutorial.}\label{fig:rc:curve-construction:forwards}
+\end{omfigure}
+
+For government bonds, which are many, noisy and not all at par, a smooth
+parametric curve fitted by least squares is usual instead of one \omterm{def:rc:curve-construction:pillar}{pillar} per
+instrument.
+
+\begin{definition}[Nelson--Siegel and Svensson curves]\label{def:rc:curve-construction:ns}
+A \emph{Nelson--Siegel curve}\index{Nelson--Siegel curve} is the zero curve
+\[
+z(T) = \beta_0 + \beta_1\,\frac{1-e^{-T/\tau_1}}{T/\tau_1}
+ + \beta_2\Bigl(\frac{1-e^{-T/\tau_1}}{T/\tau_1}-e^{-T/\tau_1}\Bigr),
+\]
+with long-run level $\beta_0$, short end $\beta_0+\beta_1$ and a hump of size
+$\beta_2$ near $\tau_1$; its forward curve is $f(0,T) = \beta_0 + \beta_1
+e^{-T/\tau_1} + \beta_2 (T/\tau_1)e^{-T/\tau_1}$. Svensson's extension adds a
+second hump term $\beta_3$ with its own $\tau_2$.
+\end{definition}
+
+\begin{example}[The ECB's AAA curve]\label{ex:rc:curve-construction:ecb}
+On 22 September 2026 the ECB's AAA Svensson parameters were $\beta_0=1.6306$,
+$\beta_1=0.6958$, $\beta_2=2.5849$, $\beta_3=6.6622$ (per cent), $\tau_1=1.0632$,
+$\tau_2=14.4456$ years. They give a ten-year zero rate of $3.4527\%$, which is
+the ECB's published ten-year spot rate, and the one-, five- and thirty-year
+published rates to six decimals; the instantaneous forward rises from
+$2.33\%$ at the short end to a peak of $4.08\%$ near fourteen years
+(\cref{fig:rc:curve-construction:svensson}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,
+  xlabel={maturity $T$ (years)},ylabel={rate (\%)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=30,ymin=2,ymax=4.4,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omDef,very thick] table[x=t,y=zero]{figdata/rates-credit-risk/01-curve-construction/svensson.csv};
+\addplot[omThm,thick,dashed] table[x=t,y=fwd]{figdata/rates-credit-risk/01-curve-construction/svensson.csv};
+\addplot[only marks,mark=*,mark size=2.2pt,omExo] table[x=t,y=zero]{figdata/rates-credit-risk/01-curve-construction/ecbpoints.csv};
+\legend{zero rate,instantaneous forward,ECB published spot rates}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The euro-area AAA government curve of 22 September 2026, from the
+six Svensson parameters the ECB publishes; the dots are the spot rates the ECB
+publishes for one, five, ten and thirty years, which the formula reproduces.
+Source: ECB statistics (ECB Data Portal, series
+YC.B.U2.EUR.4F.G\_N\_A.SV\_C\_YM).}\label{fig:rc:curve-construction:svensson}
+\end{omfigure}
+
+\section{The front end: futures, turns and meeting dates}
+
+The first two years of a dollar curve are built from instruments that price
+forward periods, not rates from spot. A future on an IMM quarter fixes one
+quarter's forward rate, after its convexity adjustment; four of them fix four
+consecutive discrete forwards, and the interpolation only decides the shape
+inside each quarter. Two features of the short end are not smooth and should
+not be interpolated as if they were. The turn
+of One Quant Book 2, chapter 2, is a jump in the overnight rate over a
+year-end or quarter-end: a curve builder that knows it adds an extra \omterm{def:rc:curve-construction:pillar}{pillar}
+around the turn date, or a separate spread over those days, so that the one
+expensive night is not smeared over a quarter. The implied policy path
+is a step function: the overnight rate moves at central-bank meetings and not
+between them, so front-end curves are often built with \omterm{def:rc:curve-construction:flatfwd}{flat-forward
+interpolation} between meeting dates, one \omterm{def:rc:curve-construction:pillar}{pillar} per meeting (Book 2's build
+\texttt{firm.meetings}). Smooth interpolation is right where the market has no
+calendar, from two or three years on.
+
+\begin{remark}[Which curve for which job]\label{rem:rc:curve-construction:which}
+Flat forwards between meeting dates at the front, a smooth rule such as
+monotone convex beyond, and a parametric curve for relative value in
+government bonds (a bond rich or cheap to the fitted curve) are complementary,
+not competing, choices. Any of them fails if an instrument is included twice
+for one period or a quote is stale.
+\end{remark}
+
+\section{Hedging consequences of an interpolation}
+
+\begin{definition}[Interpolation locality]\label{def:rc:curve-construction:locality}
+An interpolation scheme has \emph{interpolation locality}\index{interpolation
+locality} if a change in one input quote changes the curve only near that
+input's maturity. Locality decides what a bucketed hedge looks like: under a
+local scheme an \omterm{def:rc:curve-construction:pillar}{off-pillar} swap is hedged with the \omterm{def:rc:curve-construction:pillar}{pillars} around it; under a
+non-local one it acquires risk, of either sign, on \omterm{def:rc:curve-construction:pillar}{pillars} far from its
+maturity.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,
+  xlabel={maturity $T$ (years)},ylabel={change in $f(0,T)$ (bp)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=20,ymin=-5.5,ymax=5.5,grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[gray,thick] table[x=t,y=lz]{figdata/rates-credit-risk/01-curve-construction/locality.csv};
+\addplot[omDef,thick] table[x=t,y=ff]{figdata/rates-credit-risk/01-curve-construction/locality.csv};
+\addplot[omProp,thick,dashed] table[x=t,y=cs]{figdata/rates-credit-risk/01-curve-construction/locality.csv};
+\addplot[omThm,very thick] table[x=t,y=mc]{figdata/rates-credit-risk/01-curve-construction/locality.csv};
+\legend{linear zero,flat forward,cubic on zeros,monotone convex}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The response of the forward curve to a one-basis-point rise in the
+seven-year swap quote, with the curve recalibrated. Flat forwards move only
+between five and ten years (up before seven, down after, so that the ten-year
+swap still reprices); the monotone convex curve adds small
+ripples just outside that span; the cubic spline moves the forwards from three
+years to beyond twenty. Data: the chapter's tutorial.}\label{fig:rc:curve-construction:locality}
+\end{omfigure}
+
+\begin{example}[An eight-year swap on four curves]\label{ex:rc:curve-construction:eight}
+A par payer swap of USD~100 million for eight years has a parallel DV01 of
+about USD~69\,600 on all four curves: they agree on the level. They disagree
+on where it sits (\cref{fig:rc:curve-construction:buckets}). Flat forwards put
+USD~40\,400 on the seven-year quote and USD~29\,200 on the ten-year; the cubic
+spline puts USD~62\,100 on seven years, $-22\,200$ on five, $+11\,000$ on four
+and $-9\,500$ on twelve; monotone convex lies in between. Each set of buckets
+sums to the parallel DV01, and each asks for a different hedge.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,ybar,bar width=7pt,
+  ylabel={DV01 (USD thousand per bp)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=-0.6,xmax=6.6,ymin=-30,ymax=70,grid=major,grid style={gray!25},
+  xtick=data,xticklabels from table={figdata/rates-credit-risk/01-curve-construction/buckets8.csv}{tenor},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=i,y=ff]{figdata/rates-credit-risk/01-curve-construction/buckets8.csv};
+\addplot[fill=omProp!55,draw=omProp] table[x=i,y=cs]{figdata/rates-credit-risk/01-curve-construction/buckets8.csv};
+\addplot[fill=omThm!55,draw=omThm] table[x=i,y=mc]{figdata/rates-credit-risk/01-curve-construction/buckets8.csv};
+\legend{flat forward,cubic on zeros,monotone convex}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bucketed DV01 of an eight-year par payer swap of USD~100 million by
+input quote, for three interpolations (each quote bumped by a hundredth of a
+basis point, curve recalibrated, result scaled to one basis point). The
+eight-year date lies between the seven- and ten-year \omterm{def:rc:curve-construction:pillar}{pillars}; flat forwards
+load only those two, monotone convex adds small five- and twelve-year buckets,
+the cubic spline large ones of both signs from three to fifteen years. Data:
+the chapter's tutorial.}\label{fig:rc:curve-construction:buckets}
+\end{omfigure}
+
+\begin{remark}[Monotone convex is not linear in its inputs]\label{rem:rc:curve-construction:nonlinear}
+Linear-zero, flat-forward and spline curves are linear functions of the \omterm{def:rc:curve-construction:pillar}{pillar}
+rates, so a bucketed DV01 does not depend on the size of the bump. The
+monotone convex curve is not: which of its four cases applies on an interval
+depends on the inputs, so a one-basis-point bump can switch a case and move
+the forward shape inside an interval by more than the bump itself. The value
+stays continuous, but the buckets change with the bump size. The chapter
+therefore bumps by a hundredth of a basis point and scales; exercise~7
+measures the difference.
+\end{remark}
+
+\section{Tutorial: one set of quotes, four curves}\label{tut:rc:curve-construction:tutorial}
+
+\begin{tutorial}
+\textbf{Goal.} Calibrate one dollar curve from deposits, futures and swaps
+under four interpolations, and compare forwards, locality and hedges.
+\textbf{End state:}
+\cref{fig:rc:curve-construction:forwards,fig:rc:curve-construction:locality,fig:rc:curve-construction:buckets}
+and the numbers of \cref{ex:rc:curve-construction:eight}.
+\begin{tutsteps}
+\item \textbf{Instruments.} Two deposits, four futures from the third
+Wednesday of December 2026, eleven swaps; no one-year swap.
+\omcode{code/rates-credit-risk/01-curve-construction/python/rc_curves.py}{30}{36}{The instrument set of the chapter's curve.}\label{lst:rc:curve-construction:instruments}
+\item \textbf{Calibrate} with \texttt{calibrate(SPOT, instruments(), kind)} for each
+of the four kinds; check that the maximum residual is below $10^{-12}$ and the
+number of iterations is three.
+\item \textbf{Forwards.} Tabulate \texttt{curve.fwd\_t(t)} every 0.05 years; you
+should see the sawtooth of linear zeros at the two-year \omterm{def:rc:curve-construction:pillar}{pillar} (2.964\% then
+3.331\%).
+\item \textbf{Locality and buckets.} Run \texttt{locality} for the \omterm{def:rc:curve-construction:pillar}{pillar} \texttt{7Y} and
+\texttt{off\_pillar\_buckets(8)}; \texttt{fig\_rc\_curves.py} writes the charts.
+\end{tutsteps}
+\textbf{What to change next.} Put the one-year swap back two basis points
+away from the futures and look at the forward curve in September 2027; bump by a full basis point
+under monotone convex and compare the buckets with
+\cref{fig:rc:curve-construction:buckets}.
+\end{tutorial}
+
+\section{Build: a multi-instrument curve builder}\label{bld:rc:curve-construction:curvebuild}
+
+\begin{build}
+\bfield{Purpose} The first curve of Book 6's library: every rates instrument,
+exposure simulation and risk run of the book reads a curve built here, and the
+pricing library of One Quant Book 5, chapter 28, accepts it as a discount
+curve.
+\bfield{Interface} \texttt{Deposit}, \texttt{Future}, \texttt{Swap} with
+\texttt{quote()} and \texttt{model(curve)}; \texttt{calibrate(spot, instruments,
+kind)} returning the curve, the Jacobian and diagnostics; \texttt{ZeroCurve}
+with \texttt{df}, \texttt{zero\_t}, \texttt{fwd\_t} and \texttt{bumped(pillar,
+size)}; \texttt{bucket\_sensitivities}; kinds \texttt{linear\_zero},
+\texttt{flat\_forward}, \texttt{cubic\_zero}, \texttt{monotone\_convex}.
+\bfield{Rules} \omterm{def:rc:curve-construction:pillar}{Pillars} at instrument maturities, strictly increasing (an
+overlap is an error); ACT/365 times, ACT/360 accruals; flat forward beyond the
+last \omterm{def:rc:curve-construction:pillar}{pillar}; Book 2's \texttt{firm\_curve} imported, not edited.
+\bfield{Acceptance tests} \texttt{code/firm/curvebuild/tests/}: every
+instrument reprices under every kind; flat-forward on swaps equals Book 2's
+bootstrap; flat par quotes give flat forwards; the monotone convex forward is
+continuous at \omterm{def:rc:curve-construction:pillar}{pillars}; local kinds have a lower-triangular Jacobian and the
+spline does not; a seven-year bump spreads beyond fifteen years only under the
+spline; \texttt{bumped} shifts one \omterm{def:rc:curve-construction:pillar}{pillar} or all.
+\bfield{Stretch} Turn and meeting-date \omterm{def:rc:curve-construction:pillar}{pillars}; a least-squares mode with more
+instruments than \omterm{def:rc:curve-construction:pillar}{pillars}; the positivity amendment of the monotone convex
+method; an analytic Jacobian.
+\end{build}
+
+\begin{omsources}
+\item P.\ S.\ Hagan and G.\ West, ``Interpolation methods for curve
+construction'', \emph{Applied Mathematical Finance} 13(2), 2006.
+\item C.\ R.\ Nelson and A.\ F.\ Siegel, ``Parsimonious modeling of yield
+curves'', \emph{Journal of Business} 60(4), 1987; L.\ E.\ O.\ Svensson,
+``Estimating and interpreting forward interest rates: Sweden 1992--1994'', NBER
+Working Paper 4871, 1994.
+\item US Department of the Treasury, \emph{Treasury Yield Curve Methodology};
+ECB, \emph{Euro area yield curves} (ECB Data Portal).
+\item L.\ Andersen and V.\ Piterbarg, \emph{Interest Rate Modeling}, volume 1,
+Atlantic Financial Press, 2010, chapter 6.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rc:curve-construction:1}
+The continuously compounded zero rates at two and three years are $3.25\%$
+and $3.30\%$. Under \omterm{def:rc:curve-construction:flatfwd}{flat-forward interpolation}, what is the \omterm{def:rc:curve-construction:pillar}{instantaneous
+forward rate} at $2.5$ years?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rc:curve-construction:2}
+A SOFR future on the quarter from June to September 2027 trades at $96.72$ and
+its convexity adjustment is $0.6$ basis points. What forward rate must the curve
+reproduce for that quarter?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rc:curve-construction:3}
+Why does the chapter's curve leave out the one-year swap, and what would
+happen to the calibration if it were put back with a quote two basis points
+away from what the futures imply?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:curve-construction:4}
+On the chapter's linear-zero curve the \omterm{def:rc:curve-construction:pillar}{pillars} around two years are at
+$(1.2110, 3.4165\%)$, $(2.0027, 3.2883\%)$ and $(3.0027, 3.3095\%)$ (years,
+zero rate). Compute the instantaneous forward just before and just after the
+two-year \omterm{def:rc:curve-construction:pillar}{pillar}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:curve-construction:5}
+From the ECB parameters of \cref{ex:rc:curve-construction:ecb}, compute the
+ten-year \omterm{def:rc:curve-construction:pillar}{instantaneous forward rate} and the limit of the zero rate as $T\to 0$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rc:curve-construction:6}
+Read \cref{fig:rc:curve-construction:buckets}. A trader hedges the eight-year
+swap with the spline's buckets, then the desk moves to flat forwards. Which
+hedges become unnecessary, and why did the spline ask for them?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rc:curve-construction:7}
+\emph{Coding.} With \texttt{off\_pillar\_buckets(8, bump=1e-4)}, compute the
+monotone convex buckets of the eight-year swap with a full-basis-point bump and
+their sum; compare with the sum for a hundredth-of-a-basis-point bump and with
+the parallel DV01, and explain.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rc:curve-construction:8}
+\emph{Find the flaw.} ``Our new curve reprices every input to $10^{-12}$, so
+its prices for every other instrument are right.'' Correct it.
+\end{exercise}
+
+\section{Problem: The Monday Loss}
+
+\begin{problem}[{Weekend problem --- an interpolation changed over a weekend}]\label{pb:rc:curve-construction:1}
+A desk's book holds seven par swaps traded on the chapter's curve under
+linear-zero interpolation: payers of 6, 9, 13 and 22 years (USD~0.9, 0.6, 0.5
+and 0.8 billion) and receivers of 8, 11 and 17 years (USD~0.7, 0.8 and 0.7
+billion), USD~5.0 billion in all. Over the weekend the curve is rebuilt from
+the same quotes with \omterm{def:rc:curve-construction:monotone}{monotone convex interpolation}.
+
+\medskip\noindent\textbf{Part I --- The change.}
+\begin{enumerate}
+\item Why is each swap worth exactly zero on Friday?
+\item Does any input instrument change value on Monday? Why not?
+\item The 17-year par rate moves from $3.9975\%$ to $4.0074\%$. What does that
+say about the forwards between 15 and 20 years?
+\item Which swaps of the book are exposed to the change, and which are not?
+\item Give the six-year par rate before and after, and explain why it barely
+moves.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The P\&L.}
+\begin{enumerate}[resume]
+\item Give the book's value on Monday.
+\item Is it a profit or a loss, and which swaps produce most of it?
+\item Should the desk book it as trading P\&L? Who should decide?
+\item How would you present it to the head of desk in one sentence?
+\item Would a book of pillar-maturity swaps have shown anything?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The hedges.}
+\begin{enumerate}[resume]
+\item The fifteen-year bucket was $-\text{USD}~346\,584$ per basis point and is now
+$-583\,281$. The fifteen-year par swap has a DV01 of USD~1\,149\,075 per billion.
+Give the hedge notional before and after.
+\item Do the same for the twenty-year bucket ($345\,841$ then $465\,177$; USD~1\,388\,775
+per billion).
+\item The sum of the buckets is USD~555\,270 before and 557\,510 after. Why so
+close, when single buckets moved by a third or more?
+\item Why were the buckets computed with a hundredth-of-a-basis-point bump?
+\item A new twelve-year bucket appears ($-77\,741$). Where did it come from?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Give two arguments for the new interpolation and one against.
+\item How should a change of curve methodology be governed?
+\item What reserve might a controller hold for curve-methodology uncertainty?
+\item State the \emph{named result}: the P\&L of the switch and the change in the
+fifteen-year hedge.
+\item In one sentence: what does a curve's interpolation decide?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, bank}]\label{iq:rc:curve-construction:1}
+What is the difference between curve bootstrapping and a global curve fit, and
+when do you need the second?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{trader, researcher}]\label{iq:rc:curve-construction:2}
+Why does linear interpolation of zero rates give a bad forward curve?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:rc:curve-construction:3}
+List the properties you would want from a curve interpolation, and say which
+ones conflict.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:rc:curve-construction:4}
+Your eight-year swap shows risk on the four-year and twelve-year buckets. What
+do you suspect?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:rc:curve-construction:5}
+How do you handle the year-end turn and central-bank meeting dates in a curve
+builder?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, risk}]\label{iq:rc:curve-construction:6}
+Your bucketed deltas change when you change the bump size from one basis point
+to a tenth. Is the code wrong?
+\end{interviewq}

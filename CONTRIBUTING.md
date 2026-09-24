@@ -31,7 +31,9 @@ the short reference a contributor keeps open while writing.
 | `omsources` | end of lesson | — |
 | `solution{<key>}`; `\iqlookfor{…}` closes an interview solution | solutions file | — |
 
-Roles for `\iqroles`: `trader, researcher, developer, mle, bank`.
+Roles for `\iqroles`: `trader, researcher, developer, mle, bank, risk`
+(`risk` added 2026-09-24: Book 2 already used it for risk-manager questions,
+and Book 6 needs it).
 
 ## Ledger format
 
@@ -67,6 +69,113 @@ Rates, FX and credit (added for One Quant Book 2):
 | $r_{\mathrm{on}}$ | overnight benchmark rate; $K$ fixed rate of a swap (as a strike) |
 | $S$, $F$ | FX spot and outright forward, in units of the **quote** currency per one unit of the **base** currency (pair written `EURUSD`); $r_d$, $r_f$ domestic (quote) and foreign (base) rates |
 | $\lambda$ | hazard rate; $R$ recovery rate; $\mathcal{S}$ a credit spread (CDS par spread, bond Z-spread $z$) — never $s$, which is the bid–ask spread |
+
+## Series notation (fixed in One Quant Book 4, chapter 1)
+
+Agreed at the Books 3–6 batch sync (2026-09-24). Books 4, 5 and 6 and every
+later book follow it; Book 4 ch. 1 prints it. It **extends** the interim tables
+above, whose meanings are kept ($s_t$ bid–ask spread, $\mathcal S$ credit
+spread, $\lambda$ an intensity or hazard rate, $\tau = T-t$, $r$ a rate, $\ell$
+borrow fee, $K$ strike, $P(t,T)$ discount factor, $y$ yield, $\delta$ accrual,
+$R$ recovery). A symbol marked *local* may be reused with another meaning in a
+chapter that declares it.
+
+**Probability and measures**
+
+| Symbol | Meaning |
+|---|---|
+| $(\Omega,\mathcal F,\mathbb P)$, $\mathbb F=(\mathcal F_t)$ | probability space, filtration (usual conditions) |
+| $\E_t[X]=\E[X\mid\mathcal F_t]$, $\E^{\mathbb Q}_t$ | conditional expectation; under another measure |
+| $\mathbb P$, $\mathbb Q$ | real-world measure; risk-neutral measure (numeraire $B_t$) |
+| $B_t=\exp\int_0^t r_s\,ds$ | money-market (bank) account; $r_t$ the short rate, always time-indexed in model chapters |
+| $\mathcal N_t$, $\mathbb Q^{\mathcal N}$ | a generic numeraire and its measure ($N_t$ is reserved for counting processes) |
+| $\mathbb Q^T$, $\mathbb Q^A$ ($\mathbb Q^{a,b}$) | $T$-forward measure (numeraire $P(t,T)$); annuity measure (numeraire $A_t$ / $A_{a,b}(t)$); $\mathbb Q^d$ spot measure |
+| $d\mathbb Q/d\mathbb P$, $Z_t$ | Radon–Nikodym derivative; density process |
+| $\Phi$, $\varphi$ | standard normal cdf and pdf (never $N(d_1)$); $\mathcal N(m,s^2)$ the normal law, always with arguments |
+| $\varphi_X(u)=\E[e^{iuX}]$ | characteristic function, always subscripted |
+| $\mathbf 1_A$; $\overset{d}{=}$, $\xrightarrow{d}$, $\xrightarrow{\mathbb P}$ | indicator; equality and convergence in law, in probability |
+| $\tau$ (unsubscripted, stopping-time chapters) | a stopping time; where it meets a time to expiry, write $T-t$. Default times are always subscripted: $\tau_C$ (counterparty), $\tau_B$ (bank) |
+
+**Stochastic calculus and processes**
+
+| Symbol | Meaning |
+|---|---|
+| $W_t$; $W^{\mathbb Q}_t$, $W^T_t$ | Brownian motion under the measure in force; decorated when two measures appear; $d\langle W^i,W^j\rangle_t=\rho_{ij}\,dt$ |
+| $[X]_t$, $[X,Y]_t$ | quadratic variation, covariation ($\langle\cdot\rangle$ only for the predictable version); $\mathcal E(X)_t$ stochastic exponential |
+| $dX=\mu(t,X)\,dt+\sigma(t,X)\,dW$ | SDE; $\mathcal L$ the generator ($\mathcal L f=\mu f'+\tfrac12\sigma^2 f''$), $\mathcal L^*$ its adjoint |
+| $dX=\kappa(\bar x-X)\,dt+\sigma\,dW$ | Ornstein–Uhlenbeck; $\kappa$ speed of mean reversion, half-life $\ln 2/\kappa$ |
+| $dv=\kappa(\bar v-v)\,dt+\eta\sqrt v\,dW$ | square-root process; Feller condition $2\kappa\bar v\ge\eta^2$. Heston is $(v_0,\kappa,\bar v,\eta,\rho)$: $\eta$ is **the vol-of-vol throughout the series** |
+| $N_t$, $t_1<t_2<\dots$ | counting process and event times |
+| $\lambda_t$ | intensity of a point process: Poisson rate, hazard rate, **Hawkes conditional intensity** $\lambda_t=\mu+\sum_{t_i<t}g(t-t_i)$ (baseline $\mu$ *local*, kernel $g$, exponential $g(u)=\alpha e^{-\beta u}$ *local*, branching ratio $\lVert g\rVert_1$, multivariate $\lambda^{(i)}_t$, branching matrix $G$, stable iff spectral radius $<1$) |
+| $\Lambda_t=\int_0^t\lambda_s\,ds$, $M_t=N_t-\Lambda_t$ | compensator (cumulative hazard in credit); compensated martingale ($M_t$ *local*) |
+| $(\sigma^2,\nu,\gamma)$, $\nu(dx)$, $\psi$ | Lévy triplet (Cont–Tankov order), Lévy measure, characteristic exponent $\varphi_{X_t}(u)=e^{t\psi(u)}$ |
+| $H$ | Hurst exponent (fractional Brownian motion $W^H_t$) |
+
+**Statistics and time series**
+
+| Symbol | Meaning |
+|---|---|
+| $n$, $\theta\in\Theta$, $\theta_0$ | sample size, parameter, true value; hat = estimate, tilde = alternative or shrunk estimate, bar = sample mean |
+| $\ell_n(\theta)$, $\mathcal I(\theta)$ | log-likelihood (always with subscript and argument; bare $\ell$ is the borrow fee); Fisher information |
+| $V=A^{-1}BA^{-1}$ | sandwich asymptotic variance *local*; $\mathrm{se}(\hat\theta)$ standard error |
+| $\mathrm{SR}$, $\widehat{\mathrm{SR}}$ | Sharpe ratio and its estimate |
+| $R_t=\ln(S_t/S_{t-1})$ | log return; $R$ without subscript stays the recovery rate |
+| $L$ (lag), $\Delta=1-L$ | lag and difference operators (time-series chapters; *local*) |
+| $\gamma(h)$, $\rho(h)$ | autocovariance, autocorrelation; AR/MA coefficients $\phi_i$, $\vartheta_j$ always indexed; innovations $\varepsilon_t$ |
+| $\mathrm{RV}_t$, $\mathrm{IV}_t$ | realised and integrated variance; implied volatility is therefore $\sigma_{\mathrm{imp}}$, never ``IV'' in a formula |
+| $x_{t\mid t}$, $\Sigma_{t\mid t}$, $K_t$ | Kalman estimate, covariance, gain (state-space chapters, bold vectors) |
+
+**Matrices, optimisation, numerics**
+
+| Symbol | Meaning |
+|---|---|
+| $\Sigma$, $C$, $\hat\Sigma$ | covariance, correlation, sample covariance; vectors are columns, $\mathbf 1$ ones vector, $I_n$ identity, ${}^\top$ transpose |
+| $\lambda_i$ (always indexed) | eigenvalues $\lambda_1\ge\dots\ge\lambda_N$; eigenvectors $v_i$; $\operatorname{cond}(A)$ condition number (not $\kappa$) |
+| $\min f(x)$ s.t. $g_i(x)\le0$, $h_j(x)=0$ | optimisation; multipliers $u\ge0$, $v$ (not $\lambda$); $x^\star$, $p^\star$, $d^\star$ |
+| $\mathrm{fl}(x)$, $u=2^{-53}$, $\varepsilon_{\mathrm{mach}}=2^{-52}$ | floating point (binary64, round to nearest); $\mathrm{ulp}(x)$ |
+| $t_k=k\Delta t$, $x_j$, $V^k_j$ | time grid, space grid, numerical solution; $M$ Monte Carlo paths, estimator $\hat V_M$ |
+
+**Options and volatility**
+
+| Symbol | Meaning |
+|---|---|
+| $\sigma_{\mathrm{imp}}(K,T)$ | implied volatility |
+| $k=\ln(K/F_{0,T})$ | log-moneyness (forward-based) |
+| $w(k,T)=\sigma_{\mathrm{imp}}^2T$, $\theta_T$ | total implied variance; ATM total variance |
+| $\sigma_{\mathrm{loc}}(t,S)$, $v_t$, $\xi_t(u)=\E^{\mathbb Q}_t[v_u]$ | local volatility; instantaneous variance; forward variance curve |
+| $\Delta,\Gamma,\mathcal V,\Theta$; $\mathrm{Vanna}$, $\mathrm{Volga}$, $\mathrm{Rho}$ | Greeks ($\rho$ is **always** a correlation, so the rate Greek is upright Rho); cash gamma $\tfrac12\Gamma S^2$; bucketed sensitivity $\Delta_k$ |
+| $H$ (with $K$) | barrier level; $g(\cdot)$ a payoff |
+| $(\alpha,\beta,\rho,\nu)$, $\zeta$ | SABR parameters; shift of shifted SABR / shifted lognormal |
+| $(a,b,\rho,m,\varsigma)$ | raw SVI |
+| $\mu_J$, $\sigma_J$ | mean and volatility of the log-jump size |
+| $L(t,S)$ | leverage function of a stochastic-local-volatility model (always with arguments) |
+| $D_i$ at $t_i$ | cash dividends |
+
+**Rates, credit, XVA and risk**
+
+| Symbol | Meaning |
+|---|---|
+| $f(t,T)$, $\sigma_f(t,T)$ | instantaneous forward rate and its volatility (HJM) |
+| $F_k(t)=F(t;T_{k-1},T_k)$, $\sigma_k(t)$, $\rho_{ij}$ | market-model forwards, volatilities, correlations; tenor dates $T_0<\dots<T_n$ |
+| $S_{a,b}(t)$, $A_{a,b}(t)$ | swap rate and annuity |
+| $Q_C(t)$ | survival probability of name $C$ (italic, distinct from $\mathbb Q$); $\mathrm{PD}$, $\mathrm{LGD}=1-R$, $\mathrm{CS01}$, $\mathrm{JTD}$ |
+| $C^{\mathrm{Ga}}_\Sigma$, $C^t_{\nu,\Sigma}$ | Gaussian and Student-$t$ copulas (always decorated); one-factor $X_i=\sqrt\rho Z+\sqrt{1-\rho}\,\varepsilon_i$ |
+| $V_t$, $M_t$, $M^{\mathrm{VM}}_t$, $M^{\mathrm{IM}}_t$ | netting-set value; collateral (not $C_t$, a call price); $\mathrm{Th}$ threshold, $\mathrm{MTA}$ minimum transfer amount |
+| $\mathrm{EE}(t)$, $\mathrm{ENE}(t)$, $\mathrm{EPE}$, $\mathrm{PFE}_\alpha(t)$ | exposure profiles |
+| CVA, DVA, FVA, MVA, KVA | upright; funding spread $\mathcal S_F$ |
+| $L=-\Delta V$ | loss (positive = loss); $\mathrm{VaR}_{\alpha,h}$, $\mathrm{ES}_{\alpha,h}$, confidence $\alpha$, horizon $h$ days |
+| $\mathrm{RW}_k$, $\mathrm{WS}_k$, $\rho_{kl}$, $\gamma_{bc}$ | FRTB / SIMM risk weights, weighted sensitivities, correlations |
+| $I(t)$, $P_N$, $P_R$ | inflation index; nominal and real discount factors |
+
+**Commodities and crypto** (Book 3)
+
+| Symbol | Meaning |
+|---|---|
+| $F_{t,T}=S_te^{(r+u-y_c)\tau}$ | $y_c$ convenience yield, $u$ proportional storage cost |
+| $\theta_i$, $\mathrm{HDD}$, $\mathrm{CDD}$ | daily temperature (*local*), degree days |
+| $p_h$, $p_n$ | power price in market time unit $h$; nodal price |
+| $P^{\mathrm{idx}}_t$, $P^{\mathrm{mark}}_t$, $\pi_t$, $\phi$ | perpetual index and mark price, premium index, funding rate per interval (*local*) |
+| $x,y,L,p=y/x$ | AMM reserves, liquidity, pool price (*local* to the DeFi chapters) |
 
 ## Gates
 

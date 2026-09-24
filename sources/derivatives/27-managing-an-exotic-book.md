@@ -1,0 +1,28 @@
+# 27. Managing an Exotic Book — brief and source ledger
+
+## Brief
+
+- **Hook.** A desk books a new structure with a day-one profit of 2 million; the valuation-control group recognises 400,000 and holds the rest until the model's key input can be observed.
+- **Sections.** What an exotic book owns; Reserves and parameter bid-offer; Model risk on the desk; Stress and concentration; Day-one P&L and its release.
+- **Defines.** valuation reserve, bid--offer reserve, model reserve, parameter bid--offer, day-one P\&L.
+- **Uses (defined earlier).** P\&L attribution (Book 1 ch. 7), model risk, model validation (Book 6 ch. 26), independent price verification, prudent valuation (Book 6 ch. 27), autocallable (ch. 18), correlation skew (ch. 17), recalibration P\&L (ch. 24).
+- **Tutorial.** Compute bid-offer, model and parameter reserves for a small exotic book (autocallables, barriers, cliquets) by repricing under alternative models and parameter bounds, then run a stress grid.
+- **Build.** `firm.reserves`: reserve calculator (bid-offer by Greek bucket, model reserve from a model set, parameter-uncertainty reserve, day-one P&L release schedule).
+- **Weekend problem.** The deferred profit — named result: the day-one P&L recognised at inception on a three-year worst-of autocallable, and the amount released after one year as the correlation input becomes observable.
+- **Facts to verify.** IFRS 13 fair-value hierarchy; IFRS 9 B5.1.2A day-one gains; US GAAP ASC 820; EBA prudent-valuation RTS (model-risk and concentration adjustments); Fed/OCC SR 11-7 model-risk guidance; documented exotic-book losses from regulator or company records (e.g. Natixis 2018).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | IFRS 13 fair-value hierarchy: Level 1 inputs are quoted prices (unadjusted) in active markets for identical assets or liabilities (para. 76); Level 2 inputs are inputs other than Level 1 quoted prices that are observable, directly or indirectly (para. 81), and for an instrument with a contractual term must be observable for substantially the full term (para. 82); Level 3 inputs are unobservable inputs (para. 86) | Commission Regulation (EU) No 1255/2012 adopting IFRS 13, OJ text (XHTML via the EU Publications Office) | https://publications.europa.eu/resource/celex/32012R1255 | 2026-09-24 | paragraphs 76, 81, 82, 86 | sec. what an exotic book owns; def day-one P&L |
+| F2 | IFRS 9 B5.1.2A: the best evidence of fair value at initial recognition is normally the transaction price; a difference between fair value and transaction price is recognised as a gain or loss only if fair value is evidenced by a Level 1 input or a valuation technique that uses only data from observable markets; in all other cases it is deferred and recognised afterwards only to the extent that it arises from a change in a factor (including time) that market participants would take into account | Commission Regulation (EU) 2016/2067 adopting IFRS 9, OJ text (XHTML via the EU Publications Office) | https://publications.europa.eu/resource/celex/32016R2067 | 2026-09-24 | paragraph B5.1.2A | sec. day-one P&L; def day-one P&L; pb |
+| F3 | EU prudent-valuation standard (Commission Delegated Regulation (EU) 2016/101): market price uncertainty and model risk AVAs at the point of a range of plausible values where the institution is 90 % confident it could exit at that price or better (Art. 9(5), 11(3)); model risk AVA from alternative models and calibrations, or an expert-based approach (Art. 11(3)-(5)); concentrated positions AVA where the prudent exit period exceeds 10 days (Art. 14); Annex Method 1 aggregation APVA = 50 % (FV - PV) | Commission Delegated Regulation (EU) 2016/101, OJ text (XHTML via the EU Publications Office) | https://publications.europa.eu/resource/celex/32016R0101 | 2026-09-24 | Articles 9, 11, 14 and the Annex | sec. reserves; sec. model risk; sec. stress and concentration; build |
+| F4 | Supervisory model-risk guidance: SR 11-7 (4 April 2011) was superseded on 17 April 2026 by SR 26-2, "Revised Guidance on Model Risk Management", issued by the Federal Reserve, OCC and FDIC; the OCC rescinded Bulletin 2011-12; the revised guidance defines a model as a complex quantitative method, system, or approach that applies statistical, economic, or financial theories to process input data into quantitative estimates | Federal Reserve SR 26-2 letter; OCC Bulletin 2026-13 | https://www.federalreserve.gov/supervisionreg/srletters/SR2602.htm | 2026-09-24 | SR 26-2 page (search excerpt) and https://www.occ.gov/news-issuances/bulletins/2026/bulletin-2026-13.html (rescissions, definition quoted) | dat:dv:managing-an-exotic-book:mrm |
+| F5 | Natixis reported a EUR 259m non-recurring impact on Asian equity derivatives in 4Q18, after identifying a deficient hedging strategy in Asia (announced 18 December 2018) | Natixis, "2018 fourth-quarter results and 2018 annual results", press release of 12 February 2019 (GlobeNewswire) | https://www.globenewswire.com/news-release/2019/02/12/1721016/0/en/NATIXIS-2018-FOURTH-QUARTER-RESULTS-AND-2018-ANNUAL-RESULTS.html | 2026-09-24 | "EUR(259)m non-recurring impact on Asian equity derivatives in 4Q18"; "identification of a deficient hedging strategy in Asia (December 18th announcement)" | sec. stress and concentration |
+
+## EXCLUDED
+
+- US GAAP ASC 820: not fetched (FASB codification behind registration); the chapter cites IFRS only.
+- Press reports linking the Natixis loss to autocallables sold in South Korea (Bloomberg, Risk.net): not attributed; the chapter states only the company's own wording.
+- The hook's numbers are the chapter's model (a 100m sale at a 2 % margin), not a real trade.

@@ -1,0 +1,375 @@
+\chapter{Floating Point and Numerical Linear Algebra}\label{ch:qm:floating-point-and-numerical-linear-algebra}
+
+In January 1982 the Vancouver Stock Exchange launched an index at 1000. It was recomputed after every trade, a few thousand times a day,
+and after each recomputation it was truncated to three decimals, not rounded. Twenty-two months later, on Friday 25 November 1983, it closed
+at 524.811 in a market that had in fact risen; recomputed over that weekend, it stood at 1098.892. Each truncation cost less than a
+thousandth of a point. A million of them cost half the index. This chapter is about what the machine does with numbers: the format of a
+\omterm{def:qm:floating-point-and-numerical-linear-algebra:fp}{floating-point number} and the rounding of every operation, cancellation and the accumulation of error, the condition of a problem and the
+stability of an algorithm, the factorisations that numerical linear algebra is built on, iterative solvers, and the reproducibility that a
+risk system owes its users.
+
+\section{Representation}
+
+\begin{definition}[Floating-point number, machine epsilon, unit in the last place]\label{def:qm:floating-point-and-numerical-linear-algebra:fp}
+A binary \emph{floating-point number}\index{floating-point number} is $\pm m \times 2^e$ with an integer significand $m$ of $p$ bits and an exponent $e$ in a fixed range; IEEE 754
+double precision (binary64) has $p = 53$ and exponents from $-1022$ to $1023$. \emph{Machine epsilon}\index{machine epsilon} is the gap between 1 and the next larger number, $2^{1-p} =
+2^{-52} \approx 2.2 \times 10^{-16}$; the unit roundoff $u$ is half of it (some texts, and some libraries, call $u$ itself machine epsilon). A \emph{unit in the last place}\index{unit in the last place} (ulp) of $x$ is the gap between the two floating-point
+numbers around $x$.
+\end{definition}
+
+\begin{definition}[Subnormal number, fused multiply-add]\label{def:qm:floating-point-and-numerical-linear-algebra:fma}
+A \emph{subnormal number}\index{subnormal number} fills the gap between zero and the smallest normal number with a reduced significand, so that $x - y = 0$ only if $x = y$. A
+\emph{fused multiply-add}\index{fused multiply-add} computes $a \times b + c$ with a single rounding.
+\end{definition}
+
+The standard model of arithmetic: every basic operation returns the exact result rounded, $\mathrm{fl}(x \circ y) = (x \circ y)(1 + \delta)$ with $|\delta| \le u = 2^{-53}$. Most decimal
+fractions are not representable: $0.1$ is stored as the nearest binary64 number, a little above $0.1$, so $0.1 \times 10 - 1$ evaluates to exactly 0 with two roundings, while a \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused
+multiply-add}, rounding once, returns $2^{-54}$. Both are correct IEEE results. A compiler that contracts $a \times b + c$ into a \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-add} changes the answer: GCC does so by
+default outside a standards-compliant C mode (\texttt{-ffp-contract=fast}) when the target has the instruction, which is one reason a C++ and a Python risk engine can disagree in
+the last bits.
+
+\section{Cancellation and the accumulation of error}
+
+\begin{definition}[Catastrophic cancellation, compensated summation, Welford's algorithm]\label{def:qm:floating-point-and-numerical-linear-algebra:cancel}
+\emph{Catastrophic cancellation}\index{catastrophic cancellation} is the loss of relative accuracy when two nearly equal rounded numbers are subtracted: the leading digits cancel and the
+rounding errors remain. \emph{Compensated summation}\index{compensated summation} (Kahan, 1965; in Neumaier's variant, 1974) carries the rounding error of each addition in a separate
+variable and adds it back. \emph{Welford's algorithm}\index{Welford's algorithm} (1962) updates a running mean and sum of squared deviations one observation at a time.
+\end{definition}
+
+\begin{proposition}[Summation error bounds]\label{prop:qm:floating-point-and-numerical-linear-algebra:sum}
+Recursive summation of $n$ numbers has error at most $(n - 1)u\sum_i|x_i| + O(u^2)$; pairwise summation at most $\lceil\log_2n\rceil u\sum_i|x_i| + O(u^2)$; \omterm{def:qm:floating-point-and-numerical-linear-algebra:cancel}{compensated summation} at most
+$2u\sum_i|x_i| + O(nu^2)\sum_i|x_i|$, independent of $n$ to first order.
+\end{proposition}
+
+\begin{proof}
+In recursive summation the partial sum $s_k$ is rounded once per step, so $x_1$ passes through $n - 1$ roundings, each contributing a relative error at most $u$ of a partial sum bounded by
+$\sum|x_i|$; pairwise summation passes each term through only $\lceil\log_2n\rceil$ additions. In \omterm{def:qm:floating-point-and-numerical-linear-algebra:cancel}{compensated summation} the error of each addition is computed exactly (for $|s| \ge |x|$,
+$(s - t) + x$ is exact) and fed back, so only the final correction and second-order terms remain.
+\end{proof}
+
+On a million P\&L entries spanning seven orders of magnitude, the error against the exact rational sum is $2.5 \times 10^{-6}$ for the naive loop, $2.8 \times 10^{-8}$ for pairwise summation
+and $2.2 \times 10^{-9}$, less than one \omterm{def:qm:floating-point-and-numerical-linear-algebra:fp}{unit in the last place} of the total ($7.5 \times 10^{-9}$), for Neumaier's (\cref{fig:qm:floating-point-and-numerical-linear-algebra:sum}). None matters for a P\&L report; all
+matter when two systems must agree to the cent and one of them sums in a different order.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={number of P\&L entries},ylabel={absolute error},
+  tick label style={font=\small},label style={font=\small},xmin=700,xmax=1.5e6,ymin=1e-13,ymax=1e-4,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=n,y=naive]{figdata/methods/25-floating-point-and-numerical-linear-algebra/summation.csv};
+\addplot[black,very thick,mark=square*,mark size=1.6pt] table[x=n,y=pairwise]{figdata/methods/25-floating-point-and-numerical-linear-algebra/summation.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=2pt] table[x=n,y=neumaier]{figdata/methods/25-floating-point-and-numerical-linear-algebra/summation.csv};
+\legend{naive loop,pairwise,Neumaier}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Error of three summation algorithms against the exact (rational) sum of $n$ simulated P\&L entries whose magnitudes cycle over seven orders. Neumaier's compensated sum stays below
+one \omterm{def:qm:floating-point-and-numerical-linear-algebra:fp}{unit in the last place} of the total. Data: the chapter's tutorial, seeded.}\label{fig:qm:floating-point-and-numerical-linear-algebra:sum}
+\end{omfigure}
+
+The textbook variance, $(\sum x_i^2 - (\sum x_i)^2/n)/(n - 1)$, subtracts two nearly equal large numbers. On ten thousand prices equal to an offset plus a uniform draw, its relative error
+is $3 \times 10^{-13}$ with offset 1, $8.0 \times 10^{-7}$ with offset $10^4$ (prices near 10\,000), 1.3\% with offset $10^6$, and with offset $10^8$ it returns 86.8 for a true variance of 0.082.
+The two-pass formula, which subtracts the mean first, stays near $10^{-12}$ or below; Welford's update within $1.6 \times 10^{-8}$ even at $10^8$
+(\cref{fig:qm:floating-point-and-numerical-linear-algebra:var}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={offset of the data},ylabel={relative error of the variance},
+  tick label style={font=\small},label style={font=\small},xmin=0.5,xmax=2e8,ymin=1e-17,ymax=1e4,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=offset,y=textbook]{figdata/methods/25-floating-point-and-numerical-linear-algebra/variance.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=2pt] table[x=offset,y=welford]{figdata/methods/25-floating-point-and-numerical-linear-algebra/variance.csv};
+\addplot[black,very thick,mark=square*,mark size=1.6pt] table[x=offset,y=twopass]{figdata/methods/25-floating-point-and-numerical-linear-algebra/variance.csv};
+\legend{textbook one-pass,Welford,two-pass}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Relative error of three variance formulas on 10\,000 values equal to an offset plus a uniform draw on $(0, 1)$ (true variance 0.082), against the exact rational result. The
+one-pass textbook formula loses all accuracy as the offset grows. Data: the chapter's tutorial, seeded.}\label{fig:qm:floating-point-and-numerical-linear-algebra:var}
+\end{omfigure}
+
+The Vancouver index is the same mechanism with a bias. Rounding to three decimals makes errors of either sign that average out; truncating removes, on average, half a thousandth at each
+recalculation, always downward. At 2\,400 recalculations a day over 480 trading days the expected loss is $0.0005 \times 1\,152\,000 = 576$ points, against a documented shortfall of $1098.892 -
+524.811 = 574$; at the ``about 3\,000'' a day sometimes quoted it would be 720. A simulation of the recalculations, with an exact index rising to 1098.9, ends at 422 when truncated
+(the drift compounds with the index's own moves) and at 1098.57 when rounded (\cref{fig:qm:floating-point-and-numerical-linear-algebra:vancouver}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xlabel={trading day since January 1982},ylabel={index},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=480,ymin=300,ymax=1450,grid=major,grid style={gray!25},legend columns=2,legend cell align=left,
+  legend style={font=\footnotesize,at={(0.03,0.97)},anchor=north west,fill=white,draw=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick] table[x=day,y=exact]{figdata/methods/25-floating-point-and-numerical-linear-algebra/vancouver.csv};
+\addplot[omThm,very thick] table[x=day,y=truncated]{figdata/methods/25-floating-point-and-numerical-linear-algebra/vancouver.csv};
+\legend{exact,truncated to three decimals}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A simulated index recomputed 2\,400 times a day for 480 trading days, exactly and with truncation to three decimals after each recomputation; the exact index is set to end at the
+corrected Vancouver value of 1098.892. Data: the chapter's tutorial, seeded.}\label{fig:qm:floating-point-and-numerical-linear-algebra:vancouver}
+\end{omfigure}
+
+\section{Conditioning and stability}
+
+\begin{definition}[Condition number, backward error, backward stability]\label{def:qm:floating-point-and-numerical-linear-algebra:cond}
+The \emph{condition number}\index{condition number} of a problem bounds the relative change of its answer per relative change of its data; for solving $Ax = b$ it is $\kappa(A) =
+\lVert A\rVert\lVert A^{-1}\rVert$, the ratio of extreme singular values in the 2-norm. The \emph{backward error}\index{backward error} of a computed answer is the smallest perturbation of the data
+for which it is exact. An algorithm has \emph{backward stability}\index{backward stability} if its backward error is always of the order of the unit roundoff.
+\end{definition}
+
+\begin{proposition}[Forward error, condition and backward error]\label{prop:qm:floating-point-and-numerical-linear-algebra:fwd}
+If $\hat x$ solves $(A + \Delta A)\hat x = b$ with $\lVert\Delta A\rVert/\lVert A\rVert = \epsilon$ and $\kappa(A)\epsilon < 1$, then $\lVert\hat x - x\rVert/\lVert x\rVert \le \kappa(A)\epsilon/(1 - \kappa(A)\epsilon)$:
+to first order, forward error is at most \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} times \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{backward error}.
+\end{proposition}
+
+\begin{proof}
+Subtracting $Ax = b$ gives $A(\hat x - x) = -\Delta A\,\hat x$, so $\lVert\hat x - x\rVert \le \lVert A^{-1}\rVert\lVert\Delta A\rVert\lVert\hat x\rVert = \kappa\epsilon\lVert\hat x\rVert$, and $\lVert\hat x\rVert \le
+\lVert x\rVert + \lVert\hat x - x\rVert$ gives the bound.
+\end{proof}
+
+A backward-stable algorithm on a problem with \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $10^8$ can lose eight of its sixteen digits,
+and no algorithm can do better, because the data are only known to rounding. What an algorithm can do is not make the conditioning worse. The normal equations of least squares,
+$X^\top X\beta = X^\top y$, solve a problem whose \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} is $\kappa(X)^2$; a \omterm{def:qm:floating-point-and-numerical-linear-algebra:factor}{QR factorisation} of $X$ solves one with $\kappa(X)$. On five regressors with \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $10^7$, the
+normal equations lose all but two digits of the coefficients (relative error $5 \times 10^{-3}$), the QR solution keeps ten ($1.2 \times 10^{-10}$)
+(\cref{fig:qm:floating-point-and-numerical-linear-algebra:normal}). That is chapter~16's \omterm{def:qm:linear-models-under-stress:vif}{multicollinearity} seen from the machine's side.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={condition number of the design $\kappa(X)$},ylabel={relative error of $\hat\beta$},
+  tick label style={font=\small},label style={font=\small},xmin=5,xmax=2e7,ymin=1e-16,ymax=1e-1,grid=major,grid style={gray!25},
+  legend cell align=left,legend style={font=\footnotesize,at={(0.03,0.97)},anchor=north west,fill=white,draw=none},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=cond,y=normal]{figdata/methods/25-floating-point-and-numerical-linear-algebra/normal.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=cond,y=qr]{figdata/methods/25-floating-point-and-numerical-linear-algebra/normal.csv};
+\legend{normal equations,QR}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Least squares on an exactly consistent system of 500 observations and five regressors whose design has \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $\kappa$: relative error of the coefficients from the
+normal equations (which square $\kappa$) and from a \omterm{def:qm:floating-point-and-numerical-linear-algebra:factor}{QR factorisation}. Data: the chapter's tutorial, seeded.}\label{fig:qm:floating-point-and-numerical-linear-algebra:normal}
+\end{omfigure}
+
+\section{Factorisations}
+
+\begin{definition}[LU, Cholesky, QR and singular value decompositions]\label{def:qm:floating-point-and-numerical-linear-algebra:factor}
+The \emph{LU factorisation}\index{LU factorisation} writes $PA = LU$ with a permutation $P$ (partial pivoting), unit lower-triangular $L$ and upper-triangular $U$. The \emph{Cholesky
+factorisation}\index{Cholesky factorisation} of a symmetric positive-definite matrix is $A = LL^\top$ with $L$ lower triangular. The \emph{QR factorisation}\index{QR factorisation} writes $A = QR$ with
+orthonormal columns in $Q$ and $R$ upper triangular. The \emph{singular value decomposition}\index{singular value decomposition} writes $A = U\Sigma V^\top$ with orthonormal $U$, $V$ and a nonnegative
+diagonal $\Sigma$. The \emph{tridiagonal matrix algorithm}\index{tridiagonal matrix algorithm} (Thomas's algorithm) solves a tridiagonal system by one forward elimination and one back
+substitution, in $O(n)$ operations.
+\end{definition}
+
+\begin{proposition}[Cholesky succeeds exactly for positive-definite matrices]\label{prop:qm:floating-point-and-numerical-linear-algebra:chol}
+The Cholesky recursion $\ell_{jj} = (a_{jj} - \sum_{k<j}\ell_{jk}^2)^{1/2}$, $\ell_{ij} = (a_{ij} - \sum_{k<j}\ell_{ik}\ell_{jk})/\ell_{jj}$ finds a positive pivot at every step if and only if $A$ is
+symmetric positive definite.
+\end{proposition}
+
+\begin{proof}
+The $j$-th pivot is the ratio of the leading principal minors of orders $j$ and $j - 1$, so every pivot is positive if and only if every leading minor is, which (Sylvester) is positive
+definiteness.
+\end{proof}
+
+A failed Cholesky is therefore a test, and a useful one: the pairwise correlation matrix of chapter~23 (fifty series, half the data missing) fails at the sixth pivot, which is $-0.14$. Adding a
+multiple of the identity (``jitter'') cannot succeed until the multiple exceeds the magnitude of the most negative eigenvalue, 1.42, more than the unit diagonal itself, which destroys the correlations; the \omterm{def:qm:convex-optimisation:ncm}{nearest correlation matrix} of chapter~23 passes with a jitter of
+$10^{-8}$. Each factorisation has its use: LU for general systems, Cholesky for covariances (and to simulate correlated normals), QR for least squares, the SVD for rank and conditioning, and
+Thomas's algorithm for the finite-difference grids of chapter~27.
+
+\section{Iterative solvers}
+
+\begin{definition}[Conjugate gradient method, preconditioner]\label{def:qm:floating-point-and-numerical-linear-algebra:cg}
+The \emph{conjugate gradient method}\index{conjugate gradient method} (Hestenes and Stiefel, 1952) solves $Ax = b$ for symmetric positive-definite $A$ by minimising $\frac12x^\top Ax - b^\top x$ along
+mutually $A$-conjugate directions built from the residuals. A \emph{preconditioner}\index{preconditioner} $M \approx A$ replaces the system by one with $M^{-1}A$, of smaller \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number}.
+\end{definition}
+
+In exact arithmetic conjugate gradient terminates in at most $n$ steps, and the error after $k$ steps falls at least like $2\bigl((\sqrt\kappa - 1)/(\sqrt\kappa + 1)\bigr)^k$. In floating point the
+directions lose conjugacy and the finite termination is lost, but the rate survives. On a 400-dimensional system with \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $1.1 \times 10^5$, whose rows and columns are badly
+scaled, conjugate gradient needs 1\,909 iterations to reduce the residual by $10^8$, almost five times $n$; with a Jacobi (diagonal) \omterm{def:qm:floating-point-and-numerical-linear-algebra:cg}{preconditioner}, which brings the \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} to about
+100, it needs 102 (\cref{fig:qm:floating-point-and-numerical-linear-algebra:cg}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=5cm,xlabel={iteration},ylabel={relative residual},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=1950,ymin=1e-9,ymax=100,grid=major,grid style={gray!25},xtick={0,500,1000,1500},unbounded coords=jump,
+  /pgf/number format/1000 sep={\,},legend cell align=left,legend style={font=\footnotesize,at={(0.97,0.97)},anchor=north east,fill=white,draw=none},table/col sep=comma]
+\addplot[omThm,thick] table[x=iter,y=plain]{figdata/methods/25-floating-point-and-numerical-linear-algebra/cg.csv};
+\addplot[omDef,very thick] table[x=iter,y=pre]{figdata/methods/25-floating-point-and-numerical-linear-algebra/cg.csv};
+\legend{conjugate gradient,Jacobi-preconditioned}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Conjugate gradient on a badly scaled symmetric positive-definite system of dimension 400 (\omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $1.1 \times 10^5$), with and without a diagonal \omterm{def:qm:floating-point-and-numerical-linear-algebra:cg}{preconditioner}: relative
+residual against the iteration (the preconditioned run stops at 102). Data: the chapter's tutorial, seeded.}\label{fig:qm:floating-point-and-numerical-linear-algebra:cg}
+\end{omfigure}
+
+\section{The bugs that cost money}
+
+\begin{definition}[Reproducibility to the bit]\label{def:qm:floating-point-and-numerical-linear-algebra:repro}
+A computation has \emph{bitwise reproducibility}\index{bitwise reproducibility} if the same inputs give the same bits on every run, machine, compiler and language used to compute them.
+\end{definition}
+
+Floating-point addition is not associative, so anything that changes the order of operations changes the last bits: a parallel reduction with a different thread count, a vectorised loop, a
+compiler that contracts to \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-adds}, a library that sums in blocks. Those bits then propagate through thresholds (a limit breached or not, a trade filled or not) and become real
+differences. The firm's kit therefore fixes the order of every operation: its three twins, in Python, C++20 and Rust, perform the same operations in the same order on the same SplitMix64 inputs
+and agree bit for bit on the naive, pairwise and compensated sums of ten thousand P\&L entries, Welford's mean and variance of ten thousand prices, a log-sum-exp and a tridiagonal solve; a
+test in each language asserts the same 64-bit patterns. The same test with a \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-add} in place of a multiply and an add shows the difference: $0.1 \times 10 - 1$ is 0 one way and $2^{-54}$
+the other. (With \texttt{g++ -std=c++20 -O2} on x86-64 no contraction happens, because the baseline instruction set has no \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-add}; \texttt{-march=native} on a recent processor
+turns it on.)
+
+The Vancouver mechanism, a systematic rounding repeated millions of times, has cost more than money. On 25 February 1991 a Patriot air-defence battery at Dhahran, Saudi Arabia, failed to
+intercept a Scud missile, which hit an Army barracks and killed 28 Americans. The General Accounting Office traced the failure to the system clock: time was counted in tenths of a second and
+multiplied by $\frac1{10}$ in 24-bit registers, and after the battery had run for about 100 hours the computed time was 0.3433 seconds off, enough to shift the tracking window by 687 metres. The
+report's figures are what $\frac1{10}$ chopped to 23 binary places gives: it is short by $9.5 \times 10^{-8}$, and $3\,600\,000$ tenths of a second accumulate $0.3433$ seconds. Israeli data had shown
+the loss of accuracy after eight hours; the corrected software arrived the day after the attack.
+
+Not every numerical bug is in the last bit. The management task force that reviewed JPMorgan Chase's 2012 Chief Investment Office losses reported, among the errors found in a new value-at-risk
+model run in spreadsheets, that ``after subtracting the old rate from the new rate, the spreadsheet divided by their sum instead of their average'', which ``likely had the effect of muting
+volatility by a factor of two and of lowering the VaR''. The defence is the same as for rounding: an independent implementation, reference results asserted in tests, and a reviewer who
+recomputes one number by hand.
+
+\section{Tutorial: the index that lost half its value}\label{tut:qm:floating-point-and-numerical-linear-algebra:vancouver}
+
+\begin{tutorial}
+\textbf{Goal.} Reproduce the Vancouver drift, measure summation and variance errors against exact arithmetic, watch Cholesky fail, and check that three languages agree bit for bit.
+\textbf{End state:} \cref{fig:qm:floating-point-and-numerical-linear-algebra:sum,fig:qm:floating-point-and-numerical-linear-algebra:var,fig:qm:floating-point-and-numerical-linear-algebra:vancouver}
+and the bit patterns of \texttt{reference\_results()} in the three test suites.
+\begin{tutsteps}
+\item \textbf{\omterm{def:qm:floating-point-and-numerical-linear-algebra:cancel}{Compensated summation} and Welford's update} in Python.
+\omcode{code/firm/fpkit/firm_fpkit.py}{73}{95}{Neumaier summation and Welford's algorithm (Python).}\label{lst:qm:floating-point-and-numerical-linear-algebra:py}
+\item \textbf{The same operations in Rust}, in the same order.
+\omcode{code/firm/fpkit/rust/src/lib.rs}{54}{78}{Neumaier summation and Welford's algorithm (Rust twin).}\label{lst:qm:floating-point-and-numerical-linear-algebra:rs}
+\item \textbf{Run} \texttt{vancouver()}, \texttt{summation\_errors()}, \texttt{variance\_errors()}, \texttt{normal\_equations()}, \texttt{cholesky\_on\_pairwise()} and \texttt{cg\_demo()} in
+\texttt{qm\_float.py}; then the three test suites of \texttt{firm.fpkit}, and \texttt{fig\_float.py}.
+\end{tutsteps}
+\textbf{What to change next.} Compile the C++ twin with \texttt{-march=native -ffp-contract=fast} and see which asserted bit patterns break; sum the P\&L with NumPy's \texttt{sum} and explain why it
+is closer to pairwise than to naive.
+\end{tutorial}
+
+\section{Build: the numerics kit}\label{bld:qm:floating-point-and-numerical-linear-algebra:fpkit}
+
+\begin{build}
+\bfield{Purpose} Numerically careful primitives, identical in the three languages of the miniature firm, so that a risk number computed in the research notebook, the C++ engine and the Rust
+gateway is the same number.
+\bfield{Interface} \texttt{SplitMix64}; \texttt{naive\_sum}, \texttt{pairwise\_sum}, \texttt{neumaier\_sum}; \texttt{welford}, \texttt{welford\_cov}; \texttt{logsumexp}; \texttt{thomas}; in Python also
+\texttt{cholesky(A, jitter)}, \texttt{cg(A, b, precond)}, \texttt{fma\_exact}, \texttt{bits}.
+\bfield{Rules} No fast-math, no floating-point contraction in the builds that must reproduce; fixed summation order; every twin asserts the reference bit patterns; a failed Cholesky is reported with its
+index, never silently jittered.
+\bfield{Acceptance tests} \texttt{code/firm/fpkit/tests/}, \texttt{cpp/firm\_fpkit\_test.cpp}, \texttt{rust/src/lib.rs}: identical bits across the three languages; Neumaier equals the exact sum here;
+Welford against exact rational arithmetic; Thomas against a dense solve; Cholesky on positive-definite and indefinite matrices; conjugate gradient; the \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-add} example.
+\bfield{Stretch} A reproducible parallel sum (fixed blocking plus compensation); double-double arithmetic; a pivoted Cholesky that returns the rank.
+\end{build}
+
+\begin{omsources}
+\item IEEE Standard for Floating-Point Arithmetic, IEEE Std 754-2019.
+\item W.~Kahan, ``Further remarks on reducing truncation errors'', \emph{Communications of the ACM} 8, 1965; A.~Neumaier, \emph{Zeitschrift für Angewandte Mathematik und Mechanik} 54, 1974.
+\item B.~P.~Welford, ``Note on a method for calculating corrected sums of squares and products'', \emph{Technometrics} 4, 1962.
+\item M.~R.~Hestenes and E.~Stiefel, ``Methods of conjugate gradients for solving linear systems'', \emph{Journal of Research of the National Bureau of Standards} 49, 1952.
+\item N.~J.~Higham, \emph{Accuracy and Stability of Numerical Algorithms}, 2nd ed., SIAM, 2002.
+\item D.~Goldberg, ``What every computer scientist should know about floating-point arithmetic'', \emph{ACM Computing Surveys} 23, 1991.
+\item GCC manual, ``Options that control optimization'' (\texttt{-ffp-contract}), accessed 24 September 2026.
+\item US General Accounting Office, \emph{Patriot Missile Defense: Software Problem Led to System Failure at Dhahran, Saudi Arabia}, GAO/IMTEC-92-26, 4 February 1992.
+\item On the Vancouver index: K.~Quinn, \emph{The Wall Street Journal}, 8 November 1983, p.~37, and W.~Lilley, \emph{The Toronto Star}, 29 November 1983, p.~35, as cited in the Wikipedia article
+``Vancouver Stock Exchange'' (accessed 24 September 2026).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:1}
+What are the unit roundoff and \omterm{def:qm:floating-point-and-numerical-linear-algebra:fp}{machine epsilon} of binary64, and how many significant decimal digits does it carry?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:2}
+An index is truncated to two decimals after each of 10\,000 daily recalculations. What drift should one expect in a year of 250 days?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:3}
+Why is $10^8 + 1 - 10^8$ exact in double precision, but $10^{16} + 1 - 10^{16}$ not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:4}
+Show that the textbook variance formula's absolute error is of order $u\sum x_i^2/(n - 1)$, and estimate the relative error for prices near 10\,000 with variance 0.08.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:5}
+A design matrix has \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $10^5$. How many digits can the normal equations lose, and QR?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:6}
+Show that the log-sum-exp trick, $m + \log\sum e^{x_i - m}$ with $m = \max x_i$, never overflows, and compute $\log(e^{1000} + e^{1000})$.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:7}
+\emph{Coding.} Sum a million simulated P\&L entries naively, pairwise and with Neumaier's compensation, and compare with the exact rational sum.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:floating-point-and-numerical-linear-algebra:8}
+\emph{Find the flaw.} ``Our risk totals differ between the C++ engine and the Python reports in the tenth significant digit, so one of the two has a bug.''
+\end{exercise}
+
+\section{Problem: The Index That Lost Half Its Value}
+
+\begin{problem}[{Weekend problem --- truncation, a million times}]\label{pb:qm:floating-point-and-numerical-linear-algebra:1}
+An index starts at 1000 and is recomputed after every trade, 2\,400 times a day for 480 trading days; after each recomputation it is truncated to three decimals. The documented case: 524.811 before the
+correction, 1098.892 after.
+
+\medskip\noindent\textbf{Part I --- The drift.}
+\begin{enumerate}
+\item What is the expected loss from one truncation, and why?
+\item What is the expected total loss, and how does it compare with the documented shortfall?
+\item What would it be at 3\,000 recalculations a day?
+\item What does rounding instead of truncating change?
+\item Where does the simulated truncated index end, and why lower than the formula?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Accumulated error.}
+\begin{enumerate}[resume]
+\item How large are the naive, pairwise and \omterm{def:qm:floating-point-and-numerical-linear-algebra:cancel}{compensated summation} errors on a million P\&L entries?
+\item How wrong is the textbook variance for prices near 10\,000, $10^6$ and $10^8$?
+\item Why do the two-pass and Welford formulas survive?
+\item How many digits do the normal equations lose at \omterm{def:qm:floating-point-and-numerical-linear-algebra:cond}{condition number} $10^7$, and QR?
+\item Where and why does the \omterm{def:qm:floating-point-and-numerical-linear-algebra:factor}{Cholesky factorisation} of the pairwise correlation matrix fail?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Reproducibility.}
+\begin{enumerate}[resume]
+\item What do the three language twins agree on, and how is it checked?
+\item What does a \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-add} change in $0.1 \times 10 - 1$?
+\item Which compiler setting can silently introduce \omterm{def:qm:floating-point-and-numerical-linear-algebra:fma}{fused multiply-adds}?
+\item How many conjugate-gradient iterations does the badly scaled system need, with and without the Jacobi \omterm{def:qm:floating-point-and-numerical-linear-algebra:cg}{preconditioner}?
+\item Why does conjugate gradient not stop after $n$ steps here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item How would you have caught the Vancouver error within a week?
+\item What should a risk system log so that two runs can be compared bit for bit?
+\item When is \omterm{def:qm:floating-point-and-numerical-linear-algebra:repro}{bitwise reproducibility} worth its cost?
+\item State the \emph{named result}: the expected drift per recalculation times the number of recalculations against the documented shortfall.
+\item In one sentence: what does the machine do to every number you compute?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:qm:floating-point-and-numerical-linear-algebra:1}
+Why does \texttt{0.1 + 0.2 == 0.3} evaluate to false, and how do you compare \omterm{def:qm:floating-point-and-numerical-linear-algebra:fp}{floating-point numbers}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:qm:floating-point-and-numerical-linear-algebra:2}
+Your C++ and Python risk engines disagree in the last few digits. List the likely causes.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:qm:floating-point-and-numerical-linear-algebra:3}
+How do you compute a variance of prices in a streaming system, and why not with the sum of squares?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:floating-point-and-numerical-linear-algebra:4}
+Why solve least squares by QR rather than the normal equations?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:qm:floating-point-and-numerical-linear-algebra:5}
+Your \omterm{def:qm:floating-point-and-numerical-linear-algebra:factor}{Cholesky factorisation} of a \omterm{def:qm:covariance-estimation-and-random-matrices:cov}{covariance matrix} fails. What do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:qm:floating-point-and-numerical-linear-algebra:6}
+How would you make a parallel sum reproducible regardless of the number of threads?
+\end{interviewq}

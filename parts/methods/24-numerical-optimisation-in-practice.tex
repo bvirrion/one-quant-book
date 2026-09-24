@@ -1,0 +1,338 @@
+\chapter{Numerical Optimisation in Practice}\label{ch:qm:numerical-optimisation-in-practice}
+
+A desk calibrates a two-exponential kernel to a measured autocorrelation every morning: a fast component with a time scale of about three days
+and a slow one of about two months. For most of a year the slow time scale reads between 53 and 70 days. One Monday it reads 88, where Friday's
+read 57, and the fit to the data is, if anything, slightly better. Nothing is wrong with the optimiser and nothing happened in the data: the
+objective has a long, nearly flat valley along which the slow time scale and the weight of the fast component trade off, and a little noise moved the
+bottom of the valley. The same objective has a mirror-image valley, reached by swapping the labels of the two components, and dead ends at the
+boundary. This chapter is about the optimisers that turn such objectives into numbers (gradient methods and their acceleration, Newton and
+\omterm{def:qm:numerical-optimisation-in-practice:newton}{quasi-Newton methods}, \omterm{def:qm:numerical-optimisation-in-practice:lm}{nonlinear least squares}, splitting and proximal methods, stochastic gradients) and about the practice that makes a
+\omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} trustworthy: transforms, \omterm{def:qm:numerical-optimisation-in-practice:calibration}{multistart}, diagnostics of \omterm{def:qm:numerical-optimisation-in-practice:calibration}{identifiability}, and a penalty toward yesterday's answer.
+
+\section{First-order methods}
+
+\begin{definition}[Gradient descent, line search]\label{def:qm:numerical-optimisation-in-practice:gd}
+\emph{Gradient descent}\index{gradient descent} iterates $x_{k+1} = x_k - t_k\nabla f(x_k)$. A \emph{line search}\index{line search} chooses the step $t_k$ along the
+descent direction, for instance to satisfy the Wolfe conditions: sufficient decrease, $f(x + td) \le f(x) + c_1t\nabla f(x)^\top d$, and a curvature condition,
+$|\nabla f(x + td)^\top d| \le c_2|\nabla f(x)^\top d|$, with $0 < c_1 < c_2 < 1$.
+\end{definition}
+
+\begin{proposition}[Rates of gradient descent]\label{prop:qm:numerical-optimisation-in-practice:rates}
+If $f$ is $\mu$-strongly convex with $L$-Lipschitz gradient, \omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent} with step $1/L$ satisfies $f(x_k) - f^* \le (1 - \mu/L)^k(f(x_0) - f^*)$: linear convergence at a rate
+set by the condition number $\kappa = L/\mu$. For convex $f$ without strong convexity the gap falls like $O(1/k)$.
+\end{proposition}
+
+\begin{proof}
+With step $1/L$ the descent lemma gives $f(x_{k+1}) \le f(x_k) - \frac1{2L}\lVert\nabla f(x_k)\rVert^2$, and strong convexity gives $\lVert\nabla f(x_k)\rVert^2 \ge 2\mu(f(x_k) -
+f^*)$; combining, $f(x_{k+1}) - f^* \le (1 - \mu/L)(f(x_k) - f^*)$.
+\end{proof}
+
+\begin{definition}[Momentum method, Nesterov acceleration]\label{def:qm:numerical-optimisation-in-practice:momentum}
+A \emph{momentum method}\index{momentum method} adds a fraction of the previous step to the gradient step. \emph{Nesterov acceleration}\index{Nesterov acceleration} evaluates the
+gradient at an extrapolated point, $y_k = x_k + \frac{k-1}{k+2}(x_k - x_{k-1})$, $x_{k+1} = y_k - \nabla f(y_k)/L$, which improves the convex rate to $O(1/k^2)$ and the strongly convex
+rate to about $1 - 1/\sqrt\kappa$ per iteration.
+\end{definition}
+
+On the quadratic $\frac12(x_1^2 + 100x_2^2)$, plain \omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent} from $(1, 1)$ with step $1/100$ removes the stiff coordinate in one step and then shrinks the other by $1 - 1/100$ per
+step, so the objective falls from 50.5 to $\frac12(0.99)^{2k}$: 0.067 after 100 iterations and 0.0090 after 200 (the proposition's bound, $(1 - 1/\kappa)^k$, is conservative by the square);
+Nesterov's method reaches $5 \times 10^{-6}$ in 100 (\cref{fig:qm:numerical-optimisation-in-practice:rates}).
+Condition number is the enemy of first-order methods, and ill-conditioning is the normal state of \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibrations} whose parameters trade off.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=5cm,xlabel={iteration},ylabel={$f(x_k) - f^*$},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=200,ymin=1e-12,ymax=10,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick] table[x=iter,y=gd]{figdata/methods/24-numerical-optimisation-in-practice/rates.csv};
+\addplot[black,dashed,thick] table[x=iter,y=theory]{figdata/methods/24-numerical-optimisation-in-practice/rates.csv};
+\addplot[omDef,very thick] table[x=iter,y=nesterov]{figdata/methods/24-numerical-optimisation-in-practice/rates.csv};
+\legend{gradient descent,$\frac12(1 - 1/\kappa)^{2k}$,Nesterov}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:qm:numerical-optimisation-in-practice:gd}{Gradient descent} and Nesterov's accelerated method on a quadratic with condition number $\kappa = 100$, step $1/L$, from $(1, 1)$. \omterm{def:qm:numerical-optimisation-in-practice:gd}{Gradient descent} follows its linear rate exactly; the
+accelerated method is not monotone but is far faster. Data: the chapter's tutorial.}\label{fig:qm:numerical-optimisation-in-practice:rates}
+\end{omfigure}
+
+\section{Newton, quasi-Newton and nonlinear least squares}
+
+\begin{definition}[Newton's method, quasi-Newton method, BFGS]\label{def:qm:numerical-optimisation-in-practice:newton}
+\emph{Newton's method}\index{Newton's method} steps to the minimum of the local quadratic model, $x_{k+1} = x_k - \nabla^2f(x_k)^{-1}\nabla f(x_k)$. A \emph{quasi-Newton
+method}\index{quasi-Newton method} replaces the Hessian by an approximation updated from gradient differences; the \emph{BFGS method}\index{BFGS method} (Broyden, Fletcher, Goldfarb
+and Shanno, 1970) updates the inverse approximation $H$ by $H \leftarrow (I - \rho sy^\top)H(I - \rho ys^\top) + \rho ss^\top$, with $s$ the step, $y$ the gradient change and $\rho = 1/y^\top s$;
+L-BFGS (Liu and Nocedal, 1989) keeps only the last few pairs.
+\end{definition}
+
+Near a minimum with a positive-definite Hessian \omterm{def:qm:numerical-optimisation-in-practice:newton}{Newton's method} converges quadratically: the number of correct digits doubles at each step. The BFGS update keeps $H$ positive definite
+as long as $y^\top s > 0$, which a \omterm{def:qm:numerical-optimisation-in-practice:gd}{line search} satisfying the Wolfe curvature condition guarantees, since then $y^\top s \ge (c_2 - 1)\nabla f(x)^\top s > 0$. On the quadratic above,
+\omterm{def:qm:numerical-optimisation-in-practice:newton}{Newton's method} takes one step and L-BFGS seven.
+
+\begin{definition}[Nonlinear least squares, Gauss--Newton, Levenberg--Marquardt]\label{def:qm:numerical-optimisation-in-practice:lm}
+\emph{Nonlinear least squares}\index{nonlinear least squares} minimises $\frac12\lVert r(x)\rVert^2$ for a residual vector $r$. The \emph{Gauss--Newton method}\index{Gauss--Newton method}
+approximates the Hessian by $J^\top J$, $J$ the Jacobian of $r$, and solves $J^\top J\,\Delta x = -J^\top r$. The \emph{Levenberg--Marquardt algorithm}\index{Levenberg--Marquardt
+algorithm} (Levenberg, 1944; Marquardt, 1963) damps it, $(J^\top J + \lambda\operatorname{diag}(J^\top J))\Delta x = -J^\top r$, raising $\lambda$ after a failed step (toward scaled
+\omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent}) and lowering it after a success (toward Gauss--Newton).
+\end{definition}
+
+Least-squares \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} is the chapter's case: the residuals are the model's autocorrelation minus the measured one at lags 1 to 30. The weight of the fast component lives in $(0, 1)$
+and the time scales are positive, so the optimiser works on unconstrained transforms (logit and log) and never proposes an illegal parameter. $J^\top J$ at the solution also measures
+\omterm{def:qm:numerical-optimisation-in-practice:calibration}{identifiability}: on the first day, its condition number is 10.5 and the implied correlation between the fast weight and the slow time scale is 0.96, the numerical signature of the flat
+valley.
+
+\begin{definition}[Calibration, identifiability, multistart]\label{def:qm:numerical-optimisation-in-practice:calibration}
+\emph{Calibration}\index{calibration} is the choice of a model's parameters to reproduce observed quantities (prices, quotes, moments), usually by \omterm{def:qm:numerical-optimisation-in-practice:lm}{nonlinear least squares}. A parameter is
+locally unidentifiable, and \emph{identifiability}\index{identifiability} fails, when the objective is flat in some direction at the optimum, so that data cannot pin it down. \emph{Multistart}\index{multistart}
+runs a local optimiser from many starting points to explore distinct minima.
+\end{definition}
+
+From 100 random starts on the first day's curve, 28 runs end at the best fit (root-mean-squared error 0.0096), 35 end at its mirror image with the labels of the two components swapped (the
+same curve, the same error, different parameters), 26 run off to the boundary where the slow time scale reaches the 1\,000-day cap and the fit error is at least twice as large, and 11 stop
+elsewhere (\cref{fig:qm:numerical-optimisation-in-practice:multistart}). A \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} run from one fixed start never learns any of this.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=9cm,height=5.2cm,xlabel={faster time scale (days)},ylabel={slower time scale (days)},
+  tick label style={font=\small},label style={font=\small},xmin=0.1,xmax=1500,ymin=0.1,ymax=1500,grid=major,grid style={gray!25},
+  colorbar,colormap/viridis,point meta min=9,point meta max=60,colorbar style={ylabel={RMSE ($\times 10^{-3}$)},ylabel style={font=\footnotesize},
+  tick label style={font=\footnotesize}},table/col sep=comma]
+\addplot[scatter,only marks,mark=*,mark size=2pt,scatter src=explicit] table[x=tau_fast,y=tau_slow,meta=rmse]{figdata/methods/24-numerical-optimisation-in-practice/multistart.csv};
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{End points of 100 Levenberg--Marquardt runs from random starts on one day's autocorrelation, plotted by their two time scales (sorted, so mirror-image solutions coincide) and coloured by
+fit error: a cluster at the best fit (3 and 55 days; 63 runs including the mirror images), runs stuck at the 1\,000-day boundary, and a few elsewhere. Data: the chapter's tutorial,
+seeded.}\label{fig:qm:numerical-optimisation-in-practice:multistart}
+\end{omfigure}
+
+The valley itself is visible in a profile (\cref{fig:qm:numerical-optimisation-in-practice:valley}): fixing the slow time scale and re-optimising the other two parameters, the fit error is
+$9.9 \times 10^{-3}$ at 62 days, $12.3 \times 10^{-3}$ at 42 and $12.9 \times 10^{-3}$ at 89, against a noise level of $10 \times 10^{-3}$. Anything between about 45 and 80 days fits within the noise.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=10cm,height=5cm,xlabel={slow time scale $\tau_2$ (days), held fixed},ylabel={best RMSE ($\times 10^{-3}$)},
+  tick label style={font=\small},label style={font=\small},xmin=20,xmax=400,ymin=5,ymax=25,grid=major,grid style={gray!25},
+  xtick={20,50,100,200,400},xticklabels={20,50,100,200,400},table/col sep=comma]
+\addplot[omDef,very thick] table[x=tau2,y=rmse]{figdata/methods/24-numerical-optimisation-in-practice/valley.csv};
+\addplot[black,dashed,thin,sharp plot] coordinates {(20,10) (400,10)};
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Profile of the \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} objective along the slow time scale: for each fixed $\tau_2$ the best root-mean-squared error over the other two parameters, on one day's curve. The dashed line
+is the noise level of the measured autocorrelation. Data: the chapter's tutorial, seeded.}\label{fig:qm:numerical-optimisation-in-practice:valley}
+\end{omfigure}
+
+Refit every day for 250 days from the same start, the slow time scale has a day-to-day change with median 4.5 days and maximum 30.7 (day 189: from 56.8 to 87.6 days, fit error from 0.00926 to
+0.00921). With a Tikhonov penalty toward yesterday's parameters (weight 0.01 on the squared change of each transformed parameter, the fit starting from yesterday's answer), the median
+change is 1.9 days and the maximum 9.5, the standard deviation of the slow time scale over the year halves from 5.5 to 2.7 days, and the average fit error rises from 0.00945 to 0.00952, by
+0.7\% (\cref{fig:qm:numerical-optimisation-in-practice:daily}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5cm,xlabel={day},ylabel={slow time scale $\tau_2$ (days)},
+  tick label style={font=\small},label style={font=\small},xmin=1,xmax=250,ymin=40,ymax=100,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,thin] table[x=day,y=free]{figdata/methods/24-numerical-optimisation-in-practice/daily.csv};
+\addplot[omDef,very thick] table[x=day,y=penalised]{figdata/methods/24-numerical-optimisation-in-practice/daily.csv};
+\addplot[black,dashed,thin,sharp plot] coordinates {(1,60) (250,60)};
+\legend{refit from a fixed start,with a penalty toward yesterday}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The calibrated slow time scale over 250 days of noisy measurements of the same true kernel (true value 60 days, dashed): refit each day from a fixed start, and refit from yesterday's
+parameters with a Tikhonov penalty toward them. Data: the chapter's tutorial, seeded.}\label{fig:qm:numerical-optimisation-in-practice:daily}
+\end{omfigure}
+
+\section{Operator splitting}
+
+\begin{definition}[Proximal operator, proximal gradient method]\label{def:qm:numerical-optimisation-in-practice:prox}
+The \emph{proximal operator}\index{proximal operator} of a \omterm{def:qm:convex-optimisation:convex}{convex function} $g$ is $\operatorname{prox}_{tg}(v) = \arg\min_x\bigl(g(x) + \frac1{2t}\lVert x - v\rVert^2\bigr)$; for $g = \lambda\lVert\cdot\rVert_1$ it is
+soft thresholding. The \emph{proximal gradient method}\index{proximal gradient method} minimises $f + g$, $f$ smooth, by $x_{k+1} = \operatorname{prox}_{g/L}(x_k - \nabla f(x_k)/L)$; FISTA (Beck and
+Teboulle, 2009) adds Nesterov's extrapolation.
+\end{definition}
+
+The \omterm{def:qm:linear-models-under-stress:penalties}{lasso} of chapter~16 is the textbook case. On a regression of 200 observations on 50 predictors, two of them nearly collinear, the plain \omterm{def:qm:numerical-optimisation-in-practice:prox}{proximal gradient method} (ISTA) is still
+$7.6 \times 10^{-4}$ from the optimal objective after 50 iterations and $4.6 \times 10^{-4}$ after 100; FISTA is about $10^{-7}$ away after 50 and below $10^{-10}$ after 65
+(\cref{fig:qm:numerical-optimisation-in-practice:lasso}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=5cm,xlabel={iteration},ylabel={objective gap},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=150,ymin=1e-10,ymax=1,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick] table[x=iter,y=ista]{figdata/methods/24-numerical-optimisation-in-practice/lasso.csv};
+\addplot[omDef,very thick] table[x=iter,y=fista]{figdata/methods/24-numerical-optimisation-in-practice/lasso.csv};
+\legend{proximal gradient (ISTA),accelerated (FISTA)}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:qm:linear-models-under-stress:penalties}{lasso} ($\lambda = 0.1$, 200 observations, 50 predictors with a near-collinear pair) by the \omterm{def:qm:numerical-optimisation-in-practice:prox}{proximal gradient method} and its accelerated version: gap to the optimal objective
+against the iteration, floored at $10^{-10}$. Data: the chapter's tutorial, seeded.}\label{fig:qm:numerical-optimisation-in-practice:lasso}
+\end{omfigure}
+
+\begin{definition}[Alternating direction method of multipliers]\label{def:qm:numerical-optimisation-in-practice:admm}
+The \emph{alternating direction method of multipliers}\index{alternating direction method of multipliers} (ADMM) minimises $f(x) + g(z)$ subject to $x = z$ by alternating $x \leftarrow
+\operatorname{prox}_{f/\rho}(z - u)$, $z \leftarrow \operatorname{prox}_{g/\rho}(x + u)$, $u \leftarrow u + x - z$ (Boyd, Parikh, Chu, Peleato and Eckstein, 2011).
+\end{definition}
+
+ADMM converges for closed convex $f$ and $g$ whenever a solution exists, at a modest rate, and each step is only as hard as the two \omterm{def:qm:numerical-optimisation-in-practice:prox}{proximal operators}. For the \omterm{def:qm:convex-optimisation:ncm}{nearest correlation matrix} of
+chapter~23, $f$ is the distance to the given matrix plus the semidefinite constraint (an eigenvalue clip) and $g$ the unit-diagonal constraint. On chapter~23's broken matrix ADMM needs 91
+iterations to the alternating projections' 74, and the two answers agree to $1.4 \times 10^{-9}$.
+
+\section{Stochastic gradients}
+
+\begin{definition}[Stochastic gradient descent]\label{def:qm:numerical-optimisation-in-practice:sgd}
+\emph{Stochastic gradient descent}\index{stochastic gradient descent} minimises $\frac1n\sum_if_i(x)$ by steps along the gradient of one randomly chosen term (or a small batch),
+$x_{k+1} = x_k - t_k\nabla f_{i_k}(x_k)$.
+\end{definition}
+
+Each step is an unbiased but noisy estimate of a gradient step. With a constant step the iterates hover in a noise ball around the minimum; Robbins and Monro (1951) showed that steps with
+$\sum_kt_k = \infty$ and $\sum_kt_k^2 < \infty$, such as $t_k = a/(b + k)$, converge. On a least-squares problem with 1\,000 observations, 20\,000 steps land 0.009 from the least-squares
+solution with Robbins--Monro steps and 0.113 with a constant step of 0.05. Adaptive methods such as Adam (Kingma and Ba, 2014) rescale each coordinate's step by running moments of its
+gradients; they are the default for the neural networks of One Quant Book 9, and a poor default for a three-parameter \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration}, where Levenberg--Marquardt converges in a few dozen steps.
+
+\section{Tutorial: the Monday the fit moved}\label{tut:qm:numerical-optimisation-in-practice:monday}
+
+\begin{tutorial}
+\textbf{Goal.} Calibrate a two-exponential kernel every day, explore its minima by \omterm{def:qm:numerical-optimisation-in-practice:calibration}{multistart}, diagnose the flat valley, and stabilise the daily fit with a penalty toward yesterday.
+\textbf{End state:} \cref{fig:qm:numerical-optimisation-in-practice:multistart,fig:qm:numerical-optimisation-in-practice:valley,fig:qm:numerical-optimisation-in-practice:daily}; the median jump of
+4.5 and 1.9 days and the 0.7\% fit cost.
+\begin{tutsteps}
+\item \textbf{Levenberg--Marquardt} with its damping schedule.
+\omcode{code/firm/optim/firm_optim.py}{117}{142}{Levenberg--Marquardt for nonlinear least squares.}\label{lst:qm:numerical-optimisation-in-practice:lm}
+\item \textbf{The penalty toward yesterday} and the \omterm{def:qm:numerical-optimisation-in-practice:calibration}{identifiability} diagnostic.
+\omcode{code/firm/optim/firm_optim.py}{222}{239}{Identifiability diagnostics and the Tikhonov penalty.}\label{lst:qm:numerical-optimisation-in-practice:tikhonov}
+\item \textbf{Run} \texttt{daily(0.0)}, \texttt{daily(0.01)}, \texttt{multistart()}, \texttt{valley()} and \texttt{diagnostics()} in \texttt{qm\_optim.py}, then \texttt{fig\_optim.py}.
+\end{tutsteps}
+\textbf{What to change next.} Order the time scales by construction ($\tau_2 = \tau_1 + e^u$) to remove the mirror valley; choose the penalty weight by cross-validating tomorrow's fit error.
+\end{tutorial}
+
+\section{Build: the calibration harness}\label{bld:qm:numerical-optimisation-in-practice:optim}
+
+\begin{build}
+\bfield{Purpose} Every model the miniature firm calibrates daily (kernels, volatility surfaces, term structures) runs through one harness that transforms, \omterm{def:qm:numerical-optimisation-in-practice:calibration}{multistarts}, penalises and logs.
+\bfield{Interface} \texttt{gradient\_descent}, \texttt{newton}, \texttt{lbfgs}, \texttt{levenberg\_marquardt}, \texttt{prox\_l1}, \texttt{proximal\_gradient}, \texttt{admm\_nearest\_correlation},
+\texttt{sgd}, \texttt{Bounded}, \texttt{multistart}, \texttt{identifiability}, \texttt{tikhonov}.
+\bfield{Rules} Parameters are optimised in unconstrained coordinates; every production \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} logs its start, iterations, fit error, the condition number of $J^\top J$ and the change from
+yesterday; a new minimum far from yesterday's is flagged, not published silently; \omterm{def:qm:numerical-optimisation-in-practice:calibration}{multistart} runs weekly on each model.
+\bfield{Acceptance tests} \texttt{code/firm/optim/tests/}: the linear rate of \omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent}, acceleration, Newton on Rosenbrock; L-BFGS on Rosenbrock; Levenberg--Marquardt recovers an exponential
+fit and a heavy penalty pins it; soft thresholding and the \omterm{def:qm:linear-models-under-stress:penalties}{lasso} by FISTA; ADMM's \omterm{def:qm:convex-optimisation:ncm}{nearest correlation matrix}; SGD with Robbins--Monro steps; transforms round-trip; \omterm{def:qm:numerical-optimisation-in-practice:calibration}{multistart} ordering.
+\bfield{Stretch} Box constraints by projection in L-BFGS (L-BFGS-B); automatic differentiation of the residuals (chapter~28); a trust-region Levenberg--Marquardt.
+\end{build}
+
+\begin{omsources}
+\item K.~Levenberg, ``A method for the solution of certain non-linear problems in least squares'', \emph{Quarterly of Applied Mathematics} 2, 1944; D.~W.~Marquardt, ``An algorithm for least-squares
+estimation of nonlinear parameters'', \emph{Journal of the Society for Industrial and Applied Mathematics} 11, 1963.
+\item D.~C.~Liu and J.~Nocedal, ``On the limited memory BFGS method for large scale optimization'', \emph{Mathematical Programming} 45, 1989.
+\item H.~Robbins and S.~Monro, ``A stochastic approximation method'', \emph{Annals of Mathematical Statistics} 22, 1951.
+\item A.~Beck and M.~Teboulle, ``A fast iterative shrinkage-thresholding algorithm for linear inverse problems'', \emph{SIAM Journal on Imaging Sciences} 2, 2009.
+\item S.~Boyd, N.~Parikh, E.~Chu, B.~Peleato and J.~Eckstein, ``Distributed optimization and statistical learning via the alternating direction method of multipliers'', \emph{Foundations and Trends in
+Machine Learning} 3, 2011.
+\item D.~P.~Kingma and J.~Ba, ``Adam: a method for stochastic optimization'', arXiv:1412.6980, 2014.
+\item J.~Nocedal and S.~J.~Wright, \emph{Numerical Optimization}, 2nd ed., Springer, 2006.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:qm:numerical-optimisation-in-practice:1}
+How many gradient-descent iterations reduce the error of a quadratic with condition number 1\,000 by a factor of $10^{6}$? And with \omterm{def:qm:numerical-optimisation-in-practice:momentum}{Nesterov acceleration}, roughly?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:numerical-optimisation-in-practice:2}
+Compute $\operatorname{prox}_{t\lambda|\cdot|}(v)$ for $v = (3, -0.5, 1)$, $t\lambda = 1$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:numerical-optimisation-in-practice:3}
+Why does the two-exponential kernel have two minima with exactly the same fit?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:numerical-optimisation-in-practice:4}
+Show that one Newton step from any point minimises a strictly convex quadratic.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:numerical-optimisation-in-practice:5}
+Show that the Wolfe curvature condition implies $y^\top s > 0$ for a descent direction.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:numerical-optimisation-in-practice:6}
+Do the steps $t_k = 1/\sqrt k$ satisfy the Robbins--Monro conditions? And $t_k = 1/k$?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:numerical-optimisation-in-practice:7}
+\emph{Coding.} Run the daily \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} with penalty weights 0, 0.001, 0.01 and 0.1 and tabulate the median day-to-day change of the slow time scale against the average fit error.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:numerical-optimisation-in-practice:8}
+\emph{Find the flaw.} ``Our \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} always converges, with a gradient norm below $10^{-8}$, so its parameters are reliable.''
+\end{exercise}
+
+\section{Problem: The Monday the Fit Moved}
+
+\begin{problem}[{Weekend problem --- a calibration's flat valley}]\label{pb:qm:numerical-optimisation-in-practice:1}
+Each day a desk fits $\rho(k) = a e^{-k/\tau_1} + (1 - a)e^{-k/\tau_2}$, $k = 1, \dots, 30$, to a measured autocorrelation whose true parameters are $a = 0.6$, $\tau_1 = 3$ and $\tau_2 = 60$ days, measured
+with noise of standard deviation 0.01. The fit is by Levenberg--Marquardt in logit and log coordinates. Two hundred and fifty days are simulated.
+
+\medskip\noindent\textbf{Part I --- One day.}
+\begin{enumerate}
+\item From the fixed start, what does the first day's fit give, and with what error?
+\item What do 100 random starts find?
+\item What is the mirror-image solution, and why does it exist?
+\item What are the condition number of $J^\top J$ and the correlation of the parameters?
+\item Over what range of the slow time scale does the fit stay within the noise?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Every day.}
+\begin{enumerate}[resume]
+\item What are the median and largest day-to-day changes of the slow time scale?
+\item What happened on the day of the largest change?
+\item With a penalty toward yesterday of weight 0.01, what are they?
+\item What does the penalty cost in fit error?
+\item How much does the year's spread of the slow time scale fall?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Methods.}
+\begin{enumerate}[resume]
+\item How do \omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent} and Nesterov's method compare on a quadratic with condition number 100?
+\item How many steps do Newton and L-BFGS need on it?
+\item How do ISTA and FISTA compare on the \omterm{def:qm:linear-models-under-stress:penalties}{lasso}?
+\item How do ADMM and alternating projections compare on the \omterm{def:qm:convex-optimisation:ncm}{nearest correlation matrix}?
+\item What do Robbins--Monro steps buy over a constant step?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Which parameter would you publish with a warning, and what warning?
+\item How would you choose the penalty weight?
+\item How would you remove the mirror valley?
+\item State the \emph{named result}: the day-to-day parameter jump with and without the penalty, and the fit error the penalty costs.
+\item In one sentence: what does a converged \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration} not tell you?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle}]\label{iq:qm:numerical-optimisation-in-practice:1}
+Why does \omterm{def:qm:numerical-optimisation-in-practice:gd}{gradient descent} slow down on ill-conditioned problems, and what do you do about it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:qm:numerical-optimisation-in-practice:2}
+Your model \omterm{def:qm:numerical-optimisation-in-practice:calibration}{calibration}'s parameters jump from day to day while the fit error stays the same. What is happening, and what do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:numerical-optimisation-in-practice:3}
+Explain Levenberg--Marquardt. Why not plain Gauss--Newton?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:qm:numerical-optimisation-in-practice:4}
+Why does SGD with a constant learning rate not converge, and what are the Robbins--Monro conditions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:qm:numerical-optimisation-in-practice:5}
+What is a \omterm{def:qm:numerical-optimisation-in-practice:prox}{proximal operator}, and why is it useful for the \omterm{def:qm:linear-models-under-stress:penalties}{lasso}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:qm:numerical-optimisation-in-practice:6}
+Why does BFGS need a \omterm{def:qm:numerical-optimisation-in-practice:gd}{line search} satisfying the Wolfe conditions?
+\end{interviewq}

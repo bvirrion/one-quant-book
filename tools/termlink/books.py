@@ -12,11 +12,19 @@ import re
 ENTRY = {
     1: "one_quant_book_01_markets_1.tex",
     2: "one_quant_book_02_markets_2.tex",
+    3: "one_quant_book_03_markets_3.tex",
+    4: "one_quant_book_04_methods.tex",
+    5: "one_quant_book_05_derivatives.tex",
+    6: "one_quant_book_06_rates_credit_risk.tex",
 }
 
 LANGS = {
     1: ("en",),
     2: ("en",),
+    3: ("en",),
+    4: ("en",),
+    5: ("en",),
+    6: ("en",),
 }
 
 

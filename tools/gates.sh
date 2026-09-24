@@ -32,8 +32,9 @@ sources(){ local ch="$1" C="parts/$1.tex" Ld="sources/$1.md"
 firms(){ local C="parts/$1.tex" S="parts/${1%/*}/solutions/${1##*/}.tex" Ld="sources/$1.md"
   [ -f tools/firm_names.txt ] || return 0
   while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    if grep -qF -- "$name" "$C" "$S" 2>/dev/null; then
+    case "$name" in ''|'#'*) continue;; esac
+    # -w: whole words only ("Virtu" must not fire on "Virtual")
+    if grep -qwF -- "$name" "$C" "$S" 2>/dev/null; then
       grep -qF -- "$name" "$Ld" 2>/dev/null || bad "'$name' named in ${1} but absent from its ledger"
     fi
   done < tools/firm_names.txt
@@ -84,9 +85,12 @@ case "${1:-}" in
     for f in parts/"$2"/[0-9]*.tex; do chapter "$2/$(basename "${f%.tex}")"; done
     echo "== duplicate labels"; grep -rho 'label{[^}]*}' parts/"$2"/ | sort | uniq -d | sed 's/^/  DUP /' | tee /tmp/.d$$; [ -s /tmp/.d$$ ] && fail=1; rm -f /tmp/.d$$
     echo "== terms defined twice (whole series)"
-    nt=$(grep -ho 'emph{[^}]*}\\index{[^}]*}' parts/*/[0-9]*.tex | wc -l); echo "  $nt definitions harvested over $(ls -d parts/*/ | wc -l) books"
+    # perl -0777: a \emph{…}\index{…} pair may span a line break (46 of Book 1-2's
+    # 555 did; a line-based grep missed them all -- found by the Book 3 agent).
+    harvest(){ perl -0777 -ne 'while(/\\emph\{([^}]*)\}\s*\\index\{([^}]*)\}/g){($t=$2)=~s/\s+/ /g; print "$t\n"}' parts/*/[0-9]*.tex; }
+    nt=$(harvest | wc -l); echo "  $nt definitions harvested over $(ls -d parts/*/ | wc -l) books"
     [ "$nt" -gt 0 ] || bad "harvested no definitions"
-    grep -ho 'emph{[^}]*}\\index{[^}]*}' parts/*/[0-9]*.tex | sed 's/.*index{//;s/}//' | sort | uniq -d | sed 's/^/  TWICE /' | tee /tmp/.d$$; [ -s /tmp/.d$$ ] && fail=1; rm -f /tmp/.d$$
+    harvest | sort | uniq -d | sed 's/^/  TWICE /' | tee /tmp/.d$$; [ -s /tmp/.d$$ ] && fail=1; rm -f /tmp/.d$$
     echo "== problem numbering"; .venv/bin/python tools/check_problem_numbering.py parts/"$2" || fail=1
     echo "== term links"; .venv/bin/python tools/link_defined_terms.py --book "${BOOKNO[$2]}" --check | tail -1 | grep -q '^CHECK' && echo "  links match the config" || { echo "  STALE links"; fail=1; }
     log "$2";;

@@ -108,7 +108,7 @@ of front and back matter.
 
 ---
 
-## One Quant Book 3 — Markets III: Commodities, Energy and Crypto (~386 pp)
+## One Quant Book 3 — Markets III: Commodities, Energy and Crypto (written: 332 pp; outline estimate was ~386)
 
 **Part I — Commodities and energy**
 

@@ -24,7 +24,15 @@ the ones it actually fell into.
 
 Working rules that never change:
 
-- **No subagents** when writing a book. One author, one voice, one context.
+- **One author per book.** A book may be written by one subagent (user rule,
+  2026-09-24), and at most **four books per batch**; never one agent per
+  chapter — one book, one voice, one context. In a batch the main session
+  makes every shared-file edit up front (entry files, `styles/`, `latexmkrc`,
+  `tools/termlink/books.py`, part titles, notation), reconciles the books'
+  definition maps before any chapter is written, and runs the series-wide
+  gates at the end. Book agents write only files under their own slug, treat
+  other shared files as append-only, and run no git command but
+  `status`/`diff`/`log`.
 - **Never create git commits.** Leave the working tree for the user.
 - **English only.** No `<lang>/` trees, no translation tooling.
 
@@ -486,6 +494,28 @@ outline budget or the difference explained.
   pages; the Part V–VI chapters (access, craft) came out at 8–9 body pages.
   Budget a Markets-type book at **11–12 pages a chapter**; the outline's
   per-chapter figures overstate by 1–3 pages whenever they exceed 12.
+- **Books 3–6, written in parallel (2026-09-24), one agent per book:**
+
+  | Book | Chapters | Pages | Outline | pp/chapter all-in | Figures | Listings | Dated | Ledger rows | Links |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 3 Markets III | 29 | 332 | ~386 | 11.4 | 109 | 56 | 79 | 277 | 1,267 |
+  | 4 Methods | 29 | 351 | ~406 | 12.1 | 118 | 59 | 0 | 253 | 1,739 |
+  | 5 Derivatives | 28 | 348 | ~386 | 12.4 | 113 | 70 | 9 | 154 | 1,378 |
+  | 6 Rates, Credit, XVA, Risk | 29 | 314 | ~372 | 10.8 | 107 | 55 | 32 | 160 | 824 |
+
+  The four agents' checkpoints agreed: at ch. 10 every book projected 10.4–10.8
+  pages a chapter, and the books that pushed later chapters to 480–560 body
+  lines (a fifth section, a second worked example) finished at 11.4–12.4;
+  Book 6 kept 400–550 and finished at 10.8. All four land 10–16 % under
+  the outline. The mathematical books run denser in pages per chapter (Books 4
+  and 5 at 12.1–12.4), and their ledgers are bibliographic (papers, datasets,
+  incident reports) rather than venue facts, with few or no dated boxes.
+  Budget **11–12.5 pages a chapter**; a chapter under 420 body lines
+  comes out at 8 body pages. Ledger size was set by the web-search budget,
+  not the subject: Books 3 and 6 ran out of searches half-way and re-sourced
+  61 and 33 dropped facts afterwards (see section 9). The whole batch —
+  Phase A, sync, four books, two re-sourcing passes — ran in one day of wall
+  time.
 
 ## 9. Known traps (add to this list as books are written)
 
@@ -652,3 +682,79 @@ outline budget or the difference explained.
     binary plus `pdftotext`, arXiv copies of papers, eCFR's API for rule text,
     law-firm client alerts for court holdings, and the Fed, SEC and BLS sites
     with a user agent.
+- **Books 3–6 batch traps (2026-09-24, four books written in parallel).**
+  - *The web-search budget is per session and shared by every subagent.* It
+    defaulted to 200 WebSearch calls and ran out in the batch's first hours
+    (Book 6 at ch. 11, Book 5 at ch. 12, Book 3 at ch. 15). Books 3 and 6
+    then dropped 101 and 65 facts as unverifiable. Before a batch, set
+    `CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION` (the user's settings now carry
+    2000; the change took effect mid-session). Fallbacks that worked without
+    search: the Crossref API (`api.crossref.org/works/<doi>`), the arXiv API,
+    Wikipedia raw text (`?action=raw`) as a map to primary references,
+    CourtListener's RECAP API, EDGAR full-text search with a user agent,
+    GitBook/Mintlify `llms.txt` and `.md` page variants, GitHub raw docs, FRED
+    CSVs (`fredgraph.csv?id=`), and `publications.europa.eu/resource/celex/<CELEX>`
+    with `Accept: application/xhtml+xml` for EU law.
+  - *Resolve the books' definition maps before any prose.* At the Phase A sync,
+    Books 3–6 planned 1,790 terms; four collided (*equivalent martingale
+    measure*, *risk-neutral measure*, *calibration*, *copula*), all resolved
+    to Book 4 by one ownership rule; `sources/SERIES_DEFINITIONS.md` records
+    the map. The series notation (`CONTRIBUTING.md`) and the Book 5 → Book 6
+    pricing interface (`code/firm/INTERFACES.md`) were frozen at the same
+    sync, and Book 6's risk engine then ran on Book 5's real library with no
+    stub, although both books were written at the same time.
+  - *Shared checks go red on another book's half-written files.* The
+    repo-wide parts of `make test-code` (ruff over `code/`, module names,
+    chart CSVs) read other agents' work in progress; rerun before
+    investigating. `check_figdata.py` crashed on a transient empty CSV and now
+    reports it instead.
+  - *Overlapping `latexmk` runs on one entry file corrupt its `.aux`/`.toc`*,
+    and a figure crop taken while another build rewrites the PDF can return a
+    page of a different book: check the running header of every crop, never
+    wrap `latexmk` in a short timeout, and recover by deleting the entry's
+    `.aux .toc .out .fdb_latexmk` and rebuilding. Crops go to a per-book
+    subdirectory of the (shared) scratchpad.
+  - *`\label` after `\omcode` labelled the enclosing section, in every book.*
+    `listings` typesets inside its own group, so `lst:` labels resolved to the
+    section or tutorial step (Book 6 printed "Section 1.2" for a listing).
+    `\omcode` now absorbs a directly following `\label` and passes it as
+    `label=`; all six books were rebuilt and every `lst:` label resolves as a
+    listing. No gate saw it: `\cref` to a wrong object is not "undefined".
+  - *Gates fixed during the batch:* the "defined twice" harvest missed
+    `\emph{…}\index{…}` pairs broken across a line (46 in Books 1–2; now a
+    multi-line perl harvest); the firm-name gate matched substrings ("Virtu"
+    in "Virtual", "Bitwise" in "bitwise reproducibility"; now whole words, and
+    `#` comment lines are skipped); `make_briefs.py` stubs made an overfull
+    `\vbox` at 28+ chapters (now `\mbox{}`). Still open: the quote-balance gate
+    counts the prime pair `''` in mathematics as a closing quote (write
+    `f^{\prime\prime}`); `make test-code` never runs the `fig_*.py` scripts, so
+    a script broken by `ruff --fix` reordering its imports passes it and fails
+    only `make figdata` — run both.
+  - *Numbers:* a product printed from rounded factors must equal the printed
+    factors' product (7.30 × 3 000 printed as 21 890, from the unrounded
+    7.297; Book 3 ch. 5): print "about" or both values. Memorised numerical
+    constants are facts too (a Rust `erfc` typed from memory did not compile
+    and its coefficients were wrong): derive or test against a library. A
+    Monte Carlo time grid must contain the period's start and end dates (a
+    caplet came out 6 % low with a tight standard error). Least-squares
+    Monte Carlo priced on its own training paths is biased above the dual
+    bound. Monotone convex interpolation is not linear in its inputs: 1 bp
+    bucket bumps summed to 866k against a 555k parallel DV01 (bump 0.01 bp and
+    scale). A comparative claim drafted from intuition was backwards again
+    (a high borrow fee makes early exercise of puts *less* likely: it acts as
+    a dividend yield) — run the pricer before stating a direction.
+  - *Running-project code:* Book 2's `firm_curve.bootstrap` bisected ln P in
+    [−1, 0], silently wrong beyond P < 1/e (a 30-year at 4 %) and for negative
+    rates; now [−5, 1]. `listings` cannot print UTF-8 (`€STR` in a listed
+    docstring was fatal): write ASCII in code files. `ruff --fix` removes an
+    import unused *at that moment*, and a function appended later fails at
+    run time.
+  - *Captions:* write them from the rendered figure (three drafted captions
+    in one chapter described curves the chart did not show). Named theorems
+    are not linker terms: keep them out of `defines`.
+  - *PGF, again:* a comma in a `\legend` entry, `ybar interval` histograms,
+    `xtick={1,...,11}` (write ticks out), axes in the tens of thousands need
+    `xtick`, `xticklabels` and `scaled x ticks=false` together; `groupplots`
+    rejects `bar width` in the group options (put it in each
+    `\nextgroupplot`); a long label on the horizontal leg of a `-|` path runs
+    over its start node.

@@ -71,7 +71,7 @@ def bootstrap(spot: dt.date, tenors: list[int], rates: list[float]) -> Curve:
         end = add_years(spot, n)
         curve.times.append(curve.t(end))
         curve.dfs.append(1.0)
-        lo, hi = -1.0, 0.0                    # bounds on log(df)
+        lo, hi = -5.0, 1.0                    # bounds on log(df): long ends, negative rates
         dates = schedule(spot, n)
         for _ in range(200):
             mid = 0.5 * (lo + hi)

@@ -1,0 +1,391 @@
+\chapter{Monte Carlo Pricers in Practice}\label{ch:dv:monte-carlo-pricers-in-practice}
+
+A Bermudan option on the best of five shares has no finite-difference grid that fits in memory: a hundred points per
+dimension is ten billion nodes. A Monte Carlo engine prices it in seconds, and gets the exercise decision wrong by
+design. It estimates the value of waiting from a regression on the simulated paths, which is only an approximation of
+the true continuation value, so the exercise policy it follows is suboptimal and its price is a lower bound. A good desk
+therefore reports two numbers, a lower bound from the policy and an upper bound from a dual method, and the gap between
+them measures how much the regression still misses. This chapter builds the machinery around the Monte Carlo method of
+One Quant Book 4: simulating the models, early exercise by regression and its dual bound, three ways to compute \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks},
+low-discrepancy numbers with the Brownian bridge, and the engineering that turns it into a pricer.
+
+\section{Simulating the models}
+
+Lognormal assets are simulated exactly, date to date. Every other model is discretised, and the error of the scheme is a
+bias that adds to the statistical error and does not average away. Heston's variance is the standard hard case. An Euler step
+can make the variance negative, and truncating it at zero leaves a bias that shrinks only slowly with the step size. Andersen
+designed a scheme that matches the first two moments of the variance's exact transition.
+
+\begin{definition}[Quadratic-exponential scheme]\label{def:dv:monte-carlo-pricers-in-practice:qe}
+The \emph{quadratic-exponential scheme}\index{quadratic-exponential scheme} (QE) simulates Heston's variance over a step by matching
+the mean $m$ and variance $s^2$ of its exact conditional law: when $\psi=s^2/m^2$ is small it draws $a(b+Z)^2$, a scaled
+non-central square of a normal; when $\psi$ is large, a mixture of a mass at zero and an exponential. The log-price then uses the
+integrated variance implied by the start and end variances.
+\end{definition}
+
+\begin{example}[Euler against QE]\label{ex:dv:monte-carlo-pricers-in-practice:qe}
+A one-year at-the-money call in chapter 10's base \omterm{def:dv:stochastic-volatility:heston}{Heston model} ($v_0=\bar v=0.04$, $\kappa=1.5$, $\eta=0.6$, $\rho=-0.7$) is worth 6.751 by
+Fourier inversion. With 400\,000 paths and full-truncation Euler, the bias is 0.857 with 4 steps a year, 0.373 with 8, 0.140 with 16 and
+0.041 with 32. With QE the price is within one standard error (0.014) of the exact value at every step count, from 4 steps a year
+(\cref{fig:dv:monte-carlo-pricers-in-practice:heston}). QE saves a factor of ten or more in steps, and so in run time.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xmode=log,ymode=log,log basis x=2,
+  xlabel={time steps a year},ylabel={absolute bias},
+  tick label style={font=\small},label style={font=\small},
+  xmin=3,xmax=40,ymin=1e-4,ymax=2,grid=major,grid style={gray!25},
+  xtick={4,8,16,32},xticklabels={4,8,16,32},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.6pt] table[x=steps,y=euler]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.6pt] table[x=steps,y=qe]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\addplot[gray,thick,dashed] table[x=steps,y=se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\legend{full-truncation Euler,quadratic-exponential,one standard error}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bias of a one-year at-the-money call in a \omterm{def:dv:stochastic-volatility:heston}{Heston model} whose variance can reach zero, by time steps, against the Fourier price
+(400\,000 paths). Euler's bias decays slowly; QE's stays within the statistical error at every step count. Data: the
+tutorial.}\label{fig:dv:monte-carlo-pricers-in-practice:heston}
+\end{omfigure}
+
+\section{Early exercise by regression}
+
+Chapter 6 priced Bermudan and American options backwards on a tree, where the continuation value at each node is an average over its
+children. A simulation moves forward and has no such average. Longstaff and Schwartz estimated it by regression.
+
+\begin{definition}[Longstaff--Schwartz method]\label{def:dv:monte-carlo-pricers-in-practice:lsm}
+The \emph{Longstaff--Schwartz method}\index{Longstaff--Schwartz method} prices a Bermudan option by simulation: working backwards over the
+exercise dates, it regresses the discounted cash flows that each path realises from the next date on, against a set of basis functions of the
+state, using the paths that are in the money, and exercises where the exercise value exceeds the fitted continuation value; the policy is then
+applied to independent paths to give a lower bound.
+\end{definition}
+
+The price from an estimated policy is biased low, because no policy beats the optimal one. Fitting and pricing on the same paths adds an upward
+bias, because the regression has seen the paths it then prices. The build fits on one set of paths and prices on another, which keeps the result
+a lower bound. How low it is depends on the basis. A regression that cannot represent the continuation value leads to exercising at the wrong
+times.
+
+\begin{definition}[Dual upper bound]\label{def:dv:monte-carlo-pricers-in-practice:dual}
+The \emph{dual upper bound}\index{dual upper bound} of a Bermudan option is $\E\bigl[\max_j(h_j-M_j)\bigr]$ for a martingale $M$ with $M_0=0$
+and discounted exercise values $h_j$; it exceeds the price for every martingale and equals it for the martingale part of the value process. The
+Andersen--Broadie algorithm builds $M$ from a lower-bound policy by nested simulation, so that lower and upper bounds together give an interval
+for the price.
+\end{definition}
+
+In the build, the policy's continuation value $Q_j$ is estimated at every outer node by inner paths that follow the policy. With $L_j$ the
+discounted exercise value where the policy exercises and $Q_j$ where it continues, the martingale's increments are $L_j-Q_{j-1}$. The inner
+estimates are noisy, and the maximum in the bound turns noise into an upward bias. The bound is valid for any number of inner paths, but tight only
+for many.
+
+\begin{example}[The bias of too few inner paths]\label{ex:dv:monte-carlo-pricers-in-practice:inner}
+A one-year Bermudan put with ten exercise dates (spot and strike 100, 5\%, 20\%) is worth 6.0326 on chapter 6's tree. Longstaff--Schwartz with a
+cubic basis gives 6.0325 (standard error 0.023). The dual bound on 1\,000 outer paths is 6.134 with 100 inner paths per node, 6.054 with 400 and
+6.037 with 1\,600 (\cref{fig:dv:monte-carlo-pricers-in-practice:bounds}, right).
+\end{example}
+
+\begin{example}[A three-asset Bermudan max-call]\label{ex:dv:monte-carlo-pricers-in-practice:maxcall}
+A call on the best of three independent shares (each at 100, strike 100, volatility 20\%, dividend yield 10\%, rate 5\%), exercisable at nine dates
+over three years. The basis for the regression is a set of polynomials in the two largest prices, their product, the product of all three and the
+intrinsic value. With it, Longstaff--Schwartz on 200\,000 fresh paths gives 18.649 (standard error 0.039), and the dual bound (1\,000 outer paths,
+1\,000 inner) gives 18.713 (0.019). The gap is 0.064, 0.3\% of the price. With a basis of only the largest price and its square, the lower bound
+falls to 18.137 and the upper rises to 18.805, a gap of 0.668, ten times wider
+(\cref{fig:dv:monte-carlo-pricers-in-practice:bounds}, left).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
+  width=6.6cm,height=5cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xlabel={regression basis},ylabel={price},xmin=-0.6,xmax=1.6,ymin=18.0,ymax=18.95,
+  xtick={0,1},xticklabels={rich,small},title={\small max-call bounds},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omDef,only marks,mark=square*,mark size=2.4pt,error bars/.cd,y dir=both,y explicit] table[x=i,y=lower,y error=lower_se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bounds.csv};
+\addplot[omThm,only marks,mark=triangle*,mark size=2.8pt,error bars/.cd,y dir=both,y explicit] table[x=i,y=upper,y error=upper_se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bounds.csv};
+\legend{Longstaff--Schwartz (lower),dual (upper)}
+\nextgroupplot[xmode=log,log basis x=2,xlabel={inner paths per node},ylabel={dual upper bound},xmin=70,xmax=2200,ymin=6.0,ymax=6.16,
+  xtick={100,400,1600},xticklabels={100,400,1\,600},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},title={\small Bermudan put},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=inner,y=upper]{figdata/derivatives/23-monte-carlo-pricers-in-practice/inner_bias.csv};
+\addplot[black,dashed] table[x=inner,y=tree]{figdata/derivatives/23-monte-carlo-pricers-in-practice/inner_bias.csv};
+\legend{dual bound,tree value}
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Left: lower and upper bounds (bars of one standard error) for a three-asset Bermudan max-call with a rich and a small regression basis: the
+gap is the price of a poor basis. Right: the dual bound for a one-asset Bermudan put against the number of inner paths per node, approaching the
+tree's value from above. Data: the tutorial.}\label{fig:dv:monte-carlo-pricers-in-practice:bounds}
+\end{omfigure}
+
+\section{Greeks: pathwise, likelihood ratio, adjoint}
+
+Bumping a Monte Carlo price and repricing gives \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} with the variance of a difference of two noisy numbers. Common random numbers make the
+difference far less noisy. Two direct methods, due to Broadie and Glasserman, avoid the bump altogether and give \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} from the same paths as the
+price.
+
+\begin{definition}[Pathwise Greek]\label{def:dv:monte-carlo-pricers-in-practice:pathwise}
+A \emph{pathwise Greek}\index{pathwise Greek} differentiates the discounted payoff along each simulated path with respect to the parameter, holding
+the random numbers fixed, and averages; it requires the payoff to be continuous in the parameter (almost surely differentiable), and fails for
+digitals and barriers.
+\end{definition}
+
+\begin{definition}[Likelihood-ratio Greek]\label{def:dv:monte-carlo-pricers-in-practice:lr}
+A \emph{likelihood-ratio Greek}\index{likelihood-ratio Greek} differentiates the density of the simulated state instead of the payoff: it averages the
+discounted payoff times the score, the derivative of the log-density with respect to the parameter; it works for discontinuous payoffs, at the cost
+of a higher variance.
+\end{definition}
+
+The table compares the two methods on one-year at-the-money options (spot and strike 100, rate 5\%, volatility 20\%) with 200\,000 paths, standard
+errors in brackets. The last column applies the pathwise method to the digital smoothed into a call spread.
+
+\begin{center}\small
+\begin{tabular}{lrrrr}
+\toprule
+one year & exact & pathwise & likelihood ratio & smoothed\\
+\midrule
+call delta & 0.6368 & 0.6384 (0.0013) & 0.6413 (0.0033) & ---\\
+call \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} & 37.52 & 37.72 (0.17) & 38.24 (0.62) & ---\\
+digital delta & 0.01876 & 0 (wrong) & 0.01883 (0.00006) & 0.01895 (0.00021)\\
+digital \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} & $-0.657$ & 0 (wrong) & $-0.648$ (0.010) & $-0.663$ (0.007)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+For the call the pathwise estimator's variance is 6.5 times lower for delta and 13 times lower for \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega}. For the digital it returns zero, since the
+payoff's derivative is zero almost everywhere. The likelihood ratio gets it right. Smoothing the digital into a call spread of half-width one restores
+a pathwise estimate, at the cost of a bias of the spread's own.
+
+The pathwise method has an efficient implementation that matters most for large books. Giles and Glasserman's adjoint method
+runs the same pathwise calculation backwards along each path: it gives the same values, and its advantage grows with the number of
+inputs, such as the points of a \omterm{def:dv:implied-volatility-and-its-surface:surface}{volatility surface}.
+
+\begin{example}[Twelve vegas for the price of three passes]\label{ex:dv:monte-carlo-pricers-in-practice:adjoint}
+An arithmetic Asian call (one year, 48 steps, strike 100, 20\%) is priced along with its sensitivity to the volatility in each of twelve monthly
+buckets. Forward mode would need one pass per bucket. The adjoint (reverse) pass of One Quant Book 4, chapter 28, runs once backwards along each stored
+path and accumulates the derivative of the payoff with respect to every step's state and volatility. It returns all twelve \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} and the delta at a
+cost of a few forward passes. The price is 5.901 and the delta 0.593. The \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} of the first month is 5.064, where bumping that month's volatility with
+the same draws gives 5.065, and the \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} fall to 0.016 for the last month (\cref{fig:dv:monte-carlo-pricers-in-practice:adjoint}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=4.6cm,ybar,bar width=12pt,
+  xlabel={volatility bucket (month)},ylabel={vega (per unit of volatility)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0.3,xmax=12.7,ymin=0,ymax=5.6,grid=major,grid style={gray!25},xtick={1,2,3,4,5,6,7,8,9,10,11,12},
+  table/col sep=comma]
+\addplot[omThm,fill=omThm!40] table[x=month,y=vega]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bucket_vega.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} of a one-year arithmetic Asian call from one adjoint pass along each path: the average's sensitivity to early volatility
+is largest because early moves carry through every later fixing. Data: the tutorial.}\label{fig:dv:monte-carlo-pricers-in-practice:adjoint}
+\end{omfigure}
+
+\section{Bridges and quasi-random numbers}
+
+Low-discrepancy sequences (Book 4, chapter 26) fill the unit cube more evenly than random numbers, and for smooth integrands their error falls faster
+than $1/\sqrt N$. A path of $d$ dates is a point in $d$ dimensions, however, and low-discrepancy sequences lose their advantage in the later
+coordinates. The Brownian bridge reorders the construction so that the first coordinates carry most of the path's variance. The first normal sets
+the endpoint $W_T$, the second the midpoint given the ends, and so on. The good early coordinates of the sequence then determine the path's shape.
+
+\begin{example}[An Asian option with Halton points]\label{ex:dv:monte-carlo-pricers-in-practice:qmc}
+A 16-date Asian call (one year, strike 100, 20\%). With 4\,096 paths the Monte Carlo standard error is 0.131. Halton points, randomly shifted twenty times
+to measure their error, give 0.027 with the usual step-by-step construction and 0.0092 with the Brownian bridge, fourteen times smaller than Monte Carlo,
+the accuracy of about 200 times more random paths. At 256 paths the three errors are 0.53, 0.34 and 0.13
+(\cref{fig:dv:monte-carlo-pricers-in-practice:qmc}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xmode=log,ymode=log,log basis x=2,
+  xlabel={paths},ylabel={error (standard deviation)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=200,xmax=5200,ymin=0.005,ymax=0.8,grid=major,grid style={gray!25},
+  xtick={256,1024,4096},xticklabels={256,1\,024,4\,096},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.6pt] table[x=n,y=mc]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=n,y=halton]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.8pt] table[x=n,y=bridge]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\legend{Monte Carlo,Halton,Halton with bridge}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Error of a 16-date Asian call against the number of paths: Monte Carlo's standard error, and the spread over random shifts of Halton points
+with the step-by-step and the Brownian-bridge constructions. Data: the tutorial.}\label{fig:dv:monte-carlo-pricers-in-practice:qmc}
+\end{omfigure}
+
+\section{Engineering a Monte Carlo pricer}
+
+A production engine separates what varies from what is shared. Path generators are one per model: lognormal, \omterm{def:dv:local-volatility:model}{local volatility}, Heston-QE,
+stochastic-local. They write paths on a date grid that the product needs, and they never know the payoff. Payoffs read paths only (chapters 16 and
+18). Estimators, Longstaff--Schwartz, the \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} and the dual bound, sit on top. Four rules keep it honest.
+\begin{itemize}
+\item \textbf{Seeds are data.} Every price is reproducible from its seed. \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} by bumping use the same draws (common random numbers).
+\item \textbf{Every number carries its error.} The standard error for statistics, a convergence check for the discretisation, and a bound gap for early
+exercise.
+\item \textbf{Variance reduction first.} Antithetics, control variates (chapter 16's geometric Asian), conditioning (chapter 10's \omterm{prop:dv:stochastic-volatility:mixing}{mixing formula}) and
+the bridge usually buy more than extra paths.
+\item \textbf{Vectorise over paths, loop over time.} The build's generators are arrays of paths advanced date by date, the natural shape for numpy, for
+a GPU, and for the adjoint pass that runs back over the same dates.
+\end{itemize}
+
+\section{Tutorial: bounds, Greeks and bridges}\label{tut:dv:monte-carlo-pricers-in-practice:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Price a Bermudan max-call by Longstaff--Schwartz and bound it above by the dual; compute \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} of a call and a digital by the pathwise
+and likelihood-ratio methods and bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} by an adjoint pass; compare Euler and QE for Heston; measure the effect of the Brownian bridge on Halton
+points. \textbf{End state:} the four figures, the table and the numbers of the weekend problem.
+\begin{tutsteps}
+\item \textbf{The regression}, backwards over the exercise dates, in-the-money paths only:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{85}{103}{Longstaff--Schwartz regression.}\label{lst:dv:monte-carlo-pricers-in-practice:lsm}
+\item \textbf{The dual bound}: inner continuation values, martingale increments $L_j-Q_{j-1}$, the maximum:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{126}{157}{The Andersen--Broadie upper bound.}\label{lst:dv:monte-carlo-pricers-in-practice:dual}
+\item \textbf{The adjoint pass} for bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas}:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{184}{206}{Forward and reverse passes for an Asian call.}\label{lst:dv:monte-carlo-pricers-in-practice:adjoint}
+\item \textbf{Run} \texttt{dv\_mc.bounds()}, \texttt{put\_bias()}, \texttt{greek\_table()}, \texttt{adjoint()}, \texttt{heston\_bias()}, \texttt{qmc\_study()}
+and \texttt{fig\_mc.py}.
+\end{tutsteps}
+\textbf{What to change next.} Price the max-call with correlation 0.5; add the geometric Asian as a control variate on top of the Halton points; replace the
+digital's likelihood ratio by a conditional expectation over the last step (smoothing by conditioning).
+\end{tutorial}
+
+\section{Build: the Monte Carlo engine}\label{bld:dv:monte-carlo-pricers-in-practice:mcpricer}
+
+\begin{build}
+\bfield{Purpose} The miniature firm's simulation engine: path generators, early exercise with bounds, \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} by three methods, quasi-random numbers;
+chapter 28's Monte Carlo engine wraps it.
+\bfield{Interface} \texttt{gbm\_paths(s0, vols, corr, times, r, q, n, seed)}; \texttt{heston\_terminal(\ldots, scheme)}; \texttt{lsm\_fit(paths, ex\_idx, payoff,
+basis, k, disc)}, \texttt{lsm\_price}, \texttt{exercise\_now}, \texttt{max\_call\_basis}, \texttt{small\_basis}; \texttt{dual\_upper(outer, \ldots, step\_sim,
+n\_inner, seed)}; \texttt{call\_greeks(\ldots, digital, smooth)}; \texttt{asian\_adjoint}; \texttt{halton(n, dim, shift)}, \texttt{brownian\_bridge(z, t)},
+\texttt{norm\_inv}.
+\bfield{Rules} Regression and pricing on independent paths; a lower bound is reported with its \omterm{def:dv:monte-carlo-pricers-in-practice:dual}{dual upper bound} for every Bermudan; \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} by pathwise where
+the payoff is continuous, by likelihood ratio or smoothing where it is not; seeds explicit; no memorised constants in the numerics (the inverse normal is
+Newton's method on the error function).
+\bfield{Acceptance tests} \texttt{code/firm/mcpricer/tests/}: the Bermudan bounds bracket the tree value and the dual bound falls with inner paths; pathwise and
+\omterm{def:dv:monte-carlo-pricers-in-practice:lr}{likelihood-ratio Greeks} agree with Black--Scholes and the pathwise digital is zero; the adjoint matches bumping; QE matches the Fourier price; Halton's first
+points, the inverse normal and the bridge's covariances.
+\bfield{Stretch} Sobol points with published direction numbers (cited, not recalled); multilevel Monte Carlo (Book 4); an adjoint pass through
+Longstaff--Schwartz.
+\end{build}
+
+\begin{omsources}
+\item F.~A.~Longstaff and E.~S.~Schwartz, ``Valuing American options by simulation: a simple least-squares approach'', \emph{Review of Financial Studies}
+14(1) (2001) 113--147.
+\item L.~Andersen and M.~Broadie, ``Primal-dual simulation algorithm for pricing multidimensional American options'', \emph{Management Science} 50(9)
+(2004) 1222--1234.
+\item L.~Andersen, ``Simple and efficient simulation of the Heston stochastic volatility model'', \emph{Journal of Computational Finance} 11(3) (2008) 1--42.
+\item M.~Broadie and P.~Glasserman, ``Estimating security price derivatives using simulation'', \emph{Management Science} 42(2) (1996) 269--285.
+\item P.~Glasserman, \emph{Monte Carlo Methods in Financial Engineering} (Springer, 2003).
+\item M.~Giles and P.~Glasserman, ``Smoking adjoints: fast Monte Carlo Greeks'', \emph{Risk} 19 (2006) 88--92; Oxford report NA-05-15 (2005).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:1}
+Why is a Longstaff--Schwartz price, computed on paths independent of the regression, a lower bound?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:2}
+Derive the pathwise delta of a call under Black--Scholes, $e^{-rT}\mathbf 1\{S_T>K\}S_T/S_0$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:3}
+Why is the pathwise delta of a digital zero, and why is the likelihood-ratio delta not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:4}
+Derive the likelihood-ratio \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} weight $(Z^2-1)/\sigma-Z\sqrt T$ for a lognormal terminal price.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:5}
+Explain why too few inner paths bias the dual bound upwards, never downwards.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:6}
+Why does the Brownian bridge help quasi-random numbers but not pseudo-random ones?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:7}
+\emph{Coding.} Fit and price the max-call's Longstaff--Schwartz policy on the same paths and compare with the independent-paths price. Explain the sign of the
+difference.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:8}
+\emph{Find the flaw.} ``Our Monte Carlo prices the Bermudan to two cents: the standard error is 0.01.''
+\end{exercise}
+
+\section{Problem: The Bermudan Bounds}
+
+\begin{problem}[{Weekend problem --- how good is the exercise policy}]\label{pb:dv:monte-carlo-pricers-in-practice:1}
+A desk sells a three-year Bermudan call on the best of three shares (each at 100, strike 100, 20\% volatility, 10\% dividend yield, rate 5\%, nine exercise dates)
+and prices it by Longstaff--Schwartz.
+
+\medskip\noindent\textbf{Part I --- The lower bound.}
+\begin{enumerate}
+\item Give the price with the rich basis and its standard error.
+\item Why are fitting and pricing done on separate paths?
+\item Give the price with the small basis (the largest price and its square).
+\item Which exercise decisions does the small basis get wrong?
+\item What would a European max-call's price tell you?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The upper bound.}
+\begin{enumerate}[resume]
+\item Give the dual bound for the rich basis with 1\,000 outer and 1\,000 inner paths, and its standard error.
+\item Give the gap and express it as a share of the price.
+\item Give the bound and gap for the small basis.
+\item On the one-asset Bermudan put, how does the bound change with 100, 400 and 1\,600 inner paths?
+\item What does the dual bound cost relative to the lower bound, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Around the price.}
+\begin{enumerate}[resume]
+\item How would you compute the Bermudan's delta?
+\item Why not bump and reprice with fresh paths?
+\item What does the adjoint method offer for a book of such trades?
+\item How would quasi-random numbers help, and what limits them here?
+\item Which discretisation error does this product not have, and which model would introduce one?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Which price would you quote, and which would you book?
+\item How much reserve would you hold for the exercise policy?
+\item When would you stop improving the basis?
+\item State the \emph{named result}: the gap between the Longstaff--Schwartz lower bound and the \omterm{def:dv:monte-carlo-pricers-in-practice:dual}{dual upper bound} for the three-asset Bermudan max-call, and its
+sensitivity to the regression basis.
+\item In one sentence: what does the gap between the bounds measure?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:dv:monte-carlo-pricers-in-practice:1}
+Explain the Longstaff--Schwartz algorithm.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:dv:monte-carlo-pricers-in-practice:2}
+How do you get an upper bound for a Bermudan price by simulation?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:dv:monte-carlo-pricers-in-practice:3}
+Compare pathwise and \omterm{def:dv:monte-carlo-pricers-in-practice:lr}{likelihood-ratio Greeks}. When does each fail?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:dv:monte-carlo-pricers-in-practice:4}
+How would you simulate the \omterm{def:dv:stochastic-volatility:heston}{Heston model} efficiently, and why not Euler?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:dv:monte-carlo-pricers-in-practice:5}
+Your Monte Carlo risk is noisy from day to day. What do you change?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:dv:monte-carlo-pricers-in-practice:6}
+Explain adjoint algorithmic differentiation for Monte Carlo \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks}. What does it cost in memory and time?
+\end{interviewq}

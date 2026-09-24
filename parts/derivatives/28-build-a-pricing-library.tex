@@ -1,0 +1,325 @@
+\chapter{Build: A Pricing Library}\label{ch:dv:build-a-pricing-library}
+
+A risk manager asks for the book's \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to one node of the \omterm{def:dv:implied-volatility-and-its-surface:surface}{volatility surface}: the one-year, 90\% strike. The book holds a vanilla call, an
+American put, a knock-out, a \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{variance swap} and an \omterm{def:dv:autocallables:autocallable}{autocallable}. Each was priced by the chapter that introduced it, with its own inputs: a volatility
+here, a rate there, a grid of paths somewhere else. None of them reads the surface as an object that can be bumped at one node. The answer needs every
+pricer to take the same market snapshot, apply the same bump, and reprice. With a Monte Carlo pricer in the book, it also needs the bumped and unbumped
+runs to use the same random numbers, or the answer is noise. This chapter builds the library that makes the question a single call: instruments,
+models and engines behind one interface, market data as an immutable snapshot, \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} and scenarios by \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice}, and the tests that let other
+books trust it. On this chapter's book the node's \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} is 2\,072 per volatility point. Its Monte Carlo part has a standard deviation of 51 with common
+random numbers and 217 without.
+
+\section{Instruments, models and engines}
+
+A pricing library separates three things that a script mixes. The \emph{instrument} is the contract: its terms and nothing else. The \emph{model} is a
+set of assumptions about the dynamics, with its parameters. The third is the numerical method.
+
+\begin{definition}[Pricing engine]\label{def:dv:build-a-pricing-library:engine}
+A \emph{pricing engine}\index{pricing engine} is the component that computes an instrument's value under a model from a market snapshot by a given
+numerical method (closed form, tree, finite differences, Monte Carlo, Fourier); several engines may support the same instrument and model, and a
+registry chooses the default.
+\end{definition}
+
+The separation pays three times. A new instrument needs only its terms and one engine. A new method, such as a GPU Monte Carlo, prices every instrument
+it supports without touching them. And two engines on the same instrument check each other. QuantLib, the open-source library, is built this way: its
+abstract \texttt{Instrument} class takes a \omterm{def:dv:build-a-pricing-library:engine}{pricing engine} through \texttt{setPricingEngine} and returns its value through \texttt{NPV}. The Open Source
+Risk Engine extends it with further models, instruments and engines and reads trades and market data as XML.
+
+\begin{center}\small
+\begin{tabular}{lrrrr}
+\toprule
+one-year option (skewed surface) & Analytic & Tree & PDE & Monte Carlo\\
+\midrule
+call, strike 100 & 8.5437 & 8.5437 & 8.5413 & 8.5415\\
+American put, strike 95 & --- & 5.0731 & 5.0702 & ---\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The registry returns every engine that supports a pair, and the tests price across them: the analytic and tree engines agree to $2\times10^{-6}$ on the
+call. The grid's 200 nodes leave 0.0024, and one Monte Carlo run's error is of the order of its standard error. For the whole library the engines are the
+closed forms of chapters 3, 15 and 16, the trees of chapter 2, the finite differences of chapter 22, the Monte Carlo of chapter 23, the Fourier pricer of
+chapter 24 and the convertible grid of chapter 21 (\cref{fig:dv:build-a-pricing-library:arch}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,box/.style={draw,rounded corners,align=center,minimum height=0.9cm,inner sep=4pt},>=stealth]
+\node[box,fill=omDef!15,text width=3.2cm] (inst) at (0,2.2) {Instrument\\{\footnotesize terms only, JSON}};
+\node[box,fill=omThm!15,text width=3.2cm] (model) at (0,0) {Model\\{\footnotesize Black--Scholes, Heston, credit}};
+\node[box,fill=omProp!15,text width=3.4cm] (md) at (0,-2.2) {Market-data snapshot\\{\footnotesize immutable; \texttt{apply(bump)}}};
+\node[box,text width=2.6cm] (reg) at (4.4,1.1) {Registry\\{\footnotesize (instrument, model) $\to$ engines}};
+\node[box,fill=gray!10,text width=3.3cm] (eng) at (4.4,-1.1) {Engine\\{\footnotesize closed form, tree, PDE, Monte Carlo, Fourier}};
+\node[box,text width=3.3cm] (calls) at (9.0,0) {\texttt{price}, \texttt{greeks}, \texttt{sensitivities}, \texttt{bucketed\_vega}, \texttt{reprice}, \texttt{price\_batch}};
+\draw[->] (inst) -- (reg);
+\draw[->] (model) -- (reg);
+\draw[->] (reg) -- (eng);
+\draw[->] (md) -- (eng);
+\draw[->] (eng) -- (calls);
+\draw[->,dashed] (calls.south) |- node[pos=0.75,below,font=\footnotesize]{bumped snapshots} (md.east);
+\end{tikzpicture}
+
+\omcaption{The library's structure: an instrument and a model select an engine through the registry; every engine reads the same immutable snapshot; the
+top-level calls produce \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks}, sensitivities and scenarios by repricing on bumped copies of the snapshot.}\label{fig:dv:build-a-pricing-library:arch}
+\end{omfigure}
+
+\section{Market data as an immutable snapshot}
+
+\begin{definition}[Market-data snapshot]\label{def:dv:build-a-pricing-library:snapshot}
+A \emph{market-data snapshot}\index{market-data snapshot} is the complete, immutable set of market inputs of a valuation at one time (spots, curves,
+dividends, \omterm{def:dv:implied-volatility-and-its-surface:surface}{volatility surfaces}, correlations, fixings, exchange rates), addressable by risk-factor identifiers; a bump or a change of date returns a new
+snapshot and never alters the old one.
+\end{definition}
+
+QuantLib's instruments cache their last result and observe their inputs, recalculating when an input changes. That design suits a trading screen that
+reprices as quotes tick. A risk engine reprices the same book under thousands of shifted markets, often in parallel, and needs the opposite: pricing as a
+pure function of an instrument and a snapshot, with no state to invalidate. The library's snapshot has a method \texttt{apply(bump)} that returns a new
+snapshot. Bumps are keyed by the risk-factor identifiers that Book 6's risk engine shares: \texttt{SPOT:ABC}, \texttt{VOL:ABC} (parallel),
+\texttt{VOL:ABC:2027-09-24:90} (one node), \texttt{CURVE:USD}, \texttt{CORR:ABC|XYZ}, \texttt{TIME}. A surface that has nodes exposes them as risk factors,
+and one that does not is first sampled onto a grid.
+
+Immutability is what makes the rest simple. A Greek is two prices on two snapshots, a scenario is one price on one snapshot, and a batch is a matrix of
+snapshots by trades. Every engine, old or new, gets all three for free, because none of them knows that bumps exist.
+
+\section{Greeks, bumps and scenarios}
+
+\omterm{def:dv:greeks-and-the-hedging-pnl:bump}{Bump-and-reprice} is the universal Greek: slower than an engine's own derivatives, but available for every engine and consistent across them. Its enemy
+is Monte Carlo noise. Two independent runs, each with a standard error of a few tenths, differ by that much, and a bump of one volatility point divides
+the difference by 0.01. The library's binding rule removes it. Every Monte Carlo price of an instrument uses the same seed, derived from the
+instrument's identifier by a checksum, and the same time grid. The bumped and base runs share their random numbers, and the noise of the difference is
+only the noise of the sensitivity itself.
+
+\begin{example}[The vega nobody could compute]\label{ex:dv:build-a-pricing-library:node}
+The book, on a surface with 20\% at the money and a skew: long 1\,000 one-year 100 calls, short 500 one-year 95 American puts, long 800 one-year 100 calls
+knocked out at 80 (daily monitoring), short a one-year \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{variance swap} struck at 21 on a \omterm{def:dv:variance-swaps-and-volatility-derivatives:veganot}{vega notional} of 50\,000, and short 1\,000\,000 of a three-year
+\omterm{def:dv:autocallables:autocallable}{autocallable}. Its value is $-928\,523$. The \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to the (one year, 90) node, per volatility point, is $-88$ from the put, whose strike interpolates halfway
+to the node, $-90$ from the \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{variance swap}'s strip and $+2\,249$ from the \omterm{def:dv:autocallables:autocallable}{autocallable}, which the Monte Carlo engine prices on the total variance at the
+midpoint of its knock-in (80) and trigger (100): 2\,072 in all. The call and the
+knock-out, struck at 100, have none. Over twenty seeds the \omterm{def:dv:autocallables:autocallable}{autocallable}'s contribution has a standard deviation of 51 with common random numbers and 217
+without, 4.3 times more (\cref{fig:dv:build-a-pricing-library:crn}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xlabel={seed},ylabel={(1y, 90) vega (thousands a point)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=21,ymin=1.8,ymax=2.7,grid=major,grid style={gray!25},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,only marks,mark=*,mark size=1.8pt] table[x=seed,y=with]{figdata/derivatives/28-build-a-pricing-library/crn.csv};
+\addplot[omProp,only marks,mark=triangle*,mark size=2pt] table[x=seed,y=without]{figdata/derivatives/28-build-a-pricing-library/crn.csv};
+\legend{common random numbers,fresh numbers for each snapshot}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:dv:autocallables:autocallable}{autocallable}'s \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to the one-year 90 node by \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice}, from twenty seeds: with the bumped and base runs sharing their random
+numbers, and with every snapshot drawing afresh. Data: the tutorial.}\label{fig:dv:build-a-pricing-library:crn}
+\end{omfigure}
+
+The node grid gives the whole profile (\cref{fig:dv:build-a-pricing-library:vega}). Summed over its 35 nodes the book's \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} is 6\,747 per point, against
+6\,706 for a parallel bump. The difference comes from interpolation, which spreads a node's bump to its neighbours unevenly.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
+  width=6.6cm,height=5cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[ybar,bar width=10pt,xlabel={expiry (months)},ylabel={vega (thousands a point)},xtick=data,ymin=-0.5,ymax=3.5,title={\small by expiry}]
+\addplot[omDef,fill=omDef!40] table[x=months,y=vega]{figdata/derivatives/28-build-a-pricing-library/vega_expiry.csv};
+\nextgroupplot[ybar,bar width=10pt,xlabel={strike},xtick=data,ymin=-0.5,ymax=3.5,title={\small one-year expiry, by strike}]
+\addplot[omThm,fill=omThm!40] table[x=strike,y=vega]{figdata/derivatives/28-build-a-pricing-library/vega_1y.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{The book's bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} by \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice} at every node of the surface: by expiry (left) and across the one-year slice (right), where the 90
+node carries the \omterm{def:dv:autocallables:autocallable}{autocallable}'s exposure. Data: the tutorial.}\label{fig:dv:build-a-pricing-library:vega}
+\end{omfigure}
+
+Scenarios are bumps in combination. A scenario is a name and a tuple of bumps, serialisable, so that Book 6's scenario generators can build them and the
+library can apply them. The book's ten-scenario grid (\cref{fig:dv:build-a-pricing-library:scen}) shows it long volatility and long a crash, through the
+\omterm{def:dv:autocallables:autocallable}{autocallable} it sold, and losing on a rally.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=6cm,xbar,bar width=7pt,xlabel={P\&L of the book (thousands)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=-50,xmax=175,ymin=-0.6,ymax=9.6,ytick={0,1,2,3,4,5,6,7,8,9},
+  yticklabels={spot $-20\%$,spot $-10\%$,spot $-5\%$,spot $+5\%$,spot $+10\%$,vol $-5$,vol $+5$,rates $+100$\,bp,crash: $-20\%$ and vol $+10$,one month later},
+  y dir=reverse,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omProp,fill=omProp!40] table[x=pnl,y=i]{figdata/derivatives/28-build-a-pricing-library/scenarios.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The book repriced under ten scenarios in one call. Data: the tutorial.}\label{fig:dv:build-a-pricing-library:scen}
+\end{omfigure}
+
+\section{Testing a pricer}
+
+A pricer is trusted because of its tests, and a library is only as good as the tests of its weakest engine.
+
+\begin{definition}[Reference pricer]\label{def:dv:build-a-pricing-library:reference}
+A \emph{reference pricer}\index{reference pricer} is an independent, slow and accurate implementation of a valuation, kept to test production engines against:
+a closed form where one exists, otherwise a converged grid or a large simulation, with its own accuracy known.
+\end{definition}
+
+The library's tests fall into five kinds. \textbf{Reference values}: each engine against a closed form or a \omterm{def:dv:build-a-pricing-library:reference}{reference pricer} (Black's formula, the Gauss--Legendre
+Lewis integral of chapter 24, the tree at 2\,001 steps). \textbf{Cross-engine}: every engine that supports an instrument against the others, within their known
+errors. \textbf{Identities}: knock-in plus knock-out equals the vanilla, a digital call plus a digital put pays the discount factor, a one-asset basket equals the
+vanilla, a TARF with no leverage and no target equals a strip of puts, higher correlation cheapens a worst-of put. \textbf{Properties}: snapshots are unchanged by
+bumps, bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} sums to the parallel \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega}, the seed is the same in every process, JSON round-trips every instrument. \textbf{Twins}: the C++20 and Rust cores
+reproduce the Python engines to $10^{-9}$.
+
+
+\section{Tutorial: one call for the whole book}\label{tut:dv:build-a-pricing-library:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Wire the book's components into one library, price a small book through one call, compute bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} with common random numbers, and run a
+ten-scenario grid. \textbf{End state:} the four figures, the engine table and the numbers of the weekend problem.
+\begin{tutsteps}
+\item \textbf{The registry}: engines by instrument and model type, the first that supports being the default:
+\omcode{code/firm/pricing/firm_pricing.py}{506}{521}{The engine registry.}\label{lst:dv:build-a-pricing-library:registry}
+\item \textbf{Common random numbers}: the seed from the identifier, and paths drifted to the snapshot's forwards:
+\omcode{code/firm/pricing/firm_pricing.py}{1002}{1030}{Seeds and paths of the Monte Carlo engine.}\label{lst:dv:build-a-pricing-library:mc}
+\item \textbf{The C++20 twin} of the finite-difference engine:
+\omcode{code/firm/pricing/cpp/pricing.hpp}{246}{258}{The PDE engine in C++20.}\label{lst:dv:build-a-pricing-library:cpp}
+\item \textbf{Run} \texttt{dv\_library.book\_prices()}, \texttt{engine\_table()}, \texttt{node\_vega()}, \texttt{crn\_noise()}, \texttt{bucket\_profile()},
+\texttt{scenario\_grid()} and \texttt{fig\_library.py}.
+\end{tutsteps}
+\textbf{What to change next.} Price the \omterm{def:dv:autocallables:autocallable}{autocallable} under Heston by adding a Heston Monte Carlo engine; register a second Monte Carlo engine with a million paths as
+a \omterm{def:dv:build-a-pricing-library:reference}{reference pricer}; time \texttt{price\_batch} on a hundred snapshots.
+\end{tutorial}
+
+\section{Build: the library}\label{bld:dv:build-a-pricing-library:pricing}
+
+\begin{build}
+\bfield{Purpose} The miniature firm's pricing library: every instrument of Book 5 behind one interface, the one Book 6's risk engine consumes.
+\bfield{Interface} As frozen for Book 6 (\texttt{code/firm/INTERFACES.md}, section 1): \texttt{MarketData} with \texttt{apply}, \texttt{rolled},
+\texttt{risk\_factors}; \texttt{Instrument} and \texttt{instrument\_from\_dict}; \texttt{Model}, \texttt{Engine}, \texttt{register}; \texttt{price},
+\texttt{greeks}, \texttt{sensitivities}, \texttt{bucketed\_vega}, \texttt{reprice}, \texttt{price\_batch}; \texttt{seed\_for}. Added here: instruments
+\texttt{DigitalOption}, \texttt{BarrierOption}, \texttt{AsianOption}, \texttt{ForwardStart}, \texttt{Cliquet}, \texttt{VarianceSwap}, \texttt{BasketOption},
+\texttt{WorstOf}, \texttt{Autocallable}, \texttt{TARF}, \texttt{ConvertibleBond}; models \texttt{HestonModel}, \texttt{CreditBlackScholes}; engines
+\texttt{ClosedFormEngine}, \texttt{MonteCarloEngine(n\_paths, seed\_offset, crn)}, \texttt{PDEEngine} (with \texttt{fd\_vanilla}), \texttt{FourierEngine},
+\texttt{ConvertibleEngine}; \texttt{engines\_for(inst, model)}. The C++20 twin \texttt{cpp/pricing.hpp} and the Rust crate \texttt{rust/} hold the core types
+with the analytic and finite-difference engines and the desk \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks}.
+\bfield{Rules} Pricing is a pure function of instrument, model and snapshot; Monte Carlo seeds come from the instrument's identifier; every engine reads its
+market only from the snapshot; additions never rename or remove.
+\bfield{Acceptance tests} \texttt{code/firm/pricing/tests/} (the core's fourteen and this chapter's five groups above); \texttt{cpp/pricing\_test.cpp} and
+\texttt{rust/src/lib.rs} against the Python values.
+\bfield{Stretch} Engines' own \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} (pathwise and adjoint, chapter 23) behind the \texttt{greeks} override; local and stochastic volatility Monte Carlo; seasoned
+path-dependent trades from fixings; a service wrapper that prices batches in parallel processes.
+\end{build}
+
+\begin{dated}{2026-09}{Trade-representation standards}\label{dat:dv:build-a-pricing-library:standards}
+FpML, the XML standard for the electronic dealing and processing of derivatives, is at version 5.13 as a Recommendation, with 5.14 a Last Call Working Draft of
+24 August 2026. The Common Domain Model, a model of financial products, trades and their lifecycle events published as code in several languages, has been open
+source at FINOS since February 2023, in partnership with ISDA, ICMA and ISLA. A production library maps its instruments to these representations at its edge,
+not inside its engines.
+\end{dated}
+
+\begin{omsources}
+\item QuantLib reference documentation, class \texttt{QuantLib::Instrument} (version 1.43), quantlib.org.
+\item Open Source Risk Engine, repository README, github.com/OpenSourceRisk/Engine.
+\item FINOS, Common Domain Model, github.com/finos/common-domain-model.
+\item FpML, fpml.org.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:1}
+Why must the Monte Carlo seed come from a checksum of the identifier and not from Python's \texttt{hash()}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:2}
+Why do the call and the knock-out, both struck at 100, have no \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to the (one year, 90) node?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:3}
+Name the identity each of these tests checks: knock-in plus knock-out; a digital call plus a digital put; a TARF with no leverage and no target.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:4}
+The standard deviation of the node \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} is 51 with common random numbers. Where does that remaining noise come from, and how would you reduce it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:5}
+Why does the sum of the node \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} (6\,747) differ from the parallel \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} (6\,706)?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:6}
+What goes wrong if an engine reads a volatility from a global variable instead of from the snapshot?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:build-a-pricing-library:7}
+\emph{Coding.} Register a Monte Carlo engine with 400\,000 paths and compute the node \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} of the \omterm{def:dv:autocallables:autocallable}{autocallable} over twenty seeds with common random numbers. How does the
+standard deviation scale?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:build-a-pricing-library:8}
+\emph{Find the flaw.} ``Our new engine agrees with the old one to eight decimals on every trade, so it is correct.''
+\end{exercise}
+
+\section{Problem: The Vega Nobody Could Compute}
+
+\begin{problem}[{Weekend problem --- one node, five pricers}]\label{pb:dv:build-a-pricing-library:1}
+The risk manager of the opening wants the book's \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to the one-year 90\% node, today and every day.
+
+\medskip\noindent\textbf{Part I --- The library.}
+\begin{enumerate}
+\item Which engine prices each of the five positions by default, and why that one?
+\item What is the book's value?
+\item How close are the engines on the one-year call, and what explains the gaps?
+\item What must every engine do for the node bump to reach it?
+\item What does the registry do when no engine supports a pair?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The node.}
+\begin{enumerate}[resume]
+\item Give each position's \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to the node.
+\item Why is the \omterm{def:dv:autocallables:autocallable}{autocallable}'s the largest, and why is its sign positive for the firm?
+\item How does the put's strike of 95 give it half its exposure at 90?
+\item What does the \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{variance swap}'s strip contribute, and why at every node?
+\item What is the book's total \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} by expiry?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The noise.}
+\begin{enumerate}[resume]
+\item Give the node \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega}'s standard deviation over twenty seeds with and without common random numbers.
+\item Why does sharing random numbers cut it by a factor of 4.3?
+\item What would the standard deviation be with four times the paths?
+\item Why does the binding rule tie the seed to the instrument and not to the book?
+\item What does the grid of ten scenarios say about the book?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Would you report the node \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} to one unit or to a hundred?
+\item What would you add before Book 6's risk engine runs the library every night?
+\item Which test would have caught a pricer that reads a stale surface?
+\item State the \emph{named result}: the book's bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} at the one-year 90\% strike, and the Monte Carlo noise in it with and without common random numbers.
+\item In one sentence: what makes a Greek computable for every pricer?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:dv:build-a-pricing-library:1}
+Why separate instruments, models and engines?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:dv:build-a-pricing-library:2}
+Your Monte Carlo \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} are noisy. What design rule fixes most of it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:dv:build-a-pricing-library:3}
+Mutable market objects with observers, or immutable snapshots? Argue for one.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:dv:build-a-pricing-library:4}
+How do you test a new \omterm{def:dv:build-a-pricing-library:engine}{pricing engine}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:dv:build-a-pricing-library:5}
+How would you compute bucketed \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} for a book priced by different models and engines?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:dv:build-a-pricing-library:6}
+You must rewrite the core of the Python library in C++ without changing any number. How do you proceed?
+\end{interviewq}

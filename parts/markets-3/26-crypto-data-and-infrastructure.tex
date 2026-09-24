@@ -1,0 +1,324 @@
+\chapter{Crypto Data and Infrastructure}\label{ch:m3:crypto-data-and-infrastructure}
+
+A purchased history of a crypto order book shows, on a quiet afternoon, the best bid above the best offer
+for two seconds. Nothing happened in the market. One update of the venue's websocket feed was lost on the
+way to the recorder, the recorder applied the next ones anyway, and every system downstream, a backtest,
+a research notebook, a model trained on the data, treated the crossed book as real. Crypto data looks easy
+to get: the venues publish their books for free, the chains are public. It is hard to get right. This
+chapter covers the two sources of a crypto firm's data, the chains and the venues: running nodes and
+reading what contracts emit, rebuilding venues' books from snapshots and deltas and checking them,
+understanding what each timestamp measures, and knowing where the matching engines physically are.
+
+\section{Running nodes}
+
+\begin{definition}[Full node, archive node, RPC endpoint]\label{def:m3:crypto-data-and-infrastructure:node}
+A \emph{full node}\index{full node} is a program that downloads and verifies every block of a chain and keeps its current
+state, and the recent history needed to serve it. An \emph{archive node}\index{archive node} is a full node that also keeps
+every historical state, so that it can answer questions about any past block. An \emph{RPC endpoint}\index{RPC endpoint} is the
+interface through which a program queries a node and submits transactions to it.
+\end{definition}
+
+A trading firm reads the chain through nodes: its own, or a provider's. Its own nodes cost hardware and operations but give it
+the chain's data as soon as its node sees it, no \omterm{def:m3:centralised-exchanges:ratelimit}{rate limits} and no dependence on a third party; a provider's endpoints are
+convenient and are shared with everyone else, throttled, and one more party between the firm and the chain. For latency-sensitive
+work (\cref{ch:m3:maximal-extractable-value}) the firm runs its own nodes, close to the other nodes it needs to hear from first.
+
+\begin{dated}{2026-09}{Ethereum nodes}\label{dat:m3:crypto-data-and-infrastructure:nodes}
+Ethereum's developer documentation states that \omterm{def:m3:crypto-data-and-infrastructure:node}{full nodes} verify every block but keep only relatively recent state (typically the
+last 128 blocks), regenerating older data on demand; that \omterm{def:m3:crypto-data-and-infrastructure:node}{archive nodes} never delete downloaded data and represent terabytes of
+storage; and that one client, Erigon, can perform a full archive sync using around 2~TB of disk in under three days. It lists five
+execution clients (Geth, Nethermind, Besu, Erigon, Reth) written in four languages.
+\end{dated}
+
+\section{On-chain data: logs and indexers}
+
+\begin{definition}[Event log, indexer]\label{def:m3:crypto-data-and-infrastructure:log}
+An \emph{event log}\index{event log} is a record a \omterm{def:m3:blockchains-for-traders:contract}{smart contract} emits during a transaction (a swap, a transfer, a liquidation),
+stored in the transaction's receipt with indexed fields that can be searched. An \emph{indexer}\index{indexer} is a system that reads
+every block from a node, decodes the logs and state changes of the contracts it cares about, and stores them in a database that can
+be queried by time, address or event type.
+\end{definition}
+
+The chain is a database with an unhelpful interface: it answers ``what is the state now'' and ``what happened in block $n$'', but not
+``every swap in this pool last month''. The firm's \omterm{def:m3:crypto-data-and-infrastructure:log}{indexer} turns the one into the other. Its traps are those of any data pipeline with
+a twist: blocks can be reorganised away (\cref{ch:m3:blockchains-for-traders}), so recent data must carry its block hash and be revised
+when a reorganisation happens; contract upgrades change what logs mean; and a \omterm{def:m3:blockchains-for-traders:key}{token}'s decimals, not its log, say what a raw amount is
+worth.
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,
+  s/.style={draw,thick,rounded corners=2pt,align=center,minimum height=0.9cm,text width=2.3cm},
+  arr/.style={-{Stealth[length=2.2mm]},thick}]
+\node[s,draw=omDef,fill=omDef!8] (ch) at (0,1.1) {chain\\(own nodes)};
+\node[s,draw=omThm,fill=omThm!8] (ix) at (3.2,1.1) {indexer:\\logs, state};
+\node[s,draw=omDef,fill=omDef!8] (vx) at (0,-1.1) {venues'\\websockets};
+\node[s,draw=omThm,fill=omThm!8] (bb) at (3.2,-1.1) {book builder:\\ids, checksums};
+\node[s,draw=omProp,fill=omProp!8] (st) at (6.6,0) {normalised\\store, two\\timestamps};
+\node[s,draw=omExo,fill=omExo!8] (us) at (9.8,0) {strategies,\\research, risk};
+\draw[arr] (ch) -- (ix); \draw[arr] (vx) -- (bb); \draw[arr] (ix) -- (st); \draw[arr] (bb) -- (st); \draw[arr] (st) -- (us);
+\end{tikzpicture}
+
+\omcaption{A crypto firm's two data pipelines: blocks from its own nodes through an \omterm{def:m3:crypto-data-and-infrastructure:log}{indexer}, and venues' feeds through a book builder
+that checks sequence and checksums, both into one normalised store that keeps the source's timestamp and the time of receipt.
+Schematic.}\label{fig:m3:crypto-data-and-infrastructure:pipes}
+\end{omfigure}
+
+\section{Venue market data: snapshots, deltas and checksums}
+
+\begin{definition}[Snapshot-and-delta feed, book checksum]\label{def:m3:crypto-data-and-infrastructure:feed}
+A \emph{snapshot-and-delta feed}\index{snapshot-and-delta feed} publishes a venue's market-by-price book (One Quant Book 1, chapter 28)
+as a snapshot of all levels, with an update identifier, followed by a stream of changes to individual levels numbered with the same
+identifiers. A \emph{book checksum}\index{book checksum} is a value the venue computes over the top levels of its book after each change
+and publishes with it, so that a client can verify that its copy is identical.
+\end{definition}
+
+\begin{dated}{2026-09}{Rebuilding a book: one venue's procedure}\label{dat:m3:crypto-data-and-infrastructure:binance}
+Binance's documentation for a local order book instructs the client to buffer the depth stream, fetch a snapshot, discard buffered events
+whose last update id $u$ is at most the snapshot's \texttt{lastUpdateId}, and then, for each event: ignore it if $u$ is below the book's id;
+if its first update id $U$ exceeds the book's id plus one, discard the book and restart, since events were missed; otherwise set each level to
+its new quantity, removing it if the quantity is zero, and set the book's id to $u$. A single websocket connection is valid for 24 hours, and the
+server pings every 20 seconds.
+\end{dated}
+
+\begin{dated}{2026-09}{A book checksum}\label{dat:m3:crypto-data-and-infrastructure:kraken}
+Kraken's documentation for its version-2 websocket book computes the checksum over the top 10 price levels whatever the subscription depth: for asks
+from low to high and then bids from high to low, each price and quantity is written without its decimal point and leading zeros, the strings are
+concatenated, and the CRC32 of the result, as an unsigned 32-bit integer, is compared with the message's checksum field. Verification is optional.
+OKX went the other way: on 23 June 2026 it deprecated the checksum of its order-book channels, still sent but fixed at zero, and told clients to check
+continuity with the messages' sequence identifiers instead.
+\end{dated}
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,
+  s/.style={draw,thick,rounded corners=2pt,align=center,minimum height=0.9cm,text width=2.4cm},
+  arr/.style={-{Stealth[length=2.2mm]},thick}]
+\node[s,draw=omDef,fill=omDef!8] (a) at (0,0) {1.\ subscribe,\\buffer deltas};
+\node[s,draw=omThm,fill=omThm!8] (b) at (3.1,0) {2.\ fetch snapshot\\(id $n$)};
+\node[s,draw=omProp,fill=omProp!8] (c) at (6.2,0) {3.\ drop buffered\\deltas with $u \le n$};
+\node[s,draw=omExo,fill=omExo!8] (d) at (9.3,0) {4.\ apply in order;\\id becomes $u$};
+\node[s,draw=gray,fill=gray!8] (e) at (9.3,-2.0) {gap: next $U > \text{id} + 1$};
+\draw[arr] (a) -- (b); \draw[arr] (b) -- (c); \draw[arr] (c) -- (d); \draw[arr] (d) -- (e);
+\draw[arr,dashed] (e.west) -| node[below,pos=0.25,font=\footnotesize,align=center] {discard the book, flag stale,\\resynchronise} (b.south);
+\end{tikzpicture}
+
+\omcaption{Rebuilding a book from a \omterm{def:m3:crypto-data-and-infrastructure:feed}{snapshot-and-delta feed}, following the procedure of \cref{dat:m3:crypto-data-and-infrastructure:binance}: buffer, snapshot,
+discard what the snapshot already contains, apply in order, and go back to the snapshot on any gap. The book is flagged stale from the gap until the new snapshot
+is applied. Schematic.}\label{fig:m3:crypto-data-and-infrastructure:sync}
+\end{omfigure}
+
+Update identifiers catch losses on a venue that publishes them; checksums catch what identifiers cannot, such as a client's own bug in applying a
+change, and are the only protection on a feed without identifiers.
+
+\begin{proposition}[What a lost message costs]\label{prop:m3:crypto-data-and-infrastructure:loss}
+Let a book of $K$ active levels change by absolute-quantity updates, each touching one level chosen uniformly, and let each message be lost with
+probability $p$, independently. A client that applies what it receives without checking is wrong after a loss until the lost level is next updated:
+a geometric number of messages with mean about $K$, so that it is silently wrong a fraction about $pK$ of the time for small $p$. A client that detects
+the gap and needs $R$ messages to resynchronise is never silently wrong and is knowingly stale a fraction about $pR$ of the time.
+\end{proposition}
+
+\begin{proof}
+Each later message updates the lost level with probability $1/K$, so the wait is geometric with mean $K$. Losses arrive at rate $p$ per message and, for
+small $p$, rarely overlap, so the fractions are the rate times the durations.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xmode=log,ymode=log,
+  xlabel={message loss rate, \%},ylabel={share of time, \%},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0.008,xmax=1.25,ymin=0.08,ymax=50,grid=major,grid style={gray!25},
+  xtick={0.01,0.1,1},xticklabels={0.01,0.1,1},ytick={0.1,1,10},yticklabels={0.1,1,10},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.5pt] table[x=p,y=silent]{figdata/markets-3/26-crypto-data-and-infrastructure/loss.csv};\addlegendentry{silently wrong (no checks)}
+\addplot[omDef,very thick,dashed,mark=square*,mark size=1.5pt] table[x=p,y=stale]{figdata/markets-3/26-crypto-data-and-infrastructure/loss.csv};\addlegendentry{known stale (gap detection, resync)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A locally built book of 20 active levels under message loss (\cref{prop:m3:crypto-data-and-infrastructure:loss}). Without checks it is wrong,
+without knowing it, about $20p$ of the time; with gap detection it is never silently wrong but spends about $50p$ of the time resynchronising when a snapshot
+takes 50 messages to arrive. Simulated feed of 100{,}000 messages. Data: the chapter's tutorial.}\label{fig:m3:crypto-data-and-infrastructure:loss}
+\end{omfigure}
+
+The careful client is stale more of the time than the careless one is wrong, and that is the point: a stale book that knows it is stale can pull its quotes
+and mark its data as missing; a wrong book trades and records falsehoods. Purchased histories must be checked the same way: a vendor's dataset of
+incremental book updates is only as good as its recorder's handling of gaps, and a crossed or locked book in the data is the first sign.
+
+\section{Timestamps and what they mean}
+
+Every crypto data record should carry two times: the venue's (exchange timestamp) and the firm's (receive timestamp), as in One Quant Book 1, chapter 28.
+
+\begin{dated}{2026-09}{Timestamps in a vendor's data}\label{dat:m3:crypto-data-and-infrastructure:tardis}
+Tardis.dev's downloadable datasets give each record a \texttt{timestamp}, provided by the exchange in microseconds since the epoch (with the local time as a
+fallback when the exchange provides none), and a \texttt{local\_timestamp}, the message's arrival time; its incremental book data are collected from the
+exchanges' real-time websocket feeds, and files may begin with updates that precede the first snapshot, which must be skipped.
+\end{dated}
+
+The exchange's timestamp says when the venue says it happened, at the venue's clock resolution and sometimes when the message was sent rather than when the
+book changed. The receive timestamp says when the firm learned it, including the network path. Their difference is the feed's latency, which varies with the
+firm's location and the venue's load and jumps exactly when the market is busiest. Research must use the receive timestamp to decide what a strategy could have
+known, and the exchange timestamp to align venues; a backtest that uses exchange timestamps for decisions assumes the firm sat inside the matching engine. On
+chains there is a third time, the block's, and a fourth, when the firm's node saw the transaction in the \omterm{def:m3:blockchains-for-traders:mempool}{mempool}.
+
+\section{Where the matching engines sit}
+
+\begin{definition}[Cloud region]\label{def:m3:crypto-data-and-infrastructure:region}
+A \emph{cloud region}\index{cloud region} is a geographic area in which a cloud provider operates a cluster of data centres, within which network latency between
+machines is low.
+\end{definition}
+
+Unlike the exchanges of One Quant Book 1, some crypto venues run their systems in public clouds rather than in data centres of their own (one venue's
+documentation lists an API endpoint named for a cloud provider, \cref{dat:m3:getting-access-crypto-venues:endpoints}), and a firm that wants to be close to such a
+venue rents machines in the same region and, where the provider allows, the same availability zone. Latency to a venue becomes a question of which
+region it runs in, which is sometimes published and sometimes inferred by measuring round-trip times from each region; and a firm trading several venues in
+different regions faces the same geography as the multi-venue firms of the equity and futures markets, with distances between regions instead of between
+buildings.
+
+\begin{dated}{2026-09}{A venue's region}\label{dat:m3:crypto-data-and-infrastructure:region}
+Glassnode's research, reported by CoinDesk on 30 March 2026, found Hyperliquid's 24 \omterm{def:m3:blockchains-for-traders:pow}{validators} clustered in Amazon Web Services' Tokyo region, across
+several availability zones, so that orders from Tokyo reached them in 2 to 3 milliseconds and orders from Europe in more than 200.
+\end{dated}
+
+\section{Tutorial: rebuilding a book and losing a message}\label{tut:m3:crypto-data-and-infrastructure:book}
+
+\begin{tutorial}
+\textbf{Goal.} Rebuild an order book from a snapshot and a stream of update-id-numbered deltas, detect gaps and resynchronise, verify the book against a CRC32
+checksum, and measure what message loss does. \textbf{End state:} \cref{fig:m3:crypto-data-and-infrastructure:loss} and the numbers of the weekend problem.
+\begin{tutsteps}
+\item \textbf{The update rule.} Ignore old events, detect gaps, apply absolute quantities.
+\omcode{code/firm/wsbook/cpp/firm_wsbook.hpp}{37}{48}{The C++20 update rule: ignore, detect a gap, or apply.}\label{lst:m3:crypto-data-and-infrastructure:apply}
+\item \textbf{The checksum.} Ten best asks, then ten best bids, as integer strings; CRC32.
+\omcode{code/firm/wsbook/rust/src/lib.rs}{65}{74}{The Rust checksum over the top of the book.}\label{lst:m3:crypto-data-and-infrastructure:checksum}
+\item \textbf{Run} \texttt{simulate(p)} for loss rates from 0.01\% to 1\% and \texttt{fig\_data.py}.
+\end{tutsteps}
+\textbf{What to change next.} Add a checksum policy (detect a divergence at the next message, then resync) and compare it with gap detection; let losses come in
+bursts rather than independently; replay a vendor's file and count crossed books.
+\end{tutorial}
+
+\section{Build: the websocket book builder}\label{bld:m3:crypto-data-and-infrastructure:wsbook}
+
+\begin{build}
+\bfield{Purpose} Every price the miniature firm uses on a crypto venue comes from a book it built itself from the venue's feed; the builder must never present a
+wrong book as right, and must say when it is stale. It feeds the arbitrage scanner of \cref{ch:m3:spot-markets}.
+\bfield{Interface} \texttt{Book} with \texttt{snapshot(update\_id, bids, asks)}, \texttt{apply(first, last, bids, asks)} returning ignored, applied or gap,
+\texttt{top(n)} and \texttt{checksum()}; \texttt{crc32}. C++20 header \texttt{firm\_wsbook.hpp}, Rust crate \texttt{firm\_wsbook}, Python reference.
+\bfield{Rules} Integer ticks and lots; a gap leaves the book unsynced until a snapshot; the checksum computed exactly as the venue does; every update keeps both
+timestamps.
+\bfield{Acceptance tests} \texttt{code/firm/wsbook/tests/}, \texttt{cpp/firm\_wsbook\_test.cpp} and the Rust crate's tests: ignoring, applying and gap
+detection; staying unsynced; the checksum against zlib's CRC32 and the standard check value.
+\bfield{Stretch} Venue adapters (decimal strings, depth limits of snapshots); buffered resynchronisation without dropping events; burst-loss testing; a
+lock-free publication of the book to strategies.
+\end{build}
+
+\begin{omsources}
+\item Ethereum.org developer documentation, ``Nodes and clients'' (repository ethereum/ethereum-org-website). Accessed September 2026.
+\item Binance, spot WebSocket streams documentation (repository binance/binance-spot-api-docs); Kraken, WebSocket v2 book checksum guide. Accessed September 2026.
+\item Tardis.dev, downloadable CSV files: data types. Accessed September 2026.
+\item OKX, API v5 change log, entry of 23 June 2026; CoinDesk, ``Hyperliquid traders in Tokyo get 200-millisecond edge, Glassnode research shows'', 30 March 2026.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:1}
+A book's id is 100. What does the client do with events $(U, u) = (95, 99)$, $(101, 103)$ and then $(105, 106)$?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:2}
+When does a firm need an \omterm{def:m3:crypto-data-and-infrastructure:node}{archive node} rather than a \omterm{def:m3:crypto-data-and-infrastructure:node}{full node}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:3}
+Write the checksum string for asks (1001, 4), (1002, 6) and bids (999, 5), (998, 7).
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:4}
+A feed loses one message in 1{,}000 and the book has 20 active levels. For what share of the time is an unchecked book wrong? How long is a typical error?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:5}
+Why should research use receive timestamps to decide what a strategy knew?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:6}
+What must an \omterm{def:m3:crypto-data-and-infrastructure:log}{indexer} do when the chain reorganises two blocks?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:crypto-data-and-infrastructure:7}
+\emph{Coding.} With \texttt{simulate}, find the resynchronisation time at which the careful client is stale as often as the careless one is wrong, at a loss rate of
+0.1\%.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:crypto-data-and-infrastructure:8}
+\emph{Find the flaw.} ``Our data vendor records every exchange's feed, so its order books are correct.''
+\end{exercise}
+
+\section{Problem: The Missing Delta}
+
+\begin{problem}[{Weekend problem --- how wrong is a book that lost a message?}]\label{pb:m3:crypto-data-and-infrastructure:1}
+A firm builds books from a venue's feed of 20 active levels near the top. It loses one message in 1{,}000. A resynchronisation from a snapshot takes about 50
+messages.
+
+\medskip\noindent\textbf{Part I --- The careless client.}
+\begin{enumerate}
+\item For what share of messages is its book wrong?
+\item How long does a typical error last, in messages?
+\item Why is that close to the number of levels?
+\item What can a wrong book do to a quoting strategy?
+\item Why might a lost deletion be worse than a lost change of quantity?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The careful client.}
+\begin{enumerate}[resume]
+\item For what share of messages is its book flagged stale?
+\item Why is that larger than the careless client's error share?
+\item What does the strategy do while the book is stale?
+\item How would buffering events during resynchronisation shorten the stale time?
+\item What would checksums add on a venue that publishes update identifiers?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Data for research.}
+\begin{enumerate}[resume]
+\item How would you detect lost messages in a purchased dataset?
+\item What does a crossed book in the data indicate?
+\item Which timestamp should a backtest use for decisions?
+\item How do you align two venues' books in time?
+\item What should the dataset record about resynchronisations?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Is a stale book better than a wrong one?
+\item When is a provider's node enough, and when must a firm run its own?
+\item What makes crypto data harder than equity data, and what makes it easier?
+\item State the \emph{named result}: the share of time the book is wrong without checks and stale with resynchronisation, and the expected duration of an error.
+\item In one sentence: what is a local order book?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:m3:crypto-data-and-infrastructure:1}
+Describe how to maintain a local order book from a snapshot and a delta stream.
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:m3:crypto-data-and-infrastructure:2}
+What is the difference between an exchange timestamp and a receive timestamp, and when do you use each?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:m3:crypto-data-and-infrastructure:3}
+How would you design an \omterm{def:m3:crypto-data-and-infrastructure:log}{indexer} for every swap on a \omterm{def:m3:automated-market-makers:amm}{decentralised exchange}, robust to reorganisations?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:m3:crypto-data-and-infrastructure:4}
+Your \omterm{def:m3:crypto-data-and-infrastructure:feed}{book checksum} fails once an hour on one venue. How do you find out why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:m3:crypto-data-and-infrastructure:5}
+How would you measure the latency of your feed from a venue running in a public cloud?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:m3:crypto-data-and-infrastructure:6}
+Design the market-data layer for a firm trading on ten crypto venues and three chains.
+\end{interviewq}

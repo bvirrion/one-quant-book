@@ -5,7 +5,7 @@ of front and back matter.
 
 ---
 
-## One Quant Book 4 — Quantitative Methods (~406 pp)
+## One Quant Book 4 — Quantitative Methods (written: 351 pp; outline estimate was ~406)
 
 Assumes a master's-level mathematical culture: fast, rigorous, and aimed at use.
 
@@ -55,7 +55,7 @@ Assumes a master's-level mathematical culture: fast, rigorous, and aimed at use.
 
 ---
 
-## One Quant Book 5 — Derivatives and Volatility (~386 pp)
+## One Quant Book 5 — Derivatives and Volatility (written: 348 pp; outline estimate was ~386)
 
 **Part I — Foundations**
 
@@ -102,7 +102,7 @@ Assumes a master's-level mathematical culture: fast, rigorous, and aimed at use.
 
 ---
 
-## One Quant Book 6 — Rates, Credit, XVA and Risk (~372 pp)
+## One Quant Book 6 — Rates, Credit, XVA and Risk (written: 314 pp; outline estimate was ~372)
 
 **Part I — Rates modelling**
 

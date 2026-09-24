@@ -1,0 +1,371 @@
+\chapter{Trees and Finite-Difference Pricers in Practice}\label{ch:dv:trees-and-finite-difference-pricers-in-practice}
+
+A pricer returns 6.0864 for a one-year American put with a 200-step binomial tree and 6.0975 with 201 steps. The trader
+asks which to trust. The answer is neither: the true value, to five decimals, is 6.0904, below one and above the other. The
+\omterm{def:dv:the-binomial-model:crr}{Cox--Ross--Rubinstein tree} of chapter 2 converges to it, but in a zigzag that alternates with the parity of the step count,
+and only at first order. At 1\,500 steps both neighbours are finally within a tenth of a cent. A Crank--Nicolson grid with the
+right start-up and the strike on a node gets there with 200 nodes and 200 time steps, 28 times less work. This chapter is about
+the difference between a pricer that converges and one that is accurate. It covers the pricing equation on a grid, the
+conditions that dividends and barriers impose, American exercise by a direct algorithm, and how to spend a computing budget.
+
+\section{The pricing equation on a grid}
+
+For one underlying the \omterm{def:dv:black-scholes-three-ways:pde}{Black--Scholes equation} (chapter 3) is solved most naturally in $x=\ln S$ and in the time to expiry
+$\tau$:
+\[
+\partial_\tau V=\tfrac12\sigma^2\partial_{xx}V+\bigl(r-q-\tfrac12\sigma^2\bigr)\partial_xV-rV.
+\]
+On a grid $x_0<\dots<x_M$ the derivatives become three-point differences. The build allows the spacing to vary, with
+$h_\pm$ the distances to the neighbours, so that nodes can be concentrated near the strike where the payoff has its kink.
+In time the $\theta$-scheme (One Quant Book 4, chapter 27) mixes explicit and implicit steps. $\theta=\frac12$ is
+Crank--Nicolson, second-order accurate and unconditionally stable, but not free of oscillations. Each step solves one
+tridiagonal system, in $O(M)$ operations.
+
+Crank--Nicolson has one known weakness, and option payoffs trigger it. The scheme damps high-frequency components of the
+solution only weakly. A kinked payoff contains all frequencies, so the first steps leave oscillations near the strike that
+decay slowly. Prices barely notice them, and gammas do. The standard remedy is Rannacher's start-up: a few fully implicit half
+steps first, which damp the high frequencies, then Crank--Nicolson. A second remedy works on the payoff itself.
+
+\begin{definition}[Payoff smoothing]\label{def:dv:trees-and-finite-difference-pricers-in-practice:smoothing}
+\emph{Payoff smoothing}\index{payoff smoothing} replaces the payoff's value at each grid node by its average over the node's
+cell, so that the initial condition carries the kink's effect without its discontinuous derivative; with Rannacher start-up
+it restores the scheme's second-order convergence for non-smooth payoffs.
+\end{definition}
+
+\begin{example}[Gamma near expiry]\label{ex:dv:trees-and-finite-difference-pricers-in-practice:gamma}
+A European put one week from expiry (strike 100, 20\% volatility), on a 200-node grid with ten time steps. Plain
+Crank--Nicolson gives a gamma of 0.217 at the strike, where the exact value is 0.141, and wiggles around the true curve on
+either side. With two Rannacher start-up steps the largest error is 0.0002
+(\cref{fig:dv:trees-and-finite-difference-pricers-in-practice:gamma}). A risk system that reports Crank--Nicolson gammas
+without the start-up will show hedgers a phantom gamma spike at every strike near expiry.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,
+  xlabel={spot},ylabel={gamma},
+  tick label style={font=\small},label style={font=\small},
+  xmin=90,xmax=110,ymin=0,ymax=0.24,grid=major,grid style={gray!25},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[gray,very thick] table[x=s,y=exact]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/gamma.csv};
+\addplot[omProp,thick,mark=*,mark size=1pt] table[x=s,y=cn]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/gamma.csv};
+\addplot[omThm,very thick,dashed] table[x=s,y=rannacher]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/gamma.csv};
+\legend{exact,Crank--Nicolson,with Rannacher start-up}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Gamma of a one-week put from a 200-node grid and ten time steps. Plain Crank--Nicolson leaves an oscillation at the
+strike that ten steps cannot damp; two implicit half steps at the start remove it. Data: the
+tutorial.}\label{fig:dv:trees-and-finite-difference-pricers-in-practice:gamma}
+\end{omfigure}
+
+Trees are the same equation on a special grid. The binomial tree ties the space step to the time step, $\Delta x=\sigma\sqrt{\Delta t}$,
+and is an explicit scheme. The \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree} loosens the tie.
+
+\begin{definition}[Trinomial tree]\label{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}
+A \emph{trinomial tree}\index{trinomial tree} moves the log-price up, down or not at all at each step, by $\Delta x$ (for instance
+$\sigma\sqrt{3\Delta t}$), with probabilities chosen to match the mean and variance of the log-return; it is an explicit finite-difference
+scheme with a stability condition built into its geometry, and its extra middle branch lets the node grid be placed more freely than a
+binomial tree's.
+\end{definition}
+
+\section{Discrete dividends and jump conditions}
+
+A cash dividend $D$ paid at $t_d$ makes the share fall by $D$ on the ex-date while the option's value is continuous, since nothing is
+paid to its holder. The grid enforces this through a condition between the two sides of the date.
+
+\begin{definition}[Jump condition]\label{def:dv:trees-and-finite-difference-pricers-in-practice:jump}
+A \emph{jump condition}\index{jump condition} links a pricing equation's solution across a date at which the state variable jumps
+deterministically: for a cash dividend, $V(t_d^-,S)=V(t_d^+,S-D)$, applied on the grid by interpolation, followed by a fresh Rannacher
+start-up, since the interpolated profile is no longer smooth where American exercise bites.
+\end{definition}
+
+A tree cannot do this directly: shifting a \omterm{def:dv:the-binomial-model:recombining}{recombining tree}'s nodes by a cash amount stops it recombining, which is why chapter 5 used the
+escrowed model. The grid has no such problem.
+
+\begin{example}[A three-unit dividend in six months]\label{ex:dv:trees-and-finite-difference-pricers-in-practice:dividend}
+With a dividend of 3 paid at six months, the one-year European put is worth 6.835 on the grid, against 6.719 from Black--Scholes on the spot
+less the dividend's present value, the escrowed approximation at the same volatility. The American put is worth 7.407, against 6.090
+without the dividend.
+\end{example}
+
+\section{Barriers and grid alignment}
+
+A continuously monitored barrier is a boundary condition: the option is worth zero, or its rebate, at the barrier. The grid must therefore
+have a node exactly at the barrier. If the barrier falls between nodes, the pricer either moves it to the nearest node, which is a
+first-order error in the barrier level, or interpolates, which works only approximately. The stretched grid of the build starts at the
+barrier and concentrates nodes at the strike. Discretely monitored barriers are applied as a projection at the monitoring dates (chapter
+15's shift is the analytical counterpart).
+
+\begin{example}[Aligned and misaligned]\label{ex:dv:trees-and-finite-difference-pricers-in-practice:barrier}
+A one-year down-and-out call (strike 100, barrier 90) is worth 8.665 in closed form. With the barrier on a node, the grid's error is 0.0049
+with 40 nodes and 0.0002 with 200. With uniform grids on which the barrier falls between nodes, the error is 1.10 with 40 nodes, 0.16 with 200 and
+0.046 with 300 (\cref{fig:dv:trees-and-finite-difference-pricers-in-practice:barrier}): hundreds of times worse at the same cost, and
+dependent on where the barrier happens to fall between two nodes.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xmode=log,ymode=log,
+  xlabel={grid nodes},ylabel={absolute error},
+  tick label style={font=\small},label style={font=\small},
+  xmin=35,xmax=340,ymin=5e-5,ymax=3,grid=major,grid style={gray!25},
+  xtick={40,60,100,200,300},xticklabels={40,60,100,200,300},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=m,y=aligned]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/barrier.csv};
+\addplot[omProp,very thick,mark=triangle*,mark size=1.8pt] table[x=m,y=misaligned]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/barrier.csv};
+\legend{barrier on a node,barrier between nodes}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Error of a one-year down-and-out call (strike 100, barrier 90) on grids of increasing size, with the barrier exactly on a node and
+between nodes. Alignment, not size, decides the accuracy. Data: the tutorial.}\label{fig:dv:trees-and-finite-difference-pricers-in-practice:barrier}
+\end{omfigure}
+
+\section{American exercise}
+
+Early exercise turns the pricing equation into a free-boundary problem (chapter 6): $V\ge g$, the exercise value, everywhere, with the
+equation holding where $V>g$. On a grid, the naive treatment solves the linear system and then takes the maximum with $g$. That works with an
+implicit step, and it costs Crank--Nicolson its accuracy, because the projection and the solve are not consistent. Iterative methods such as
+projected successive over-relaxation solve the constrained system properly, at many times the cost. For a put, whose exercise region is a
+single interval of low spots, there is a direct method.
+
+\begin{definition}[Brennan--Schwartz algorithm]\label{def:dv:trees-and-finite-difference-pricers-in-practice:bs}
+The \emph{Brennan--Schwartz algorithm}\index{Brennan--Schwartz algorithm} solves a tridiagonal system with the constraint $V\ge g$ exactly
+when the exercise region is an interval at one end of the grid: it eliminates from the other end, then back-substitutes towards the exercise
+region, taking the maximum with $g$ at each node; its cost is that of one tridiagonal solve.
+\end{definition}
+
+The order of elimination is the whole trick. For a put the exercise region lies at low spots, so the elimination runs from the top of the grid
+down, and the back substitution runs upwards from the exercise region. There each value is fixed by the constraint before the continuation
+values above it are computed. For a call on a dividend-paying share the order reverses.
+
+The grid also gives the \omterm{def:dv:american-options-and-early-exercise:boundary}{exercise boundary} as a by-product: the highest spot at which the value equals the exercise value, at each date,
+refined between nodes. The tree gives it too, but only as a staircase of its own nodes
+(\cref{fig:dv:trees-and-finite-difference-pricers-in-practice:boundary}). For the one-year put the grid places the boundary at 80.85 one year
+before expiry, while a 2\,000-step tree's boundary jumps between 80.68 and 81.04 from one step to the next.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,
+  xlabel={time to expiry (years)},ylabel={exercise boundary},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=1,ymin=78,ymax=101,grid=major,grid style={gray!25},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,thin] table[x=tau,y=s]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/boundary_tree.csv};
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=tau,y=s]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/boundary_grid.csv};
+\legend{2\,000-step binomial tree,grid (400 nodes)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The American put's \omterm{def:dv:american-options-and-early-exercise:boundary}{exercise boundary} (strike 100, 5\%, 20\%) by time to expiry: exercise below the curve. The tree's boundary is a
+staircase of its nodes; the grid's, refined between nodes, is smooth. Data: the tutorial.}\label{fig:dv:trees-and-finite-difference-pricers-in-practice:boundary}
+\end{omfigure}
+
+\section{Accuracy against speed}
+
+Every pricer has two dials, the grid and the time steps, and a budget. The question the trader asked in the introduction is really
+this: how much computation buys a given accuracy?
+
+\begin{example}[A tenth of a cent]\label{ex:dv:trees-and-finite-difference-pricers-in-practice:budget}
+The one-year American put (spot and strike 100, rate 5\%, volatility 20\%) is worth 6.0904, from a Richardson-extrapolated grid (1\,600 and 800 nodes
+and steps). The \omterm{def:dv:the-binomial-model:crr}{Cox--Ross--Rubinstein tree}'s error alternates in sign with the parity of the step count. Its two neighbours are both within 0.1 cent
+from 1\,500 steps, 1\,125\,750 node updates. The \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree} converges without the zigzag but at first order: its error is 0.11 cent at 1\,600 steps
+and 0.054 at 3\,200. The grid, with a node on the strike, \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:smoothing}{payoff smoothing} and Rannacher start-up, errs by 1.04 cent with 50 nodes and steps, 0.30 with
+100, 0.091 with 200 and 0.029 with 400: second order. It is within 0.1 cent at 200, 40\,600 node updates. That is 28 times less work than the tree
+(\cref{fig:dv:trees-and-finite-difference-pricers-in-practice:work}). Without smoothing and start-up the grid errs by 0.125 cent at 200.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
+  width=6.6cm,height=5cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xlabel={tree steps},ylabel={American put},xmin=100,xmax=400,ymin=6.075,ymax=6.105,
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=3},
+  title={\small the binomial zigzag},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omProp,thin] table[x=n,y=crr]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/oscillation.csv};
+\addplot[black,thick,dashed] table[x=n,y=ref]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/oscillation.csv};
+\legend{Cox--Ross--Rubinstein,value}
+\nextgroupplot[xmode=log,ymode=log,xlabel={work (node updates)},ylabel={error (cents)},xmin=500,xmax=2e7,ymin=0.01,ymax=10,
+  title={\small error against work},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omProp,thick,mark=*,mark size=1pt] table[x=work,y=err]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/work_crr.csv};
+\addplot[omDef,thick,mark=square*,mark size=1.4pt] table[x=work,y=err]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/work_tri.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.8pt] table[x=work,y=err]{figdata/derivatives/22-trees-and-finite-difference-pricers-in-practice/work_fd.csv};
+\addplot[black,dashed] coordinates {(500,0.1) (2e7,0.1)};
+\legend{binomial (worst of $n$ and $n+1$),trinomial,grid (smoothing and Rannacher),0.1 cent}
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{A one-year American put. Left: the \omterm{def:dv:the-binomial-model:crr}{Cox--Ross--Rubinstein tree} against the value, by number of steps. Right: absolute error in cents
+against work, in node updates, for the binomial tree (the larger error of each pair $n$, $n+1$), the \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree} and the Crank--Nicolson
+grid. Data: the tutorial.}\label{fig:dv:trees-and-finite-difference-pricers-in-practice:work}
+\end{omfigure}
+
+Work in node updates is a fair proxy for run time between methods written in the same language, and the grid's per-node work (a tridiagonal
+solve) is a few times the tree's (a weighted average), so the real speed-up is smaller than 28, though of the same order. Two further economies
+follow from second-order convergence. Richardson extrapolation (Book 4) of two grid sizes cancels the leading error term. Grid stretching puts the
+nodes where the payoff has its kink. The build carries both. Trees keep a place where their simplicity matters more than their cost: teaching,
+checking, and products whose early-exercise rules are easiest to state node by node.
+
+\section{Tutorial: a finite-difference engine}\label{tut:dv:trees-and-finite-difference-pricers-in-practice:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build a Crank--Nicolson pricer on a stretched log-spot grid with Rannacher start-up, \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:smoothing}{payoff smoothing}, dividend \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:jump}{jump conditions},
+barrier boundaries and American exercise by Brennan--Schwartz; compare it with the trees on error against work. \textbf{End state:} the four
+figures and the numbers of the weekend problem.
+\begin{tutsteps}
+\item \textbf{The operator on a non-uniform grid}: three-point differences with unequal spacings:
+\omcode{code/firm/fdpricer/firm_fdpricer.py}{42}{50}{Tridiagonal coefficients of the pricing operator.}\label{lst:dv:trees-and-finite-difference-pricers-in-practice:operator}
+\item \textbf{Brennan--Schwartz}: eliminate from the top, back-substitute upwards with the constraint:
+\omcode{code/firm/fdpricer/firm_fdpricer.py}{68}{82}{The Brennan--Schwartz solver.}\label{lst:dv:trees-and-finite-difference-pricers-in-practice:bs}
+\item \textbf{The time loop}: Rannacher half steps, Crank--Nicolson, boundaries, dividends:
+\omcode{code/firm/fdpricer/firm_fdpricer.py}{107}{135}{The theta-scheme time loop with jump conditions.}\label{lst:dv:trees-and-finite-difference-pricers-in-practice:loop}
+\item \textbf{The C++20 twin} of the solver, tested against the Python numbers to rounding (the Rust twin has the same algorithm):
+\omcode{code/firm/fdpricer/cpp/firm_fdpricer.hpp}{36}{52}{Brennan--Schwartz in C++20.}\label{lst:dv:trees-and-finite-difference-pricers-in-practice:cpp}
+\item \textbf{Run} \texttt{dv\_fd.accuracy\_study()}, \texttt{gamma\_profile()}, \texttt{dividend\_example()}, \texttt{barrier\_alignment()} and
+\texttt{fig\_fd.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace Brennan--Schwartz by solve-then-project with Crank--Nicolson and measure the order of convergence; price the
+American call with the dividend and find the grid's \omterm{def:dv:american-options-and-early-exercise:boundary}{exercise boundary} just before the ex-date; time the Python, C++ and Rust versions on the same
+grid.
+\end{tutorial}
+
+\section{Build: the finite-difference engine}\label{bld:dv:trees-and-finite-difference-pricers-in-practice:fdpricer}
+
+\begin{build}
+\bfield{Purpose} The miniature firm's one-dimensional PDE engine: the finite-difference engine of chapter 28's pricing library, used for American
+exercise, barriers, dividends and convertibles (chapter 21); twins in C++20 and Rust for the production path.
+\bfield{Interface} \texttt{uniform\_grid(s0, vol, t, m, width)}; \texttt{stretched\_grid(s0, k, vol, t, m, width, concentration, lower)};
+\texttt{solve(payoff, x, t, r, q, vol, n\_t, american, rannacher, dividends, smoothing, lower, upper) -> values}; \texttt{value\_at(x, v, s0) -> value,
+delta, gamma}; \texttt{american\_put}; \texttt{smoothed\_payoff}; \texttt{trinomial(s0, k, t, r, q, vol, n, right, american)}. C++20
+\texttt{firm::fdpricer::american\_put}, Rust \texttt{firm\_fdpricer::american\_put}.
+\bfield{Rules} The strike (and any barrier) is a grid node; Rannacher start-up after expiry and after every discontinuity; American exercise by
+Brennan--Schwartz where the exercise region is an interval, projected iteration otherwise; every price comes with its convergence check (two grid
+sizes).
+\bfield{Acceptance tests} \texttt{code/firm/fdpricer/tests/}: European value and delta against Black--Scholes on both grids; the American put converges at
+second order; the \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree} converges; the dividend \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:jump}{jump condition} against a simulation; a barrier on a node against the closed form;
+\texttt{cpp/} and \texttt{rust/}: the twins reproduce the Python engine's numbers to $10^{-9}$ and converge.
+\bfield{Stretch} Two-dimensional grids (alternating directions) for stochastic volatility; a projected successive over-relaxation fallback; adaptive time
+steps around dividends.
+\end{build}
+
+\begin{omsources}
+\item M.~J.~Brennan and E.~S.~Schwartz, ``The valuation of American put options'', \emph{Journal of Finance} 32(2) (1977) 449--462.
+\item R.~Rannacher, ``Finite element solution of diffusion problems with irregular data'', \emph{Numerische Mathematik} 43(2) (1984) 309--327.
+\item D.~M.~Pooley, K.~R.~Vetzal and P.~A.~Forsyth, ``Convergence remedies for non-smooth payoffs in option pricing'', \emph{Journal of
+Computational Finance} 6(4) (2003) 25--40.
+\item D.~Tavella and C.~Randall, \emph{Pricing Financial Instruments: The Finite Difference Method} (Wiley).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:1}
+Why does the binomial tree's price alternate above and below the value as the number of steps changes parity?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:2}
+A grid's error is 0.30 cent with 100 nodes and 0.091 with 200. Estimate the order of convergence and the error with 400.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:3}
+Why can a \omterm{def:dv:the-binomial-model:recombining}{recombining tree} not handle a cash dividend directly, and how does the grid?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:4}
+Using the grid values with 800 and 1\,600 nodes and steps, derive the Richardson-extrapolated value for a second-order method.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:5}
+Explain why Brennan--Schwartz must eliminate from the top of the grid for a put.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:6}
+Why does moving a barrier by half a grid cell produce a first-order error in the price?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:7}
+\emph{Coding.} Price the American put by solving with Crank--Nicolson and projecting afterwards instead of Brennan--Schwartz. Measure the error at 100, 200
+and 400 nodes and the order.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:trees-and-finite-difference-pricers-in-practice:8}
+\emph{Find the flaw.} ``Our tree prices the American put to six decimals: we ran it at 2\,000 steps and the result did not change in the sixth decimal
+between runs.''
+\end{exercise}
+
+\section{Problem: Neither 200 Nor 201}
+
+\begin{problem}[{Weekend problem --- how much computation a tenth of a cent costs}]\label{pb:dv:trees-and-finite-difference-pricers-in-practice:1}
+A risk system prices a book of one-year American puts (spot and strike 100, rate 5\%, volatility 20\%) with a 200-step binomial tree. The desk must certify every
+price to a tenth of a cent.
+
+\medskip\noindent\textbf{Part I --- The tree.}
+\begin{enumerate}
+\item Give the tree's price with 200 and 201 steps, and the value.
+\item Give the two errors in cents.
+\item From how many steps are both neighbours within 0.1 cent?
+\item How many node updates is that?
+\item Why is averaging $n$ and $n+1$ not a real fix?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The grid.}
+\begin{enumerate}[resume]
+\item Give the grid's error with 50, 100, 200 and 400 nodes and steps.
+\item Which size first meets the tolerance, and at what work?
+\item What does the grid lose without \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:smoothing}{payoff smoothing} and Rannacher start-up?
+\item Give the \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree}'s errors at 1\,600 and 3\,200 steps.
+\item What would Richardson extrapolation of 100 and 200 nodes give?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The rest of the book.}
+\begin{enumerate}[resume]
+\item The book also holds puts with a dividend of 3 in six months. Give the European and American prices.
+\item And down-and-out calls with a barrier at 90: what goes wrong on a uniform grid?
+\item Which Greek does plain Crank--Nicolson get wrong near expiry, and by how much in the chapter's example?
+\item Why is work in node updates only a proxy for run time?
+\item How would the C++ twin change the picture?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item What would you tell the trader who asked which of 200 and 201 to trust?
+\item How would you certify a price's accuracy in production?
+\item When is a tree still the right tool?
+\item State the \emph{named result}: the grid size and work at which the American put is within 0.1 cent, for the tree and for the grid, and the speed-up of
+the grid.
+\item In one sentence: what distinguishes a pricer that converges from one that is accurate?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:1}
+Why does Crank--Nicolson produce oscillating \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Greeks} for options near expiry, and how do you fix it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:2}
+How do you price an American put on a finite-difference grid efficiently?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:3}
+Compare the convergence of a binomial tree, a \omterm{def:dv:trees-and-finite-difference-pricers-in-practice:trinomial}{trinomial tree} and a Crank--Nicolson grid for an American put.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:4}
+How do you handle a discrete cash dividend and a continuously monitored barrier on a grid?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:5}
+How would you validate the numerical accuracy of a production pricer?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:dv:trees-and-finite-difference-pricers-in-practice:6}
+Your grid pricer for an American call on a dividend-paying share gives a slightly wrong \omterm{def:dv:american-options-and-early-exercise:boundary}{exercise boundary} just before the ex-date. Diagnose.
+\end{interviewq}

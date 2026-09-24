@@ -62,7 +62,7 @@ def main():
             sfile = f"parts/{SLUG}/solutions/{slug}.tex"
             if not os.path.exists(sfile):
                 with open(sfile, "w", encoding="utf8") as f:
-                    f.write(f"\\section*{{Chapter \\ref{{ch:{PFX}:{label}}} --- {ch['title']}}}\n\n% TODO\n")
+                    f.write(f"\\section*{{Chapter \\ref{{ch:{PFX}:{label}}} --- {ch['title']}}}\n\\mbox{{}}\n\n% TODO\n")
     open(f"parts/{SLUG}/part.tex", "w", encoding="utf8").write("\n".join(part_lines) + "\n")
     open(f"parts/{SLUG}/solutions/solutions.tex", "w", encoding="utf8").write("\n".join(sol_lines) + "\n")
     with open(f"sources/{SLUG}/DEFINITIONS.md", "w", encoding="utf8") as f:

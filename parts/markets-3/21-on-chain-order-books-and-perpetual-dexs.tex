@@ -1,0 +1,382 @@
+\chapter{On-Chain Order Books and Perpetual DEXs}\label{ch:m3:on-chain-order-books-and-perpetual-dexs}
+
+On one decentralised venue every order, every cancel and every liquidation of a \omterm{def:m3:perpetual-futures:perp}{perpetual futures} market
+is a transaction in a block. The venue's \omterm{def:m3:blockchains-for-traders:pow}{validators} agree not only on what happened but on the order in
+which it happened, and that order decides who is filled: a market maker whose quote has gone stale sends a
+cancel, an arbitrageur sends an order to hit the quote, and both arrive in the same block. On a
+\omterm{def:m3:centralised-exchanges:cex}{centralised exchange} the matching engine's clock settles the race. On a chain, a rule written into the
+protocol does. This chapter explains why putting an order book on a chain is hard, examines in detail the
+design of the venue that has gone furthest in doing it, looks at what went wrong when markets were
+stressed, and compares the other designs: order books kept off chain by \omterm{def:m3:blockchains-for-traders:pow}{validators}, and exchanges that
+dispense with order books altogether and trade at an \omterm{def:m3:blockchains-for-traders:contract}{oracle}'s price.
+
+\section{Why an on-chain order book is hard}
+
+\begin{definition}[Perpetual DEX, on-chain order book]\label{def:m3:on-chain-order-books-and-perpetual-dexs:perpdex}
+A \emph{perpetual DEX}\index{perpetual DEX} is a \omterm{def:m3:automated-market-makers:amm}{decentralised exchange} for \omterm{def:m3:perpetual-futures:perp}{perpetual futures}, whose margin,
+positions and settlement are held and computed by a \omterm{def:m3:blockchains-for-traders:chain}{blockchain}'s state rather than by a company. An
+\emph{on-chain order book}\index{on-chain order book} is a central limit order book whose orders, cancels
+and matches are transactions executed and recorded by the chain's consensus.
+\end{definition}
+
+A market maker on a centralised venue sends thousands of messages a second and cancels most of its orders;
+a message costs nothing and is processed in microseconds. On a general-purpose chain every message is a
+transaction that pays gas (\cref{ch:m3:blockchains-for-traders}) and waits for a block, seconds away: quoting
+costs money, cancels are slow, and anyone watching the \omterm{def:m3:blockchains-for-traders:mempool}{mempool} sees the cancel coming. Three consequences
+follow. The chain must be built for the purpose, with blocks in fractions of a second and no per-message gas
+for trading actions. The ordering of actions inside a block must be specified by the protocol, since the
+block's proposer could otherwise sell the right to go first. And every function of the exchange that a
+company would perform (the index, the \omterm{def:m3:perpetual-futures:index}{mark price}, liquidation, the backstop) must be performed by the
+protocol and its \omterm{def:m3:blockchains-for-traders:pow}{validators}, in public.
+
+\begin{definition}[App-chain]\label{def:m3:on-chain-order-books-and-perpetual-dexs:appchain}
+An \emph{app-chain}\index{app-chain} is a \omterm{def:m3:blockchains-for-traders:chain}{blockchain} built to run one application, here an exchange, with its
+own \omterm{def:m3:blockchains-for-traders:pow}{validators}, consensus parameters and transaction rules chosen for that application rather than for
+general computation.
+\end{definition}
+
+\section{Hyperliquid in detail}
+
+Hyperliquid is an \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:appchain}{app-chain} whose state includes the order books, margin and positions of its perpetual and
+spot markets (it calls this part HyperCore), alongside a general-purpose smart-contract environment.
+
+\begin{dated}{2026-09}{Consensus, latency and throughput}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:hl}
+Hyperliquid's documentation describes a proof-of-stake chain secured by HyperBFT, a variant of HotStuff consensus,
+with the order books and margin state held in the chain's state rather than off chain. It reports a median
+end-to-end latency of 0.2 seconds and a 99th percentile of 0.9 seconds for an order from a co-located client, and
+a throughput of about 200{,}000 orders a second, limited by execution. It states that there is no designated
+market-maker programme, and no special rebates, fees or latency advantages.
+\end{dated}
+
+\begin{definition}[In-block priority rule]\label{def:m3:on-chain-order-books-and-perpetual-dexs:priority}
+An \emph{in-block priority rule}\index{in-block priority rule} is the protocol rule that sorts the trading actions
+of a block before they are applied to the order books, overriding the order in which the block's proposer received
+or listed them.
+\end{definition}
+
+\begin{dated}{2026-09}{The in-block ordering of one venue}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:order}
+Hyperliquid's documentation states that within a block, actions are sorted in each consensus batch (usually one or
+two per block) as: first, actions that send no GTC or IOC order to any book; second, cancels; third, actions that send at
+least one GTC or IOC order. Within each category actions keep the order proposed by the block's proposer. Its books match
+in price-time priority, with prices on a tick grid and sizes on a lot grid; \omterm{def:m3:centralised-exchanges:postonly}{post-only orders} (ALO) rest without executing.
+\end{dated}
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,
+  c/.style={draw,thick,rounded corners=2pt,align=center,minimum height=0.9cm,text width=3.3cm},
+  arr/.style={-{Stealth[length=2.2mm]},thick}]
+\node[draw,thick,rounded corners=2pt,align=left,text width=4.3cm,fill=gray!6] (in) at (-0.4,0) {\footnotesize actions as proposed:\\
+IOC buy (taker)\\cancel stale ask (maker)\\post-only new ask (maker)\\GTC sell (trader)};
+\node[c,draw=omDef,fill=omDef!8] (c1) at (5.6,1.3) {1.\ no GTC/IOC:\\post-only quotes};
+\node[c,draw=omThm,fill=omThm!8] (c2) at (5.6,0) {2.\ cancels};
+\node[c,draw=omExo,fill=omExo!8] (c3) at (5.6,-1.3) {3.\ GTC and IOC orders};
+\node[c,draw=omProp,fill=omProp!8] (bk) at (10.6,0) {order book,\\price-time priority};
+\draw[arr] (in.east) -- (c1.west); \draw[arr] (in.east) -- (c2.west); \draw[arr] (in.east) -- (c3.west);
+\draw[arr] (c1.east) -- (bk.west); \draw[arr] (c2.east) -- (bk.west); \draw[arr] (c3.east) -- (bk.west);
+\end{tikzpicture}
+
+\omcaption{An \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:priority}{in-block priority rule} of the kind \cref{dat:m3:on-chain-order-books-and-perpetual-dexs:order} describes: the
+block's actions are sorted into three classes and applied class by class, in proposed order within each class. A maker's
+cancel and new post-only quote are applied before any taker's order in the same block. Schematic.}\label{fig:m3:on-chain-order-books-and-perpetual-dexs:classes}
+\end{omfigure}
+
+The rule is a deliberate transfer of value from takers to makers. On a centralised venue a taker who reacts faster than a
+maker's cancel picks off the stale quote; here, if both reach the same block, the cancel wins, as does the maker's new
+post-only quote. Makers can quote tighter because they are picked off less, and a taker who wants to hit a stale quote must
+get into an earlier block than the maker's cancel. The tutorial replays a thousand blocks: with the taker arriving first half
+the time, arrival order lets it pick off 610 lots, 940 ticks of the maker's value; the class rule, none.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,
+  xlabel={block},ylabel={maker's cumulative loss, ticks},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=1000,ymin=0,ymax=1000,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,very thick] table[x=block,y=arrival]{figdata/markets-3/21-on-chain-order-books-and-perpetual-dexs/pickoff.csv};\addlegendentry{arrival order}
+\addplot[omDef,very thick,dashed] table[x=block,y=cancels_first]{figdata/markets-3/21-on-chain-order-books-and-perpetual-dexs/pickoff.csv};\addlegendentry{quotes and cancels before takers}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A maker's losses to stale-quote pick-offs over a thousand blocks under two in-block rules, with fair value moving a
+normal two ticks a block and the taker's order arriving before the maker's cancel half the time. Under the class rule the
+maker's cancel and requote always come first. Synthetic replay. Data: the chapter's tutorial.}\label{fig:m3:on-chain-order-books-and-perpetual-dexs:pickoff}
+\end{omfigure}
+
+The rest of the exchange is on chain too. Prices come from \omterm{def:m3:blockchains-for-traders:pow}{validators} rather than from the venue's own trades alone, so that the
+thin books of a young venue cannot be used to move its own references.
+
+\begin{dated}{2026-09}{Oracle, mark and liquidation at one venue}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:oracle}
+Hyperliquid's \omterm{def:m3:blockchains-for-traders:pow}{validators} each publish, about every three seconds, a spot \omterm{def:m3:blockchains-for-traders:contract}{oracle} price per perpetual: a weighted median of spot mid
+prices on Binance, OKX, Bybit, Kraken, KuCoin, Gate.io, MEXC and Hyperliquid, with weights 3, 2, 2, 1, 1, 1, 1 and 1 (external sources
+only for assets whose main spot liquidity is elsewhere); the clearinghouse uses the stake-weighted median of the \omterm{def:m3:blockchains-for-traders:pow}{validators}' prices.
+The \omterm{def:m3:perpetual-futures:index}{mark price} is the median of the \omterm{def:m3:blockchains-for-traders:contract}{oracle} price plus a 150-second moving average of the basis, the median of the venue's best bid,
+best ask and last trade, and a weighted median of perpetual mids on five external venues. Maintenance margin is half the initial
+margin at maximum leverage (1.25\% to 16.7\%); liquidations are first sent to the book as market orders (20\% at a time for positions
+above 100{,}000 USDC); below two thirds of maintenance margin a position is taken over by the liquidator vault, a strategy of the
+protocol's vault, HLP, whose depositors share its P\&L.
+\end{dated}
+
+\begin{definition}[Liquidity vault]\label{def:m3:on-chain-order-books-and-perpetual-dexs:vault}
+A \emph{liquidity vault}\index{liquidity vault} is a pool of depositors' capital run by a protocol, or by a manager under protocol rules,
+that makes markets, takes over liquidated positions or supplies capital to a venue, sharing its P\&L among its depositors.
+\end{definition}
+
+A vault that backstops liquidations is the venue's \omterm{def:m3:margin-liquidation-and-loss-allocation:fund}{insurance fund} and its market maker of last resort, owned by whoever deposits in it.
+Its depositors earn the liquidation buffer on average and bear the tail when a position it inherits cannot be closed at a sensible price.
+
+\section{Incidents}
+
+Stress tests the design where a centralised venue's staff would step in. In the 10 October 2025 sell-off
+(\cref{ch:m3:margin-liquidation-and-loss-allocation}), CoinDesk Research measured the largest contraction of open interest on Hyperliquid,
+from USD~14 billion to 6 billion, a fall of 57\%. The venue's \omterm{def:m3:margin-liquidation-and-loss-allocation:adl}{auto-deleveraging} closed profitable positions of other traders, and an analysis
+by Tarun Chitra of Gauntlet, reported by Protos, argued that its queue-based ranking closed about USD~650 million more of them than was
+necessary. Earlier, on 12 March 2025, a trader holding a 50 times leveraged long of 113{,}000 ether withdrew margin until the position was
+liquidated into the vault: the trader kept about USD~1.8 million of profit and the vault lost about 4 million; the venue then cut its
+maximum leverage to 40 times on bitcoin and 25 on ether.
+
+A second kind of incident is specific to a venue whose backstop is a public vault. A trader opens a large position in a thin market, lets
+it be liquidated so that the vault inherits it, and then moves the external spot prices that feed the \omterm{def:m3:blockchains-for-traders:contract}{oracle}, on smaller venues where that is
+cheap; the vault, holding a position it cannot close without moving the book, marks a growing loss. The protocol's defences are an
+\omterm{def:m3:on-chain-order-books-and-perpetual-dexs:oicap}{open-interest cap} per asset and per account, margin tiers that raise maintenance margin with size, and, in the last resort, governance: the
+\omterm{def:m3:blockchains-for-traders:pow}{validators} can vote to delist a market.
+
+\begin{definition}[Open-interest cap]\label{def:m3:on-chain-order-books-and-perpetual-dexs:oicap}
+An \emph{open-interest cap}\index{open-interest cap} is a limit on the total open interest of a market, or on the position of one account in it,
+beyond which the venue rejects orders that would increase it.
+\end{definition}
+
+\begin{proposition}[The loss of a vault that inherits a squeezed position]\label{prop:m3:on-chain-order-books-and-perpetual-dexs:squeeze}
+A vault takes over a short position of notional $N$ with a fraction $b$ of it left as margin, and the price then rises by a fraction $s$ before the
+vault can close. Its loss is $N(s - b)^+$. To keep the loss within $L$ for squeezes up to $s_{\max}$, the positions it may inherit must be capped at
+$N \le L/(s_{\max} - b)$.
+\end{proposition}
+
+\begin{proof}
+The short loses $Ns$ and the inherited margin covers $Nb$ of it; the bound follows by solving $N(s_{\max} - b) \le L$.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,
+  xlabel={squeeze after takeover, \%},ylabel={vault loss, USD million},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=500,ymin=0,ymax=50,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,very thick] table[x=squeeze_pct,y=nocap]{figdata/markets-3/21-on-chain-order-books-and-perpetual-dexs/squeeze.csv};\addlegendentry{USD~10 million inherited}
+\addplot[omDef,very thick,dashed] table[x=squeeze_pct,y=cap2]{figdata/markets-3/21-on-chain-order-books-and-perpetual-dexs/squeeze.csv};\addlegendentry{cap USD~2 million}
+\addplot[omExo,very thick,dotted] table[x=squeeze_pct,y=cap1]{figdata/markets-3/21-on-chain-order-books-and-perpetual-dexs/squeeze.csv};\addlegendentry{cap USD~1 million}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Loss of a vault that inherits a short in a market whose maximum leverage is 3 times (maintenance margin 16.7\%, takeover at two thirds of it,
+leaving 11.1\% of notional as margin), as a function of the rise that follows (\cref{prop:m3:on-chain-order-books-and-perpetual-dexs:squeeze}). Illustrative
+positions. Data: the chapter's tutorial.}\label{fig:m3:on-chain-order-books-and-perpetual-dexs:squeeze}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Delisting by validators}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:delist}
+Hyperliquid's documentation states that \omterm{def:m3:blockchains-for-traders:pow}{validators} vote on whether to delist validator-operated perpetuals; if they do, the perpetuals settle to the
+one-hour time-weighted spot \omterm{def:m3:blockchains-for-traders:contract}{oracle} price before the scheduled voting time, all positions are settled and open orders cancelled.
+The pattern above happened on 26 March 2025: a JELLY short passed to the vault, HLP, through liquidation, spot buying elsewhere took the vault's
+unrealised loss to USD~13.5 million, and the \omterm{def:m3:blockchains-for-traders:pow}{validators} voted to delist the market, which settled at 0.0095 while about 0.50 was being fed to the
+\omterm{def:m3:blockchains-for-traders:contract}{oracle}.
+\end{dated}
+
+A vote that settles a market at a price is the decentralised equivalent of an exchange's emergency powers. It can protect a vault from a squeeze; it
+also shows that the market's rules can be changed by the \omterm{def:m3:blockchains-for-traders:pow}{validators} while positions are open, a governance risk that a trader prices in the same way
+as a centralised venue's discretion.
+
+\section{App-chain and oracle-priced designs}
+
+Two other designs trade some of the on-chain book's properties for performance or simplicity.
+
+\begin{dated}{2026-09}{An app-chain with an off-chain book}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:dydx}
+dYdX's documentation describes its chain (``v4'') as a proof-of-stake chain built on CometBFT and the Cosmos SDK, whose \omterm{def:m3:blockchains-for-traders:pow}{validators} keep the order book
+in memory, off chain and outside consensus; when orders match, the block's proposer adds the matches to its proposed block, and a block is committed when
+two thirds of the stake approve it. Proposers take turns in a stake-weighted round robin.
+\end{dated}
+
+\begin{definition}[Oracle-priced exchange]\label{def:m3:on-chain-order-books-and-perpetual-dexs:oracle}
+An \emph{oracle-priced exchange}\index{oracle-priced exchange} is a perpetual or spot DEX that has no order book: traders open and close positions
+against a \omterm{def:m3:automated-market-makers:amm}{liquidity pool} at a price supplied by an \omterm{def:m3:blockchains-for-traders:contract}{oracle}, with fees and price-impact charges set by the protocol, and the pool's depositors take the
+other side of every trade.
+\end{definition}
+
+\begin{dated}{2026-09}{An oracle-priced perpetual exchange}\label{dat:m3:on-chain-order-books-and-perpetual-dexs:gmx}
+GMX's documentation describes a decentralised spot and perpetual exchange on Arbitrum, Avalanche and MegaETH, with leverage up to 100 times, that routes
+every order against its \omterm{def:m3:automated-market-makers:amm}{liquidity pools} and quotes the \omterm{def:m3:blockchains-for-traders:contract}{oracle} \omterm{def:m3:perpetual-futures:index}{index price} rather than relying on an order book or external market makers; it uses Chainlink
+Data Streams \omterm{def:m3:blockchains-for-traders:contract}{oracles}, and liquidity providers earn 63\% of the fees from trading, liquidations, borrowing and swaps on Arbitrum and Avalanche.
+\end{dated}
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  h/.style={draw,thick,rounded corners=2pt,align=center,text width=2.9cm,minimum height=0.8cm},
+  r/.style={align=center,text width=2.9cm}]
+\node[h,draw=omDef,fill=omDef!8] at (0,0) {centralised\\exchange};
+\node[h,draw=omThm,fill=omThm!8] at (3.5,0) {on-chain\\order book};
+\node[h,draw=omProp,fill=omProp!8] at (7,0) {off-chain book,\\on-chain matches};
+\node[h,draw=omExo,fill=omExo!8] at (10.5,0) {oracle-priced\\pool};
+\node[r,anchor=north] at (0,-0.6) {book: company\\order: its clock\\custody: company};
+\node[r,anchor=north] at (3.5,-0.6) {book: chain\\order: rule\\custody: chain};
+\node[r,anchor=north] at (7,-0.6) {book: validators\\order: proposer\\custody: chain};
+\node[r,anchor=north] at (10.5,-0.6) {book: none\\price: oracle\\custody: chain};
+\end{tikzpicture}
+
+\omcaption{Four designs of a derivatives venue, by who holds the book, who decides the order of actions, and who holds the collateral. Schematic.}\label{fig:m3:on-chain-order-books-and-perpetual-dexs:designs}
+\end{omfigure}
+
+The oracle-priced design removes order-book games and replaces them with \omterm{def:m3:blockchains-for-traders:contract}{oracle} games: the pool loses whenever a trader knows the price better than the
+\omterm{def:m3:blockchains-for-traders:contract}{oracle}, as an \omterm{def:m3:automated-market-makers:amm}{automated market maker} loses to arbitrageurs (\cref{ch:m3:automated-market-makers}), and it must defend itself with fees, delays and limits on
+open interest. The off-chain book restores speed but hands the ordering of matches to each block's proposer. For a trading firm the questions are those of
+any venue (\cref{ch:m3:centralised-exchanges}), with different answers: who orders its messages, what happens to its collateral if the venue fails, and who
+can change the rules while it is positioned.
+
+\section{Tutorial: two orderings of one block}\label{tut:m3:on-chain-order-books-and-perpetual-dexs:replay}
+
+\begin{tutorial}
+\textbf{Goal.} Replay blocks of maker quotes, cancels and taker orders through a price-time-priority book under arrival order and under the class rule, and
+count the stale quotes picked off. \textbf{End state:} \cref{fig:m3:on-chain-order-books-and-perpetual-dexs:pickoff,fig:m3:on-chain-order-books-and-perpetual-dexs:squeeze}.
+\begin{tutsteps}
+\item \textbf{The rule.} Sort a block's actions by class, keeping arrival order within each class.
+\omcode{code/firm/blockbook/firm_blockbook.py}{83}{96}{The in-block ordering and the block runner.}\label{lst:m3:on-chain-order-books-and-perpetual-dexs:order}
+\item \textbf{The replay.} A maker requotes every block; a taker attacks quotes that fair value has passed.
+\omcode{code/markets-3/21-on-chain-order-books-and-perpetual-dexs/python/m3_perpdex.py}{12}{41}{The pick-off replay.}\label{lst:m3:on-chain-order-books-and-perpetual-dexs:replay}
+\item \textbf{Run} \texttt{replay} with the rules \texttt{arrival} and \texttt{cancels\_first}, then \texttt{fig\_perpdex.py}.
+\end{tutsteps}
+\textbf{What to change next.} Let the taker arrive first 90\% of the time; let the maker's cancel fall in the next block with some probability and see what the class
+rule still protects; add a second maker who never cancels.
+\end{tutorial}
+
+\section{Build: the block-batched book}\label{bld:m3:on-chain-order-books-and-perpetual-dexs:blockbook}
+
+\begin{build}
+\bfield{Purpose} To trade on block-based venues the miniature firm must predict how its actions will be ordered and matched; to backtest there it must replay
+blocks exactly; and its risk must include the venue's \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:oicap}{open-interest caps} and its \omterm{def:m3:perpetual-futures:index}{mark price}.
+\bfield{Interface} \texttt{Action(kind, trader, side, price, qty, oid)} with kinds \texttt{alo}, \texttt{gtc}, \texttt{ioc}, \texttt{cancel};
+\texttt{Book(oi\_cap)} with \texttt{apply(action)} and \texttt{best()}; \texttt{order\_block(actions, rule)} for \texttt{arrival} and
+\texttt{cancels\_first}; \texttt{run\_block(book, actions, rule)}; \texttt{mark\_price(oracle\_basis, book\_median, external)}, the median of the three. Uses \texttt{firm.perp} and
+\texttt{firm.liquidation} for margin.
+\bfield{Rules} Integer ticks and lots; stable sorting, so that replays are deterministic; \omterm{def:m3:centralised-exchanges:postonly}{post-only orders} that would cross are rejected; orders that would take a
+position beyond the cap are rejected.
+\bfield{Acceptance tests} \texttt{code/firm/blockbook/tests/}: price-time priority and post-only rejection; a stale quote picked off under arrival order and protected under
+the class rule; the \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:oicap}{open-interest cap}; the median mark.
+\bfield{Stretch} Consensus batches within a block; margin checks at order entry and at the resting side's fill; liquidation orders entering the block as IOCs.
+\end{build}
+
+\begin{omsources}
+\item Hyperliquid documentation: HyperCore overview, order book, oracle, robust price indices, liquidations, protocol vaults, delisting, market making.
+Accessed September 2026.
+\item dYdX documentation, ``Intro to dYdX Chain Architecture''; GMX documentation, introduction. Accessed September 2026.
+\item CoinDesk Research, 17 October 2025; Protos, 10 December 2025 (see \cref{ch:m3:margin-liquidation-and-loss-allocation}).
+\item CoinDesk, ``Hyperliquid Loses \$4M After Whale's Over \$200M Ether Trade Unwinds'', 12 March 2025; ``HyperLiquid Delists JELLY
+After Vault Squeezed in \$13M Tussle'', 26 March 2025.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:1}
+In one block arrive, in this order: an IOC buy at 101, a cancel of the ask at 101, and a post-only ask at 103. What executes under arrival order, and under the
+class rule?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:2}
+Why can a general-purpose chain with 12-second blocks and per-transaction gas not host a competitive order book?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:3}
+What does the stake-weighted median of \omterm{def:m3:blockchains-for-traders:pow}{validators}' \omterm{def:m3:blockchains-for-traders:contract}{oracle} prices protect against?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:4}
+An asset has a maximum leverage of 20 times. What is its maintenance margin under the rule of \cref{dat:m3:on-chain-order-books-and-perpetual-dexs:oracle}, and at
+what equity is a position taken over by the vault?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:5}
+A vault inherits a USD~4 million short at 3 times maximum leverage and the price then doubles. What does it lose?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:6}
+Compare the risks a liquidity provider bears in an oracle-priced pool and in an order-book venue's vault.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:7}
+\emph{Coding.} With \texttt{replay}, raise the probability that the taker arrives first to 0.9. How do the two rules compare?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:on-chain-order-books-and-perpetual-dexs:8}
+\emph{Find the flaw.} ``The venue is decentralised, so no one can change a market's rules while I hold a position.''
+\end{exercise}
+
+\section{Problem: The Squeezed Vault}
+
+\begin{problem}[{Weekend problem --- a thin market, a large short, a public backstop}]\label{pb:m3:on-chain-order-books-and-perpetual-dexs:1}
+A thin \omterm{def:m3:blockchains-for-traders:key}{token} trades as a perpetual with a maximum leverage of 3 times. A trader opens a USD~10 million short and lets it be liquidated; the vault takes it over at two
+thirds of the maintenance margin. The \omterm{def:m3:blockchains-for-traders:key}{token}'s spot price, on small external venues, is then pushed up.
+
+\medskip\noindent\textbf{Part I --- The takeover.}
+\begin{enumerate}
+\item What is the maintenance margin, and what margin comes with the position when the vault takes it over?
+\item Why could the position not be closed in the book before the takeover?
+\item What does the vault lose if the price rises 100\% before it can close? 400\%?
+\item Why can the trader profit although his short was liquidated?
+\item What does the \omterm{def:m3:blockchains-for-traders:contract}{oracle}'s construction make the attacker do?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The cap.}
+\begin{enumerate}[resume]
+\item What cap on a single position keeps the vault's loss within USD~5 million for squeezes up to 500\%?
+\item What would a cap of USD~2 million have limited the loss to at 400\%?
+\item Why should the cap depend on the depth of the external spot markets?
+\item What other parameters could the venue tighten?
+\item What does the vault's depositor need to know about these parameters?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Governance.}
+\begin{enumerate}[resume]
+\item What does a \omterm{def:m3:blockchains-for-traders:pow}{validators}' vote to delist do to open positions?
+\item Who gains and who loses from settling at the \omterm{def:m3:blockchains-for-traders:contract}{oracle}'s one-hour average?
+\item Is the vote a failure of decentralisation or a feature of it?
+\item How would a centralised venue have handled the same attack?
+\item How does a trading firm price this governance risk?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Should a vault backstop thin markets at all?
+\item What makes an on-chain venue safer than a centralised one, and what does not?
+\item Where would you want the firm's market making: on the order-book DEX, the off-chain book or the oracle-priced pool?
+\item State the \emph{named result}: the vault's loss as a function of the squeeze for a USD~10 million position, and the cap that bounds it to USD~5 million at 500\%.
+\item In one sentence: what is a public backstop?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:1}
+How does an \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:priority}{in-block priority rule} that applies cancels before orders change a market maker's economics?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:2}
+What changes in your order-management system when the venue is a \omterm{def:m3:blockchains-for-traders:chain}{blockchain} with sub-second blocks?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:3}
+Compare a weighted median of external prices with a volume-weighted average as an \omterm{def:m3:blockchains-for-traders:contract}{oracle}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:4}
+What limits would you set for a firm's exposure to a \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:perpdex}{perpetual DEX}'s vault or pool?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader, researcher}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:5}
+How would you attack an \omterm{def:m3:on-chain-order-books-and-perpetual-dexs:oracle}{oracle-priced exchange}, and how would you defend it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:m3:on-chain-order-books-and-perpetual-dexs:6}
+Design a deterministic replay system for a block-based venue's order books from its published blocks.
+\end{interviewq}

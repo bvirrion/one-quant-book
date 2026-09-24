@@ -1,0 +1,313 @@
+\chapter{Transforms, Interpolation and Algorithmic Differentiation}\label{ch:qm:transforms-interpolation-and-algorithmic-differentiation}
+
+The risk run bumps 400 curve points one at a time and reprices the book 401 times every night. The same 400 sensitivities come out of one recording of the pricing code and one sweep backwards
+through it, at the cost of a few prices. This chapter collects the numerical tools that pricing and risk code is made of: Fourier methods that price from a \omterm{def:qm:probability-at-speed:charfn}{characteristic function}, interpolation that
+turns a handful of quotes into a curve, root finders that invert a pricing formula, and \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{algorithmic differentiation}, which delivers exact derivatives of whatever the code computes.
+
+\section{Fourier methods}
+
+\begin{definition}[Discrete and fast Fourier transforms]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:dft}
+The \emph{discrete Fourier transform}\index{discrete Fourier transform} of $x_0, \dots, x_{N-1}$ is $X_k = \sum_{j=0}^{N-1}x_je^{-2\pi\mathrm ijk/N}$, $k = 0, \dots, N - 1$. A \emph{fast Fourier
+transform}\index{fast Fourier transform} computes it in $O(N\log N)$ operations instead of $O(N^2)$ by splitting it recursively into transforms of half the length (Cooley and Tukey, 1965).
+\end{definition}
+
+A Lévy model is specified by its \omterm{def:qm:jump-processes:triplet}{characteristic exponent} (chapter~6), not its density, so prices come from the \omterm{def:qm:probability-at-speed:charfn}{characteristic function} $\varphi(u) = \E[e^{\mathrm iu\ln(S_T/S_0)}]$. Carr and Madan (1999)
+price a whole strip of strikes with one \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:dft}{fast Fourier transform} of a damped call; the method below needs no damping and converges faster.
+
+\begin{proposition}[Fourier inversion]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:gp}
+For a random variable $X$ with \omterm{def:qm:probability-at-speed:charfn}{characteristic function} $\varphi$ and a continuity point $k$ of its distribution, $\P(X > k) = \frac12 + \frac1\pi\int_0^\infty\mathrm{Re}\bigl[e^{-\mathrm iuk}\varphi(u)/(\mathrm iu)\bigr]\,du$
+(Gil-Pelaez, 1951).
+\end{proposition}
+
+For a Merton jump diffusion ($\sigma = 15\%$, jumps at rate 0.5 a year with mean $-0.1$ and standard deviation 0.2 in log-price, $r = 3\%$, one year), the formula with the trapezoidal rule on $[0, 200]$ gives
+$\P(S_T > 110) = 0.3503999$, against the Poisson mixture of lognormals to $3 \times 10^{-10}$.
+
+\begin{definition}[COS method]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:cos}
+The \emph{COS method}\index{COS method} (Fang and Oosterlee, 2008) truncates the density of $y = \ln(S_T/K)$ to an interval $[a, b]$, expands it in a cosine series whose coefficients are read off the
+\omterm{def:qm:probability-at-speed:charfn}{characteristic function}, $A_k \approx \frac2{b-a}\mathrm{Re}[\varphi(\frac{k\pi}{b-a})e^{-\mathrm ik\pi a/(b-a)}]$, and integrates the payoff against each cosine in closed form, so that a price is
+$e^{-rT}\sum_{k<N}{}'A_kV_k$ (the first term halved).
+\end{definition}
+
+\begin{proposition}[Convergence of the COS method]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:cosconv}
+For a density that is smooth on the truncation interval, the cosine coefficients decay faster than any power of $k$, and the error of the COS price decays exponentially in $N$ until the \omterm{def:qm:finite-difference-methods:consistent}{truncation error}
+of $[a, b]$ dominates (Fang and Oosterlee, 2008; stated).
+\end{proposition}
+
+With $[a, b]$ set by ten standard deviations from the \omterm{def:qm:jump-processes:cumulant}{cumulants}, a Black--Scholes call is exact to $7 \times 10^{-15}$ with 64 terms, and the Merton call to $10^{-7}$ with 64 and $2 \times 10^{-12}$ with 128
+(\cref{fig:qm:transforms-interpolation-and-algorithmic-differentiation:cos}). The firm prices calls from the put expansion and parity, which keeps the coefficients bounded. For a variance-gamma model,
+where only simulation is available as a check, 256 terms give 9.5243 and 400\,000 simulated paths $9.528 \pm 0.022$.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=5cm,xlabel={number of cosine terms $N$},ylabel={price error},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=264,ymin=1e-15,ymax=10,grid=major,grid style={gray!25},
+  legend cell align=left,legend style={font=\footnotesize,at={(0.97,0.97)},anchor=north east,fill=white,draw=none},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.5pt] table[x=N,y=bs]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/cos.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.5pt] table[x=N,y=merton]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/cos.csv};
+\legend{Black--Scholes ($\sigma = 20\%$),Merton jump diffusion}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Error of the COS price of a one-year at-the-money call against the number of cosine terms (logarithmic error axis, linear $N$): exponential convergence down to rounding for Black--Scholes and
+to the accuracy of the reference series for Merton. Data: the chapter's tutorial.}\label{fig:qm:transforms-interpolation-and-algorithmic-differentiation:cos}
+\end{omfigure}
+
+\section{Interpolation and splines}
+
+\begin{definition}[Cubic, natural and monotone splines, Runge phenomenon]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:spline}
+A \emph{cubic spline}\index{cubic spline} through $(x_i, y_i)$ is a piecewise cubic with continuous first and second derivatives; a \emph{natural cubic spline}\index{natural cubic spline} has zero second
+derivative at both ends, and its second derivatives at the nodes solve a tridiagonal system. \emph{Monotone cubic interpolation}\index{monotone cubic interpolation} chooses the node slopes of a piecewise
+cubic Hermite interpolant so that it is monotone wherever the data are. The \emph{Runge phenomenon}\index{Runge phenomenon} (Runge, 1901) is the growth, near the ends of the interval, of the error of
+polynomial interpolation at equally spaced nodes as the degree increases.
+\end{definition}
+
+\begin{proposition}[Minimal curvature of the natural spline]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:minimal}
+Among all twice continuously differentiable functions through the data, the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:spline}{natural cubic spline} minimises $\int(f^{\prime\prime})^2$.
+\end{proposition}
+
+\begin{proof}
+Let $s$ be the spline and $g = f - s$, which vanishes at the nodes. Integrating by parts on each interval, $\int s^{\prime\prime}g^{\prime\prime} = [s^{\prime\prime}g']_{x_0}^{x_n} - \int s^{\prime\prime\prime}g' = 0$, because $s^{\prime\prime}$ vanishes at the ends and $s^{\prime\prime\prime}$ is
+constant on each interval, where $\int g' = 0$. Hence $\int(f^{\prime\prime})^2 = \int(s^{\prime\prime})^2 + \int(g^{\prime\prime})^2 \ge \int(s^{\prime\prime})^2$.
+\end{proof}
+
+\begin{proposition}[Fritsch--Carlson condition]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:fc}
+On an interval where the data increase with secant slope $\delta > 0$, the cubic Hermite interpolant with end slopes $m_0, m_1 \ge 0$ is monotone if $\alpha = m_0/\delta$ and $\beta = m_1/\delta$ satisfy
+$\alpha^2 + \beta^2 \le 9$ (Fritsch and Carlson, 1980).
+\end{proposition}
+
+Minimal curvature is not what a rates desk wants. On the Treasury curve of 3 July 2023 (constant-maturity yields from one month to thirty years, treated as zero rates for the illustration), the natural
+spline of the zero rates produces a forward curve that falls to 2.63\% at thirty years; the monotone interpolation of $rt$, whose derivative is the forward, keeps every forward between 3.32\% and 5.67\%;
+linear interpolation of zero rates gives forwards that jump by up to 0.43 percentage points at the pillars (\cref{fig:qm:transforms-interpolation-and-algorithmic-differentiation:fwd}). Hagan and West (2006)
+survey the methods used for curves. Global polynomials are worse still: through eleven equally spaced samples of $1/(1 + 25x^2)$ on $[-1, 1]$, the interpolating polynomial errs by 1.92 near the ends.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xlabel={maturity (years)},ylabel={instantaneous forward (\%)},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=30,ymin=2.4,ymax=6,grid=major,grid style={gray!25},
+  legend columns=4,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[black!50,thick] table[x=t,y=linear]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/forwards.csv};
+\addplot[omThm,very thick] table[x=t,y=spline]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/forwards.csv};
+\addplot[omDef,very thick] table[x=t,y=monotone]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/forwards.csv};
+\addplot[only marks,mark=*,mark size=1.6pt,black] table[x=t,y=zero]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/pillars.csv};
+\legend{linear zeros,natural spline,monotone ($rt$),zero-rate pillars}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Instantaneous forward curves implied by three interpolations of the Treasury curve of 3 July 2023, with the pillar yields (treated as zero rates). Data: FRED series DGS1MO to DGS30 (Board of
+Governors of the Federal Reserve System, H.15).}\label{fig:qm:transforms-interpolation-and-algorithmic-differentiation:fwd}
+\end{omfigure}
+
+\section{Root finding}
+
+\begin{definition}[Bisection, secant and Brent's methods]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:roots}
+The \emph{bisection method}\index{bisection method} halves a bracket $[a, b]$ with $f(a)f(b) < 0$ at each step. The \emph{secant method}\index{secant method} replaces the derivative in \omterm{def:qm:numerical-optimisation-in-practice:newton}{Newton's method} by the
+slope through the last two iterates. \emph{Brent's method}\index{Brent's method} (Brent, 1973) keeps a bracket and takes an inverse quadratic interpolation or secant step when it stays inside the bracket and
+shrinks it fast enough, and a bisection step otherwise.
+\end{definition}
+
+\begin{proposition}[Convergence of the root finders]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:rootconv}
+Bisection gains one bit per step and always converges; the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:roots}{secant method} converges locally with order $(1 + \sqrt5)/2 \approx 1.618$ at a simple root; \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:roots}{Brent's method} always converges, never much more slowly than bisection
+(at most about the square of the bisection count), and superlinearly near a simple root (Brent, 1973).
+\end{proposition}
+
+Implied volatility is the standard test. For a one-year call ($S = 100$, $r = 3\%$, true volatility 25\%), bisection on $[0.001, 5]$ needs 36 steps at every strike. At the money, Newton from 20\% needs 3
+iterations, the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:roots}{secant method} 4, Brent 5. At a strike of 400 the price is $2.5 \times 10^{-7}$ and the vega at 20\% is $8 \times 10^{-9}$: Newton's first step goes to a volatility of 3\,062\%, where the vega
+underflows, and the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:roots}{secant method} also fails, while Brent converges in 18. The firm's rule is a bracketing method with a fast interior step, and Newton only from a guess known to be close.
+
+\section{Forward and adjoint algorithmic differentiation}
+
+\begin{definition}[Algorithmic differentiation, forward and reverse modes, dual numbers]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}
+\emph{Algorithmic differentiation}\index{algorithmic differentiation} computes derivatives of a function given as a program by applying the chain rule to its elementary operations, exactly up to
+rounding. \emph{Forward mode}\index{forward mode} propagates, with each value, its derivative along one input direction; \emph{dual numbers}\index{dual number} $a + b\epsilon$ with $\epsilon^2 = 0$ implement it,
+since $f(a + b\epsilon) = f(a) + f'(a)b\epsilon$ (Wengert, 1964). \emph{Reverse mode}\index{reverse mode} records the operations and then propagates adjoints $\bar v = \partial y/\partial v$ from the output back to
+every input (Linnainmaa, 1976, from his 1970 master's thesis on rounding errors; Griewank, 2012, recounts several independent discoveries); in finance it is called \emph{adjoint mode}\index{adjoint mode}, or AAD.
+\end{definition}
+
+\begin{definition}[Tape, checkpointing]\label{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}
+A \emph{tape}\index{tape} is the record, made during the forward evaluation, of each elementary operation's inputs and local partial derivatives. \emph{Checkpointing}\index{checkpointing} stores only some
+intermediate states during the forward pass and recomputes the operations between them during the reverse pass, trading computation for memory.
+\end{definition}
+
+\begin{proposition}[Cheap gradient principle]\label{prop:qm:transforms-interpolation-and-algorithmic-differentiation:cheap}
+For a scalar function of $n$ inputs evaluated with $E$ elementary operations, each with at most two inputs, the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} computes the whole gradient with a number of operations bounded by a small
+constant times $E$, independent of $n$; \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode} and finite differences need $n$ passes (Griewank and Walther, 2008).
+\end{proposition}
+
+\begin{proof}
+The recording evaluates each operation once and computes at most two local partials; the reverse sweep performs one multiply-add per recorded (operation, input) pair. With $P \le 2E$ pairs, the total
+is $E + 2P \le 5E$ in this count, whatever $n$. \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{Forward mode} propagates one tangent per pass, so the full gradient needs $n$ passes.
+\end{proof}
+
+The firm's toy book has 400 zero-rate pillars on thirty years, 120 quarterly cash flows and 119 caplets priced by Black's formula on the three-month forwards: 2\,864 operations for one value. The reverse
+sweep costs, in the count above, 3.58 evaluations; bumping costs 401 and \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode} 1\,433 (\cref{fig:qm:transforms-interpolation-and-algorithmic-differentiation:cost}). The adjoint gradient agrees
+with \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode} to $2 \times 10^{-13}$ and with central differences to $9 \times 10^{-6}$ on sensitivities as large as 517 (the bumps' own error); 213 of the 400 are nonzero, since only the pillars
+next to a cash-flow date matter under linear interpolation. The C++20 twin, timed in its acceptance test, returns the gradient of a similar 400-input function in less than twenty times one plain
+evaluation (between five and seven in the runs made for this chapter, \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape} allocation included).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={number of inputs $n$},ylabel={cost of the gradient (evaluations)},
+  tick label style={font=\small},label style={font=\small},xmin=20,xmax=500,ymin=1,ymax=3000,grid=major,grid style={gray!25},
+  xtick={25,50,100,200,400},xticklabels={25,50,100,200,400},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black,very thick,mark=square*,mark size=1.5pt] table[x=n,y=bump]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/adcost.csv};
+\addplot[omThm,very thick,mark=*,mark size=1.5pt] table[x=n,y=forward]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/adcost.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=1.8pt] table[x=n,y=reverse]{figdata/methods/28-transforms-interpolation-and-algorithmic-differentiation/adcost.csv};
+\legend{bumping ($n + 1$),forward mode,reverse mode}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Cost of the gradient of the toy rates book, in evaluations, by operation count, against the number of zero-rate pillars: bumping and \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode} grow with $n$, the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} does not.
+Data: the chapter's tutorial.}\label{fig:qm:transforms-interpolation-and-algorithmic-differentiation:cost}
+\end{omfigure}
+
+The price of the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} is memory: the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape} holds every operation. A time-stepping loop of 10\,000 steps records 60\,003 nodes; with a checkpoint every 100 steps, the reverse pass holds at most 201
+states (100 checkpoints and one segment) and recomputes the loop once, and the gradient is the same to $10^{-14}$. Two practical cautions: a payoff with a kink or a jump has a derivative that is zero or
+undefined almost everywhere, so AAD of a Monte Carlo digital returns zero and needs smoothing or a likelihood-ratio term; and code that branches on values records only the branch taken. Giles and
+Glasserman (2006) brought the adjoint method to Monte Carlo Greeks in finance.
+
+\section{Tutorial: one sweep instead of 401}\label{tut:qm:transforms-interpolation-and-algorithmic-differentiation:aad}
+
+\begin{tutorial}
+\textbf{Goal.} Price by COS from a Lévy exponent, build three forward curves, invert Black--Scholes with four root finders, and differentiate a 400-input book three ways. \textbf{End state:} the four figures
+and the gradient agreement.
+\begin{tutsteps}
+\item \textbf{The \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape}.} Nodes, the reverse sweep and one overloaded operation in the C++20 header.
+\omcode{code/firm/aad/cpp/firm_aad.hpp}{13}{52}{A tape, its reverse sweep and a recorded multiplication (C++20).}
+\item \textbf{\omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{Checkpointing}.} The Python reference recomputes each segment on a fresh \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape}.
+\omcode{code/firm/aad/firm_aad.py}{201}{229}{Reverse mode through a long loop with checkpoints (Python).}
+\item \textbf{Run} \texttt{cos\_convergence()}, \texttt{vg\_check()}, \texttt{gil\_pelaez\_digital()}, \texttt{forward\_curves()}, \texttt{implied\_vol\_iterations()}, \texttt{gradients()} and
+\texttt{checkpoint\_demo()} in \texttt{qm\_transforms.py}; then \texttt{fig\_transforms.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace linear by monotone interpolation inside the book and watch the number of nonzero sensitivities; differentiate the COS price with respect to the Merton parameters by
+running \texttt{cos\_call} on \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{dual numbers}; add a second-order (forward over reverse) gamma.
+\end{tutorial}
+
+\section{Build: algorithmic differentiation}\label{bld:qm:transforms-interpolation-and-algorithmic-differentiation:aad}
+
+\begin{build}
+\bfield{Purpose} Exact sensitivities of any pricing code at the cost of a few evaluations, for the pricing library and the risk engine of later books.
+\bfield{Interface} Python reference: \texttt{Tape}, \texttt{Var}, \texttt{Dual}, \texttt{exp}, \texttt{log}, \texttt{sqrt}, \texttt{ncdf}, \texttt{maximum}, \texttt{gradient}, \texttt{forward\_gradient},
+\texttt{bump\_gradient}, \texttt{checkpointed\_gradient}. C++20: \texttt{firm::aad::Var} on a thread-local \texttt{tape}, \texttt{Tape::reverse}, \texttt{Dual}. Rust: \texttt{Var}, \texttt{reverse},
+\texttt{clear}, \texttt{Dual}, \texttt{ncdf}.
+\bfield{Rules} Every AAD gradient ships with a bump check on a sample of inputs; the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape} is cleared per valuation and per thread; kinks and jumps are smoothed before differentiation; long loops are
+checkpointed.
+\bfield{Acceptance tests} \texttt{code/firm/aad/\{tests,cpp,rust\}}: elementary rules against hand derivatives; operation counts; the 400-input test function's value and three gradient components
+equal in the three languages; forward against reverse to $10^{-11}$; central and one-sided bumps; \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{checkpointing} equal to the full \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape}; the C++ time ratio below twenty.
+\bfield{Stretch} Vector \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode}; second derivatives; expression templates to shrink the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape}; adjoints of a linear solve (chapter~25) without taping its inner loops.
+\end{build}
+
+\begin{omsources}
+\item J.~W.~Cooley and J.~W.~Tukey, \emph{Mathematics of Computation} 19, 1965; P.~Carr and D.~Madan, ``Option valuation using the fast Fourier transform'', \emph{Journal of Computational Finance} 2(4), 1999.
+\item F.~Fang and C.~W.~Oosterlee, ``A novel pricing method for European options based on Fourier-cosine series expansions'', \emph{SIAM Journal on Scientific Computing} 31, 2008; J.~Gil-Pelaez, \emph{Biometrika} 38, 1951.
+\item F.~N.~Fritsch and R.~E.~Carlson, ``Monotone piecewise cubic interpolation'', \emph{SIAM Journal on Numerical Analysis} 17, 1980; P.~S.~Hagan and G.~West, ``Interpolation methods for curve construction'',
+\emph{Applied Mathematical Finance} 13, 2006; C.~Runge, \emph{Zeitschrift für Mathematik und Physik} 46, 1901.
+\item R.~P.~Brent, \emph{Algorithms for Minimization without Derivatives}, Prentice-Hall, 1973.
+\item R.~E.~Wengert, \emph{Communications of the ACM} 7, 1964; S.~Linnainmaa, \emph{BIT} 16, 1976; A.~Griewank, ``Who invented the reverse mode of differentiation?'', \emph{Documenta Mathematica}, Extra Volume ISMP, 2012; A.~Griewank and A.~Walther, \emph{Evaluating Derivatives}, 2nd ed., SIAM, 2008; M.~Giles and P.~Glasserman,
+``Smoking adjoints: fast Monte Carlo Greeks'', \emph{Risk}, January 2006.
+\item Treasury yields: Board of Governors of the Federal Reserve System, H.15, via FRED (series DGS1MO to DGS30), accessed 24 September 2026.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:1}
+How many complex multiplications does a direct \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:dft}{discrete Fourier transform} of length 4\,096 need, and roughly how many does a radix-2 \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:dft}{fast Fourier transform} need?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:2}
+Evaluate $f(x) = x^2e^x$ on the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{dual number} $1 + \epsilon$ and read off $f'(1)$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:3}
+How many bisection steps reduce a bracket of width 5 below $10^{-10}$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:4}
+Write the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{tape} of $y = \sin(x_1x_2) + x_1$ and run the reverse sweep by hand at $(x_1, x_2) = (1, 2)$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:5}
+Show that the instantaneous forward is $f(t) = r(t) + tr'(t)$, and explain why a spline of $r$ with a large negative slope at the long end produces low forwards there.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:6}
+Why does a pathwise AAD delta of a Monte Carlo digital option return zero, and name two remedies.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:7}
+\emph{Coding.} Record the implied-volatility iteration counts of the four root finders at strikes 50, 70, 100, 150, 250 and 400, and explain the failures.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:transforms-interpolation-and-algorithmic-differentiation:8}
+\emph{Find the flaw.} ``Our AAD gradient differs from the bumped one by $10^{-5}$ on a sensitivity of 500, so the AAD library has a bug.''
+\end{exercise}
+
+\section{Problem: One Sweep Instead of 401}
+
+\begin{problem}[{Weekend problem --- 400 sensitivities for the price of a few}]\label{pb:qm:transforms-interpolation-and-algorithmic-differentiation:1}
+A toy rates book on a 400-pillar zero curve holds 120 quarterly cash flows and 119 caplets. The nightly risk run bumps each pillar.
+
+\medskip\noindent\textbf{Part I --- Prices from transforms.}
+\begin{enumerate}
+\item How does the COS error behave with the number of terms for Black--Scholes and Merton?
+\item What does the Gil-Pelaez formula give for the Merton digital, and against what?
+\item How is the variance-gamma COS price checked?
+\item Why price calls from the put expansion?
+\item When is the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:dft}{fast Fourier transform} the better tool?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Curves and roots.}
+\begin{enumerate}[resume]
+\item What happens to the forwards under the natural spline of zero rates, and where?
+\item What does monotone interpolation of $rt$ guarantee, and what range of forwards does it give?
+\item What is wrong with linear interpolation of zero rates?
+\item How do the four root finders fare at the money and at a strike of 400?
+\item What is the Runge error on eleven equispaced nodes?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The gradient.}
+\begin{enumerate}[resume]
+\item How many operations does one valuation perform, and how many (operation, input) pairs?
+\item What do bumping, \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{forward mode} and \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} cost, in evaluations?
+\item How well do the three gradients agree, and why does the bump differ?
+\item Why are only 213 of 400 sensitivities nonzero?
+\item What does \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:tape}{checkpointing} buy on a 10\,000-step loop?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Which sensitivities should still be bumped?
+\item What must the risk engine check every night?
+\item What does the C++ timing add to the operation count?
+\item State the \emph{named result}: the cost ratio of the adjoint gradient to one evaluation for the 400-input book, against 401 for bumping, and the agreement between the two.
+\item In one sentence: why is the \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{adjoint mode} the natural mode for risk?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, developer}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:1}
+Explain forward and \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} differentiation, and when each is cheaper.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:2}
+How would you implement \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:ad}{reverse mode} in C++, and what limits its use in production?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:3}
+How do you compute an implied volatility robustly for any strike?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:4}
+Which interpolation would you use for a discount curve, and why not a \omterm{def:qm:transforms-interpolation-and-algorithmic-differentiation:spline}{natural cubic spline} of zero rates?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:5}
+How would you price a European option under a model known only through its \omterm{def:qm:probability-at-speed:charfn}{characteristic function}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk}]\label{iq:qm:transforms-interpolation-and-algorithmic-differentiation:6}
+Your AAD Monte Carlo gives a zero delta for a barrier option. What happened and what do you do?
+\end{interviewq}
