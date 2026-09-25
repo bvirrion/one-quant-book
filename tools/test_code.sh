@@ -6,6 +6,8 @@
 #   LaTeX  : every \omcode{path}{a}{b} points at an existing file and a..b is inside it
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Many small matrix products: BLAS threads only add overhead (a 12-second model took 6.5 minutes with them).
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}" OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 PY=.venv/bin/python
 sel="${1:-}"
 roots=()

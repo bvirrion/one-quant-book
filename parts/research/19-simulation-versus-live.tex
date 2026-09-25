@@ -1,0 +1,258 @@
+\chapter{Simulation Versus Live}\label{ch:rs:simulation-versus-live}
+
+The research replay of a quoting strategy, the level-3 simulation of chapter~18 run on the same hours the strategy then traded, said it would lose
+about \$50 an hour. Live, it lost \$491 an hour, and filled twice as many lots. Nothing was wrong with the replay's code; its fills were reproduced
+in three languages. What went wrong is what every firm meets on its first live month: the simulator answered a slightly different question from the one
+the market asked. This chapter builds the reconciliation (\texttt{firm.simlive}): match the live fills to the simulated ones, walk the simulated P\&L to
+the live one an assumption at a time, locate the fills the simulator could not produce, and decide what to change so that the next estimate is closer. The
+``live'' market is a stand-in that can be rerun: \texttt{firm.tape} with the strategy trading inside it as an agent, its orders real orders that other traders
+see and trade against.
+
+\section{Reconciling fills}
+
+\begin{definition}[Sim-to-live reconciliation, shadow trading]\label{def:rs:simulation-versus-live:reconciliation}
+\emph{Sim-to-live reconciliation}\index{sim-to-live reconciliation} is the systematic comparison of a strategy's live orders, fills and P\&L with what its
+simulator produces on the same market data and the same signals. \emph{Shadow trading}\index{shadow trading} runs the simulator in parallel with live trading,
+on the live feed, so that the comparison is available every day.
+\end{definition}
+
+The chapter's quoter keeps one lot on the best bid and one on the best ask within five lots of inventory. Live, inside \texttt{firm.tape}, it draws its own
+latencies (market data 0.02 seconds plus an exponential of mean 0.02; order entry 0.03 plus an exponential of mean 0.02) and pays 0.1 tick a share. Its orders
+are matched in time priority, count in the book that informed traders and liquidity providers react to, and are never cancelled by the background flow. The
+research estimate is the replay of chapter~18 (fifo queue model) on the same hour without the quoter: the same seed and the same efficient-price path, as a
+researcher would have run it the day before. Over six one-hour sessions the quoter filled 597 lots an hour live; the replay, on the live hour's messages without
+the quoter's own and with the live latencies, 305.
+
+\begin{definition}[Replay parity test]\label{def:rs:simulation-versus-live:parity}
+A \emph{replay parity test}\index{replay parity test} replays a live session through the simulator, with the live orders' decisions and timings, and measures the
+share of live fills the simulator reproduces (same side, price and time within a tolerance) and the share of simulated fills that happened live.
+\end{definition}
+
+\texttt{firm.simlive.match\_fills} pairs each live fill with a simulated fill of the same side and price within a second. Only 27\% of the live lots have a simulated
+counterpart, and 54\% of the simulated lots happened live. A parity this low says the simulator is not a noisy version of live; it is a different model of it.
+
+\section{Reconciling P\&L}
+
+\begin{definition}[Divergence decomposition]\label{def:rs:simulation-versus-live:decomposition}
+A \emph{divergence decomposition}\index{divergence decomposition} walks the simulated P\&L to the live P\&L through a sequence of intermediate estimates, each changing
+one assumption to its live value, and attributes each step's change to that assumption.
+\end{definition}
+
+The order of the steps matters (changing latency first and the market second is not the same as the reverse), and each step must be a run of the simulator, not an
+estimate. The chapter's sequence, averaged over the six sessions (\cref{fig:rs:simulation-versus-live:waterfall}):
+\begin{enumerate}
+\item the research replay: no latency, no fees, the hour without the quoter: $-\$50.5$ an hour;
+\item with the live mean latencies: $-\$56.4$ (latency: $-\$5.9$);
+\item on the market the quoter actually met, the live hour's messages without its own: $-\$112.8$ (the market: $-\$56.4$);
+\item the live fills themselves, before fees: $-\$431.2$ (the fills: $-\$318.3$);
+\item live, after fees: $-\$490.9$ (fees: $-\$59.7$).
+\end{enumerate}
+
+The market step compares two different realisations of the hour's order flow, with and without the quoter, and part of it is chance. A second realisation of each hour
+without the quoter (the same efficient-price path, another order-flow seed) differs from the first by \$62.8 an hour on average: the market step is within its chance.
+Latency and fees are small and known; the gap is in the fills.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.8cm,ybar,bar width=20pt,ylabel={P\&L an hour (\$)},tick label style={font=\small},label style={font=\small},
+  xtick={0,1,2,3,4},xticklabels={{research\\replay},{+ live\\latency},{+ market\\met},{+ live\\fills},{+ fees:\\live}},
+  xticklabel style={align=center,font=\footnotesize},xmin=-0.6,xmax=4.6,ymin=-560,ymax=0,grid=major,grid style={gray!25},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/fixed zerofill,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=level]{figdata/research/19-simulation-versus-live/waterfall.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{From the research replay to live, an assumption at a time: the quoter's P\&L an hour, averaged over six simulated sessions, at each step of the
+decomposition, each \omterm{def:rs:market-data-for-research:bar}{bar} the level after that step. Data: \texttt{rs\_simlive.decomposition}.}\label{fig:rs:simulation-versus-live:waterfall}
+\end{omfigure}
+
+\section{Locating the divergence}
+
+Two mechanisms produce the live fills the replay cannot. They are visible only in the live messages, with the quoter's own orders in them.
+
+\textbf{Trades that stopped at the quoter.} An aggressive order that meets the quoter's lot at the front of the queue is filled by it and may stop there. In the live
+messages without the quoter's, that trade does not exist; a replay of them cannot fill the shadow with volume it never sees. 68\% of the live lots came from aggressive
+orders that executed only against the quoter. The market after a firm trades is not the market without the firm.
+
+\textbf{The last order at a price.} When the other orders at a price are cancelled as the price moves away, the quoter, whose cancellation is still travelling to the
+exchange, is left alone at a stale price, and the next aggressor takes it. In the replay the level simply empties, and nothing trades there. 21\% of the live lots were
+filled with no other order resting at their price, and their mark-out after ten seconds was $-0.85$ ticks, against $-0.11$ for the other live fills: the worst fills
+of the day are the ones the simulator never shows.
+
+\section{Keeping the simulator honest}
+
+\begin{definition}[Simulator calibration, implementation shortfall, arrival price]\label{def:rs:simulation-versus-live:calibration}
+\emph{Simulator calibration}\index{simulator calibration} adjusts a simulator's parameters (latency, queue model, fill probabilities) so that its output matches live
+outcomes. The \emph{implementation shortfall}\index{implementation shortfall} of an order (Perold, 1988) is the difference between the P\&L of a paper portfolio traded
+in full at the \omterm{def:rs:vectorised-backtests:timing}{decision time}'s price and the P\&L actually realised; the price at the \omterm{def:rs:vectorised-backtests:timing}{decision time}, or at the order's arrival in the market, is its \emph{arrival
+price}\index{arrival price}.
+\end{definition}
+
+Calibration is the obvious response, and here it fails instructively. No latency makes the replay fill as many lots as live did: even at zero latency the replay on the
+live messages fills 1\,898 lots over the six sessions against live's 3\,582. Switching to the front-of-queue model fills 8\,886, more than live, with a P\&L of $+\$2\,207$
+against live's $-\$2\,587$. A simulator tuned to match the fill count would have tripled the error in P\&L. The divergence is structural, and the fix is structural too: a
+reactive simulation, in which the strategy's orders are part of the market (as the agent here, and as the exchange simulator of Book~10), for strategies whose orders
+are a noticeable share of the flow at their prices; and for the rest, a replay kept honest by the numbers this chapter produces every day.
+
+The standing reconciliation is a report, produced daily from \omterm{def:rs:simulation-versus-live:reconciliation}{shadow trading}: parity of fills (both shares), the decomposition's steps, the mark-outs of live fills by
+group (matched, live only, alone at the price), and the \omterm{def:rs:simulation-versus-live:calibration}{implementation shortfall} of every parent order against its \omterm{def:rs:simulation-versus-live:calibration}{arrival price}, split into execution, opportunity and
+fees (\texttt{firm.simlive.implementation\_shortfall}). A simulator that has not been reconciled with live is a hypothesis; one that is reconciled every day is an
+instrument.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=8pt,xlabel={session},ylabel={P\&L (\$ an hour)},tick label style={font=\small},label style={font=\small},
+  xtick={1,2,3,4,5,6},ymin=-1050,ymax=150,grid=major,grid style={gray!25},legend columns=3,
+  legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=session,y=sim]{figdata/research/19-simulation-versus-live/sessions.csv};
+\addplot[fill=gray!40,draw=gray] table[x=session,y=chance]{figdata/research/19-simulation-versus-live/sessions.csv};
+\addplot[fill=omThm!55,draw=omThm] table[x=session,y=live]{figdata/research/19-simulation-versus-live/sessions.csv};
+\legend{research replay,replay of another realisation,live}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The quoter's P\&L in each of six simulated sessions: the research replay, the replay of a second realisation of the same hour (with the live latencies), and live.
+The live loss exceeds both in every session. Data: \texttt{rs\_simlive.decomposition}.}\label{fig:rs:simulation-versus-live:sessions}
+\end{omfigure}
+
+\section{Tutorial: ten times the simulated loss}\label{tut:rs:simulation-versus-live:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Trade the quoter live inside \texttt{firm.tape}, replay the same hours, and reconcile: parity, decomposition, the location of the divergence, and a
+calibration that fails. \textbf{End state:} \cref{fig:rs:simulation-versus-live:waterfall,fig:rs:simulation-versus-live:sessions}; the numbers of this chapter.
+\begin{tutsteps}
+\item \textbf{Match the fills}: greedy, in time order, by side and price within a tolerance.
+\omcode{code/firm/simlive/firm_simlive.py}{31}{51}{Matching live fills to simulated ones.}\label{lst:rs:simulation-versus-live:match}
+\item \textbf{The agent}: the quoter inside the market, with its own latencies.
+\omcode{code/research/19-simulation-versus-live/python/rs_simlive.py}{36}{70}{The live quoter as a firm.tape agent.}\label{lst:rs:simulation-versus-live:agent}
+\item \textbf{Run} \texttt{decomposition()}, \texttt{steps()}, \texttt{vanished\_volume()}, \texttt{alone\_at\_price()}, \texttt{effective\_latency()},
+\texttt{model\_calibration()} and \texttt{fig\_simlive.py}.
+\end{tutsteps}
+\textbf{What to change next.} Make the quoter cancel as soon as the other orders at its price fall below a threshold, and watch the ``alone'' fills and the gap shrink;
+restore the executions against the quoter in the replay's input as executions against an anonymous order, and measure the parity again.
+\end{tutorial}
+
+\section{Build: the reconciliation toolkit}\label{bld:rs:simulation-versus-live:simlive}
+
+\begin{build}
+\bfield{Purpose} The daily comparison of every live strategy with its simulator, and the evidence for changing the simulator.
+\bfield{Interface} \texttt{FILL}, \texttt{as\_fills}, \texttt{match\_fills(live, sim, tol)}, \texttt{parity}, \texttt{fill\_pnl(fills, mark)}, \texttt{waterfall(steps)},
+\texttt{calibrate(grid, metric, target)}, \texttt{implementation\_shortfall(side, qty, decision\_px, fills, end\_px, fee\_per\_unit)}; \texttt{firm.tape.simulate(cfg,
+agent)} for the reactive stand-in.
+\bfield{Rules} Every step of a decomposition is a run, in a stated order; parity is reported both ways; calibration is judged on P\&L and mark-outs, not on fill counts alone.
+\bfield{Acceptance tests} \texttt{code/firm/simlive/tests/}: matching with partial quantities and a tolerance; parity both ways, and perfect on identical fills; per-fill P\&L
+summing to the marked total; the waterfall's steps; calibration on a grid; the \omterm{def:rs:simulation-versus-live:calibration}{implementation shortfall} of a buy and a sell by hand.
+\bfield{Stretch} Matching by order identifier with the exchange's acknowledgements; decomposition by time of day; recalibration of a probabilistic queue model on live fills.
+\end{build}
+
+\begin{omsources}
+\item A.~F.~Perold, ``The implementation shortfall: paper versus reality'', \emph{Journal of Portfolio Management} 14(3), 1988.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:simulation-versus-live:1}
+Live fills: buy 100 at 50.00 at 10.2 s, sell 100 at 50.02 at 14.0 s. Simulated fills: buy 100 at 50.00 at 10.9 s, buy 100 at 49.99 at 12.0 s. With a one-second
+tolerance, what are the two parity shares?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:simulation-versus-live:2}
+A decision to buy 10\,000 shares is taken at 20.00. 6\,000 fill at an average of 20.04 and the rest is cancelled; the price ends at 20.30. Fees are 0.2 cents a share.
+Compute the \omterm{def:rs:simulation-versus-live:calibration}{implementation shortfall} and its three parts.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:simulation-versus-live:3}
+Why must each step of a \omterm{def:rs:simulation-versus-live:decomposition}{divergence decomposition} be a run of the simulator rather than an estimate?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:simulation-versus-live:4}
+Why can the market step of the decomposition be within chance even when the strategy's impact is real? How would you separate the two?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:simulation-versus-live:5}
+Explain why a replay of the live session without the strategy's own messages undercounts its fills, and what share of the chapter's live lots it cannot see.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:simulation-versus-live:6}
+Why are fills that happen when the strategy is the last order at its price worse than the others?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:simulation-versus-live:7}
+\emph{Coding.} With \texttt{rs\_simlive.effective\_latency}, confirm that no latency closes the fill gap. Which of the chapter's two mechanisms would a latency change
+affect, and why not the other?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:simulation-versus-live:8}
+\emph{Find the flaw.} ``Live fills were double the simulator's, so we switched the simulator to optimistic fills; now the fill counts match and the \omterm{def:rs:vectorised-backtests:backtest}{backtest} is
+calibrated.''
+\end{exercise}
+
+\section{Problem: Ten Times the Simulated Loss}
+
+\begin{problem}[{Weekend problem --- a live strategy against its simulator}]\label{pb:rs:simulation-versus-live:1}
+The chapter's quoter, live inside \texttt{firm.tape} for six one-hour sessions, and its level-3 replays.
+
+\medskip\noindent\textbf{Part I --- Fills.}
+\begin{enumerate}
+\item How many lots an hour did the quoter fill live, and how many did the replay fill on the live messages without its own?
+\item What are the two parity shares?
+\item What does a parity this low say about the simulator?
+\item Which live latencies did the quoter have, and what does the research replay assume?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- P\&L.}
+\begin{enumerate}[resume]
+\item Give the P\&L an hour at each step of the decomposition.
+\item How large is each step?
+\item How much of the market step can chance explain?
+\item Which steps are known in advance, and which had to be measured?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The divergence.}
+\begin{enumerate}[resume]
+\item What share of the live lots came from aggressive orders that executed only against the quoter, and why can the replay not see them?
+\item What share of the live lots were filled with no other order at their price, and what were their mark-outs against the others'?
+\item Why does the quoter end up alone at a price?
+\item What would reduce those fills?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the decomposition of the gap between live and simulated P\&L into latency, the market, the fills and fees.
+\item What does calibrating latency achieve?
+\item What does switching to the front-of-queue model do to fills and P\&L?
+\item What is the structural fix?
+\item What should the daily reconciliation report contain?
+\item How would you use the \omterm{def:rs:simulation-versus-live:calibration}{implementation shortfall} for this strategy's inventory unwinds?
+\item What changes if the strategy trades 1\% of the volume at its prices instead of 10\%?
+\item In one sentence: what makes a simulator an instrument rather than a hypothesis?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:rs:simulation-versus-live:1}
+Your strategy makes half in production what it made in simulation. Where do you look first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:simulation-versus-live:2}
+What is \omterm{def:rs:simulation-versus-live:calibration}{implementation shortfall}, and how do you decompose it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:rs:simulation-versus-live:3}
+Describe a \omterm{def:rs:simulation-versus-live:parity}{replay parity test} and what it catches.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:rs:simulation-versus-live:4}
+Why does a \omterm{def:rs:vectorised-backtests:backtest}{backtest} on market data recorded while you were trading misstate your fills?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:simulation-versus-live:5}
+How would you calibrate a fill simulator on live fills without overfitting it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, developer}]\label{iq:rs:simulation-versus-live:6}
+Design a daily \omterm{def:rs:simulation-versus-live:reconciliation}{sim-to-live reconciliation} for a firm with fifty strategies.
+\end{interviewq}

@@ -1,0 +1,31 @@
+# 4. Universe, Symbology and Corporate Actions — brief and source ledger
+
+## Brief
+
+- **Hook.** On 9 June 2022 a large technology company's shares began trading under a new ticker; a backtest that joins prices on tickers silently splices two histories, or loses one.
+- **Sections.** A tradable universe through time; Identifiers that change; The security master; Adjusting without leaking; Delistings and the delisting return.
+- **Defines.** tradable universe, universe membership, liquidity filter, security master, permanent identifier, identifier mapping, ticker change, delisting return.
+- **Uses (defined earlier).** symbology (B1.28), reference data (B1.28), adjustment factor (B1.8), stock split (B1.8), dividend (B1.8), spin-off (B1.8), rights issue (B1.8), free float (B1.8), market capitalisation (B1.8), index reconstitution (B1.15), buffer rule (B1.15), point-in-time data (ch3), survivorship bias (ch3), as-of join (ch3), look-ahead bias (ch3).
+- **Tutorial.** Build a security master from a synthetic event history (ticker changes and reuse, mergers, spin-offs, delistings), construct a liquidity universe with buffers through time, and show the returns a ticker join mis-attributes.
+- **Build.** `firm.secmaster`: permanent identifiers with dated identifier mappings, as-of symbol resolution, universe construction with entry and exit buffers, point-in-time adjustment factors (imports firm.corpactions and firm.pit); Python.
+- **Weekend problem.** The ticker that changed hands — named result: the error in a ten-year momentum backtest caused by joining on tickers instead of permanent identifiers in a synthetic universe with ticker reuse, and the share of names affected.
+- **Facts to verify.** ticker change FB to META on 9 June 2022 (company press release); ISIN standard ISO 6166; FIGI standard (OMG / X9.145) and OpenFIGI; CUSIP (CUSIP Global Services); CRSP permanent numbers PERMNO/PERMCO (CRSP documentation); Shumway 1997 delisting returns (JF).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Meta Platforms' Class A common stock began trading on Nasdaq under the ticker symbol META prior to market open on June 9, 2022, replacing FB | Meta press release of 31 May 2022, filed as exhibit 99.1 to a Form 8-K | https://www.sec.gov/Archives/edgar/data/1326801/000132680122000070/may312022-exhibit991.htm | 2026-09-24 | "(Nasdaq: FB) today announced that its Class A common stock will begin trading on NASDAQ under the ticker symbol 'META' prior to market open on June 9, 2022" | hook |
+| F2 | General Motors Company (new GM): common stock approved for listing on the NYSE under the symbol "GM"; on 10 July 2009 it acquired substantially all of the assets of Old GM in a 363 Sale; Old GM's Chapter 11 on 1 June 2009; MLC (Motors Liquidation Company, formerly Old GM) common stock trading under the symbol MTLQQ (Pink Sheets) on 31 December 2009 | General Motors Co., Form S-1/A, November 2010 (SEC EDGAR, CIK 1467858) | https://www.sec.gov/Archives/edgar/data/1467858/000119312510255258/ds1a.htm | 2026-09-24 | "Our common stock has been approved for listing on the New York Stock Exchange under the symbol 'GM'"; "On July 10, 2009, we ... acquired substantially all of the assets and assumed certain liabilities of Old GM (the 363 Sale)"; "MLC Common Stock which is still being traded under the symbol MTLQQ (Pink Sheets) on December 31, 2009" | section 2; fig. reuse |
+| F3 | New GM's initial public offering on 18 November 2010 | secondary: Harvard Business School Working Knowledge and Wikipedia (the S-1/A of F2 precedes the pricing) | https://www.library.hbs.edu/working-knowledge/gms-ipo-back-to-the-future | 2026-09-24 | "The company made its initial public offering (IPO) on November 18th, 2010, resurrecting the old 'GM' ticker on the NYSE" (search excerpt); the chapter says only "November 2010" | section 2 |
+| F4 | CUSIPs are 9-character identifiers for issuers and their financial instruments in the US and Canada | CUSIP Global Services, identifiers page | https://www.cusip.com/identifiers.html | 2026-09-24 | "CUSIPs are 9-character identifiers that capture an issue's important differentiating characteristics for issuers and their financial instruments in the U.S. and Canada" | section 2 |
+| F5 | ISIN (ISO 6166): 12 characters, the first two the ISO 3166-1 alpha-2 country code, then a national security identifier and a check digit | ISO TC 68, "What is ISIN?" (PDF) | https://committee.iso.org/files/live/sites/tc68/files/Robin%20Doyle/What%20is%20ISIN-Final.pdf | 2026-09-24 | "The ISIN code consists of a total of 12 characters, comprised as follows: The first 2 characters are the alpha-2 country code prefix, as issued per ISO 3166-1" | section 2 |
+| F6 | FIGI: once assigned never changes; when the instrument ceases to exist the FIGI is retired and never reused | OpenFIGI, "About FIGI" | https://www.openfigi.com/about/figi | 2026-09-24 | "Once a FIGI is assigned, it never changes throughout the trade lifecycle. If the financial instrument referenced by a FIGI ceases to exist, the FIGI assigned to it is retired and never reused" | section 2 |
+| F7 | Shumway (1997): performance delisting returns mostly missing; average -30% with 71% recovered from OTC prices | chapter 3 ledger F6 | https://www.tylergshumway.org/Shumway-DelistingBiasCRSP-1997.pdf | 2026-09-24 | "With 71 percent of the delisting returns accounted for, the average return is -30 percent" | section 5; iq 5 |
+
+## EXCLUDED
+
+- CRSP PERMNO definition (planned): the CRSP documentation pages did not return the text; the chapter speaks of permanent identifiers generically.
+- That a reorganisation gives an issue new CUSIP/ISIN codes (drafted): no source fetched; removed.
+- The simulated market's counts and returns are computed and tested, not sourced; the permanent identifiers 1044 and 2877 in the GM figure are illustrative, as its caption says.
+- The planned momentum backtest keyed on tickers (named result of the brief): the difference was noise across seeds (the simulated market had no momentum, and freed tickers were reused only after a year); replaced by the spliced-return counts and the adjusted-floor leak, which are stable across seeds.

@@ -1,0 +1,275 @@
+\chapter{Transaction Costs in Research}\label{ch:rs:transaction-costs-in-research}
+
+A daily forecast of fifty large stocks has a gross Sharpe ratio of 2.56. Traded as the mean--variance book it implies, by a fund of \$1 billion, it turns over
+5.33 times its capital a day and pays 1\,223 per cent of its capital a year in costs: a Sharpe ratio of $-29$ after costs. The same forecast with the costs inside
+the optimiser nets 1.80; smoothed over a day as well, 2.43. Nothing about the signal changed. Costs are not a haircut applied to a finished \omterm{def:rs:vectorised-backtests:backtest}{backtest}; they belong
+in the model of the market, in the optimiser and in the signal, and they depend on the fund's size. This chapter fits a cost model to the firm's fills, puts it
+inside the construction with \texttt{firm.tcost}, nets strategies' trades against each other, and makes signals cost-aware.
+
+\section{Cost models}
+
+\begin{definition}[Temporary impact, permanent impact, square-root impact law, percentage of volume]\label{def:rs:transaction-costs-in-research:impact}
+The \emph{temporary impact}\index{temporary impact} of a trade is the part of its price concession that decays after the trade; the \emph{permanent
+impact}\index{permanent impact} is the part that remains, the information the market reads in it. An order's \emph{percentage of volume}\index{percentage of volume}
+is its size $Q$ over the market's daily volume $V$. The \emph{square-root impact law}\index{square-root impact law} states that an order's average impact, as a fraction
+of price, is about $\eta\,\sigma\sqrt{Q/V}$ for daily volatility $\sigma$ and a constant $\eta$ of order one.
+\end{definition}
+
+A trade's cost has three parts: half the bid--ask spread (Book~1, chapter~1), fees, and \omterm{def:rs:order-book-replay-simulation:impact}{market impact} (chapter~18). The first two are linear in the size traded;
+impact is not. Tóth and co-authors explained the square root by a supply and demand that vanish at the current price, so that a large order must be cut up and
+digested; Almgren, Thum, Hauptmann and Li, fitting almost 700\,000 orders executed by Citigroup's US equity desks, found the \omterm{def:rs:transaction-costs-in-research:impact}{temporary impact} grew as the 3/5 power of
+the trading rate. The exponent near a half matters more than its precise value: a trade twice as large costs more per share, and so the cost of a book is not
+proportional to its size.
+
+\section{Estimating costs from your own fills}
+
+The firm's cost model comes from its own parent orders. The chapter simulates a year of them, 5\,000 orders with sizes from 0.01\% to 20\% of daily volume and
+daily volatilities from 1\% to 3\%, from a planted law: half a spread of 2 basis points and impact $0.7\,\sigma\sqrt{Q/V}$, plus the price's own move while the order
+works. The move is the difficulty. At 1\% of daily volume and 2\% volatility the planted impact is 14 basis points; the price's move over the order's life has a
+standard deviation of 63. A single order says almost nothing about its cost, and a cost model is a regression on thousands of orders, whose noise grows with the
+order's size.
+
+\texttt{firm.tcost.fit\_impact} (\cref{lst:rs:transaction-costs-in-research:fit}) averages the costs within twenty bins of participation, fits the exponent on the
+logarithms of the bin averages, and fits $\eta$ with the exponent held at a half, with a standard error robust to the growing noise. From 5\,000 orders it recovers
+$\eta = 0.71$ (standard error 0.08) and an exponent of 0.48 (0.03); from 500 orders, $1.09$ (0.24) and 0.59 (0.07); from 50\,000, $0.67$ (0.03) and 0.49 (0.01)
+(\cref{fig:rs:transaction-costs-in-research:fills}). A desk with a few hundred orders a year knows its cost coefficient to within a third; Kyle and Obizhaeva's
+invariance hypotheses, supported on more than 400\,000 portfolio-transition orders, are one way to borrow strength across stocks by scaling costs with each stock's
+volume and volatility.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10.5cm,height=6cm,xlabel={participation $Q/V$},ylabel={impact at 2\% volatility (bp)},tick label style={font=\small},label style={font=\small},
+  xmin=8e-5,xmax=0.25,ymin=0.5,ymax=150,grid=major,grid style={gray!25},legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=1.6pt,omDef,error bars/.cd,y dir=both,y explicit] table[x=participation,y=cost_bp,y error=se_bp]{figdata/research/27-transaction-costs-in-research/fills.csv};
+\addplot[omThm,thick] table[x=participation,y=fit_bp]{figdata/research/27-transaction-costs-in-research/fills.csv};
+\legend{bin averages of 5\,000 orders,fitted power law}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Impact estimated from a simulated year of parent orders (half spread removed, scaled to 2\% daily volatility), with two-standard-error \omterm{def:rs:market-data-for-research:bar}{bars} and the fitted
+law. The smallest orders' bins are the noisiest relative to their cost. Data: \texttt{rs\_tcost.fills}.}\label{fig:rs:transaction-costs-in-research:fills}
+\end{omfigure}
+
+\section{Costs inside the optimiser}
+
+\begin{definition}[Cost-aware optimisation]\label{def:rs:transaction-costs-in-research:aware}
+\emph{Cost-aware optimisation}\index{cost-aware optimisation} maximises $\alpha^\top w - \frac\gamma2 w^\top\Sigma w - C(w - w_0)$, with $C$ the cost model of the trade
+from the current book: here $C(d) = \sum_i s_i\lvert d_i\rvert + \eta\sigma_i\lvert d_i\rvert^{3/2}\sqrt{A/V_i}$ for half spreads $s_i$, a fund of size $A$ and daily traded
+values $V_i$.
+\end{definition}
+
+The $3/2$ power makes the problem a second-order cone programme (Book~4, chapter~23). \texttt{firm.tcost.cost\_aware} solves it by accelerated proximal gradient
+instead: the quadratic part is smooth, the cost is separable, and its proximal step has a closed form, a soft threshold by the spread followed by the root of a
+quadratic in $\sqrt{\lvert d\rvert}$ (\cref{lst:rs:transaction-costs-in-research:aware}). The chapter's books hold chapter~26's fifty names long and short, daily; the
+forecast is the true expected return of the three planted signals plus noise one and a half times as large, new every day, and $\gamma = 72$. The daily traded
+values of these names have a median of \$474 million.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+fund size & \$10 million & \$100 million & \$1 billion & \$10 billion\\
+\midrule
+mean--variance, costs ignored: after costs & $-4.96$ & $-15.91$ & $-29.47$ & $-34.0$\\
+costs inside: Sharpe ratio before costs & 3.12 & 3.14 & 3.06 & 2.11\\
+\quad after costs & $-0.31$ & 0.06 & 1.80 & 1.76\\
+\quad costs a year & 46.1\% & 28.8\% & 7.6\% & 1.2\%\\
+\quad daily turnover & 2.269 & 0.814 & 0.148 & 0.018\\
+costs inside, forecast smoothed over one day & 1.68 & 2.03 & 2.43 & 1.66\\
+costs ignored, forecast smoothed over fifty days & 1.78 & 1.63 & 1.15 & $-0.23$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The book that ignores costs trades 5.33 times its capital a day; even a \$10 million fund, which pays little more than the spread, loses. The cost-aware book has
+a surprise at the small end: it loses at \$10 million and wins at \$1 billion. With cheap trading it believes its forecast and chases its daily noise, which the
+optimiser cannot tell from alpha; at \$1 billion the cost of trading forces it to move slowly, and moving slowly averages the noise away, so that its Sharpe ratio
+before costs (3.06) is higher than the naive book's (2.56). Costs in the optimiser protect a book from its forecast's noise only when they are large relative to
+that noise; below that, the forecast itself must be made slower.
+
+\section{Netting across strategies}
+
+\begin{definition}[Internal crossing]\label{def:rs:transaction-costs-in-research:crossing}
+\emph{Internal crossing}\index{internal crossing} nets the trades of a firm's strategies in the same stock before any reach the market: a buy of one strategy and
+a sell of another cross at no market cost.
+\end{definition}
+
+Two teams trading the same fifty names from their own forecasts of the same truth, each with its own noise, each smoothed over twenty days and each running
+\$1 billion, would pay 8.27\% and 8.73\% of a team's capital a year apart. Netted, their trades cost 16.04\%: a saving of 0.96 points, 5.7\% of the total. The saving
+is smaller than the offsetting trades suggest, because netting cuts both ways under a concave impact law. Where the teams trade opposite ways, the netted trade is
+smaller and cheaper; where they trade the same way, the combined trade is larger and, cost growing as the $3/2$ power, dearer than the two apart: 2.94 points a year
+dearer here. Each team's own cost estimate understates what its trades cost the firm when others trade alongside it, the first appearance of crowding (chapter~28).
+\texttt{firm.tcost.netting\_saving} shares the saving out in proportion to each strategy's standalone cost, so that netting never makes a strategy's reported costs
+worse.
+
+\section{Cost-aware signals}
+
+\begin{definition}[Signal smoothing, break-even cost]\label{def:rs:transaction-costs-in-research:smoothing}
+\emph{Signal smoothing}\index{signal smoothing} replaces a forecast by an exponentially weighted average of its recent values, with a half-life chosen for net
+performance. A strategy's \emph{break-even cost}\index{break-even cost} is the cost per unit traded at which its return after costs is zero: its gross return over
+its turnover.
+\end{definition}
+
+Smoothing trades signal for turnover. It delays the forecast, which loses the part of the alpha that decays fast, and it averages the forecast's noise, which
+removes trading that had no reason. \Cref{fig:rs:transaction-costs-in-research:smoothing} shows the net Sharpe ratio against the half-life at \$1 billion. The
+book that ignores costs rises from $-29.47$ to a peak of 1.15 at fifty days, and falls beyond it (0.93 at a hundred days, 0.69 at two hundred) as the \omterm{def:rs:measuring-market-making-and-execution:costs}{delay costs} more
+signal than it saves in costs. The cost-aware book peaks early, at 2.43 with a one-day half-life, because the optimiser already smooths; long half-lives only cost it
+signal (0.94 at two hundred days). The optimal smoothing depends on who does the rest of the smoothing, and chapter~26's \omterm{def:rs:portfolio-construction-ii:aim}{aim portfolio} is the same idea made exact
+for signals whose decay rates are known.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=6cm,xlabel={smoothing half-life (days; the first point is no smoothing)},ylabel={Sharpe ratio after costs},
+  tick label style={font=\small},label style={font=\small},xmin=0.22,xmax=250,ymin=-4.2,ymax=3,xtick={0.3,1,10,100},xticklabels={none,1,10,100},
+  grid=major,grid style={gray!25},legend pos=south east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[black!60,thick,mark=o] table[x=half_life,y=naive]{figdata/research/27-transaction-costs-in-research/smoothing.csv};
+\addplot[omDef,very thick,mark=*] table[x=half_life,y=aware]{figdata/research/27-transaction-costs-in-research/smoothing.csv};
+\draw[black!50,densely dotted] (axis cs:0.22,0) -- (axis cs:250,0);
+\legend{costs ignored,costs inside the optimiser}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{The net Sharpe ratio of the fifty-name book at \$1 billion against the half-life of the forecast's smoothing; values below $-4$ are drawn at $-4$. Data:
+\texttt{rs\_tcost.smoothing\_curve}.}\label{fig:rs:transaction-costs-in-research:smoothing}
+\end{omfigure}
+
+\section{Tutorial: from 2.56 to $-29$ and back}\label{tut:rs:transaction-costs-in-research:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Fit the impact law to simulated fills, trade the fifty-name forecast with costs ignored and inside the optimiser at four fund sizes, smooth the
+forecast, and net two teams' trades. \textbf{End state:} the table, \cref{fig:rs:transaction-costs-in-research:fills,fig:rs:transaction-costs-in-research:smoothing}.
+\begin{tutsteps}
+\item \textbf{The fit}: binned averages for the exponent, the robust fit for $\eta$.
+\omcode{code/firm/tcost/firm_tcost.py}{34}{56}{Estimating the impact law from fills.}\label{lst:rs:transaction-costs-in-research:fit}
+\item \textbf{The cost-aware book}: the closed-form proximal step and the accelerated iteration.
+\omcode{code/firm/tcost/firm_tcost.py}{67}{96}{Mean--variance with spread and power-law impact inside.}\label{lst:rs:transaction-costs-in-research:aware}
+\item \textbf{Run} \texttt{rs\_tcost.estimate(n)}, \texttt{run(book, aum, half\_life)}, \texttt{smoothing\_curve}, \texttt{netting} and \texttt{fig\_tcost.py}.
+\end{tutsteps}
+\textbf{What to change next.} Make the forecast's noise persistent (an autoregression rather than new each day) and watch the optimal smoothing lengthen; add
+linear costs only and see the cost-aware book's no-trade region appear.
+\end{tutorial}
+
+\section{Build: the cost toolkit}\label{bld:rs:transaction-costs-in-research:tcost}
+
+\begin{build}
+\bfield{Purpose} One cost model, estimated from the firm's fills and used everywhere: in \omterm{def:rs:vectorised-backtests:backtest}{backtests}, in the optimiser, in capacity estimates and in the netting of
+strategies.
+\bfield{Interface} \texttt{impact\_bp(eta, sigma, participation, exponent)}, \texttt{fit\_impact(cost, sigma, participation, half\_spread)},
+\texttt{trade\_cost(dw, aum, sigma, adv, half\_spread, eta, fee)}, \texttt{prox\_cost(v, s, c)}, \texttt{cost\_aware(alpha, Sigma, w0, aum, sigma, adv, half\_spread,
+eta, gamma, neutral)}, \texttt{net\_trades}, \texttt{netting\_saving(lists, cost\_fn)}, \texttt{smooth(signal, half\_life)}, \texttt{breakeven\_cost}.
+\bfield{Rules} Costs depend on fund size and are always charged at the size the strategy will run; the cost model is re-fitted on the firm's fills with standard
+errors; no strategy is judged before costs; netting savings are shared so that no strategy's costs rise because of another.
+\bfield{Acceptance tests} \texttt{code/firm/tcost/tests/}: the planted law recovered within its standard errors; the proximal step optimal on a fine grid; the cost of a
+trade by hand; the cost-aware book equal to mean--variance without costs, and locally optimal with them; netting by hand; the smoothing's step response; break-even.
+\bfield{Stretch} Temporary and \omterm{def:rs:transaction-costs-in-research:impact}{permanent impact} with decay (a propagator); costs per venue and time of day; multi-period cost-aware construction.
+\end{build}
+
+\begin{omsources}
+\item B.~Tóth et al., ``Anomalous price impact and the critical nature of liquidity in financial markets'', \emph{Physical Review X} 1, 021006, 2011.
+\item R.~Almgren, C.~Thum, E.~Hauptmann and H.~Li, ``Direct estimation of equity market impact'', \emph{Risk}, 2005.
+\item A.~S.~Kyle and A.~A.~Obizhaeva, ``Market microstructure invariance: empirical hypotheses'', \emph{Econometrica} 84(4), 2016.
+\item J.-P.~Bouchaud, J.~Bonart, J.~Donier and M.~Gould, \emph{Trades, Quotes and Prices}, Cambridge University Press, 2018.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:transaction-costs-in-research:1}
+What does an order of 5\% of daily volume cost in a stock of 2\% daily volatility, with a half spread of 2 basis points and $\eta = 0.7$?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:transaction-costs-in-research:2}
+The naive book earns 49.1\% a year before costs and trades 5.33 times its capital a day. What is its \omterm{def:rs:transaction-costs-in-research:smoothing}{break-even cost} per unit traded?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:transaction-costs-in-research:3}
+Two strategies each trade $q$ in the same direction under a cost growing as $q^{3/2}$. By how much does the netted trade cost more than the two apart?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:transaction-costs-in-research:4}
+Why does a single parent order say almost nothing about the firm's cost coefficient? How many would you want?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:transaction-costs-in-research:5}
+Why does the cost-aware book lose at \$10 million but win at \$1 billion?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:transaction-costs-in-research:6}
+Derive the proximal step of $s\lvert x\rvert + c\lvert x\rvert^{3/2}$.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:transaction-costs-in-research:7}
+\emph{Coding.} Run \texttt{rs\_tcost.smoothing\_curve} for both books and explain why their optimal half-lives differ.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:transaction-costs-in-research:8}
+\emph{Find the flaw.} ``Impact follows a square root, so our costs grow with the square root of our assets: doubling the fund costs only 41\% more.''
+\end{exercise}
+
+\section{Problem: From 2.56 to $-29$}
+
+\begin{problem}[{Weekend problem --- a signal, costed}]\label{pb:rs:transaction-costs-in-research:1}
+The chapter's simulated fills and fifty-name books.
+
+\medskip\noindent\textbf{Part I --- The cost model.}
+\begin{enumerate}
+\item State the planted cost law and the size of the price noise at 1\% participation.
+\item What do 500, 5\,000 and 50\,000 orders recover for $\eta$ and the exponent?
+\item What did Almgren and co-authors and Tóth and co-authors find for the exponent?
+\item Why is the fit done on bin averages, and why a robust standard error?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The books.}
+\begin{enumerate}[resume]
+\item What do the naive book's turnover, costs and net Sharpe ratio come to at \$1 billion?
+\item Give the cost-aware book's net Sharpe ratios at the four fund sizes.
+\item Why is its Sharpe ratio before costs higher than the naive book's?
+\item What happens at \$10 billion?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Netting and smoothing.}
+\begin{enumerate}[resume]
+\item What do the two teams' costs come to apart and netted?
+\item Why does netting cost more on same-direction trades?
+\item What are the net Sharpe ratios against the half-life for both books?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the net Sharpe ratio against the smoothing half-life, and the optimal smoothing.
+\item Which book would you run at \$1 billion?
+\item What fund size would you advise for the smoothed naive book?
+\item How should a research report present a strategy's costs?
+\item Where would a propagator model of impact change the conclusions?
+\item How would you estimate the firm's cost model if it had no fills yet?
+\item What does netting imply for the capacity of several strategies trading the same names?
+\item How does chapter~26's \omterm{def:rs:portfolio-construction-ii:aim}{aim portfolio} relate to smoothing?
+\item In one sentence: where do costs belong in research?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader, researcher}]\label{iq:rs:transaction-costs-in-research:1}
+How does \omterm{def:rs:order-book-replay-simulation:impact}{market impact} scale with order size? What evidence is there?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:transaction-costs-in-research:2}
+Your signal has a daily Sharpe ratio of 2.5 before costs. What do you do before you believe it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:rs:transaction-costs-in-research:3}
+How would you estimate your desk's \omterm{def:rs:order-book-replay-simulation:impact}{market impact} from its own fills?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:rs:transaction-costs-in-research:4}
+How do you put a $3/2$-power cost into a portfolio optimiser?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:rs:transaction-costs-in-research:5}
+Two of the firm's strategies trade the same stocks. What should the firm do about it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:rs:transaction-costs-in-research:6}
+Show that with costs growing as the $3/2$ power of the trade, a strategy's return after costs is maximised at a finite fund size, and find it for a constant gross
+return.
+\end{interviewq}

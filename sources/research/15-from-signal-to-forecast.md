@@ -1,0 +1,28 @@
+# 15. From Signal to Forecast — brief and source ledger
+
+## Brief
+
+- **Hook.** A stock's composite score is +2. Is its expected return over the next month two basis points or two hundred?
+- **Sections.** Calibrating a score; Scaling across assets and horizons; The fundamental law of active management; Where the law breaks; Evaluating forecasts.
+- **Defines.** forecast calibration, alpha scaling rule, calibration curve, isotonic regression, breadth, effective breadth, fundamental law of active management, transfer coefficient.
+- **Uses (defined earlier).** alpha (B1.1), information ratio (B1.3), Mincer--Zarnowitz regression (B4.18), information coefficient (ch6), composite signal (ch14), forecast horizon (ch6).
+- **Tutorial.** Calibrate chapter 14's composite into expected returns by the scaling rule, by bins and by isotonic regression; draw the calibration curves; check the fundamental law on firm.synthmkt with known IC and breadth, then with correlated bets.
+- **Build.** `firm.forecast`: calibrators (scaling rule, binned, isotonic by pool-adjacent-violators), volatility and horizon scaling, effective breadth from the forecast correlation, and a forecast-evaluation report; Python.
+- **Weekend problem.** Why is our information ratio half what the law promised? — named result: the decomposition of the shortfall into effective breadth, transfer coefficient and noise in the IC.
+- **Facts to verify.** Grinold 1989, the fundamental law of active management (JPM); Clarke, de Silva, Thorley 2002, portfolio constraints and the fundamental law (FAJ); Buckle 2004, relaxing the fundamental law (Physica A); Ding 2010 time-series dynamics of the fundamental law (SSRN); Ayer et al. 1955 pool-adjacent-violators (Annals of Math. Stat.); Zhou 2008 estimation error in the fundamental law.
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | R. C. Grinold, "The fundamental law of active management", J. Portfolio Management 15(3) (1989) 30-37 | Crossref record (no abstract); the law's statement IR = IC x sqrt(BR), breadth = the number of independent forecasts of exceptional returns a year, from F3 | https://doi.org/10.3905/jpm.1989.409211 | 2026-09-24 | bibliographic record; statement via F3 | def. law; omsources |
+| F2 | R. Clarke, H. de Silva, S. Thorley, "Portfolio constraints and the fundamental law of active management", Financial Analysts Journal 58(5) (2002) 48-66: constraints (short positions, turnover, neutralities) restrict the use of forecasts; an ex ante relationship generalising the fundamental law and an ex post decomposition into the prediction's success and the noise of the constraints, checked by Monte Carlo | OpenAlex record with abstract; Crossref record | https://doi.org/10.2469/faj.v58.n5.2468 | 2026-09-24 | "The ex ante relationship is a generalized version of a previously developed 'fundamental law of active management'"; "a practical decomposition of performance into the success of the return-prediction process and the 'noise' associated with portfolio constraints" | section 4; prop. generalised; omsources |
+| F3 | F. Zhang, X. Wang, H. Cao, "Turnover-adjusted information ratio", arXiv:2105.10306 (2021): the fundamental law IR = IC x sqrt(BR) (Grinold); Qian and Hua's form IR = mu_IC / V_IC with a random IC; Ding and Martin's form mu_IC / sqrt(V_IC^2 + (1 - mu_IC^2 - V_IC^2)/N) | arXiv PDF, pdftotext, equations (1)-(3) | http://arxiv.org/abs/2105.10306 | 2026-09-24 | "According to this 'law', IR is connected to IC through a term called 'breadth' (BR), which is the number of independent forecasts of exceptional returns made by the manager each year"; "IR = IC * sqrt(BR)"; "IR is found to be the ratio of the expected value of IC relative to the IC volatility" | sections 3-4; firm.forecast; omsources |
+| F4 | R. O. Michaud, D. N. Esch, R. O. Michaud, "Estimation error and the fundamental law of active management: is quant fundamentally flawed?", J. Investing 29(4) (2020) 20-30: applications of Grinold's law (adding securities, factors, trading more often, reducing constraints) are often unreliable because they ignore estimation error and practical constraints | OpenAlex record with abstract; Crossref record | https://doi.org/10.3905/joi.2020.1.133 | 2026-09-24 | "many applications of Grinold theory for optimized portfolio design are often unreliable and self-defeating. Critical limitations of the theory are due to ignoring estimation error ... and constraints" | section 5; omsources |
+| F5 | M. Ayer, H. D. Brunk, G. M. Ewing, W. T. Reid, E. Silverman, "An empirical distribution function for sampling with incomplete information", Annals of Mathematical Statistics 26(4) (1955) 641-647: maximum-likelihood ordered estimates by replacing adjacent out-of-order ratios with their pooled ratio until monotone (pool adjacent violators) | OpenAlex record with abstract | https://doi.org/10.1214/aoms/1177728423 | 2026-09-24 | "the ratios ... are then replaced in the sequence ... by the single ratio ... This procedure is repeated until an ordered set of ratios is obtained which are monotone" | def. isotonic regression; omsources |
+
+## EXCLUDED
+
+- Buckle (2004) on breadth and Ding (2010, SSRN) on the law's time-series dynamics: records found, no abstracts retrievable; not cited (the Qian-Hua and Ding-Martin forms are cited through F3).
+- Zhou (2008), estimation error in the fundamental law: no record matching the brief was found; Michaud, Esch and Michaud (2020) cover the point (F4).
+- All calibration, information-ratio, transfer-coefficient and breadth numbers are planted or computed and tested.

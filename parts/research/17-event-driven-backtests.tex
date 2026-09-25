@@ -1,0 +1,288 @@
+\chapter{Event-Driven Backtests}\label{ch:rs:event-driven-backtests}
+
+A strategy that rests limit orders one tick either side of the last price fills, in a \omterm{def:rs:market-data-for-research:bar}{bar} \omterm{def:rs:vectorised-backtests:backtest}{backtest}, every time a \omterm{def:rs:market-data-for-research:bar}{bar}'s range reaches its
+price. Asked instead to see the price trade one tick through its order before counting a fill, the same \omterm{def:rs:vectorised-backtests:backtest}{backtest} fills 55\% as often and turns
+a small daily profit into a loss of \$584 a day, with fills followed by a two-tick move against it. Add an order-entry latency of five seconds,
+and the \omterm{def:rs:vectorised-backtests:backtest}{backtest}'s answer depends on a question the \omterm{def:rs:market-data-for-research:bar}{bars} cannot answer: did the price touch the order while it was live? Level~1 of
+chapter~16 cannot even express such a strategy. The \omterm{def:rs:event-driven-backtests:evbt}{event-driven backtest} can: it simulates orders on a clock, and it makes every assumption
+about fills an explicit, replaceable model. This chapter builds it (\texttt{firm.evbt}) and shows how much of a passive strategy's result is the
+\omterm{def:rs:event-driven-backtests:fill}{fill model}'s.
+
+\section{Architecture: clock, events, handlers}
+
+\begin{definition}[Event-driven backtest, simulated clock]\label{def:rs:event-driven-backtests:evbt}
+An \emph{event-driven backtest}\index{event-driven backtest} processes a time-ordered stream of events (market data, order acknowledgements,
+fills, cancellations, corporate actions) one at a time, each changing the state of the strategy, its orders and its portfolio. Its
+\emph{simulated clock}\index{simulated clock} is the time of the event being processed; nothing may use information stamped later.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,inner sep=4pt,minimum height=9mm,text width=2.7cm},
+  arr/.style={-Stealth,thick,draw=black!60}]
+\node[box] (q) at (0,0) {event queue\\ (time, kind, sequence)};
+\node[box] (d) at (3.6,0) {dispatcher:\\ advances the clock};
+\node[box] (m) at (7.2,0) {order manager:\\ lifecycle};
+\node[box] (p) at (10.8,0) {portfolio:\\ position, cash};
+\node[box] (s) at (7.2,2.0) {strategy:\\ on\_bar, on\_fill};
+\node[box] (f) at (7.2,-2.0) {fill model: touch,\\ penetration, cap};
+\draw[arr] (q) -- (d);
+\draw[arr] (d) -- (m);
+\draw[arr] (m) -- (p);
+\draw[arr] (d) |- (s);
+\draw[arr] (s) -- node[right,font=\footnotesize]{submit, cancel} (m);
+\draw[arr] (m) -- (f);
+\draw[arr] (f) -| (p);
+\draw[arr,dashed] (s.north) -- ++(0,0.5) -| node[pos=0.25,above,font=\footnotesize]{acknowledgements and cancellations, after the latency} (q.north);
+\end{tikzpicture}
+
+\omcaption{The architecture of \texttt{firm.evbt}: one queue of events ordered by time, kind and sequence number, a dispatcher, and handlers that
+may only schedule events in the future.}\label{fig:rs:event-driven-backtests:architecture}
+\end{omfigure}
+
+\texttt{firm.evbt} keeps one priority queue. At each \omterm{def:rs:market-data-for-research:bar}{bar}'s end the dispatcher first matches the working orders against the \omterm{def:rs:market-data-for-research:bar}{bar} through the \omterm{def:rs:event-driven-backtests:fill}{fill
+model}, then marks the portfolio, then calls the strategy, which may submit or cancel orders; a submission becomes a working order only when its
+acknowledgement event arrives, after the order-entry latency, and a cancellation takes effect only when its own event does. Events at the same
+time are ordered by kind (\omterm{def:rs:market-data-for-research:bar}{bars} before order events) and then by a sequence number, so a run is deterministic: the same data, strategy and
+models give the same fills to the last digit. The result is the \texttt{BacktestResult} of chapter~16, with the orders and fills attached.
+
+\section{Orders and fills at bar level}
+
+\begin{definition}[Order lifecycle, partial fill]\label{def:rs:event-driven-backtests:lifecycle}
+The \emph{order lifecycle}\index{order lifecycle} is the sequence of states an order passes through: pending (sent, not yet acknowledged),
+working, partially filled, and one of filled or cancelled. A \emph{partial fill}\index{partial fill} executes part of an order's quantity, leaving
+the rest working.
+\end{definition}
+
+\begin{definition}[Fill model, touch fill, penetration fill, volume participation cap]\label{def:rs:event-driven-backtests:fill}
+A \emph{fill model}\index{fill model} decides from market data whether a working order executes, at what price and for what quantity. The
+\emph{touch fill}\index{touch fill} fills a limit order in full when a \omterm{def:rs:market-data-for-research:bar}{bar} trades at its price; the \emph{penetration fill}\index{penetration fill}
+only when the \omterm{def:rs:market-data-for-research:bar}{bar} trades a given number of ticks beyond it; a \emph{volume participation cap}\index{volume participation cap} limits the quantity
+filled in a \omterm{def:rs:market-data-for-research:bar}{bar} to a share of the \omterm{def:rs:market-data-for-research:bar}{bar}'s volume.
+\end{definition}
+
+A \omterm{def:rs:market-data-for-research:bar}{bar} records four prices and a volume; it does not record where the strategy's order stood in the queue at its price, how much traded there, or
+whether the trades at that price came before or after the order arrived. Each \omterm{def:rs:event-driven-backtests:fill}{fill model} fills that gap with an assumption. The \omterm{def:rs:event-driven-backtests:fill}{touch fill} assumes
+the order was first in the queue. The \omterm{def:rs:event-driven-backtests:fill}{penetration fill} assumes it was last: if the price traded through, everything ahead of it must have traded.
+The volume cap assumes the order can take a fixed share of the \omterm{def:rs:market-data-for-research:bar}{bar}'s volume; the open-source backtester Zipline's \texttt{VolumeShareSlippage}
+model, for instance, caps fills at 2.5\% of each \omterm{def:rs:market-data-for-research:bar}{bar}'s volume by default and prices them off the \omterm{def:rs:market-data-for-research:bar}{bar}'s close with a quadratic impact. The truth lies
+between the touch and \omterm{def:rs:event-driven-backtests:fill}{penetration fills} and depends on the queue (chapter~18).
+
+The chapter's strategy (\texttt{rs\_evbt.Quoter}) runs on one-minute \omterm{def:rs:market-data-for-research:bar}{bars} built from four simulated 6.5-hour days of \texttt{firm.tape}: at every
+\omterm{def:rs:market-data-for-research:bar}{bar}'s close it cancels its orders and rests one lot (100 shares) one tick below the close and one lot one tick above, within an inventory of five
+lots, marking to the close. Per day, on average:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\omterm{def:rs:event-driven-backtests:fill}{fill model} (no latency) & lots filled & fill rate & P\&L (\$) & mark-out (ticks)\\
+\midrule
+touch & 523 & 70\% & $+17$ & $-0.16$\\
+penetration by one tick & 290 & 41\% & $-584$ & $-2.00$\\
+touch, capped at 2.5\% of volume & 388 & 55\% & $+20$ & $-0.18$\\
+level 1: buy after a down \omterm{def:rs:market-data-for-research:bar}{bar}, sell after an up \omterm{def:rs:market-data-for-research:bar}{bar} & --- & --- & $-215$ & ---\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The mark-out (the close five \omterm{def:rs:market-data-for-research:bar}{bars} after a fill, in the fill's direction) measures adverse selection: the \omterm{def:rs:event-driven-backtests:fill}{penetration fills} are the ones that happen
+when the price is moving through the order, and they lose two ticks on average in five minutes (\cref{fig:rs:event-driven-backtests:models}). The \omterm{def:rs:event-driven-backtests:fill}{touch
+fill}'s daily P\&L (from $-\$333$ to $+\$206$ over the four days) is within its noise of zero; the \omterm{def:rs:event-driven-backtests:fill}{penetration fill}'s is negative every day. A fill rate
+of 70\% for an order one tick away from the price is itself a warning: a real order joins the back of a queue that may hold thousands of shares.
+
+\section{Decision time and latency}
+
+\begin{definition}[Latency and the live-in-bar policy]\label{def:rs:event-driven-backtests:latency}
+With an order-entry latency, an order sent at a \omterm{def:rs:market-data-for-research:bar}{bar}'s close is live from some moment within the next \omterm{def:rs:market-data-for-research:bar}{bar}. A \emph{conservative} policy lets an order
+fill in a \omterm{def:rs:market-data-for-research:bar}{bar} only if it was live for the whole \omterm{def:rs:market-data-for-research:bar}{bar}; an \emph{optimistic} policy, if it was live at any moment of it. A \omterm{def:rs:market-data-for-research:bar}{bar} cannot say which is right,
+because it does not say when within it the price reached the order.
+\end{definition}
+
+With a latency of five seconds, the quoter's orders, cancelled and replaced at every \omterm{def:rs:market-data-for-research:bar}{bar}'s close, are never live for a whole \omterm{def:rs:market-data-for-research:bar}{bar}: under the
+conservative policy they never fill. Under the optimistic policy they fill more often than with no latency (585 lots a day for the \omterm{def:rs:event-driven-backtests:fill}{touch fill}), and
+lose more: $-\$41$ a day for the \omterm{def:rs:event-driven-backtests:fill}{touch fill}, $-\$776$ for the \omterm{def:rs:event-driven-backtests:fill}{penetration fill}, $-\$190$ for the capped fill, with the capped fills' mark-out falling
+from $-0.18$ to $-0.87$ ticks. The two policies bracket the answer, and a strategy whose result swings from nothing to a loss between them cannot be
+judged at level~2. That is the signal to move to level~3, where the order's arrival, its queue position and every trade at its price are events of their
+own.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=lots,width=7cm,height=5.4cm,ybar,bar width=9pt,title={\small lots filled a day},tick label style={font=\footnotesize},
+  xtick={0,1,2,3,4,5},xticklabels={touch,penetr.,capped,touch,penetr.,capped},x tick label style={rotate=45,anchor=east},
+  xmin=-0.6,xmax=5.6,ymin=0,ymax=760,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=lots]{figdata/research/17-event-driven-backtests/models.csv};
+\draw[black!50,dashed] (axis cs:2.5,0) -- (axis cs:2.5,760);
+\node[font=\footnotesize,anchor=north] at (axis cs:1,750) {no latency};
+\node[font=\footnotesize,anchor=north] at (axis cs:4,750) {5 s, optimistic};
+\end{axis}
+\begin{axis}[at={(lots.east)},anchor=west,xshift=1.4cm,width=7cm,height=5.4cm,ybar,bar width=9pt,title={\small P\&L a day (\$)},
+  tick label style={font=\footnotesize},xtick={0,1,2,3,4,5,6},xticklabels={touch,penetr.,capped,touch,penetr.,capped,level 1},
+  x tick label style={rotate=45,anchor=east},ymin=-850,ymax=100,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=pnl]{figdata/research/17-event-driven-backtests/models.csv};
+\draw[black!50,dashed] (axis cs:2.5,-850) -- (axis cs:2.5,100);
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The passive quoter on four simulated days under each \omterm{def:rs:event-driven-backtests:fill}{fill model}, with no latency and with a five-second latency under the optimistic
+policy (under the conservative policy it never fills), and the level-1 version of the same idea. Data: \texttt{rs\_evbt} on \texttt{firm.tape} \omterm{def:rs:market-data-for-research:bar}{bars}.}\label{fig:rs:event-driven-backtests:models}
+\end{omfigure}
+
+\section{Calendars and corporate actions in the loop}
+
+Events that a \omterm{def:rs:vectorised-backtests:backtest}{vectorised backtest} folds into adjusted prices are, in an event-driven one, events in the queue. A split multiplies the position and the
+working orders' quantities by its ratio and divides their limit prices by it, at the moment it takes effect; the \omterm{def:rs:market-data-for-research:bar}{bars} keep the prices as traded, so a
+limit order that survived a split unadjusted would sit at twice the new price and fill instantly. A dividend pays cash on its payment date to positions
+held at the record date. Half-days end the session early, auctions replace continuous trading at the open and the close (Book~1, chapter~13), and a halt
+freezes the book; each belongs in the calendar the dispatcher reads, with its own handler, and each has caused a \omterm{def:rs:vectorised-backtests:backtest}{backtest} to trade at a time the market
+was closed. \texttt{firm.evbt} implements splits and leaves the others as the build's stretch; its acceptance test holds a lot through a two-for-one
+split and checks that the position doubles and the capital does not move.
+
+\section{Determinism}
+
+A \omterm{def:rs:vectorised-backtests:backtest}{backtest} that gives different answers on two runs cannot be debugged, compared or reviewed. Determinism needs three things: a total order on events
+(time, then kind, then sequence number; never the order in which a dictionary happens to iterate), no randomness except from seeded generators passed
+in explicitly, and no dependence on the wall clock. \texttt{firm.evbt}'s tests run the same \omterm{def:rs:vectorised-backtests:backtest}{backtest} twice and compare the net returns bit for bit. The
+same discipline lets a level-2 and a level-3 \omterm{def:rs:vectorised-backtests:backtest}{backtest} be compared on the same events, and a live run be replayed against its own logs (chapter~19).
+
+\section{Tutorial: the limit order that always filled}\label{tut:rs:event-driven-backtests:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run the passive quoter in \texttt{firm.evbt} under three \omterm{def:rs:event-driven-backtests:fill}{fill models} and two latencies with both live-in-bar policies, and compare with
+the level-1 version of the same idea. \textbf{End state:} \cref{fig:rs:event-driven-backtests:models}; the table.
+\begin{tutsteps}
+\item \textbf{The \omterm{def:rs:event-driven-backtests:fill}{fill models}}: touch, penetration, and a cap on the \omterm{def:rs:market-data-for-research:bar}{bar}'s volume.
+\omcode{code/firm/evbt/firm_evbt.py}{70}{104}{Three fill models for bars.}\label{lst:rs:event-driven-backtests:fills}
+\item \textbf{Matching}: which orders were live in the \omterm{def:rs:market-data-for-research:bar}{bar}, and what the model fills.
+\omcode{code/firm/evbt/firm_evbt.py}{151}{175}{Matching working orders against a bar.}\label{lst:rs:event-driven-backtests:match}
+\item \textbf{Run} \texttt{summary()}, \texttt{level1()} and \texttt{fig\_evbt.py}.
+\end{tutsteps}
+\textbf{What to change next.} Rest the orders at the close instead of one tick away and watch the touch model's fill rate approach 100\%; add a
+cancel-only-if-the-price-moved rule so orders survive whole \omterm{def:rs:market-data-for-research:bar}{bars} under latency.
+\end{tutorial}
+
+\section{Build: the level-2 backtester}\label{bld:rs:event-driven-backtests:evbt}
+
+\begin{build}
+\bfield{Purpose} The firm's backtester for strategies whose orders, fills and timing matter at \omterm{def:rs:market-data-for-research:bar}{bar} resolution: limit orders, stop orders, intraday
+schedules, corporate actions in the loop.
+\bfield{Interface} \texttt{Order}, \texttt{Fill}, \texttt{TouchFill()}, \texttt{PenetrationFill(ticks)}, \texttt{VolumeCapFill(inner, participation)},
+\texttt{Strategy.on\_bar(ctx, i, bar)}, \texttt{Strategy.on\_fill(ctx, fill)}, \texttt{Engine(bars, strategy, fill\_model, latency, fee, capital, splits,
+policy).run()} returning the \texttt{BacktestResult}, the orders and the fills.
+\bfield{Rules} Handlers schedule only future events; orders fill only after their acknowledgement; every fill assumption lives in a \omterm{def:rs:event-driven-backtests:fill}{fill model}; the
+live-in-bar policy is stated; the run is deterministic.
+\bfield{Acceptance tests} \texttt{code/firm/evbt/tests/}: touch, penetration and capped fills on hand \omterm{def:rs:market-data-for-research:bar}{bars} with their lifecycles; a market order at the next
+open; a latency that misses a \omterm{def:rs:market-data-for-research:bar}{bar}; cancellations; the optimistic policy filling an order live for an instant; fees, P\&L and a split; two runs identical.
+\bfield{Stretch} Dividends, half-days, auctions and halts as calendar events; stop orders; several instruments on one clock.
+\end{build}
+
+\begin{omsources}
+\item Zipline (open-source Python backtester), \texttt{zipline/finance/slippage.py}: \texttt{VolumeShareSlippage}, default volume limit of 2.5\% of each bar.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:1}
+A buy limit at 99.00 is working. The next \omterm{def:rs:market-data-for-research:bar}{bar} has open 99.20, high 99.30, low 99.00 and close 99.10. Does it fill under the \omterm{def:rs:event-driven-backtests:fill}{touch fill}? Under a one-tick
+\omterm{def:rs:event-driven-backtests:fill}{penetration fill} with a tick of 0.01?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:2}
+An order for 5\,000 shares faces \omterm{def:rs:market-data-for-research:bar}{bars} of 40\,000, 10\,000 and 60\,000 shares with a 2.5\% volume cap. How much fills in each \omterm{def:rs:market-data-for-research:bar}{bar}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:3}
+Draw the lifecycle of an order for 300 shares that fills 100, then is cancelled with 200 remaining.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:4}
+Why are \omterm{def:rs:event-driven-backtests:fill}{penetration fills} followed by adverse price moves more than \omterm{def:rs:event-driven-backtests:fill}{touch fills}? Relate it to the queue at the order's price.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:5}
+With a latency of 5 seconds and one-minute \omterm{def:rs:market-data-for-research:bar}{bars}, why does the quoter never fill under the conservative policy? How would a strategy that cancels only when
+the price moves fare?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:6}
+A two-for-one split takes effect while a sell limit at \$120 for 100 shares is working and the position is 100 shares. What must the engine do, and what
+goes wrong if it does not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:event-driven-backtests:7}
+\emph{Coding.} Run the quoter with the orders at the close price (not one tick away) under the touch and \omterm{def:rs:event-driven-backtests:fill}{penetration fills}. What happens to the fill rates and
+the mark-outs?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:event-driven-backtests:8}
+\emph{Find the flaw.} ``Our \omterm{def:rs:vectorised-backtests:backtest}{backtest} fills limit orders when the \omterm{def:rs:market-data-for-research:bar}{bar}'s low reaches them, and the strategy made money every week for two years.''
+\end{exercise}
+
+\section{Problem: The Limit Order That Always Filled}
+
+\begin{problem}[{Weekend problem --- a passive strategy, three fill models}]\label{pb:rs:event-driven-backtests:1}
+The chapter's quoter on four simulated days of \texttt{firm.tape} one-minute \omterm{def:rs:market-data-for-research:bar}{bars}.
+
+\medskip\noindent\textbf{Part I --- The engine.}
+\begin{enumerate}
+\item In what order does \texttt{firm.evbt} process a \omterm{def:rs:market-data-for-research:bar}{bar}'s close: fills, marks, strategy? Why that order?
+\item When does a submitted order first become able to fill?
+\item What makes two runs identical?
+\item What does the engine return?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- \omterm{def:rs:event-driven-backtests:fill}{Fill models}.}
+\begin{enumerate}[resume]
+\item Give the lots filled, fill rate, P\&L and mark-out a day under each \omterm{def:rs:event-driven-backtests:fill}{fill model} with no latency.
+\item Which assumption about the queue does each model make?
+\item Why is the \omterm{def:rs:event-driven-backtests:fill}{penetration fill}'s P\&L negative every day while the \omterm{def:rs:event-driven-backtests:fill}{touch fill}'s is not?
+\item What is the level-1 version of the idea, and what does it earn?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Latency.}
+\begin{enumerate}[resume]
+\item What happens at a latency of 5 seconds under the conservative policy?
+\item And under the optimistic policy, for each \omterm{def:rs:event-driven-backtests:fill}{fill model}?
+\item What does the difference between the two policies tell you about the strategy?
+\item How would you change the strategy so that latency matters less?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the fill rate and P\&L of the passive \omterm{def:rs:market-data-for-research:bar}{bar} strategy under touch, penetration and capped fills, with and without
+latency.
+\item Which result would you report to a portfolio manager, and with which caveat?
+\item What would a level-3 replay add (chapter~18)?
+\item What does Zipline's default cap mean for a strategy that trades 5\% of volume?
+\item Which corporate actions belong in the event queue for this strategy?
+\item Why is a 70\% fill rate for orders one tick away suspicious?
+\item What would you log from a live run to calibrate the \omterm{def:rs:event-driven-backtests:fill}{fill model}?
+\item In one sentence: what is the \omterm{def:rs:event-driven-backtests:fill}{fill model}?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:rs:event-driven-backtests:1}
+Describe the architecture of an event-driven backtester.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:rs:event-driven-backtests:2}
+How would you simulate limit-order fills on \omterm{def:rs:market-data-for-research:bar}{bar} data, and what biases does each approach have?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:rs:event-driven-backtests:3}
+How do you make a \omterm{def:rs:vectorised-backtests:backtest}{backtest} deterministic?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:event-driven-backtests:4}
+What is adverse selection for a passive order, and how would you measure it in a \omterm{def:rs:vectorised-backtests:backtest}{backtest}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:rs:event-driven-backtests:5}
+How should a backtester handle a stock split while orders are working?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:rs:event-driven-backtests:6}
+When is a level-2 \omterm{def:rs:vectorised-backtests:backtest}{backtest} not enough? Give a test that tells you.
+\end{interviewq}

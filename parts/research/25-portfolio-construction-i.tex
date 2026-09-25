@@ -1,0 +1,331 @@
+\chapter{Portfolio Construction I}\label{ch:rs:portfolio-construction-i}
+
+An unconstrained mean--variance optimiser is given a hundred large stocks, an honest alpha forecast and the sample covariance of their last six months of daily
+returns. It builds a long--short book whose gross exposure averages sixty-one times its capital, forecasts it at 36 per cent annual volatility and an
+information ratio of 4.25, and rebuilds it every month for eight years. The book realises a volatility of 207 per cent and an information ratio of 0.92 before
+costs; it trades eighty-four times its capital a month, and after costs of ten basis points a trade its information ratio is 0.43. The same forecasts, through
+chapter~24's risk model and the constraints a real book carries, realise 1.77 after costs. The optimiser did what it was told: it found the directions in which
+the inputs were most wrong. This chapter builds \texttt{firm.portcons}, a construction layer over Book~4's \texttt{firm.portopt}, adds constraints one at a time,
+and prices each one with its shadow price.
+
+\section{Mean--variance with an alpha and a risk model}
+
+\begin{definition}[Mean--variance optimisation, risk-aversion parameter, efficient frontier]\label{def:rs:portfolio-construction-i:mv}
+\emph{Mean--variance optimisation}\index{mean--variance optimisation} chooses the weights $w$ that maximise $\alpha^\top w - \frac{\gamma}{2} w^\top\Sigma w$
+subject to constraints, for an alpha forecast $\alpha$ and a covariance forecast $\Sigma$ over the same horizon (Markowitz, 1952). The
+\emph{risk-aversion parameter}\index{risk-aversion parameter} $\gamma$ sets the trade between expected return and variance. The \emph{efficient
+frontier}\index{efficient frontier} is the set of portfolios, over all $\gamma$, with the highest expected return for their risk.
+\end{definition}
+
+\begin{proposition}[The unconstrained and the equality-constrained optimum]\label{prop:rs:portfolio-construction-i:mv}
+Without constraints the optimum is $w^* = \Sigma^{-1}\alpha/\gamma$, with ex-ante information ratio $\sqrt{\alpha^\top\Sigma^{-1}\alpha}$ whatever $\gamma$. With
+equality constraints $A^\top w = 0$ it is $w^* = \Sigma^{-1}(\alpha - A\lambda)/\gamma$, where $\lambda$, the shadow prices, solve $A^\top\Sigma^{-1}(\alpha - A\lambda) = 0$.
+\end{proposition}
+
+\begin{proof}
+Setting the gradient of $\alpha^\top w - \frac\gamma2 w^\top\Sigma w - \lambda^\top A^\top w$ to zero gives $\gamma\Sigma w = \alpha - A\lambda$; the constraint fixes
+$\lambda$. At $w^* = \Sigma^{-1}\alpha/\gamma$, $\alpha^\top w^*/\sqrt{w^{*\top}\Sigma w^*} = \sqrt{\alpha^\top\Sigma^{-1}\alpha}$.
+\end{proof}
+
+The chapter's book holds the hundred largest names of \texttt{firm.synthmkt}, rebuilt at 95 month-ends from year~3 to year~10 and held over the following month's
+days. Its alpha is the simulation's stock-specific expected return for the month (the persistent drift and the post-earnings drift), plus noise twice as large,
+standardised and scaled by chapter~15's rule, $\alpha_i = \mathrm{IC}\,\sigma_i z_i$ with an \omterm{def:rs:anatomy-of-a-predictor:ic}{information coefficient} of 0.05 and $\sigma_i$ the name's residual
+volatility; the noise is new every month. The risk model is chapter~24's at a monthly horizon; $\gamma = 12$; trades cost ten basis points of the weight traded.
+The alpha is the truth plus noise on purpose: the chapter studies what construction does to a given forecast, not the forecast.
+
+\section{The error maximiser}
+
+\begin{definition}[Error maximisation]\label{def:rs:portfolio-construction-i:error}
+\emph{Error maximisation}\index{error maximisation} is the tendency of an optimiser to load the directions in which its inputs are most in error: assets with
+overestimated returns, underestimated variances or understated correlations, which look like the best trades because they are the worst estimates (Michaud,
+1989, who called mean--variance optimisers ``estimation-error maximizers'').
+\end{definition}
+
+The opening's optimiser uses the forecast in return units (the same scale for every name, not divided by risk) and the sample covariance of 126 days for 100
+names. With barely more days than names, the smallest eigenvalues of the sample covariance are far below the truth, and $\Sigma^{-1}$ amplifies them: the book
+takes enormous offsetting positions in combinations of stocks that happened to move together in the last six months. Its gross exposure averages 61, its
+forecast volatility 36\% against 207\% realised, and the two largest positions hold only 9\% of the gross on average (16\% at most): the errors are spread across
+hedged combinations rather than concentrated in a pair of names. The ex-ante information ratio of 4.25 is the optimiser's measure of its own errors. Replacing
+the inputs, not constraining the output, is the first fix: alphas scaled by the risk the optimiser sees (chapter~15), and a factor risk model whose few
+parameters are estimated on many stocks (chapter~24). With nothing else changed but \omterm{def:rs:portfolio-construction-i:constraints}{dollar neutrality}, the book's forecast volatility becomes 13.7\% against
+14.0\% realised, and its information ratio 1.39 after costs.
+
+\section{Realistic constraints}
+
+\begin{definition}[Dollar, beta and factor neutrality; name limit; liquidity constraint; 130/30 portfolio]\label{def:rs:portfolio-construction-i:constraints}
+A book has \emph{dollar neutrality}\index{dollar neutrality} when its long and short weights sum to zero, \emph{beta neutrality}\index{beta neutrality} when its
+\omterm{def:rs:performance-measurement:beta}{market beta} is zero, and satisfies a \emph{factor-neutrality constraint}\index{factor-neutrality constraint} when its exposure to a risk-model factor is zero. A
+\emph{name limit}\index{name limit} bounds each position's weight; a \emph{liquidity constraint}\index{liquidity constraint} bounds it by a fraction of the
+stock's average daily traded value relative to the book's capital. A \emph{130/30 portfolio}\index{130/30 portfolio} is long 130\% and short 30\% of its capital:
+a long-only mandate given limited room to short.
+\end{definition}
+
+Constraints enter in the order a desk meets them. Each is a line in \texttt{rs\_portcons.build} (\cref{lst:rs:portfolio-construction-i:build}), and
+\texttt{firm.portcons} turns the set into one quadratic programme for \texttt{firm.portopt.qp}:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+ & \multicolumn{3}{c}{information ratio} & & & & forecast / \\
+\cmidrule(lr){2-4}
+cumulative setting & ex ante & realised & net & turnover & gross & TC & realised vol.\\
+\midrule
+naive (sample covariance) & 4.25 & 0.92 & 0.43 & 84 & 61 & 0.44 & 36\% / 207\%\\
+dollar neutral & 1.64 & 1.89 & 1.39 & 5.80 & 4.44 & 0.97 & 13.7\% / 14.0\%\\
++ beta, industry, style neutral & 1.59 & 1.72 & 1.22 & 5.70 & 4.35 & 0.92 & 13.3\% / 13.6\%\\
++ \omterm{def:rs:portfolio-construction-i:constraints}{name limits} of 3\% & 1.41 & 1.29 & 0.83 & 2.50 & 2.21 & 0.82 & 6.4\% / 6.6\%\\
++ gross at most 2 & 1.44 & 1.40 & 0.94 & 2.37 & 2.00 & 0.83 & 6.1\% / 6.3\%\\
++ liquidity, 5\% of daily value & 1.23 & 0.87 & 0.46 & 1.55 & 1.34 & 0.71 & 4.4\% / 4.4\%\\
++ turnover at most 0.5 a month & 1.00 & 1.94 & 1.77 & 0.53 & 1.01 & 0.58 & 3.5\% / 3.6\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Turnover is one-way monthly, as a multiple of capital; TC is the \omterm{def:rs:from-signal-to-forecast:breadth}{transfer coefficient} (chapter~15); the liquidity limit assumes \$1 billion of capital. Each
+constraint lowers the ex-ante information ratio, by construction: the optimiser loses room. Realised information ratios over 7.9 years have standard errors of
+about 0.5, so most of the differences between neighbouring rows are noise; the robust facts are the first row, the effect of costs, and the last row. Neutrality
+to the risk model's factors costs little ex ante (1.64 to 1.59) because the alpha is stock-specific; Jacobs, Levy and Starer showed that dollar and \omterm{def:rs:portfolio-construction-i:constraints}{beta neutrality}
+are in general suboptimal, and here they are nearly free. \omterm{def:rs:portfolio-construction-i:constraints}{Name limits} and the gross limit halve the book's scale and its costs. The liquidity limit binds on 28 of the hundred names on average and lowers the ex-ante information ratio from 1.44 to 1.23. Jagannathan and Ma explained why constraints that are wrong on paper help in
+practice: they act as shrinkage on estimation error, the error maximiser's fuel.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=6pt,ylabel={information ratio},xtick={0,1,2,3,4,5,6},
+  xticklabels={naive,dollar,factor,names,gross,liquidity,turnover},tick label style={font=\small},label style={font=\small},
+  xmin=-0.6,xmax=6.6,ymin=0,ymax=4.5,grid=major,grid style={gray!25},legend columns=3,
+  legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=gray!40,draw=gray] table[x=level,y=exante]{figdata/research/25-portfolio-construction-i/ir.csv};
+\addplot[fill=omDef!40,draw=omDef] table[x=level,y=realised]{figdata/research/25-portfolio-construction-i/ir.csv};
+\addplot[fill=omDef!85,draw=omDef] table[x=level,y=net]{figdata/research/25-portfolio-construction-i/ir.csv};
+\legend{ex ante,realised,realised after costs}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Information ratios of the hundred-name book as constraints are added (each label names the constraint added to those on its left), 95 monthly rebalances. Ex-ante ratios fall with every constraint; realised ones
+do not follow, and the turnover limit gives the best book after costs. Data: \texttt{rs\_portcons.summary}.}\label{fig:rs:portfolio-construction-i:ir}
+\end{omfigure}
+
+\section{Turnover control}
+
+\begin{definition}[Turnover penalty]\label{def:rs:portfolio-construction-i:turnover}
+A \emph{turnover penalty}\index{turnover penalty} subtracts $\kappa\,\lVert w - w_0\rVert_1$ from the objective, a linear cost on the weight traded from the
+current book $w_0$; a turnover limit bounds $\lVert w - w_0\rVert_1$ instead.
+\end{definition}
+
+The turnover limit is the constraint that earns. It cuts the book's monthly trading from 1.55 to 0.53 times capital and its costs from 1.9\% to 0.6\% a year; its
+realised information ratio rises from 0.87 to 1.94 before costs, which costs cannot explain. The reason is in the forecast: the planted drift persists for years,
+while the noise added to it is new every month. A book that may move only part of the way towards each month's target averages several months' forecasts, and
+averaging removes noise. The \omterm{def:rs:from-signal-to-forecast:breadth}{transfer coefficient}, the correlation between the book's risk-adjusted weights and the forecast (Clarke, de Silva and Thorley), falls
+from 0.97 to 0.58, and it is right to fall: the forecast it transfers is noisier than the book. A \omterm{def:rs:portfolio-construction-i:turnover}{turnover penalty} or limit is therefore two things at once, a cost
+model and a smoother of forecasts; chapter~26's multi-period rule makes the second explicit, and chapter~27 prices the first properly.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.8cm,xlabel={years from the first rebalance},ylabel={cumulative return at 10\% volatility},tick label style={font=\small},
+  label style={font=\small},xmin=0,xmax=8,ymin=-0.1,ymax=1.45,grid=major,grid style={gray!25},legend pos=north west,legend style={font=\footnotesize},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=1},scaled y ticks=false,table/col sep=comma]
+\addplot[black!50,thick,dashed] table[x=year,y=naive]{figdata/research/25-portfolio-construction-i/cum.csv};
+\addplot[omDef!60,thick] table[x=year,y=dollar]{figdata/research/25-portfolio-construction-i/cum.csv};
+\addplot[black!70,thick] table[x=year,y=gross]{figdata/research/25-portfolio-construction-i/cum.csv};
+\addplot[omDef,very thick] table[x=year,y=turnover]{figdata/research/25-portfolio-construction-i/cum.csv};
+\legend{naive,dollar neutral,+ gross limit,+ turnover limit}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Cumulative returns after costs, each book scaled to 10\% annual volatility so that the slopes compare information ratios. Data:
+\texttt{rs\_portcons.run}.}\label{fig:rs:portfolio-construction-i:cum}
+\end{omfigure}
+
+\section{Shadow prices and what each constraint costs}
+
+Every constraint has a shadow price, the rate at which the objective would improve if it were relaxed (Book~4, chapter~23). \texttt{firm.portcons} returns it, and
+more: the vector through which each constraint bends the optimum.
+
+\begin{proposition}[Decomposing the information ratio by constraint]\label{prop:rs:portfolio-construction-i:decomp}
+At the optimum of a constrained mean--variance problem, $\alpha - \gamma\Sigma w^* = \sum_k g_k$, where $g_k$ collects constraint $k$'s rows weighted by their
+multipliers. The unconstrained ex-ante $\mathrm{IR}^2 = \alpha^\top\Sigma^{-1}\alpha$ exceeds $\gamma^2 w^{*\top}\Sigma w^*$ by exactly $\sum_k \delta_k$, with
+$\delta_k = g_k^\top\Sigma^{-1}(2\alpha - G)$ and $G = \sum_k g_k$.
+\end{proposition}
+
+\begin{proof}
+The first statement is the stationarity condition of the Karush--Kuhn--Tucker system restricted to the weights (split variables for absolute values contribute
+through the rows that link them to $w$). Then $\gamma^2 w^{*\top}\Sigma w^* = (\alpha - G)^\top\Sigma^{-1}(\alpha - G) = \alpha^\top\Sigma^{-1}\alpha - \sum_k
+g_k^\top\Sigma^{-1}(2\alpha - G)$.
+\end{proof}
+
+The quantity $\gamma^2 w^\top\Sigma w$ is the squared information ratio of the alpha the constraints leave to the optimiser, and $\delta_k$ is the share of the
+forecast's information that constraint $k$ takes away; the shares add up (\cref{lst:rs:portfolio-construction-i:decomp}). For the fully constrained book,
+averaged over the 95 months, the turnover limit takes 44.0\% of the unconstrained $\mathrm{IR}^2$, liquidity 39.4\%, the neutralities 7.0\%, the \omterm{def:rs:portfolio-construction-i:constraints}{name limits} 3.1\%;
+the gross limit and \omterm{def:rs:portfolio-construction-i:constraints}{dollar neutrality} take nothing, because once liquidity and turnover have shrunk the book its gross is 1.0 and never binds. On an average month
+28 liquidity bounds bind, 2.5 \omterm{def:rs:portfolio-construction-i:constraints}{name limits}, and the turnover limit always. Ex ante, turnover and liquidity cost most; realised, the turnover limit earned more than it
+cost (\cref{fig:rs:portfolio-construction-i:decomp}). That is the named result, and the reason to report both: shadow prices say what a constraint costs if the
+forecast is right, and a \omterm{def:rs:vectorised-backtests:backtest}{backtest} after costs says whether it was.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar,width=9.5cm,height=4.8cm,bar width=9pt,xlabel={share of the unconstrained ex-ante $\mathrm{IR}^2$},symbolic y coords={factor neutral,
+  name limits,gross limit,liquidity,turnover limit},ytick=data,tick label style={font=\small},label style={font=\small},xmin=0,xmax=0.5,
+  grid=major,grid style={gray!25},xticklabel style={/pgf/number format/fixed,/pgf/number format/precision=1},scaled x ticks=false,table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[y=group,x=share]{figdata/research/25-portfolio-construction-i/decomp.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The shadow-price decomposition of the fully constrained book: the average share of the unconstrained squared ex-ante information ratio each constraint
+takes away. Data: \texttt{rs\_portcons.decomposition}.}\label{fig:rs:portfolio-construction-i:decomp}
+\end{omfigure}
+
+\section{Solving at scale}
+
+\texttt{firm.portcons} writes the problem in the factor form of the risk model, $\Sigma = XFX^\top + D$, and adds split variables only for the absolute values
+that the gross and turnover terms need, so a hundred names become at most five hundred variables. \texttt{firm.portopt.qp} is a dense interior-point solver, whose cost
+grows with the cube of the number of variables: enough for a hundred names and 95 months in under a minute, not for a firm book of three thousand names rebuilt
+daily, which needs the structure exploited. Introducing the \omterm{def:rs:risk-models:families}{factor exposures}
+$y = X^\top w$ as variables makes the quadratic term $y^\top F y + w^\top D w$, diagonal plus a small dense block, and a sparse solver or an operator-splitting
+method (Book~4's ADMM) then scales with the number of names rather than its cube. Warm starts from last month's solution, and screening names whose alpha
+cannot pay for their cost, do the rest.
+
+\section{Tutorial: the sixty-one-times book}\label{tut:rs:portfolio-construction-i:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the hundred-name book with seven cumulative sets of constraints, 95 months, and record ex-ante and realised information ratios, turnover,
+\omterm{def:rs:from-signal-to-forecast:breadth}{transfer coefficient}, shadow prices and the decomposition. \textbf{End state:} the table, \cref{fig:rs:portfolio-construction-i:ir,fig:rs:portfolio-construction-i:cum,fig:rs:portfolio-construction-i:decomp}.
+\begin{tutsteps}
+\item \textbf{The problem}, one constraint set at a time.
+\omcode{code/research/25-portfolio-construction-i/python/rs_portcons.py}{79}{106}{The chapter's constraint sets.}\label{lst:rs:portfolio-construction-i:build}
+\item \textbf{Shadow-price vectors and the decomposition.}
+\omcode{code/firm/portcons/firm_portcons.py}{147}{170}{Each constraint's pull on the optimum, and its share of the information ratio.}\label{lst:rs:portfolio-construction-i:decomp}
+\item \textbf{Run} \texttt{rs\_portcons.summary(k)} for $k = 0, \dots, 6$, \texttt{decomposition(6)} and \texttt{fig\_portcons.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the turnover limit by a penalty and trace net information ratio against $\kappa$; make the noise persistent (the same
+draw each month) and see the turnover limit lose its advantage.
+\end{tutorial}
+
+\section{Build: the construction layer}\label{bld:rs:portfolio-construction-i:portcons}
+
+\begin{build}
+\bfield{Purpose} Every book the firm trades is built by one layer: the alpha, the risk model and the costs in, the constraints named, the trades and the price of
+each constraint out.
+\bfield{Interface} \texttt{Problem(alpha, X, F, spec, gamma, w0)}; \texttt{.equality(row, value, name)}, \texttt{.neutral\_factors(cols, names)},
+\texttt{.bounds(lo, hi, name)}, \texttt{.liquidity(adv, participation, capital, name)}, \texttt{.gross(limit, name)}, \texttt{.turnover(limit, name)},
+\texttt{.turnover\_penalty(kappa)}; \texttt{.solve()} returns weights, ex-ante information ratio, shadow prices, binding counts and pull vectors;
+\texttt{.ir\_decomposition(result)}; \texttt{ir\_ex\_ante}; \texttt{trade\_list(w, w0, capital, prices, names)}.
+\bfield{Rules} Alphas are scaled by the risk the optimiser sees; the covariance is a factor model, never a sample covariance of more names than it has periods;
+every constraint is named, and its shadow price and share are reported with the book.
+\bfield{Acceptance tests} \texttt{code/firm/portcons/tests/}: the closed form without constraints; neutralities met, and multipliers equal to the KKT ones; bounds,
+gross and turnover limits met and binding; the gross limit's shadow price equal to the objective's finite difference; a large \omterm{def:rs:portfolio-construction-i:turnover}{turnover penalty} holds the book still;
+liquidity bounds; pull vectors summing to $\alpha - \gamma\Sigma w$ and a decomposition that adds up; a trade list in shares.
+\bfield{Stretch} A factor-form solver for thousands of names; the eigenfactor adjustment of chapter~24's model inside the optimiser; tax lots.
+\end{build}
+
+\begin{omsources}
+\item H.~Markowitz, ``Portfolio selection'', \emph{Journal of Finance} 7(1), 1952.
+\item R.~O.~Michaud, ``The Markowitz optimization enigma: is `optimized' optimal?'', \emph{Financial Analysts Journal} 45(1), 1989.
+\item R.~Jagannathan and T.~Ma, ``Risk reduction in large portfolios: why imposing the wrong constraints helps'', \emph{Journal of Finance} 58(4), 2003.
+\item B.~I.~Jacobs, K.~N.~Levy and D.~Starer, ``On the optimality of long--short strategies'', \emph{Financial Analysts Journal} 54(2), 1998.
+\item R.~Clarke, H.~de Silva and S.~Thorley, ``Portfolio constraints and the fundamental law of active management'', \emph{Financial Analysts Journal} 58(5), 2002.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:portfolio-construction-i:1}
+Two uncorrelated assets have alphas of 2\% and 1\% and volatilities of 20\% and 10\%; $\gamma = 5$. Give the unconstrained weights and the ex-ante information ratio.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:portfolio-construction-i:2}
+The naive book trades 84 times its capital a month at ten basis points. What do its costs come to in a year?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:portfolio-construction-i:3}
+Give the standard errors of realised information ratios of 1.77 and 1.39 measured over 7.9 years.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:portfolio-construction-i:4}
+Why does the sample covariance of a hundred stocks over 126 days lead to gross exposures of sixty times capital?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:portfolio-construction-i:5}
+Explain how a turnover limit can raise the realised information ratio before costs.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:portfolio-construction-i:6}
+With \$1 billion of capital and positions limited to 5\% of a stock's average daily traded value, what is the largest weight in a stock trading \$10 million a
+day?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:portfolio-construction-i:7}
+\emph{Coding.} With \texttt{rs\_portcons.decomposition(6)} and \texttt{run(6)}, explain why the gross limit's share is zero although it is in the problem.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:portfolio-construction-i:8}
+\emph{Find the flaw.} ``The optimiser's ex-ante information ratio is 4.25 on a sample covariance of the last six months, so we will size the fund on it.''
+\end{exercise}
+
+\section{Problem: The Sixty-One-Times Book}
+
+\begin{problem}[{Weekend problem --- constraints, priced}]\label{pb:rs:portfolio-construction-i:1}
+The chapter's hundred-name book on \texttt{firm.synthmkt}.
+
+\medskip\noindent\textbf{Part I --- The optimiser.}
+\begin{enumerate}
+\item Write the unconstrained optimum and its ex-ante information ratio.
+\item How are the alpha and the risk model built, and why is the alpha the truth plus noise?
+\item What does the naive book look like: gross, forecast and realised volatility, ex-ante and realised information ratios, turnover?
+\item Why are its errors spread over hedged combinations rather than two names?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Constraints.}
+\begin{enumerate}[resume]
+\item What does the factor risk model with \omterm{def:rs:portfolio-construction-i:constraints}{dollar neutrality} change?
+\item What do factor neutralities cost ex ante, and why so little?
+\item What do name and gross limits do to scale and costs?
+\item How many liquidity bounds bind, and what do they cost ex ante?
+\item Why are most differences in realised information ratio between neighbouring settings noise?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Turnover.}
+\begin{enumerate}[resume]
+\item What do turnover and costs become with the turnover limit?
+\item Why does the realised information ratio rise before costs?
+\item Why does the \omterm{def:rs:from-signal-to-forecast:breadth}{transfer coefficient} fall, and is that bad?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the proposition behind the decomposition.
+\item State the \emph{named result}: the share of the unconstrained ex-ante information each constraint takes, and what each earned after costs.
+\item Why do the gross limit and \omterm{def:rs:portfolio-construction-i:constraints}{dollar neutrality} take nothing?
+\item Which book would you trade, and what would you report with it?
+\item When is a sample covariance acceptable in an optimiser?
+\item What would Jagannathan and Ma say about the \omterm{def:rs:portfolio-construction-i:constraints}{name limits}?
+\item How would you solve the problem for three thousand names?
+\item In one sentence: what is an optimiser's ex-ante information ratio worth?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:rs:portfolio-construction-i:1}
+Why do unconstrained mean--variance portfolios perform badly out of sample?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:portfolio-construction-i:2}
+What is a shadow price in portfolio construction, and how would you use it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, risk}]\label{iq:rs:portfolio-construction-i:3}
+Your book must be dollar, beta and sector neutral. What does that cost, and when is it free?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:rs:portfolio-construction-i:4}
+How do you set a liquidity limit, and what happens to the book as capital grows?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:portfolio-construction-i:5}
+What is the \omterm{def:rs:from-signal-to-forecast:breadth}{transfer coefficient}, and why can a lower one be better?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, developer}]\label{iq:rs:portfolio-construction-i:6}
+Design the optimiser for a book of three thousand names rebalanced daily: formulation, solver, and what you precompute.
+\end{interviewq}

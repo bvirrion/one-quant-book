@@ -1,0 +1,304 @@
+\chapter{Order-Book Replay Simulation}\label{ch:rs:order-book-replay-simulation}
+
+A strategy that keeps one lot on the best bid and one on the best ask earns \$1\,106 an hour in a replay of the simulated order book, filling
+61\% of all the volume that trades. The same strategy on the same messages, placed where a real order would stand, behind the orders already
+resting at its price, fills 10\% of the volume and loses \$76 an hour. The first replay assumed that the strategy's quotes stood first in every
+queue they joined. Level~3 of the firm's \omterm{def:rs:vectorised-backtests:backtest}{backtests} replays the market's messages one by one, puts the strategy's own orders in the queue, and
+makes their place in it, and the time it takes them to get there, explicit models. This chapter builds it (\texttt{firm.lobreplay}, with a C++20
+core and a Rust twin that reproduce its fills), measures how much of a passive strategy's result is \omterm{def:rs:order-book-replay-simulation:queue}{queue position} and latency, and bounds what a
+replay cannot see: the strategy's own impact.
+
+\section{Replaying a market-by-order feed}
+
+\begin{definition}[Order-book replay]\label{def:rs:order-book-replay-simulation:replay}
+An \emph{order-book replay}\index{order-book replay} rebuilds the book from a recorded message feed and runs a strategy against it, inserting the
+strategy's own orders as shadow orders: they can be filled by the recorded executions but do not change the messages that follow.
+\end{definition}
+
+A market-by-order feed (Book~1, chapter~19) carries every order's arrival, cancellation and execution with its identifier, so the replay knows the
+queue at each price in time priority. \texttt{firm.lobreplay} replays the messages of \texttt{firm.tape}: one simulated hour holds 129\,303 of them.
+Its book is the queue of (order, size) pairs at each price; its clock is the messages' timestamps, merged with the strategy's own events (its orders'
+arrivals and cancellations at the exchange, its view of the market) in one priority queue, as in chapter~17.
+
+\section{Where am I in the queue?}
+
+\begin{definition}[Queue position, queue-position model]\label{def:rs:order-book-replay-simulation:queue}
+The \emph{queue position}\index{queue position} of a resting order is the quantity ahead of it at its price, which must execute or cancel before it
+can fill. A \emph{queue-position model}\index{queue-position model} says how a shadow order's queue position is set when it arrives and how it changes
+as the book changes.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,x=1cm,y=1cm]
+\foreach \x/\w/\l in {0/1.6/300,1.7/1.1/200,2.9/1.3/250} {\draw[fill=omDef!15,draw=omDef] (\x,0) rectangle ++(\w,0.7); \node at (\x+\w/2,0.35) {\l};}
+\draw[fill=omThm!30,draw=omThm,thick] (4.3,0) rectangle ++(0.9,0.7); \node at (4.75,0.35) {ours};
+\foreach \x/\w/\l in {5.3/1.4/400,6.8/0.9/100} {\draw[fill=gray!10,draw=gray] (\x,0) rectangle ++(\w,0.7); \node at (\x+\w/2,0.35) {\l};}
+\draw[-Stealth,thick] (-0.8,0.35) -- (-0.05,0.35) node[pos=0,left,align=right,font=\footnotesize]{executions\\ from the front};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (0,-0.1) -- (4.2,-0.1) node[midway,below=6pt,font=\footnotesize]{ahead: 750 shares};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (5.3,-0.1) -- (7.7,-0.1) node[midway,below=6pt,font=\footnotesize]{behind: arrived later};
+\draw[-Stealth,thick,omThm] (2.3,1.4) -- (2.3,0.8) node[pos=0,above,font=\footnotesize,align=center]{a cancellation ahead\\ moves us up};
+\node[font=\footnotesize,anchor=west] at (8.0,0.35) {best bid, time priority};
+\end{tikzpicture}
+
+\omcaption{A shadow order in the queue at its price. Executions consume the queue from the front; cancellations ahead of the order move it up,
+cancellations behind do not; it fills when an execution reaches it.}\label{fig:rs:order-book-replay-simulation:queue}
+\end{omfigure}
+
+\texttt{firm.lobreplay} implements three models:
+\begin{itemize}
+\item \emph{front}: the order is first at its price as soon as it arrives, and every execution at that price fills it (the \omterm{def:rs:event-driven-backtests:fill}{touch fill} of chapter~17);
+\item \emph{fifo}: the order joins behind the orders resting at its price when it arrives, known by identifier from the market-by-order feed; it moves
+up as those orders execute or cancel, and fills when an execution reaches an order that arrived after it;
+\item \emph{prob}: only the level's total size is known (a market-by-price feed): executions consume the quantity ahead first, and a cancellation
+removes size ahead of the order in proportion to the share of the level that is ahead of it.
+\end{itemize}
+The open-source backtester hftbacktest, which replays market-by-price data, offers the same two families: a risk-averse model in which cancellations
+happen only at the tail of the queue, so the order advances only on trades, and probabilistic models in which decreases happen both before and after
+the order's position, with the probability given by a function of its place in the queue.
+
+\section{Latency}
+
+\begin{definition}[Latency model, order-entry latency, market-data latency]\label{def:rs:order-book-replay-simulation:latency}
+A \emph{latency model}\index{latency model} gives the delays between the market and the strategy: the \emph{market-data latency}\index{market-data
+latency}, from an event at the exchange to the strategy seeing it, and the \emph{order-entry latency}\index{order-entry latency}, from the strategy
+sending an order or cancellation to the exchange acting on it.
+\end{definition}
+
+The chapter's touch quoter keeps one lot on the best bid and one on the best ask, moving an order when its price is no longer the best, within five lots
+of inventory. Replayed on two simulated hours under each model, with order-entry latencies from zero to five seconds and a \omterm{def:rs:order-book-replay-simulation:latency}{market-data latency} of half
+of it (\cref{fig:rs:order-book-replay-simulation:latency}):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\omterm{def:rs:order-book-replay-simulation:latency}{order-entry latency} & 0 & 50 ms & 200 ms & 1 s & 5 s\\
+\midrule
+front: P\&L an hour (\$) & 1\,106 & 778 & 672 & 498 & 192\\
+front: share of traded volume & 61\% & 48\% & 43\% & 28\% & 11\%\\
+fifo: P\&L an hour (\$) & $-76$ & $-94$ & $-89$ & $-146$ & $-8$\\
+fifo: lots filled an hour & 522 & 505 & 470 & 350 & 182\\
+fifo: mark-out after 10 s (ticks) & $+0.008$ & $-0.001$ & $-0.025$ & $-0.100$ & $-0.115$\\
+prob: P\&L an hour (\$) & $-49$ & $-42$ & $-41$ & $-26$ & $+33$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The front model's profits are an artefact: a quote that is first in every queue takes the benign executions that a real order behind the queue never
+sees, and its mark-out stays near $+0.4$ ticks at every latency. With \omterm{def:rs:order-book-replay-simulation:queue}{queue positions}, the quoter has no edge: its P\&L is within its noise of zero,
+and its 10-second mark-out, a hundredth of a tick with no latency, turns negative by 50 milliseconds and reaches $-0.1$ ticks at one second: the orders
+that still fill when the quoter is slow are the ones the fast traders let through. Lehalle and Mounjid (2017) found the same erosion in a model of limit
+orders: the value of knowing the liquidity imbalance is eroded by latency when there is not enough time to cancel and reinsert. The probabilistic model,
+which knows only the level's size, lands close to the exact one (499 lots against 522 with no latency).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=pnl,width=7cm,height=5.4cm,title={\small P\&L an hour (\$)},tick label style={font=\footnotesize},xtick={0,1,2,3,4},
+  xticklabels={0,50 ms,200 ms,1 s,5 s},xlabel={\small order-entry latency},ymin=-250,ymax=1200,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(1.1,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!55,thick,dashed,mark=o] table[x=k,y=front_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omDef,very thick,mark=*] table[x=k,y=fifo_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omThm,thick,mark=square*] table[x=k,y=prob_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\legend{front of queue,fifo (market-by-order),prob (market-by-price)}
+\end{axis}
+\begin{axis}[at={(pnl.east)},anchor=west,xshift=1.4cm,width=7cm,height=5.4cm,title={\small mark-out after 10 s (ticks)},tick label style={font=\footnotesize},
+  xtick={0,1,2,3,4},xticklabels={0,50 ms,200 ms,1 s,5 s},xlabel={\small order-entry latency},ymin=-0.2,ymax=0.45,grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[black!55,thick,dashed,mark=o] table[x=k,y=front_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omDef,very thick,mark=*] table[x=k,y=fifo_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omThm,thick,mark=square*] table[x=k,y=prob_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The touch quoter replayed on two simulated hours of \texttt{firm.tape} under three \omterm{def:rs:order-book-replay-simulation:queue}{queue-position models}, against the \omterm{def:rs:order-book-replay-simulation:latency}{order-entry latency} (the
+\omterm{def:rs:order-book-replay-simulation:latency}{market-data latency} is half of it). Only the front-of-queue model, which no real order enjoys, makes money. Data: \texttt{rs\_lobreplay.touch\_grid}.}\label{fig:rs:order-book-replay-simulation:latency}
+\end{omfigure}
+
+\section{Fill logic}
+
+\begin{definition}[Passive fill probability]\label{def:rs:order-book-replay-simulation:passive}
+The \emph{passive fill probability}\index{passive fill probability} of a resting order over a horizon is the probability that the executions at its price
+consume the queue ahead of it and reach it within the horizon.
+\end{definition}
+
+Under the fifo model a fill has one rule: an execution against an order that arrived after the shadow means, in time priority, that the aggressor reached
+the shadow first; the shadow fills by the smaller of its remaining size and the execution's. Every other message at its price only moves it up (an
+execution or cancellation of an order ahead) or does nothing (an order joining behind, a cancellation behind). The rule is simple enough to write three
+times: in Python for research, in C++20 for the firm's engines (Book~13) and in Rust, and the three must agree. The shared fixture is five simulated
+minutes (8\,513 messages) and the 75 shadow orders a touch quoter sent with a 50-millisecond latency; the Python engine, the Python reference
+\texttt{track\_fifo}, the C++20 core and the Rust twin all produce the same 29 fills, to the last bit of the timestamps.
+
+The same engine gives chapter~17 its answer. The \omterm{def:rs:market-data-for-research:bar}{bar} quoter of that chapter, replayed on its four days under the fifo model, fills 344 lots a day (47\% of
+its orders) and loses \$239 a day, with a five-minute mark-out of $-0.77$ ticks: between the \omterm{def:rs:event-driven-backtests:fill}{touch fill}'s 523 lots and $+\$17$ and the \omterm{def:rs:event-driven-backtests:fill}{penetration fill}'s
+290 lots and $-\$584$, and nearer the pessimistic end. The \omterm{def:rs:event-driven-backtests:fill}{penetration fill} was the better level-2 guess; neither was the answer.
+
+\section{The missing market impact and how to bound it}
+
+\begin{definition}[Market impact, counterfactual impact]\label{def:rs:order-book-replay-simulation:impact}
+The \emph{market impact}\index{market impact} of a strategy is the change its own orders and trades cause in the prices it later trades at. In a replay
+it is a \emph{counterfactual impact}\index{counterfactual impact}: the recorded market did not contain the strategy's orders, so what it would have
+done with them can only be modelled.
+\end{definition}
+
+A replay leaves the recorded messages unchanged: when the shadow fills, the real order behind it still executes in the data, and the aggressor who in
+reality would have taken the shadow's lot and then stopped (or moved the price further) is replayed as if the shadow were not there. hftbacktest's
+documentation states the assumption plainly: the replayed order cannot change the simulated market, and must be small enough not to make any impact.
+The assumption can be bounded. \omterm{def:rs:trade-flow-features:lambda}{Kyle's lambda} on this simulated tape is 0.10 ticks per 100 shares (chapter~9); if each lot the quoter trades moved the
+price against it by half that on average, the fifo quoter's hour would cost about \$26 more with no latency and \$9 more at five seconds, small against
+its noise here and decisive for a strategy with an edge of a few tens of dollars. Where the bound matters, the answer is not a better replay but a
+reactive simulator, in which the other traders respond to the strategy's orders (Book~10), or live trading at small size (chapter~21).
+
+\section{The fourth level}
+
+The four levels of chapter~16 now have their machinery: \texttt{firm.vecbt} for weights and costs, \texttt{firm.evbt} for orders on \omterm{def:rs:market-data-for-research:bar}{bars},
+\texttt{firm.lobreplay} for orders in the queue with latency. Each level has answered a question the one below could not: level~2 showed that the passive
+quoter's result was the \omterm{def:rs:event-driven-backtests:fill}{fill model}'s; level~3 showed which \omterm{def:rs:event-driven-backtests:fill}{fill model}, and that its edge was an artefact of \omterm{def:rs:order-book-replay-simulation:queue}{queue position}. What no replay can supply is
+the market's reaction to the strategy and the strategy's real latency and fills: that is level~4, trading live at small size or on paper against live
+data, and chapters 19 and 21 measure how far the three simulations are from it.
+
+\section{Tutorial: where did the queue go?}\label{tut:rs:order-book-replay-simulation:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Replay a touch quoter under three \omterm{def:rs:order-book-replay-simulation:queue}{queue-position models} and five latencies, replay chapter~17's \omterm{def:rs:market-data-for-research:bar}{bar} quoter at level~3, and check the C++20
+and Rust cores against the Python fills. \textbf{End state:} \cref{fig:rs:order-book-replay-simulation:latency}; the table; three agreeing implementations.
+\begin{tutsteps}
+\item \textbf{The queue models}: what each message at the shadow's price does to it.
+\omcode{code/firm/lobreplay/firm_lobreplay.py}{106}{143}{Queue positions under three models.}\label{lst:rs:order-book-replay-simulation:models}
+\item \textbf{The C++20 core} of the fifo model, reproducing the Python fills.
+\omcode{code/firm/lobreplay/cpp/firm_lobreplay.hpp}{88}{106}{The fifo model's per-message step in C++20.}\label{lst:rs:order-book-replay-simulation:cpp}
+\item \textbf{Run} \texttt{touch\_grid()}, \texttt{bar\_quoter\_level3()}, \texttt{impact\_bound()}, \texttt{fig\_lobreplay.py} and \texttt{make\_lobreplay\_fixture.py}; build
+the C++ test and \texttt{cargo test} the Rust crate.
+\end{tutsteps}
+\textbf{What to change next.} Quote only when the queue at the best is short (a queue-imbalance filter, chapter~8) and see whether an edge appears; replace
+the proportional cancellation rule of the prob model with a risk-averse one and compare its fills with the exact model's.
+\end{tutorial}
+
+\section{Build: the level-3 replay engine}\label{bld:rs:order-book-replay-simulation:lobreplay}
+
+\begin{build}
+\bfield{Purpose} The firm's backtester for strategies whose fills depend on the queue and on latency: market making, passive execution, queue-imbalance
+signals; the reference the production engines' fill logic is checked against.
+\bfield{Interface} \texttt{Book}, \texttt{Shadow}, \texttt{QueueTracker(model)}, \texttt{Replay(msgs, strategy, model, entry\_latency, data\_latency).run()}
+returning shadows, fills, position, cash and the mid path; \texttt{Strategy.on\_market(ctx, t, snapshot)}, \texttt{on\_fill}; \texttt{track\_fifo(msgs,
+orders)}; C++20 \texttt{firm::track\_fifo} in \texttt{cpp/firm\_lobreplay.hpp}; Rust \texttt{firm\_lobreplay::track\_fifo}.
+\bfield{Rules} Shadow orders never change the replayed messages; our events at a message's time act before it; every queue assumption lives in the model;
+the three implementations agree on the fixture.
+\bfield{Acceptance tests} \texttt{code/firm/lobreplay/tests/}: the book by hand; the fifo queue moving up on executions and cancellations ahead and filling on
+an execution behind, with and without a cancellation; the three models and both latencies on a hand stream; the fixture's 29 fills from the reference;
+the C++20 and Rust tests on the same fixture.
+\bfield{Stretch} Pro-rata matching; iceberg orders; a reactive book in which other traders respond (Book~10).
+\end{build}
+
+\begin{omsources}
+\item C.-A.~Lehalle and O.~Mounjid, ``Limit order strategic placement with adverse selection risk and the role of latency'', \emph{Market Microstructure and
+Liquidity} 3(1), 2017.
+\item R.~Cont and A.~de Larrard, ``Price dynamics in a Markovian limit order market'', \emph{SIAM Journal on Financial Mathematics} 4(1), 2013.
+\item hftbacktest (open-source backtester), documentation, ``Order fill'': exchange models and queue models.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:1}
+A shadow buy joins a bid queue of 300, 200 and 250 shares. Then 300 execute, 100 of the 200-share order cancel, an order of 400 joins, and 450 execute. How
+much of the shadow's 100 fills under the fifo model?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:2}
+Under the prob model a shadow has 600 ahead and 200 behind when 400 shares cancel at its price. What is its new position?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:3}
+The strategy sees an event 3 milliseconds after it happens and its orders reach the exchange 5 milliseconds after it sends them. How old is the book its
+order meets?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:4}
+Why does the front-of-queue model's mark-out stay positive at every latency while the fifo model's turns negative?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:5}
+The fifo quoter trades 522 lots an hour. With \omterm{def:rs:trade-flow-features:lambda}{Kyle's lambda} at 0.10 ticks per 100 shares, what impact bound does the chapter's rule give, in dollars an hour?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:6}
+Why does a shadow order placed at a price with no resting orders (inside the spread) never fill in a replay, and what does that say about replaying strategies
+that improve the price?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-replay-simulation:7}
+\emph{Coding.} Run the touch quoter under the fifo model with the \omterm{def:rs:order-book-replay-simulation:latency}{market-data latency} set to zero and only the \omterm{def:rs:order-book-replay-simulation:latency}{order-entry latency} varying. Does the edge
+depend more on seeing late or on acting late?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-replay-simulation:8}
+\emph{Find the flaw.} ``Our market-making replay fills our quotes whenever a trade prints at our price, and it shows a Sharpe ratio of 9.''
+\end{exercise}
+
+\section{Problem: Where Did the Queue Go?}
+
+\begin{problem}[{Weekend problem --- a passive strategy, level 3}]\label{pb:rs:order-book-replay-simulation:1}
+The chapter's touch quoter on two simulated hours, and chapter~17's \omterm{def:rs:market-data-for-research:bar}{bar} quoter on four simulated days, replayed through \texttt{firm.lobreplay}.
+
+\medskip\noindent\textbf{Part I --- The replay.}
+\begin{enumerate}
+\item How many messages does a simulated hour hold, and what does a market-by-order feed give the queue models that a market-by-price feed does not?
+\item What does a shadow order change in the replay, and what does it not?
+\item In what order do the strategy's events and a market message at the same time act?
+\item How were the three implementations of the fifo model checked?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- \omterm{def:rs:order-book-replay-simulation:queue}{Queue position}.}
+\begin{enumerate}[resume]
+\item What do the front and fifo models give the touch quoter with no latency: P\&L, share of traded volume, lots?
+\item What does the prob model give, and why is it close to fifo?
+\item Why is the front model's profit an artefact?
+\item What are the mark-outs of the front and fifo models?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Latency.}
+\begin{enumerate}[resume]
+\item How do the fifo model's lots and mark-out change from zero to five seconds?
+\item At what latency does the quoter's edge vanish?
+\item What did Lehalle and Mounjid find about latency?
+\item What does the front model do as latency grows, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the P\&L of the passive strategy under each queue model and latency, and the latency at which its edge vanishes.
+\item What is the level-3 answer for chapter~17's \omterm{def:rs:market-data-for-research:bar}{bar} quoter, and which level-2 \omterm{def:rs:event-driven-backtests:fill}{fill model} was closer?
+\item What does the impact bound add, and when would it decide?
+\item What does a replay fundamentally miss, and where does the firm go to find it?
+\item What would you change in the strategy before replaying it again?
+\item What would you log live to calibrate the queue model?
+\item Why write the fill rule in three languages?
+\item In one sentence: what does a \omterm{def:rs:order-book-replay-simulation:queue}{queue-position model} assume?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:rs:order-book-replay-simulation:1}
+Why do market-making \omterm{def:rs:vectorised-backtests:backtest}{backtests} usually overstate profits?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:rs:order-book-replay-simulation:2}
+How would you estimate your order's position in the queue from a market-by-price feed?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:rs:order-book-replay-simulation:3}
+Design an \omterm{def:rs:order-book-replay-simulation:replay}{order-book replay} engine that supports latency and shadow orders. What are its invariants?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:rs:order-book-replay-simulation:4}
+How does latency affect a passive strategy's fills and their quality?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:order-book-replay-simulation:5}
+What does a replay \omterm{def:rs:vectorised-backtests:backtest}{backtest} miss about \omterm{def:rs:order-book-replay-simulation:impact}{market impact}, and how would you bound it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:rs:order-book-replay-simulation:6}
+How would you make sure a research replay in Python and a production engine in C++ fill orders identically?
+\end{interviewq}

@@ -1,0 +1,31 @@
+# 5. The Volatility-Index Complex — brief and source ledger
+
+## Brief
+
+- **Hook.** An exchange-traded product that held short-dated VIX futures lost most of its value in years when the index itself ended where it started: the futures curve's roll-down paid its short sellers.
+- **Sections.** VIX futures and their curve; Exchange-traded volatility products and their rebalancing; Futures against options; February 2018.
+- **Defines.** exchange-traded volatility product, ETP rebalancing flow, VIX term-structure slope.
+- **Uses (defined earlier).** VIX future (B1.25), VIX option (B5.14), volatility roll-down (B5.25), exchange-traded product (B3.19), leveraged ETF (B1.14), backtest (B7.16), information coefficient (B7.6), transaction cost analysis (B7.23), capacity curve (B7.28).
+- **Strategy files.** short VIX futures roll-down; ETP rebalancing front-running; VIX futures against SPX options; long volatility on inverted curve.
+- **Tutorial.** Build a VIX-like index and its futures curve on firm.synthvol, simulate long, inverse and leveraged ETPs with daily rebalancing, and measure roll-down returns and the ETPs' rebalancing flow in a volatility spike.
+- **Build.** `firm.vixetp`: volatility-index construction from a surface, a futures curve, ETP daily rebalancing and flow, and roll-down trades; Python.
+- **Weekend problem.** Roll-down — named result: the short-futures book's roll-down return and the inverse ETP's loss in the planted spike.
+- **Facts to verify.** Cboe VIX methodology white paper (dated); Whaley 2013 trading volatility: at what cost? (JPM); Augustin, Cheng, Van den Bergen 2021 volmageddon (Management Science).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Cboe Volatility Index methodology: VIX is designed to measure the market's expectation of 30-day forward-looking volatility of the S&P 500, computed from the prices of SPX and SPXW options (out-of-the-money strikes weighted as in a variance swap replication, following Demeterfi, Derman, Kamal and Zou 1999) at a near and a next term interpolated to a constant 30 days; the final settlement value of VIX futures and options is a Special Opening Quotation of the index on the morning of expiration, from SPX or SPXW options of a single expiration 30 calendar days away | Cboe methodology PDF (pdftotext) | https://cdn.cboe.com/resources/indices/Volatility_Index_Methodology_Cboe_Volatility_Index.pdf | 2026-09-25 | "The Cboe Volatility Index (VIX) is designed to measure the market's expectation of 30-day forward looking volatility"; "The VIX Index measures 30-day expected volatility of the S&P 500 Index. The calculation takes as input the market prices of SPX options and SPXW options"; "The final settlement value for VIX futures and options is determined on the morning of their expiration ate (usually a Wednesday) through a Special Opening Quotation" | section 1; section 3 |
+| F2 | R. E. Whaley, "Trading volatility: at what cost?", Journal of Portfolio Management 40(1) (2013) 95-108: VIX ETPs launched January 2009; the most popular are not suitable buy-and-hold investments and are virtually guaranteed to lose money over time; ETPs linked to the S&P 500 VIX short-term futures indices had lost nearly $4 billion since launch | Crossref metadata; OpenAlex abstract | https://doi.org/10.3905/jpm.2013.40.1.095 | 2026-09-25 | abstract: "The most popular VIX ETPs are not suitable buy-and-hold investments and are virtually guaranteed to lose money over time"; "losses of nearly $4 billion" | section 2; strat:s2:the-volatility-index-complex:rolldown; omsources |
+| F3 | P. Augustin, I.-H. Cheng, L. Van den Bergen, "Volmageddon and the failure of short volatility products", Financial Analysts Journal 77(3) (2021) 35-51: describes the abrupt crash of short volatility strategies on 5 February 2018 and the risks of hedge and leverage rebalancing when markets are highly concentrated and volatile, reminiscent of portfolio insurance | Crossref metadata; OpenAlex abstract | https://doi.org/10.1080/0015198x.2021.1913040 | 2026-09-25 | abstract: "the abrupt market crash of short volatility strategies on 5 February 2018"; "the risks associated with hedge and leverage rebalancing" | section 4; strat:s2:the-volatility-index-complex:flow; omsources |
+| F4 | Credit Suisse AG media release, 6 February 2018 (SEC exhibit 99.1): event acceleration of the VelocityShares Daily Inverse VIX Short Term ETNs (XIV) because the intraday indicative value on 5 February 2018 was equal to or less than 20% of the prior day's closing indicative value; closing indicative value on 2 February 2018 $108.3681; expected acceleration date 21 February 2018, last trading day 20 February 2018; no new units issued | SEC EDGAR exhibit | https://www.sec.gov/Archives/edgar/data/1053092/000095010318001572/dp86358_ex9901.htm | 2026-09-25 | "Because the intraday indicative value of XIV on February 5, 2018 was equal to or less than twenty percent of the prior day's closing indicative value, an acceleration event has occurred"; "On February 2, 2018, the closing indicative value was $108.3681" | section 4; strat:s2:the-volatility-index-complex:rolldown |
+| F5 | Cboe Futures Exchange VIX futures daily settlements (monthly contracts expiring January 2013 to 2026, one file per contract) and the VIX index history, used only through derived statistics | Cboe historical data files | https://cdn.cboe.com/data/us/futures/market_statistics/historical_data/VX/VX_<expiry>.csv ; https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv | 2026-09-25 | files downloaded; statistics recomputed by s2_fetch_vx.py | hook; section 1; section 4 |
+
+## EXCLUDED
+
+- XIV's 96% one-day loss as reported in the press (etf.com, CNBC): not a primary source; the chapter quotes Credit Suisse's own release and the chapter's reconstruction from Cboe settlements.
+- The S&P 500 VIX Short-Term Futures Index methodology: not fetched; the chapter builds its own constant 30-day index and says so.
+- Assets and flows of named ETPs: none quoted beyond Whaley's abstract.
+- The synthetic term premium (0.3 a year of maturity) and vol-of-variance are the chapter's own choices.
+

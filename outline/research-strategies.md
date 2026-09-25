@@ -7,7 +7,7 @@ after a summary is the planned count of strategy files.
 
 ---
 
-## One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios (~398 pp)
+## One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios (written: 345 pp; outline estimate was ~398)
 
 **Part I — Process and data**
 
@@ -55,7 +55,7 @@ after a summary is the planned count of strategy files.
 
 ---
 
-## One Quant Book 8 — Strategies I: Equities and Futures (~388 pp)
+## One Quant Book 8 — Strategies I: Equities and Futures (written: 330 pp, 118 strategy files; outline estimate was ~388)
 
 **Part I — Equity statistical arbitrage**
 
@@ -97,7 +97,7 @@ after a summary is the planned count of strategy files.
 
 ---
 
-## One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks (~382 pp)
+## One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks (written: 333 pp, 118 strategy files; outline estimate was ~382)
 
 **Part I — Volatility and convertibles**
 

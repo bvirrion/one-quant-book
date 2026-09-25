@@ -1,0 +1,26 @@
+# 26. Volatility Targeting and Risk-Managed Portfolios — brief and source ledger
+
+## Brief
+
+- **Hook.** When volatility spikes, trillions of dollars of volatility-targeting funds sell at the same time; the selling is mechanical, predictable, and part of the spike.
+- **Sections.** The mechanics of volatility targeting; Does it improve the Sharpe ratio?; The industry's footprint.
+- **Defines.** volatility-managed portfolio, leverage rebalancing flow.
+- **Uses (defined earlier).** volatility targeting (ch19), EWMA volatility (B4.18), risk parity (B7.26), backtest (B7.16), vectorised backtest (B7.16), information coefficient (B7.6), transaction cost analysis (B7.23), capacity curve (B7.28), fundamental factor model (B7.24).
+- **Strategy files.** volatility-managed equity; volatility-targeted multi-asset; trading against deleveraging flow.
+- **Tutorial.** Apply volatility targeting to the firm.synthmkt market and firm.synthfut portfolios, measure Sharpe and drawdown effects, and simulate the aggregate selling of many targeting funds after a volatility spike and its price impact.
+- **Build.** `firm.voltarget`: volatility forecasting and targeting with leverage caps and rebalancing bands, and an aggregate-flow simulator for many targeting funds; Python.
+- **Weekend problem.** Mechanical selling — named result: the Sharpe improvement from volatility management and the aggregate flow as a fraction of volume after a spike.
+- **Facts to verify.** Moreira and Muir 2017, Volatility-managed portfolios (JF); Cederburg, O'Doherty, Wang, Yan 2020 on the performance of volatility-managed portfolios (JFE); Harvey, Hoyle, Korgaonkar, Rattray, Sargaison, van Hemert 2018 impact of volatility targeting (JPM).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | A. Moreira, T. Muir, "Volatility-managed portfolios", Journal of Finance 72(4) (2017) 1611-1644: managed portfolios that take less risk when volatility is high produce large alphas, increase Sharpe ratios and produce large utility gains for mean-variance investors, for the market, value, momentum, profitability, return on equity, investment and betting-against-beta factors and the currency carry trade; volatility timing works because changes in volatility are not offset by proportional changes in expected returns; the strategy takes relatively less risk in recessions | Crossref metadata; OpenAlex abstract; NBER w22208 | https://doi.org/10.1111/jofi.12513 ; https://www.nber.org/papers/w22208 | 2026-09-25 | abstract: "Managed portfolios that take less risk when volatility is high produce large alphas, increase Sharpe ratios"; "Volatility timing increases Sharpe ratios because changes in volatility are not offset by proportional changes in expected returns" | section 2; strat:s1:volatility-targeting-and-risk-managed-portfolios:equity; omsources |
+| F2 | S. Cederburg, M. S. O'Doherty, F. Wang, X. S. Yan, "On the performance of volatility-managed portfolios", Journal of Financial Economics 138(1) (2020) 95-117: across 103 equity strategies, volatility-managed portfolios do not systematically outperform the unmanaged ones in direct comparisons; they tend to show positive alphas in spanning regressions, but the implied strategies are not implementable in real time, and out-of-sample versions generally earn lower certainty-equivalent returns and Sharpe ratios than the unmanaged portfolios, from structural instability in the spanning regressions | Crossref metadata; abstract on the RePEc/IDEAS record | https://doi.org/10.1016/j.jfineco.2020.04.015 ; https://ideas.repec.org/a/eee/jfinec/v138y2020i1p95-117.html | 2026-09-25 | abstract: "Volatility-managed portfolios do not systematically outperform their corresponding unmanaged portfolios in direct comparisons" | hook; section 2; strat:s1:volatility-targeting-and-risk-managed-portfolios:equity; omsources |
+| F3 | C. R. Harvey, E. Hoyle, R. Korgaonkar, S. Rattray, M. Sargaison, O. van Hemert, "The impact of volatility targeting", Journal of Portfolio Management 45(1) (2018) 14-33: higher Sharpe ratios from volatility management hold only for risk assets such as equity and credit, linked to the leverage effect; for bonds, currencies and commodities the Sharpe impact is negligible; volatility targeting reduces the likelihood of extreme returns across all asset classes; for a 60-40 portfolio and a risk parity portfolio, scaling at asset and portfolio level improves Sharpe ratios and reduces tail events | Crossref metadata; OpenAlex abstract | https://doi.org/10.3905/jpm.2018.45.1.014 | 2026-09-25 | abstract: "this result only holds for risk assets, such as equity and credit, and they link this finding to the so-called leverage effect"; "for bonds, currencies, and commodities, the impact of volatility targeting on the Sharpe ratio is negligible" | section 2; section 3; strat:s1:volatility-targeting-and-risk-managed-portfolios:multi; omsources |
+
+## EXCLUDED
+
+- The hook's "trillions of dollars of volatility-targeting funds": no source fetched for the industry's size; the chapter's fund share (0.2% of market value), turnover and impact are labelled assumptions.
+- Named volatility-control funds, indices or dealers' estimates of systematic selling: none cited.

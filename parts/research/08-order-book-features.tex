@@ -1,0 +1,380 @@
+\chapter{Order-Book Features}\label{ch:rs:order-book-features}
+
+Three lots rest at the best bid and forty at the best ask, the spread is one tick. Which way does the next mid-price change
+go? The book's intraday simulator answers from three hours of its own data: when the bid queue is that much smaller, the next
+move is down three times in four. The order book is the most immediate information a market publishes, and every trading firm
+that acts at horizons of seconds reads it. This chapter defines the standard order-book features (imbalance at the touch and
+beyond, \omterm{def:rs:order-book-features:ofi}{order-flow imbalance}, the weighted mid and a \omterm{def:rs:order-book-features:micro}{microprice}, queue depletion and \omterm{def:rs:order-book-features:depletion}{cancellation rates}), measures them on
+firm.tape, compares the imbalance with the prediction of a queueing model, and builds a streaming feature engine in three
+languages. Its data are three hours of simulated messages: 239\,528 of them.
+
+\section{Imbalance at the touch}
+
+\begin{definition}[Queue imbalance]\label{def:rs:order-book-features:imbalance}
+The \emph{queue imbalance}\index{queue imbalance} at the touch is $I = (q^b - q^a)/(q^b + q^a)$, where $q^b$ and $q^a$ are the
+quantities resting at the best bid and the best ask; it lies in $[-1, 1]$ and is positive when the bid queue is the larger.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=0.075cm,y=0.62cm]
+\draw[black!60] (0,-0.5) -- (0,5.5);
+\foreach \y/\p/\q in {4/100.02/35,3/100.01/28,2/100.00/40} {
+  \fill[omThm!40] (0,\y-0.35) rectangle (\q,\y+0.35);
+  \node[anchor=east] at (-2,\y) {\p};
+  \node[anchor=west,omThm] at (\q+1,\y) {\q};
+}
+\foreach \y/\p/\q in {1/99.99/3,0/99.98/22,-1/99.97/31} {
+  \fill[omDef!45] (0,\y-0.35) rectangle (\q,\y+0.35);
+  \node[anchor=east] at (-2,\y) {\p};
+  \node[anchor=west,omDef] at (\q+1,\y) {\q};
+}
+\node[anchor=west,omThm] at (48,3.4) {asks (lots)};
+\node[anchor=west,omDef] at (48,0.2) {bids (lots)};
+\draw[black!70,dashed] (-14,1.5) -- (46,1.5);
+\node[anchor=west,black!70] at (48,1.5) {spread: one tick};
+\node[anchor=west,align=left] at (48,-1.0) {touch imbalance $I = (3 - 40)/43 = -0.86$};
+\end{tikzpicture}
+
+\omcaption{The book around the touch: three lots at the best bid (99.99), forty at the best ask (100.00). The \omterm{def:rs:order-book-features:imbalance}{queue imbalance} at the
+touch is $-0.86$; over three levels on each side it is $(56 - 103)/159 = -0.30$, because the deeper bids are larger. A schematic, not
+data.}\label{fig:rs:order-book-features:book}
+\end{omfigure}
+
+When the spread is one tick, the mid moves only when one of the two best queues empties (or a new level appears inside a wider
+spread). A small bid queue is closer to emptying than a large ask queue, so imbalance predicts the direction of the next move.
+The first model of this is a race.
+
+\begin{proposition}[Imbalance as a race of two queues]\label{prop:rs:order-book-features:race}
+Model the two best queues, in lots, as independent birth--death processes with arrival rate $\lambda$ and departure rate $\mu$
+(Book 4, chapter 8), starting from $q^b$ and $q^a$. The probability that the next mid move is up is the probability that the ask
+queue empties first, $\int_0^\infty(1 - F_{q^b}(t))\,dF_{q^a}(t)$, where $F_q$ is the law of the time for a queue starting at $q$ to
+empty. It increases with $q^b$, decreases with $q^a$, and equals $\tfrac12$ when $q^b = q^a$.
+\end{proposition}
+
+\begin{proof}
+The next move is up when the ask side empties before the bid side; with independent queues this is the stated race. A larger
+starting queue takes stochastically longer to empty, which gives the monotonicity; symmetry gives $\tfrac12$.
+\end{proof}
+
+On the simulator's three hours, 2.03 lots a second arrive at each best queue and 2.13 leave it (additions at the best price;
+cancellations and executions there). \Cref{fig:rs:order-book-features:updown} sets the race's prediction against the data, bucket
+by bucket of the imbalance. The direction is right: the probability of an up move rises from 0.245 in the most ask-heavy tenth of
+observations to 0.736 in the most bid-heavy. The model is far too confident: it predicts 0.017 and 0.979. The reason is the
+mechanism the simulator plants, and that real markets share: the queues are not independent random walks, because the
+efficient price moves and the liquidity providers on its wrong side cancel. Imbalance is a noisy view of that, and a queueing
+model that ignores it overstates what the view is worth. Gould and Bonart (2016) fit the same relation by logistic regression on
+ten Nasdaq stocks and find a strongly significant improvement over a null model, large for large-tick stocks.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.4cm,xlabel={queue imbalance $I$ (bucket centre)},ylabel={P(next mid move is up)},
+  tick label style={font=\small},label style={font=\small},xmin=-1,xmax=1,ymin=0,ymax=1,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*] table[x=centre,y=empirical]{figdata/research/08-order-book-features/updown.csv};
+\addplot[omThm,thick,dashed,mark=square] table[x=centre,y=model]{figdata/research/08-order-book-features/updown.csv};
+\addplot[black!50,thin,sharp plot] coordinates {(-1,0.5) (1,0.5)};
+\legend{simulated tape,race of two birth--death queues}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Probability that the next mid-price move is up, by tenth of \omterm{def:rs:order-book-features:imbalance}{queue imbalance} at a one-tick spread: 0.245 to 0.736 in three
+hours of \texttt{firm.tape}, against 0.017 to 0.979 for the race of two independent birth--death queues with the rates measured on the
+same data. Data: \texttt{firm.tape}, seed 8; \texttt{firm.queues}.}\label{fig:rs:order-book-features:updown}
+\end{omfigure}
+
+\section{Depth beyond the touch}
+
+\begin{definition}[Depth imbalance, depth profile]\label{def:rs:order-book-features:depth}
+The \emph{depth imbalance}\index{depth imbalance} over $L$ levels is $(\sum_{i \le L}q^b_i - \sum_{i \le L}q^a_i)/(\sum_{i\le L}q^b_i
++ \sum_{i \le L}q^a_i)$, with $q^b_i, q^a_i$ the quantities at the $i$-th best bid and ask prices. The \emph{depth profile}\index{depth
+profile} of a side is the vector of its quantities by distance from the touch.
+\end{definition}
+
+Depth beyond the touch is where the next best quote will come from once a queue empties, and where large orders show their hand, or
+hide it. Its information is slower than the touch's and more easily faked (orders far from the touch are cheap to place and cancel,
+which Book~9, chapter~29, returns to). A \omterm{def:rs:order-book-features:depth}{depth profile} is a feature vector rather than a number: its slope, its concentration, the
+distance to the first level holding more than a given quantity. The engine of this chapter computes the imbalance over the first five
+levels; the \omterm{def:rs:order-book-features:depth}{depth profile} itself is the input of the machine-learned models of Book~12.
+
+\section{Order-flow imbalance}
+
+\begin{definition}[Order-flow imbalance]\label{def:rs:order-book-features:ofi}
+Let $b_n, q^b_n, a_n, q^a_n$ be the best bid, its size, the best ask and its size after the $n$-th book event. The \emph{order-flow
+imbalance}\index{order-flow imbalance} contribution of event $n$ is
+\[
+e_n = \mathbf 1_{b_n \ge b_{n-1}}q^b_n - \mathbf 1_{b_n \le b_{n-1}}q^b_{n-1} - \mathbf 1_{a_n \le a_{n-1}}q^a_n + \mathbf 1_{a_n \ge
+a_{n-1}}q^a_{n-1},
+\]
+and the order-flow imbalance (OFI) over an interval is the sum of the $e_n$ in it (Cont, Kukanov and Stoikov, 2014).
+\end{definition}
+
+The four terms count demand added at the bid, demand removed from it, supply added at the ask and supply removed from it; when a
+price level changes, the whole old queue counts as removed and the whole new one as added. Cont, Kukanov and Stoikov found on 50 US
+stocks that over short intervals price changes are mainly driven by OFI, through a linear relation whose slope is inversely proportional
+to market depth.
+
+\begin{method}[Measuring the impact of order flow]\label{met:rs:order-book-features:ofi}
+On a grid of intervals of length $\Delta$, regress the change in mid price (in ticks) on the interval's OFI divided by the average size
+of the best queues; the slope is the price impact per unit of depth-normalised flow, and the $R^2$ says how much of the price change the
+flow explains at that horizon.
+\end{method}
+
+On the simulated tape the regression explains 10\% of mid changes at one second, 53\% at ten seconds and 79\% at sixty; the slope at ten
+seconds is 0.47 ticks per average best-queue size of net flow (\cref{fig:rs:order-book-features:ofi}). At one second most intervals have
+no mid change at all, and those that do are single ticks triggered by the last event, which OFI sees only in part.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.5cm,height=5.2cm,xlabel={OFI over 10 seconds (in average best-queue sizes)},ylabel={mid change (ticks)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,only marks,mark=*,mark size=1.8pt] table[x=ofi,y=dmid]{figdata/research/08-order-book-features/ofi.csv};
+\addplot[omThm,thick,domain=-3.5:3.5,samples=2] {0.4664*x};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Mid-price change over ten-second intervals against the interval's \omterm{def:rs:order-book-features:ofi}{order-flow imbalance}, in twenty bins of equal count, with
+the regression line (slope 0.47 ticks per unit, $R^2 = 0.53$ on the 1\,078 intervals). Data: \texttt{firm.tape} through
+\texttt{firm.lobfeat}, seed 8.}\label{fig:rs:order-book-features:ofi}
+\end{omfigure}
+
+\section{The microprice}
+
+\begin{definition}[Weighted mid price, microprice]\label{def:rs:order-book-features:micro}
+The \emph{weighted mid price}\index{weighted mid price} is $(a\,q^b + b\,q^a)/(q^b + q^a)$: the mid moved towards the side with the
+smaller queue. The book's \emph{microprice}\index{microprice} is the mid plus the expected size and sign of the next mid change given the
+current imbalance bucket (at a one-tick spread), estimated on past data.
+\end{definition}
+
+The weighted mid uses the imbalance through a fixed formula; the \omterm{def:rs:order-book-features:micro}{microprice} learns the adjustment from data. Stoikov (2018) builds the full
+estimator from the whole sequence of later mid changes and finds it a better \omterm{def:rs:anatomy-of-a-predictor:predictor}{predictor} of short-term prices than either the mid or the
+weighted mid; the book's version keeps only the first term of that sequence. Fitted on the first half of the simulated session and scored
+on the second, it has a mean squared error 10\% below the mid's for the mid one second later; the weighted mid is 27\% worse at one second
+but the best at five and thirty seconds (12\% and 3\% below the mid). A first-order correction is right about the next move and blind
+beyond it; the weighted mid is crude but keeps pointing the right way.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.5cm,height=5cm,ybar,bar width=14pt,ylabel={MSE relative to the mid},tick label style={font=\small},
+  label style={font=\small},xmin=-0.6,xmax=2.6,ymin=0,ymax=1.4,xtick={0,1,2},xticklabels={1 second,5 seconds,30 seconds},
+  grid=major,grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=wmid]{figdata/research/08-order-book-features/forecast.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=micro]{figdata/research/08-order-book-features/forecast.csv};
+\addplot[black!70,thin,sharp plot,forget plot] coordinates {(-0.6,1) (2.6,1)};
+\legend{weighted mid,microprice (one step)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Mean squared error of the weighted mid and of the one-step \omterm{def:rs:order-book-features:micro}{microprice} as forecasts of the mid 1, 5 and 30 seconds later,
+relative to the mid's own error, on the second half of the simulated session (the \omterm{def:rs:order-book-features:micro}{microprice}'s table is fitted on the first). Data:
+\texttt{firm.tape} through \texttt{firm.lobfeat}, seed 8.}\label{fig:rs:order-book-features:forecast}
+\end{omfigure}
+
+\section{Queue depletion and cancellations}
+
+\begin{definition}[Queue depletion rate, cancellation rate]\label{def:rs:order-book-features:depletion}
+The \emph{queue depletion rate}\index{queue depletion rate} of a best queue is the quantity leaving it per second (cancellations and
+executions) over a trailing window; its \emph{cancellation rate}\index{cancellation rate} counts cancellations only.
+\end{definition}
+
+Rates carry what sizes do not: a queue of forty lots losing ten a second is weaker than one of twenty losing none. In the simulator,
+liquidity providers cancel faster on the side the efficient price has moved away from, as real ones do when their quotes become stale.
+The difference between the cancellations at the best ask and at the best bid over the last second is therefore a direct view of the
+hidden price: its correlation with the direction of the next mid move is 0.30, against 0.25 for the \omterm{def:rs:order-book-features:imbalance}{queue imbalance}. The general lesson
+is the chapter's: the most informative features are those closest to the mechanism that moves the price.
+
+\section{Predictor cards}
+
+\begin{predictorcard}{Queue imbalance}\label{pred:rs:order-book-features:imbalance}
+\sfield{Definition} $I = (q^b - q^a)/(q^b + q^a)$ at the touch, after each message.
+\sfield{Inputs and timestamps} The book after the last message received; the receive time is the \omterm{def:rs:point-in-time-data-and-the-biases:bitemporal}{knowledge time}.
+\sfield{Rationale} The smaller queue empties first (\cref{prop:rs:order-book-features:race}); liquidity providers on the wrong side of the
+efficient price withdraw.
+\sfield{Horizon and half-life} The next mid move, seconds. P(up) from 0.245 to 0.736 across tenths of $I$ on the simulated tape.
+\sfield{Normalisation} None needed: bounded; bucketed or fed to a logistic model.
+\sfield{Failure modes} Spoofed size (Book~9, chapter~29); hidden and iceberg orders; wide spreads, where moves need not empty a queue.
+\sfield{Sources} Gould and Bonart (2016); \texttt{rs\_orderbook.up\_probability}.
+\end{predictorcard}
+
+\begin{predictorcard}{Order-flow imbalance}\label{pred:rs:order-book-features:ofi}
+\sfield{Definition} The sum of the $e_n$ over the last $\Delta$ seconds, divided by the average best-queue size.
+\sfield{Inputs and timestamps} Every book event, in sequence, with receive times.
+\sfield{Rationale} Net demand at the touch moves the price linearly, with a slope inversely proportional to depth.
+\sfield{Horizon and half-life} Contemporaneous in its definition; as a \omterm{def:rs:anatomy-of-a-predictor:predictor}{predictor}, the next seconds. $R^2$ 10\%, 53\% and 79\% at 1, 10 and 60
+seconds (contemporaneous) on the simulated tape.
+\sfield{Normalisation} By depth; by volatility across instruments.
+\sfield{Failure modes} Needs every event in order (a gap in the feed corrupts the sum); spoofed additions count as demand.
+\sfield{Sources} Cont, Kukanov and Stoikov (2014); \texttt{rs\_orderbook.ofi\_regression}.
+\end{predictorcard}
+
+\begin{predictorcard}{Stale-quote cancellation imbalance}\label{pred:rs:order-book-features:cancel}
+\sfield{Definition} Lots cancelled at the best ask minus lots cancelled at the best bid over the last second.
+\sfield{Inputs and timestamps} Cancel messages with their prices and receive times.
+\sfield{Rationale} Liquidity providers pull quotes the efficient price has left behind.
+\sfield{Horizon and half-life} The next mid move; correlation 0.30 with its direction on the simulated tape.
+\sfield{Normalisation} By the queues' sizes, or ranked across instruments.
+\sfield{Failure modes} Cancel-and-replace at the same price by an algorithm that refreshes its quotes; venue differences in how amendments
+are reported.
+\sfield{Sources} The simulator's mechanism (chapter~2); \texttt{rs\_orderbook.cancel\_feature}.
+\end{predictorcard}
+
+\section{Tutorial: reading the book}\label{tut:rs:order-book-features:read}
+
+\begin{tutorial}
+\textbf{Goal.} Run three hours of simulated messages through the feature engine, measure imbalance, OFI and the \omterm{def:rs:order-book-features:micro}{microprice}, and compare the
+imbalance with the queueing model. \textbf{End state:}
+\cref{fig:rs:order-book-features:updown,fig:rs:order-book-features:ofi,fig:rs:order-book-features:forecast}.
+\begin{tutsteps}
+\item \textbf{The engine.} Apply the message to the order and level maps, read the new top, compute the OFI contribution from the previous
+top, then the imbalances, the weighted mid and the \omterm{def:rs:order-book-features:micro}{microprice}.
+\omcode{code/firm/lobfeat/firm_lobfeat.py}{66}{96}{One message through the Python reference engine.}\label{lst:rs:order-book-features:engine}
+\item \textbf{The race.} The probability that the ask queue empties first, from the depletion laws of Book 4's \texttt{firm.queues},
+conditioned on one of them emptying within ten minutes.
+\omcode{code/research/08-order-book-features/python/rs_orderbook.py}{79}{86}{The birth--death race.}\label{lst:rs:order-book-features:race}
+\item \textbf{Run} \texttt{up\_probability()}, \texttt{best\_level\_rates()}, \texttt{ofi\_regression} at 1, 10 and 60 seconds,
+\texttt{forecast\_errors()}, \texttt{cancel\_feature()} and \texttt{fig\_orderbook.py}.
+\end{tutsteps}
+\textbf{What to change next.} Fit a logistic regression of the next move's direction on $I$ and on the cancellation imbalance together;
+estimate the \omterm{def:rs:order-book-features:micro}{microprice} table on spreads of two ticks as well.
+\end{tutorial}
+
+\section{Build: the streaming feature engine}\label{bld:rs:order-book-features:lobfeat}
+
+\begin{build}
+\bfield{Purpose} The order-book features of the miniature firm, computed message by message in the same way in research (Python) and in
+production (C++20, with a Rust twin); Book~11's market maker and Book~12's order-book model consume them.
+\bfield{Interface} \texttt{Engine(levels, g).on(kind, oid, side, price, qty)} returning \texttt{Features} (best quotes and sizes,
+\texttt{imbalance}, \texttt{depth\_imbalance}, \texttt{ofi}, \texttt{ofi\_cum}, \texttt{wmid}, \texttt{micro}); \texttt{run(msgs)};
+\texttt{LobFeatures} in \texttt{cpp/firm\_lobfeat.hpp} and \texttt{rust/src/lib.rs}.
+\bfield{Rules} Integer prices and sizes; no features until both sides have a quote; the OFI of the first two-sided event is zero; identical
+arithmetic in the three languages.
+\bfield{Acceptance tests} \texttt{code/firm/lobfeat/tests/}: a hand-checked sequence of adds, executions and a level change; the committed
+fixture reproduced by the Python reference; bounded imbalances and OFI tracking the mid; the C++ and Rust tests replay the 2\,769-message
+fixture and match every feature of the 2\,766 two-sided rows.
+\bfield{Stretch} \omterm{def:rs:order-book-features:depth}{Depth profiles} as fixed-size vectors; trailing-window depletion and \omterm{def:rs:order-book-features:depletion}{cancellation rates} in the engine; a lock-free
+single-writer queue feeding it (Book~13).
+\end{build}
+
+The C++ core, the one subtle part of the engine, is the order-flow update from the previous top of book:
+
+\omcode{code/firm/lobfeat/cpp/firm_lobfeat.hpp}{43}{60}{The C++20 engine after each message.}\label{lst:rs:order-book-features:cpp}
+
+\begin{omsources}
+\item R.~Cont, A.~Kukanov and S.~Stoikov, ``The price impact of order book events'', \emph{Journal of Financial Econometrics} 12(1), 2014.
+\item S.~Stoikov, ``The micro-price: a high-frequency estimator of future prices'', \emph{Quantitative Finance} 18(12), 2018.
+\item M.~D.~Gould and J.~Bonart, ``Queue imbalance as a one-tick-ahead price predictor in a limit order book'', \emph{Market Microstructure
+and Liquidity} 2(2), 2016.
+\item R.~Cont, S.~Stoikov and R.~Talreja, ``A stochastic model for order book dynamics'', \emph{Operations Research} 58(3), 2010.
+\item W.~Huang, C.-A.~Lehalle and M.~Rosenbaum, ``Simulating and analyzing order book data: the queue-reactive model'', \emph{Journal of the
+American Statistical Association} 110(509), 2015.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-features:1}
+Best bid 99.98 for 700 shares, best ask 99.99 for 300. What are the \omterm{def:rs:order-book-features:imbalance}{queue imbalance}, the mid and the weighted mid?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-features:2}
+The bid moves from 99.98 (500 shares) to 99.99 (200 shares) and the ask stays at 100.00 (400 shares, unchanged). What is the event's OFI
+contribution?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-features:3}
+The OFI slope is 0.47 ticks per average best-queue size, and that size is 2\,750 shares. What mid move does a net buying flow of 11\,000
+shares over ten seconds predict?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-features:4}
+For the race with $\lambda = \mu$ and queues of one lot at the bid and $n$ lots at the ask, argue that the probability of an up move tends to
+zero as $n$ grows. What does that say about the model's extreme buckets?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-features:5}
+Why does OFI's $R^2$ rise with the length of the interval, from 10\% at one second to 79\% at sixty?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-features:6}
+Show that the weighted mid equals the mid plus $\tfrac s2 I$, with $s$ the spread and $I$ the \omterm{def:rs:order-book-features:imbalance}{queue imbalance}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-features:7}
+\emph{Coding.} Using the tape of the chapter, compute the correlation of the \omterm{def:rs:order-book-features:depth}{depth imbalance} over five levels with the direction of the
+next mid move, and compare it with the touch imbalance's.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-features:8}
+\emph{Find the flaw.} ``Our order-book model predicts the next mid move with 74\% accuracy. We computed the features from the consolidated
+book stamped with exchange timestamps and the target from the same feed.''
+\end{exercise}
+
+\section{Problem: Three Lots Against Forty}
+
+\begin{problem}[{Weekend problem --- how much does the order book know, and how much does a queueing model think it knows?}]\label{pb:rs:order-book-features:1}
+Three hours of \texttt{firm.tape} (seed 8), 239\,528 messages, through \texttt{firm.lobfeat}.
+
+\medskip\noindent\textbf{Part I --- Imbalance.}
+\begin{enumerate}
+\item What are the probabilities of an up move in the lowest and highest tenths of the \omterm{def:rs:order-book-features:imbalance}{queue imbalance}?
+\item How many observations fall in each of those two tenths?
+\item What are the average queue sizes (lots) in the extreme tenths?
+\item At what imbalance is the probability one half?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The model.}
+\begin{enumerate}[resume]
+\item What arrival and departure rates (lots per second) does each best queue have?
+\item What does the race predict for the extreme tenths?
+\item Why is the model too confident?
+\item Which mechanism of the simulator would a correct model have to include?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Flow.}
+\begin{enumerate}[resume]
+\item What are OFI's $R^2$ at 1, 10 and 60 seconds, and its slope at ten seconds?
+\item What is the average best-queue size used to normalise it?
+\item How does the one-step \omterm{def:rs:order-book-features:micro}{microprice} compare with the mid at one second?
+\item Which forecast wins at five and thirty seconds, and by how much?
+\item What is the cancellation imbalance's correlation with the next move, and the \omterm{def:rs:order-book-features:imbalance}{queue imbalance}'s?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Engineering and judgement.}
+\begin{enumerate}[resume]
+\item Why must the three implementations of the engine produce identical numbers?
+\item How many fixture rows do the C++ and Rust tests check?
+\item Which features need every message in sequence, and which survive a snapshot feed?
+\item Which of the chapter's features would a spoofer move most easily?
+\item State the \emph{named result}: the empirical and modelled probabilities of an up move in the extreme tenths of imbalance, and OFI's
+$R^2$ at ten seconds.
+\item What would you add to the race model first?
+\item In one sentence: what does the order book tell you?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader, researcher}]\label{iq:rs:order-book-features:1}
+The bid queue is ten times the ask queue at a one-tick spread. What do you expect the next price move to be, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:order-book-features:2}
+Define \omterm{def:rs:order-book-features:ofi}{order-flow imbalance} and explain why it relates linearly to price changes.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:rs:order-book-features:3}
+What is a \omterm{def:rs:order-book-features:micro}{microprice}? How would you estimate one?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:rs:order-book-features:4}
+Your research features are in Python and production is in C++. How do you guarantee they compute the same thing?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader, researcher}]\label{iq:rs:order-book-features:5}
+How can an order-book feature be manipulated, and how would you make a model robust to it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:rs:order-book-features:6}
+Model the best bid and ask queues as independent birth--death processes. What does the model predict for the next move, and what does it
+leave out?
+\end{interviewq}

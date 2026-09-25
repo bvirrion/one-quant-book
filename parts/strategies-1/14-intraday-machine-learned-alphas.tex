@@ -1,0 +1,291 @@
+\chapter{Intraday Machine-Learned Alphas}\label{ch:s1:intraday-machine-learned-alphas}
+
+A gradient-boosted model trained on fourteen hours of a simulated order book predicts the next five seconds of the mid-price with an out-of-sample
+R-squared of 25\%, the next thirty seconds with 5\%, and the next two minutes not at all. Traded naively (crossing the spread on every forecast of a fifth
+of a tick or more) the five-second model loses 0.6 ticks a share: the spread it pays is larger than the moves it predicts. Traded passively, joining the
+queue on the forecast's side and waiting to be filled, the same forecasts earn about a third of a tick a share. An \omterm{def:s1:intraday-machine-learned-alphas:alpha}{intraday alpha} is a prediction and an
+execution rule together; neither is worth anything alone. The build is \texttt{firm.intraml}.
+
+\section{Targets and horizons}
+
+\begin{definition}[Intraday alpha, prediction horizon]\label{def:s1:intraday-machine-learned-alphas:alpha}
+An \emph{intraday alpha}\index{intraday alpha} is a forecast of a security's price change over seconds to hours, built from market data (the order book, the
+trades, related securities) and traded within the day. Its \emph{prediction horizon}\index{prediction horizon} is the interval over which the price change is
+forecast, which sets how often the alpha trades and what execution cost it can bear.
+\end{definition}
+
+The target of this chapter is the change of the mid-price over the next 5, 30 and 120 seconds, in ticks, sampled every second on twenty one-hour sessions of
+\texttt{firm.tape} (Book~7, chapter~2), whose default configuration includes a news window in mid-session. Its spread is about one tick (1.07 on average) and
+the standard deviation of the target is 0.69 ticks at five seconds, 2.19 at thirty and 4.47 at two minutes. Kolm, Turiel and Westray, forecasting 115 Nasdaq
+stocks at several horizons, found that stock-specific forecasts had an effective horizon of about two average price changes: beyond that, the book says
+little. The synthetic tape agrees in shape.
+
+\section{Features from the book and the tape}
+
+Ten features, all computed from data up to the forecast's second (\cref{lst:s1:intraday-machine-learned-alphas:features}): the top-of-book imbalance, the
+spread, the order-flow imbalance of Cont, Kukanov and Stoikov over the last 1, 5 and 30 seconds (Book~7, chapter~8), the signed trade volume over 5 and 30
+seconds (Book~7, chapter~9), the mid's own change over 5 and 30 seconds, and the microprice's distance from the mid. Order-flow features, normalised by the
+book's depth, are the ones the literature finds stationary: Kolm and co-authors report that models trained on order flow outperform most models trained on
+raw book states. The unit tests check causality by construction: cutting the tape at a time leaves every feature before it unchanged.
+
+\section{Models and their validation}
+
+Two models per horizon: ridge regression on the standardised features, and a gradient-boosted ensemble (Friedman's method) of sixty depth-two regression
+trees split on quantiles of the features, written in a few dozen lines of NumPy. Training uses sessions 1 to 14 and testing sessions 15 to 20: whole sessions
+apart, so that overlapping targets (a thirty-second target at second $t$ shares 29 seconds with the one at $t + 1$) cannot leak across the split, the purging
+and embargo of Book~7, chapter~20 at session scale.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+horizon & 5 seconds & 30 seconds & 120 seconds\\
+\midrule
+out-of-sample R-squared: ridge; boosted trees & 21.1\%; 24.6\% & 5.1\%; 5.1\% & $-0.4\%$; $-1.5\%$\\
+rank IC: ridge; boosted trees & 0.33; 0.34 & 0.23; 0.28 & 0.07; 0.07\\
+in-sample R-squared, boosted trees & 23.3\% & 9.2\% & 3.2\%\\
+\midrule
+every forecast above 0.2 ticks, aggressive (ticks a share) & $-0.60$ & $-0.48$ & $-0.87$\\
+every forecast above 0.2 ticks, passive & 0.37 & 0.33 & $-0.02$\\
+coupled: aggressive above the spread, passive below & 0.33 & 0.22 & $-0.24$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The five-second R-squared of a quarter is high by the standard of real markets, and the reason is the tape: Book~7 found that its mids trend over a few
+seconds, a property the chapter's model learns. What carries over is the pattern across horizons (a rapid decay of predictability, with the thirty-second
+forecast already down to 5\% and the two-minute one worthless out of sample while it still fits 3.2\% in sample) and the small gain of the trees over ridge
+where there is a signal to find. Sirignano and Cont found, with deep learning on billions of US quotes, that a model trained on all stocks predicts better
+than stock-specific ones, even for stocks outside its training set: price formation from order flow is largely universal. That is an argument for pooling
+data across instruments, which this chapter's twenty sessions only mimic.
+
+\section{Coupling the alpha to execution}
+
+\begin{definition}[Execution coupling]\label{def:s1:intraday-machine-learned-alphas:coupling}
+\emph{Execution coupling}\index{execution coupling} is the design of an intraday strategy's orders from its forecast: crossing the spread only when the
+forecast exceeds the cost of crossing, resting passively when it does not, and sizing and cancelling orders as the forecast changes, so that the alpha and the
+execution are one decision.
+\end{definition}
+
+The table's lower half is the chapter's point. A forecast of a fifth of a tick does not pay a spread of a tick: crossing on every such forecast loses 0.60
+ticks a share at five seconds. The same forecasts, used to choose which side of the book to join, earn 0.37 ticks a share on the orders that are filled
+(\cref{lst:s1:intraday-machine-learned-alphas:passive}), because a passive order earns the spread instead of paying it and the forecast tilts the fills
+toward the favourable side. Coupling the two (crossing only when the forecast exceeds the spread, 324 times over six test hours, and resting otherwise)
+earns 0.33 ticks a share at five seconds and 0.22 at thirty. At two minutes nothing works: the forecast has no out-of-sample power, and both execution styles
+lose. The passive numbers are optimistic in one way (the fill model fills a resting order as soon as the market trades through its price, ignoring its place
+in the queue; Book~7, chapter~18 has the queue-aware replay) and honest in another (the exit crosses the spread).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=a,ybar,bar width=8pt,width=6.4cm,height=5.2cm,xlabel={\small horizon (seconds)},ylabel={\small out-of-sample R-squared (\%)},
+  tick label style={font=\footnotesize},symbolic x coords={5,30,120},xtick=data,ymin=-3,ymax=28,grid=major,grid style={gray!25},
+  enlarge x limits=0.3,legend style={font=\scriptsize,at={(0.97,0.97)},anchor=north east},table/col sep=comma]
+\addplot[fill=black!25,draw=black!60] table[x=h,y=ridge]{figdata/strategies-1/14-intraday-machine-learned-alphas/r2.csv};
+\addplot[fill=omDef!60,draw=omDef] table[x=h,y=gbm]{figdata/strategies-1/14-intraday-machine-learned-alphas/r2.csv};
+\legend{ridge,boosted trees}
+\end{axis}
+\begin{axis}[at={(a.east)},anchor=west,xshift=2.0cm,ybar,bar width=6pt,width=6.4cm,height=5.2cm,xlabel={\small horizon (seconds)},
+  ylabel={\small P\&L per share (ticks)},tick label style={font=\footnotesize},symbolic x coords={5,30,120},xtick=data,ymin=-1,ymax=0.6,
+  grid=major,grid style={gray!25},enlarge x limits=0.3,legend style={font=\scriptsize,at={(0.5,1.03)},anchor=south,legend columns=3},
+  table/col sep=comma]
+\addplot[fill=omThm!60,draw=omThm] table[x=h,y=naive_aggressive]{figdata/strategies-1/14-intraday-machine-learned-alphas/pnl.csv};
+\addplot[fill=omDef!40,draw=omDef] table[x=h,y=passive]{figdata/strategies-1/14-intraday-machine-learned-alphas/pnl.csv};
+\addplot[fill=omDef!80,draw=omDef] table[x=h,y=coupled]{figdata/strategies-1/14-intraday-machine-learned-alphas/pnl.csv};
+\legend{aggressive,passive,coupled}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Machine-learned forecasts of the synthetic tape's mid-price. Left: out-of-sample R-squared by horizon. Right: P\&L per share of the boosted-tree
+forecasts on six test hours, traded aggressively, passively, or coupled (aggressive only above the spread). Data: \texttt{s1\_intraml}.}
+\label{fig:s1:intraday-machine-learned-alphas:results}
+\end{omfigure}
+
+\section{Strategy files}
+
+\begin{strategyfile}{Book-imbalance alpha}\label{strat:s1:intraday-machine-learned-alphas:book}
+\sfield{Who pays you, and why} Traders whose orders reveal pressure before prices move: the book's imbalance is the queue that will be eaten next.
+\sfield{Instruments and venues} Liquid stocks and futures with deep, visible books.
+\sfield{Signal} Top-of-book and depth imbalance, order-flow imbalance over seconds.
+\sfield{Sizing and execution} Mostly passive, joining the favoured side; aggressive only when the forecast beats the spread.
+\sfield{Costs} Spread, fees and rebates; queue position.
+\sfield{How it dies} Faster competitors reading the same book; spoofed depth.
+\sfield{Horizon, capacity, infrastructure} Seconds; small capacity per name; co-located, low-latency systems.
+\sfield{Backtest honestly} A queue-aware replay (Book~7, chapter~18); latency; fees.
+\sfield{Sources} Cont, Kukanov and Stoikov (2014); this chapter's simulation.
+\end{strategyfile}
+
+\begin{strategyfile}{Trade-flow alpha}\label{strat:s1:intraday-machine-learned-alphas:flow}
+\sfield{Who pays you, and why} Metaorders split into many trades, whose signs persist (Book~7, chapter~9).
+\sfield{Instruments and venues} As for book imbalance.
+\sfield{Signal} Signed trade volume over seconds to minutes; the persistence of trade signs.
+\sfield{Sizing and execution} As for book imbalance.
+\sfield{Costs} As for book imbalance.
+\sfield{How it dies} Metaorders that hide better; competitors on the same flow.
+\sfield{Horizon, capacity, infrastructure} Seconds to minutes; the trade feed with its sign.
+\sfield{Backtest honestly} Trade signs as they could be known (Lee--Ready or the feed's aggressor flag), with its latency.
+\sfield{Sources} Kolm, Turiel and Westray (2023) on order-flow inputs.
+\end{strategyfile}
+
+\begin{strategyfile}{Cross-asset lead alpha}\label{strat:s1:intraday-machine-learned-alphas:lead}
+\sfield{Who pays you, and why} Slower instruments that follow faster ones (a stock after its index future, an ETF after its constituents).
+\sfield{Instruments and venues} Pairs of related instruments on the same or different venues.
+\sfield{Signal} The leader's recent move, relative to the follower's (Book~7, chapter~10).
+\sfield{Sizing and execution} Trade the follower in the leader's direction before it catches up.
+\sfield{Costs} Speed: the gain is only there for whoever is first.
+\sfield{How it dies} Latency competition; the lead shrinking to microseconds.
+\sfield{Horizon, capacity, infrastructure} Milliseconds to seconds; networks and co-location (Books~10 and~11).
+\sfield{Backtest honestly} Timestamps from the same clock; realistic latency between venues.
+\sfield{Sources} Sirignano and Cont (2019) on universal, pooled features; no performance figure verified.
+\end{strategyfile}
+
+\begin{strategyfile}{Alpha-driven execution}\label{strat:s1:intraday-machine-learned-alphas:execution}
+\sfield{Who pays you, and why} The spread, earned instead of paid, when the forecast chooses where to rest.
+\sfield{Instruments and venues} Any instrument the firm trades for other reasons, and market-making books.
+\sfield{Signal} The short-horizon forecast, against the spread and the queue.
+\sfield{Sizing and execution} Aggressive above the spread, passive below, cancel when the forecast turns.
+\sfield{Costs} Adverse selection on passive fills; cancellation limits.
+\sfield{How it dies} It does not die; it saves cost on every other strategy's trading.
+\sfield{Horizon, capacity, infrastructure} Seconds; an execution engine that takes forecasts as input.
+\sfield{Backtest honestly} Queue-aware fills; the markouts of passive fills (Book~7, chapter~23).
+\sfield{Sources} This chapter's simulation (0.33 ticks a share coupled against $-0.60$ aggressive at five seconds).
+\end{strategyfile}
+
+\section{Tutorial: one per cent is a lot}\label{tut:s1:intraday-machine-learned-alphas:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build features from the synthetic tape, train and validate two models at three horizons, and trade their forecasts three ways. \textbf{End state:}
+the table and \cref{fig:s1:intraday-machine-learned-alphas:results}.
+\begin{tutsteps}
+\item \textbf{Features}: every second, from data up to that second.
+\omcode{code/firm/intraml/firm_intraml.py}{34}{59}{Order-book and trade-flow features.}\label{lst:s1:intraday-machine-learned-alphas:features}
+\item \textbf{Passive execution}: join the touch on the forecast's side; filled only if traded through; exit across the spread.
+\omcode{code/firm/intraml/firm_intraml.py}{154}{172}{Passive entries with a touch-fill model.}\label{lst:s1:intraday-machine-learned-alphas:passive}
+\item \textbf{Run} \texttt{scores(h)}, \texttt{naive(h)} and \texttt{trading(h)} for 5, 30 and 120 seconds, and \texttt{fig\_intraml.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the touch-fill model by Book~7's queue-aware replay; add the second instrument of \texttt{simulate\_pair} as a lead
+feature; train one model on all horizons with the horizon as a feature.
+\end{tutorial}
+
+\section{Build: intraday machine learning}\label{bld:s1:intraday-machine-learned-alphas:intraml}
+
+\begin{build}
+\bfield{Purpose} Causal intraday features, horizon targets, two models with session-level validation, and execution rules coupled to the forecasts.
+\bfield{Interface} \texttt{features(tape, step)}, \texttt{targets(tape, times, horizons)}, \texttt{ridge} and \texttt{ridge\_predict}, \texttt{gbm} and
+\texttt{gbm\_predict}, \texttt{r2(y, yhat)}, \texttt{aggressive(pred, fwd, spread, threshold)}, \texttt{passive(tape, times, pred, h, threshold, wait)}.
+\bfield{Rules} Features from data up to each time; training and test separated by whole sessions; costs in every P\&L.
+\bfield{Acceptance tests} \texttt{code/firm/intraml/tests/}: features unchanged when the future is removed; both models recover a planted signal; the aggressive
+P\&L by hand.
+\bfield{Stretch} A queue-aware passive fill model; cross-asset features; deeper trees and early stopping on a validation session.
+\end{build}
+
+\begin{omsources}
+\item R.~Cont, A.~Kukanov and S.~Stoikov, ``The price impact of order book events'', \emph{Journal of Financial Econometrics} 12(1), 2014.
+\item P.~N.~Kolm, J.~Turiel and N.~Westray, ``Deep order flow imbalance'', \emph{Mathematical Finance} 33(4), 2023.
+\item J.~Sirignano and R.~Cont, ``Universal features of price formation in financial markets'', \emph{Quantitative Finance} 19(9), 2019.
+\item J.~H.~Friedman, ``Greedy function approximation: a gradient boosting machine'', \emph{Annals of Statistics} 29(5), 2001.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:s1:intraday-machine-learned-alphas:1}
+A forecast has an R-squared of 25\% against a target with a standard deviation of 0.69 ticks. What is the standard deviation of the forecast?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:s1:intraday-machine-learned-alphas:2}
+Why can a thirty-second target at second $t$ not be validated on a sample that contains second $t + 1$?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:s1:intraday-machine-learned-alphas:3}
+An aggressive round trip pays one spread of a tick. What must a forecast predict, in ticks, to break even?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s1:intraday-machine-learned-alphas:4}
+Why do passive fills earn money on forecasts too small to pay the spread? What biases the chapter's passive numbers upward?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s1:intraday-machine-learned-alphas:5}
+The two-minute model fits 3.2\% in sample and $-1.5\%$ out of sample. What happened?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s1:intraday-machine-learned-alphas:6}
+Why normalise order-flow features by the book's depth?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:s1:intraday-machine-learned-alphas:7}
+\emph{Coding.} Train the models with the mid's own past changes removed from the features, and compare the five-second R-squared. What does the difference
+say about the synthetic tape?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:s1:intraday-machine-learned-alphas:8}
+\emph{Find the flaw.} ``Our model predicts the next second's price change with 60\% accuracy on direction; we will trade it with market orders on 3,000
+stocks.''
+\end{exercise}
+
+\section{Problem: One Per Cent Is a Lot}
+
+\begin{problem}[{Weekend problem --- a forecast and its execution}]\label{pb:s1:intraday-machine-learned-alphas:1}
+The chapter's models on \texttt{firm.tape}, and the published record.
+
+\medskip\noindent\textbf{Part I --- The forecast.}
+\begin{enumerate}
+\item Define an \omterm{def:s1:intraday-machine-learned-alphas:alpha}{intraday alpha} and its \omterm{def:s1:intraday-machine-learned-alphas:alpha}{prediction horizon}.
+\item Describe the targets, the sessions and the spread.
+\item List the features and how causality is tested.
+\item What did Kolm, Turiel and Westray find about horizons and inputs?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The models.}
+\begin{enumerate}[resume]
+\item Describe the two models.
+\item How are training and test separated, and why by session?
+\item Give the out-of-sample R-squared and IC by horizon.
+\item Why is the five-second R-squared so high here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Execution.}
+\begin{enumerate}[resume]
+\item Define \omterm{def:s1:intraday-machine-learned-alphas:coupling}{execution coupling}.
+\item Give the P\&L per share of the three execution styles by horizon.
+\item Why do aggressive trades lose on small forecasts?
+\item What does the passive fill model assume?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: out-of-sample R-squared by horizon and the P\&L per share after the spread, aggressive against passive.
+\item What did Sirignano and Cont find about universality?
+\item How would you pool data across instruments?
+\item What would change with a queue-aware replay?
+\item How does latency enter?
+\item Which strategy file is least exposed to competition?
+\item What is the capacity of a five-second alpha?
+\item In one sentence: what is an \omterm{def:s1:intraday-machine-learned-alphas:alpha}{intraday alpha} worth?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle}]\label{iq:s1:intraday-machine-learned-alphas:1}
+What features would you build from an order book to predict the next few seconds?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:s1:intraday-machine-learned-alphas:2}
+How do you cross-validate a model whose targets overlap in time?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:s1:intraday-machine-learned-alphas:3}
+Your model predicts moves smaller than the spread. Is it useless?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, developer}]\label{iq:s1:intraday-machine-learned-alphas:4}
+How would you serve a gradient-boosted model within microseconds of a market data update?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:s1:intraday-machine-learned-alphas:5}
+Why might an R-squared of 1\% be a good intraday model?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:s1:intraday-machine-learned-alphas:6}
+A forecast $f$ of a move $y$ has correlation $\rho$ with it and both are normal with standard deviations $\sigma_f$ and $\sigma_y$. With a round-trip cost
+$c$, derive the expected P\&L per trade of trading only when $|f| > c$, and discuss how it depends on $\rho$.
+\end{interviewq}

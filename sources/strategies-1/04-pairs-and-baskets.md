@@ -1,0 +1,31 @@
+# 4. Pairs and Baskets — brief and source ledger
+
+## Brief
+
+- **Hook.** Two stocks moved together for a year; the pair opened at two standard deviations and never closed, because one of the companies was being taken over.
+- **Sections.** Selection: distance, cointegration, copulas; Trading rules and the formation window; Why pairs died, and what replaced them; Baskets: one stock against its synthetic twin.
+- **Defines.** pairs trading, distance method, formation period, trading period, synthetic twin.
+- **Uses (defined earlier).** cointegration (B4.20), Engle--Granger test (B4.20), copula (B4.15), multiple testing (B4.12), backtest (B7.16), vectorised backtest (B7.16), information coefficient (B7.6), transaction cost analysis (B7.23), capacity curve (B7.28), fundamental factor model (B7.24).
+- **Strategy files.** distance-method pairs; cointegration pairs; copula pairs; stock against its synthetic basket.
+- **Tutorial.** Select pairs on firm.synthmkt by distance and by Engle--Granger tests in a formation year and trade them in the next; count the false discoveries among the tested pairs; build a synthetic-twin basket by ridge regression and compare.
+- **Build.** `firm.pairsel`: pair selection (distance on normalised prices, Engle--Granger with multiple-testing control, a Gaussian-copula mispricing index), trading rules, synthetic-twin baskets; Python.
+- **Weekend problem.** The pair that never closed — named result: the share of cointegrated pairs in the formation year that stay cointegrated in the trading year, and the pairs book's Sharpe ratio after costs.
+- **Facts to verify.** Gatev, Goetzmann, Rouwenhorst 2006, Pairs trading (RFS); Do and Faff 2010, Does simple pairs trading still work? (FAJ); Vidyamurthy 2004, Pairs Trading (Wiley); Krauss 2017 survey (J. Economic Surveys).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | E. Gatev, W. N. Goetzmann, K. G. Rouwenhorst, "Pairs trading: performance of a relative-value arbitrage rule", Review of Financial Studies 19(3) (2006) 797-827: daily data 1962-2002; pairs matched by minimum distance between normalised historical prices; a simple rule yields average annualised excess returns of up to 11% for self-financing portfolios of pairs; profits typically exceed conservative transaction-cost estimates; differs from reversal profits; linked to a common factor | Crossref metadata; OpenAlex abstract | https://doi.org/10.1093/rfs/hhj020 | 2026-09-25 | abstract: "A simple trading rule yields average annualized excess returns of up to 11% for self-financing portfolios of pairs" | hook; section 1; section 3; strat:s1:pairs-and-baskets:distance; omsources |
+| F2 | The method (NBER working paper 7032, 1999 version): pairs formed over twelve months and traded over the next six; stocks with a day without trade screened out; cumulative total return index; partner minimising the sum of squared deviations of normalised prices; top 5 and 20 pairs; open when prices diverge by more than two historical standard deviations estimated in the formation period, unwind at the next crossing, or at the end of the trading period; on average 82% of the stocks in the top 20 pairs are utilities | NBER working paper PDF, section III and IV | https://www.nber.org/system/files/working_papers/w7032/w7032.pdf | 2026-09-25 | "We form pairs over a twelve month period (formation period) trade them in the next six-month period (trading period)"; "We open a position in a pair when prices diverge by more than two historical standard deviations"; "We unwind the position at the next crossing of the prices"; "On average, 82% of the stocks in the top 20 pairs are utility stocks" | section 1; section 2; tutorial; strat:s1:pairs-and-baskets:distance |
+| F3 | B. Do, R. Faff, "Does simple pairs trading still work?", Financial Analysts Journal 66(4) (2010) 83-95: confirms the continuing downward trend in pairs-trading profitability; the strategy performs strongly during prolonged turbulence, including the global financial crisis | Crossref metadata; OpenAlex abstract | https://doi.org/10.2469/faj.v66.n4.1 | 2026-09-25 | abstract: "Despite confirming the continuing downward trend in profitability of pairs trading, this study found that the strategy performs strongly during periods of prolonged turbulence" | section 3; omsources |
+| F4 | C. Krauss, "Statistical arbitrage pairs trading strategies: review and outlook", Journal of Economic Surveys 31(2) (2017) 513-545: over 100 references in five groups (distance, cointegration, time-series, stochastic control, other approaches) | Crossref metadata; OpenAlex abstract | https://doi.org/10.1111/joes.12153 | 2026-09-25 | abstract: "Research is categorized into five groups: The distance approach ... The cointegration approach ... The time-series approach ... The stochastic control approach ..." | section 1; omsources |
+| F5 | H. Rad, R. K. Y. Low, R. Faff, "The profitability of pairs trading strategies: distance, cointegration and copula methods", Quantitative Finance 16(10) (2016) 1541-1558: US equities 1962-2014 with time-varying costs; mean monthly excess returns of 91, 85 and 43 basis points before costs and 38, 33 and 5 after, for distance, cointegration and copula; from 2009 fewer trading opportunities for distance and cointegration, stable for copula; a two-step design for the cointegration and copula methods | Crossref metadata; OpenAlex abstract | https://doi.org/10.1080/14697688.2016.1164337 | 2026-09-25 | abstract: "show a mean monthly excess return of 91, 85 and 43 bps (38, 33 and 5 bps) before transaction costs (after transaction costs), respectively"; "from 2009, the frequency of trading opportunities via the distance and cointegration methods is reduced considerably" | section 1; section 3; strat:s1:pairs-and-baskets:coint; strat:s1:pairs-and-baskets:copula; omsources |
+
+## EXCLUDED
+
+- Vidyamurthy (2004), Pairs Trading (Wiley): not found in Crossref under that title; not cited.
+- The published RFS version's detailed tables: the method is quoted from the 1999 working paper, the headline result from the 2006 abstract.
+- Named firms' pairs desks: none named.
+- Every number about the synthetic market (with MarketConfig.twin_share, new in this chapter) is computed and tested.
+

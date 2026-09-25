@@ -10,9 +10,11 @@ eighteen English-only LaTeX books covering quantitative finance end to end
 HFT, machine learning, low-latency software, networks, platforms, the firm,
 the industry, interviews).
 
-**Status (2026-09-24): Books 1–6 are written; Books 7–18 are outline only.**
-Books 1–2 are committed; Books 3–6 (and the batch's fixes to shared files and
-Books 1–2) are uncommitted. Books 3–6 were written in one parallel batch, one agent per
+**Status (2026-09-25): Books 1–9 are written; Books 10–18 are outline only.**
+Books 1–6 are committed; Books 7 (Research Craft), 8 (Strategies I: Equities and
+Futures) and 9 (Strategies II: Volatility, Relative Value, Macro and the Bank Desks),
+written 2026-09-24/25 in the main session, no subagents, per the user's ruling, are
+uncommitted. Books 3–6 were written in one parallel batch, one agent per
 book (`sources/BATCH_BOOKS_3-6.md`; series definition map
 `sources/SERIES_DEFINITIONS.md`; cross-book code interface
 `code/firm/INTERFACES.md`).
@@ -25,12 +27,24 @@ book (`sources/BATCH_BOOKS_3-6.md`; series definition map
 | 4 Quantitative Methods | `one_quant_book_04_methods.tex` | `methods` / `qm` | 29 | 351 | 118 | 59 | 0 | 253 | 1,739 |
 | 5 Derivatives and Volatility | `one_quant_book_05_derivatives.tex` | `derivatives` / `dv` | 28 | 348 | 113 | 70 | 9 | 154 | 1,378 |
 | 6 Rates, Credit, XVA and Risk | `one_quant_book_06_rates_credit_risk.tex` | `rates-credit-risk` / `rc` | 29 | 314 | 107 | 55 | 32 | 160 | 824 |
+| 7 Research Craft | `one_quant_book_07_research.tex` | `research` / `rs` | 29 | 345 | 86 | 67 | 3 | 177 | 1,306 |
+| 8 Strategies I: Equities and Futures | `one_quant_book_08_strategies_1.tex` | `strategies-1` / `s1` | 29 | 330 | 54 | 57 | 13 | 140 | 597 |
+| 9 Strategies II: Vol, RV, Macro, Bank Desks | `one_quant_book_09_strategies_2.tex` | `strategies-2` / `s2` | 29 | 333 | 57 | 59 | 5 | 98 | 262 |
 
-All six: gates 0 errors / 0 undefined / 0 overfull, `make gates` green (the
+Books 1–6: gates 0 errors / 0 undefined / 0 overfull, `make gates` green (the
 series-wide "defined twice" check: 1,646 terms, none twice), `make test-code`
-green (1,775 Python tests, 19 C++20 and 20 Rust builds, 391 listing ranges), `make figdata` reproduces every chart CSV. Book 4 ch. 1 prints the series
+green (1,775 Python tests, 19 C++20 and 20 Rust builds, 391 listing ranges), `make figdata` reproduces every chart CSV. Book 7 alone: 0/0/0, 240 Python tests
+(115 chapter, 125 firm), figdata reproduced with no diff. Book 8 alone: 0/0/0, 218
+Python tests (126 chapter, 92 firm), 118 strategy files, figdata reproduced with no
+diff. Book 9 alone: 0/0/0, 226 Python tests (132 chapter, 94 firm), 118 strategy
+files, figdata reproduced with no diff; real data only from public-domain or openly
+licensed series, derived statistics in `data/strategies-2/` (`LICENSES.md`). Book 4 ch. 1 prints the series
 notation (`CONTRIBUTING.md`, "Series notation"). The running project in
-`code/firm/` has 174 components; Book 5's `pricing` library (Python, core in
+`code/firm/` has 174 components (204 with Book 7's thirty, `INTERFACES.md` §4:
+backtester levels 1–3, synthetic universe and order book, performance, markouts,
+equity risk model, portfolio construction, costs, capacity, workflow; 234 with Book
+8's thirty strategy components, §5, including the synthetic futures universe
+`synthfut`; 264 with Book 9's thirty, §6, several built on earlier books' engines); Book 5's `pricing` library (Python, core in
 C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
 `styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
 code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas, no scipy), CI.

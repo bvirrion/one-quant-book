@@ -1,0 +1,440 @@
+\chapter{Market Data for Research}\label{ch:rs:market-data-for-research}
+
+Two researchers measure the volatility of the same stock on the same day from one-second returns. One uses trade prices,
+the other midquotes, and the first variance is 3.6 times the second. Sampled every five minutes, the two agree within 2\%.
+Neither researcher made an error; each chose a representation of the market, and every representation keeps some of what
+happened and destroys the rest. This chapter is about those choices: what a message feed records, the clocks by which a
+stream of trades is cut into \omterm{def:rs:market-data-for-research:bar}{bars}, what trade prices, midquotes and \omterm{def:rs:market-data-for-research:bar}{bars} each lose, how a continuous history is built from
+futures that expire, and how much data all this is. Its data are one simulated trading day from the book's market simulator,
+built in this chapter, and nine years of crude oil futures settlements.
+
+\section{What a message feed contains}
+
+One Quant Book 1, chapter 28, described the levels of market data: the best prices (level 1), the depth by price (level 2)
+and the book order by order (level 3), with exchange and receive timestamps, sequence numbers and trade conditions. A research
+store starts from the richest of these, an order-by-order feed, because every coarser view can be rebuilt from it and no finer
+view can be rebuilt from a coarser one.
+
+The book's simulator, \texttt{firm.tape}, writes three messages in the style of Nasdaq's TotalView-ITCH feed (the table
+below). An order is added with an identifier, a side, a price and a size; it is later cancelled in whole or part, or executed
+against an incoming order. Trades are not separate facts: they are the executions, and the aggressor's side is the opposite of
+the resting order's. The simulated day used throughout the chapter has 1\,555\,872 messages and 55\,542 trades, 28 messages a
+trade: most messages are quotes placed and withdrawn without ever trading.
+
+\begin{center}
+\small
+\begin{tabular}{llp{7.6cm}}
+\toprule
+type & fields & meaning \\
+\midrule
+\texttt{A} add & time, id, side, price, size & a limit order joins the back of the queue at its price \\
+\texttt{X} cancel & time, id, size & part or all of a resting order is withdrawn \\
+\texttt{E} execute & time, id, size, aggressor, trade id & a resting order is filled by an incoming order; one row per resting order filled \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The simulator's mechanism is simple enough to state in a paragraph, and every later chapter that uses it relies on it. An
+efficient price, which nobody observes, jumps by a tick or two at random times. Liquidity providers add orders at the ten best
+levels of each side and cancel them at a steady rate, faster when the efficient price has moved through their level. Noise
+traders send market orders whose arrivals cluster (a Hawkes process, One Quant Book 4, chapter 7) and whose signs persist,
+because most are slices of larger parent orders. Informed traders send market orders towards the efficient price when the
+mid is far from it. A random activity level, persistent over minutes, and a U-shaped intraday profile scale all of these
+rates together, and a news burst in mid-session makes the efficient price move faster for ninety seconds. The simulator
+records the truth that real data hide: the efficient price, and which trades were informed.
+
+\begin{dated}{2026-09}{How large is a day of order-by-order data?}\label{dat:rs:market-data-for-research:itch}
+Nasdaq publishes sample files of full days of its TotalView-ITCH 5.0 feed on a public server. The compressed (gzip) files for
+single days in 2019 and early 2020 are 3.5 to 5.6 billion bytes (30 January 2019: 4.8~GB; 30 January 2020: 5.6~GB); the
+files posted between August 2025 and June 2026 are 4.7 to 17.9~GB. That is one exchange's feed, for every stock it trades, for
+one day, compressed.
+\end{dated}
+
+\section{Sampling clocks}
+
+A strategy that does not trade on every message looks at the market through \omterm{def:rs:market-data-for-research:bar}{bars}: summaries of the trades between two
+instants. The instants are chosen by a clock, and the clock need not be the wall clock.
+
+\begin{definition}[Bar, time bar, tick bar, volume bar, dollar bar, VWAP]\label{def:rs:market-data-for-research:bar}
+A \emph{bar}\index{bar} summarises a run of consecutive trades by its open, high, low and close prices, its volume, its traded
+value and its number of trades. A \emph{time bar}\index{time bar} covers a fixed interval of wall-clock time; a \emph{tick
+bar}\index{tick bar} a fixed number of trades; a \emph{volume bar}\index{volume bar} closes on the trade at which its cumulative
+volume reaches a threshold, and a \emph{dollar bar}\index{dollar bar} on the trade at which its cumulative traded value does.
+The \emph{volume-weighted average price}\index{volume-weighted average price} (VWAP) of a set of trades is $\sum_i p_iq_i/\sum_i q_i$.
+\end{definition}
+
+\begin{definition}[Imbalance bar]\label{def:rs:market-data-for-research:imbalance}
+An \emph{imbalance bar}\index{imbalance bar} closes when the absolute sum of the trade signs since its start, $|\theta| =
+|\sum b_i|$, reaches a threshold set from the \omterm{def:rs:market-data-for-research:bar}{bars} already closed: the expected number of trades per \omterm{def:rs:market-data-for-research:bar}{bar} times the expected
+absolute imbalance per trade (López de Prado's tick-imbalance \omterm{def:rs:market-data-for-research:bar}{bar}), floored at the square root of the expected number of trades.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=1.25cm,y=0.22cm]
+\draw[->,>=Stealth] (0,0) -- (10.4,0) node[right] {time};
+\foreach \x/\h in {0.3/2,0.5/1,0.7/3,0.9/2,1.1/1,1.3/2,2.6/1,4.2/1,5.8/2,6.1/3,6.3/2,6.5/1,6.7/2,6.9/3,7.1/1,8.8/1,9.5/2}
+  \draw[omDef,line width=1.6pt] (\x,0) -- (\x,\h*2);
+\foreach \x in {2,4,6,8} \draw[black!60,dashed] (\x,-3.5) -- (\x,8.5);
+\draw[omThm,very thick] (0.7,-8.5) -- (0.7,-4.5) (2.6,-8.5) -- (2.6,-4.5) (6.1,-8.5) -- (6.1,-4.5) (6.9,-8.5) -- (6.9,-4.5);
+\node[black!70,anchor=west] at (0,10) {time clock: a bar every two units, whatever happens};
+\node[omThm,anchor=west] at (0,-10.5) {volume clock: a bar each time six units of volume have traded};
+\node[omDef,anchor=west] at (6.6,10) {trades (height = size)};
+\end{tikzpicture}
+
+\omcaption{The same seventeen trades cut by two clocks. The time clock closes five equal intervals (dashed): three nearly
+empty, one holding the early burst and one the burst between $t = 6$ and 7. The volume clock (solid, below) closes four
+\omterm{def:rs:market-data-for-research:bar}{bars}: two short ones inside the bursts, ending at 0.7 and 6.9, and two long ones that absorb the quiet stretches; the last
+three trades wait for the next \omterm{def:rs:market-data-for-research:bar}{bar}.}\label{fig:rs:market-data-for-research:schematic}
+\end{omfigure}
+
+The floor is needed in practice. When buys and sells balance, the expected imbalance per trade is near zero and so is the
+threshold, and every trade would close a \omterm{def:rs:market-data-for-research:bar}{bar}; the square root of $\E[T]$ is the level a random walk of signs first reaches after
+about $\E[T]$ trades.
+
+Why sample by activity rather than by time? Because the variance of a price change grows with the amount of trading behind
+it, and trading is uneven.
+
+\begin{proposition}[Time bars are a variance mixture]\label{prop:rs:market-data-for-research:mixture}
+Suppose that, given the volume $V$ traded in a \omterm{def:rs:market-data-for-research:bar}{bar}, the \omterm{def:rs:market-data-for-research:bar}{bar}'s log return is $\mathcal N(0, \sigma^2V)$. Then the kurtosis of
+\omterm{def:rs:market-data-for-research:bar}{time-bar} returns is
+\[
+\frac{\E[r^4]}{\E[r^2]^2} = \frac{3\,\E[V^2]}{\E[V]^2} = 3\bigl(1 + \mathrm{CV}(V)^2\bigr),
+\]
+with $\mathrm{CV}$ the coefficient of variation of the \omterm{def:rs:market-data-for-research:bar}{bars}' volumes, while \omterm{def:rs:market-data-for-research:bar}{bars} of equal volume have Gaussian returns.
+\end{proposition}
+
+\begin{proof}
+$\E[r^2] = \sigma^2\E[V]$ and $\E[r^4] = 3\sigma^4\E[V^2]$ by conditioning on $V$. A \omterm{def:rs:market-data-for-research:bar}{volume bar} has $V$ constant, up to the last
+trade's overshoot.
+\end{proof}
+
+Clark (1973) proposed this subordination of prices to trading volume to explain heavy-tailed daily returns, and Ané and Geman
+(2000) found that returns sampled on a clock of trade counts were close to Gaussian. On the simulated day the one-minute \omterm{def:rs:market-data-for-research:bar}{bars}'
+volumes have a coefficient of variation of 0.94, so the proposition predicts a kurtosis of 5.67; the one-minute midquote returns
+have 5.44, and the close-to-close returns 5.47. The \omterm{def:rs:market-data-for-research:bar}{bars} cut by the other clocks, with the same number of \omterm{def:rs:market-data-for-research:bar}{bars} in the day (about
+390), have kurtoses of 3.58 (tick), 4.04 (volume) and 3.92 (dollar): not 3, because in the simulator volatility follows the
+activity level and not volume exactly, but much closer. The event clocks spend their \omterm{def:rs:market-data-for-research:bar}{bars} where the trading is
+(\cref{fig:rs:market-data-for-research:clocks}): between 2 and 42 \omterm{def:rs:market-data-for-research:bar}{bars} per quarter-hour, against a steady 15 for the time clock.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xlabel={minutes after the open},ylabel={bars per quarter-hour},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=390,ymin=0,ymax=45,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!60,very thick,const plot mark mid] table[x=minute,y=time]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[omDef,very thick,const plot mark mid] table[x=minute,y=volume]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[omThm,thick,dashed,const plot mark mid] table[x=minute,y=tick]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[black,thin,sharp plot] coordinates {(210,0) (210,45)};
+\legend{time bars,volume bars,tick bars}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:rs:market-data-for-research:bar}{Bars} closed per quarter-hour on the simulated day, each clock cutting about 390 \omterm{def:rs:market-data-for-research:bar}{bars}. The time clock closes 15 \omterm{def:rs:market-data-for-research:bar}{bars}
+in every quarter-hour; the volume and tick clocks follow the activity: busy after the open, quiet in the middle of the day,
+busy around the news burst at minute 210 (vertical line) and before the close. \omterm{def:rs:market-data-for-research:bar}{Dollar bars} coincide with \omterm{def:rs:market-data-for-research:bar}{volume bars} at this
+scale. Data: \texttt{firm.tape}, the chapter's day, seeded.}\label{fig:rs:market-data-for-research:clocks}
+\end{omfigure}
+
+\section{What each representation destroys}
+
+\begin{definition}[Midquote series]\label{def:rs:market-data-for-research:midquote}
+A \emph{midquote series}\index{midquote series} is the mid price $\tfrac12(b_t + a_t)$ sampled at chosen times, each value the
+last mid at or before the sampling time (an as-of sample).
+\end{definition}
+
+A trade price is the mid plus or minus half the spread, depending on who initiated the trade. Sampled too finely, it bounces.
+
+\begin{proposition}[The bounce adds half a squared spread per return]\label{prop:rs:market-data-for-research:bounce}
+Let the trade price be $p = m + \tfrac s2 b$, with a constant spread $s$ and trade signs $b = \pm1$ independent of each other and
+of the mid. Between two trades, $\E[(\Delta p)^2] = \E[(\Delta m)^2] + s^2/2$.
+\end{proposition}
+
+\begin{proof}
+$\Delta p = \Delta m + \tfrac s2(b_2 - b_1)$, and $\E[(b_2 - b_1)^2] = 2$ when the signs are independent with mean zero.
+\end{proof}
+
+This is Roll's model, whose estimator of the spread Book 4, chapter 21, derives; the same chapter's signature plot draws the
+realised variance against the sampling interval. Here the plot answers the hook
+(\cref{fig:rs:market-data-for-research:signature}). At one second the trade-price variance of the day is 0.83 (in squared
+per cent) and the midquote's 0.23; at five minutes they are 0.84 and 0.85. The trade price overstates at high frequency, as the
+proposition says. The midquote understates, for a reason the proposition does not see: in the simulator, as in real markets,
+the mid catches up with the efficient price in steps, a stale quote at a time, so its short-horizon returns are positively
+autocorrelated and their squares add up to less than the variance over longer horizons. Neither series is the efficient price.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=10cm,height=5.2cm,xlabel={sampling interval (seconds)},ylabel={realised variance (\%$^2$)},
+  tick label style={font=\small},label style={font=\small},xmin=1,xmax=900,ymin=0,ymax=1.2,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=seconds,y=trade]{figdata/research/02-market-data-for-research/signature.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.2pt] table[x=seconds,y=mid]{figdata/research/02-market-data-for-research/signature.csv};
+\legend{last trade price,midquote}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Signature plot of the simulated day: realised variance of log returns against the sampling interval, from trade
+prices and from midquotes. At one second, 0.83 against 0.23; from about a minute on the two agree, and the noise of a
+single day's estimate dominates. Data: \texttt{firm.tape}, the chapter's day, seeded.}\label{fig:rs:market-data-for-research:signature}
+\end{omfigure}
+
+The bounce is one loss among several, and a research store should know which each representation suffers:
+\begin{itemize}
+\item \emph{Trade prices} carry the bounce, and trades flagged with special conditions (odd lots, out-of-sequence reports,
+auction prints, late corrections: Book 1, chapter 28) mixed with regular ones. An opening auction print is a price at which a
+large volume traded at one instant; treating it as one more trade distorts the first \omterm{def:rs:market-data-for-research:bar}{bar} of every day.
+\item \emph{Midquotes} cannot see what traded or how much, and at a wide spread the mid can move without any trade.
+\item \emph{\omterm{def:rs:market-data-for-research:bar}{Bars}} lose the order of events inside the \omterm{def:rs:market-data-for-research:bar}{bar}, the book, and every event between samples; the high and the low keep a
+trace of the path, which chapter~7's range estimators exploit.
+\item \emph{\omterm{def:rs:market-data-for-research:bar}{Time bars} on several instruments} are aligned in time but not in information: an illiquid instrument's last trade
+may be minutes old (non-synchronous trading and the Epps effect, Book 4, chapter 21).
+\item \emph{Any series stamped with one clock} hides the difference between the exchange's timestamp and the moment the data
+arrived; a backtest must use the second (chapter~3).
+\end{itemize}
+
+\section{Continuous futures series}
+
+A futures contract expires, and its successor trades at a different price. A history long enough for research must splice
+contracts, and the splice is a choice.
+
+\begin{definition}[Continuous futures series, back-adjustment, ratio adjustment]\label{def:rs:market-data-for-research:continuous}
+A \emph{continuous futures series}\index{continuous futures series} follows the contract a position would hold under a roll rule:
+the nearby contract until a roll date some days before its last trading day, then the next contract. \emph{Back-adjustment}\index{back-adjustment}
+adds, to every price before a roll, the gap between the new and the old contract on the roll date, so that the series has no
+jump at the roll and its latest prices are real. \emph{Ratio adjustment}\index{ratio adjustment} multiplies every earlier price by
+the ratio of the new contract's price to the old one's on the roll date instead.
+\end{definition}
+
+\begin{proposition}[What each adjustment preserves]\label{prop:rs:market-data-for-research:adjust}
+\omterm{def:rs:market-data-for-research:continuous}{Ratio adjustment} preserves the percentage returns of the rolled position on every day; \omterm{def:rs:market-data-for-research:continuous}{back-adjustment} preserves its price
+changes, the profit of one contract. Neither preserves the price levels of the past, and back-adjusted prices can be negative.
+\end{proposition}
+
+\begin{proof}
+Between two roll dates both adjustments act on the held contract's prices by a constant: an additive constant leaves differences
+unchanged, a multiplicative one leaves ratios unchanged. Across a roll date the adjustment is chosen so that the new contract's
+price change (or return) is recorded, not the jump between contracts. Additive constants accumulate the roll gaps and can exceed
+a past price.
+\end{proof}
+
+The crude oil futures settlements published by the US Energy Information Administration make the choice concrete
+(\cref{fig:rs:market-data-for-research:wti}). From 2 January 2015 to 5 April 2024 the nearby contract went from USD~52.69 to
+USD~86.91 a barrel, up 65\%. A long position rolled five trading days before each of the 111 expiries of the period, the way a
+fund holding the nearby contract must, lost 27\%: most of those years were in contango, and each roll sold a cheaper contract to
+buy a dearer one (the roll yield of One Quant Book 3, chapter 10). The ratio-adjusted series tells the fund's story; its first price is
+USD~118.33. The back-adjusted series starts at USD~70.23 and, because the backwardation of 2021--2023 made the later gaps
+negative, reaches $-5.89$ on 21 April 2020, a day when the contract actually held (June 2020) settled at USD~11.57. The nearby
+series itself shows $-37.63$ on 20 April 2020, the settlement of an expiring contract no rolled position held.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={year},ylabel={USD per barrel},tick label style={font=\small},
+  label style={font=\small},xmin=2015,xmax=2024.3,ymin=-40,ymax=130,grid=major,grid style={gray!25},
+  xtick={2015,2016,2017,2018,2019,2020,2021,2022,2023,2024},xticklabels={2015,2016,2017,2018,2019,2020,2021,2022,2023,2024},
+  scaled x ticks=false,legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!45,thin] table[x=year,y=front]{figdata/research/02-market-data-for-research/wti.csv};
+\addplot[omDef,thick] table[x=year,y=ratio]{figdata/research/02-market-data-for-research/wti.csv};
+\addplot[omThm,thick,dashed] table[x=year,y=back]{figdata/research/02-market-data-for-research/wti.csv};
+\legend{nearby (as published),ratio-adjusted,back-adjusted}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{WTI crude oil futures, 2015 to April 2024: the nearby contract as published (with $-37.63$ on 20 April 2020), and
+continuous series rolling five trading days before each expiry, ratio-adjusted (starting at 118.33) and back-adjusted (starting
+at 70.23, negative in April 2020). All three end at the same price. Data: US Energy Information Administration, NYMEX settlements,
+contracts 1 and 2.}\label{fig:rs:market-data-for-research:wti}
+\end{omfigure}
+
+\begin{remark}[Which series for which question]\label{rem:rs:market-data-for-research:which}
+Returns of a rolled strategy: ratio-adjusted. Profit of a fixed number of contracts: back-adjusted differences. A signal on
+price levels (a moving average of the price, a breakout above a past high): neither without care, since both rewrite the past
+at every roll; compute the signal on the contract held at the time. The shape of the curve (carry, Book 8): the raw contracts,
+never an adjusted series.
+\end{remark}
+
+\section{Volumes, storage and formats}
+
+One simulated instrument-day of 1.56 million messages at 36 bytes (the size of an ITCH add-order message) is 56~MB before
+compression; the dated box shows what a whole exchange-day weighs. Three rules keep a research store usable.
+
+\begin{method}[Storing market data for research]\label{met:rs:market-data-for-research:store}
+\begin{enumerate}
+\item Keep the raw messages as received, immutable, with both timestamps, partitioned by date and instrument; every derived
+table (books, \omterm{def:rs:market-data-for-research:bar}{bars}, features) is rebuilt from them by versioned code.
+\item Store derived tables in a columnar, compressed format and partition them the way they are read: by date for
+cross-sectional work, by instrument for time-series work.
+\item Record for every derived table the code version, the raw partitions it read and its parameters (the clock, the
+threshold, the roll rule), so that a result can name the exact data it used (chapter~29).
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: one day, four clocks}\label{tut:rs:market-data-for-research:clocks}
+
+\begin{tutorial}
+\textbf{Goal.} Simulate a trading day, cut it by four clocks and measure what each clock and each price does to the returns.
+\textbf{End state:} \cref{fig:rs:market-data-for-research:clocks,fig:rs:market-data-for-research:signature}; kurtoses 5.47 (time),
+3.58 (tick), 4.04 (volume), 3.92 (dollar); the one-second variance ratio of 3.6.
+\begin{tutsteps}
+\item \textbf{The day.} \texttt{simulate(TapeConfig(seconds=23\,400, u\_shape=1.5, news\_at=12\,600, seed=3))} returns the
+messages, the trades, the top of book after every message and the efficient price (about 10 seconds).
+\item \textbf{Threshold \omterm{def:rs:market-data-for-research:bar}{bars}.} A \omterm{def:rs:market-data-for-research:bar}{bar} closes on the trade that crosses the threshold; trades are never split between \omterm{def:rs:market-data-for-research:bar}{bars}.
+\omcode{code/firm/bars/firm_bars.py}{65}{90}{Volume and dollar bars close on the crossing trade.}\label{lst:rs:market-data-for-research:cuts}
+\item \textbf{Two prices, one day.} Sample the last trade and the midquote on grids of 1 to 900 seconds and sum the squared
+log returns; compare the kurtosis with the mixture prediction from the \omterm{def:rs:market-data-for-research:bar}{bars}' volumes.
+\omcode{code/research/02-market-data-for-research/python/rs_marketdata.py}{45}{78}{Realised variance from trades and from mids; the mixture kurtosis.}\label{lst:rs:market-data-for-research:rv}
+\item \textbf{Run} \texttt{summary()} and \texttt{fig\_marketdata.py}.
+\end{tutsteps}
+\textbf{What to change next.} Set \texttt{act\_vol=0} (no random activity) and watch the \omterm{def:rs:market-data-for-research:bar}{time bars}' kurtosis fall towards the
+mixture value of the U-shape alone; cut \omterm{def:rs:market-data-for-research:imbalance}{imbalance bars} and follow their length through the day (exercise~7).
+\end{tutorial}
+
+\section{Build: the market simulator and the bar builders}\label{bld:rs:market-data-for-research:tape}
+
+\begin{build}
+\bfield{Purpose} The book's standard intraday data, with the truth attached: \texttt{firm.tape} writes an order-by-order feed
+from a known mechanism (efficient price, informed and noise flow, stale-quote cancellations); \texttt{firm.bars} turns trades
+into \omterm{def:rs:market-data-for-research:bar}{bars}. Chapters 8--10 measure predictors on the tape, chapter~18 replays it, chapter~19 trades against it.
+\bfield{Interface} \texttt{TapeConfig} (duration, tick, levels, rates, Hawkes and metaorder parameters, efficient-price jump
+rate, news window, intraday profile, activity process, seed); \texttt{simulate(cfg, v\_path)} returning a \texttt{Tape} of
+structured arrays \texttt{msgs}, \texttt{trades} (with true signs and an informed flag), \texttt{top}, and the paths \texttt{v\_t},
+\texttt{v}, \texttt{act}; \texttt{simulate\_pair(cfg, latency)}; \texttt{Book().apply(msg)}. \texttt{time\_bars},
+\texttt{tick\_bars}, \texttt{volume\_bars}, \texttt{dollar\_bars}, \texttt{imbalance\_bars}, \texttt{vwap}, \texttt{asof},
+\texttt{continuous(c1, c2, expiry, days\_before)}.
+\bfield{Rules} Deterministic for a seed. Rates piecewise constant between events except the Hawkes intensity, simulated exactly
+by thinning. The opening book is a snapshot at time zero. Prices are integer ticks, sizes integer shares.
+\bfield{Acceptance tests} \texttt{code/firm/tape/tests/} and \texttt{code/firm/bars/tests/}: identical output for a seed;
+the messages rebuild the recorded top of book at every step and the book never crosses; executions equal trades; the mid tracks
+the efficient price; pooled over six seeds, imbalance predicts the next mid move and informed trades lose money for the resting
+side while noise trades pay it; \omterm{def:rs:market-data-for-research:bar}{bars} close on the crossing trade; a hand-checked roll.
+\bfield{Stretch} Several instruments sharing a factor in their efficient prices; auctions at the open and close; a C++20 port
+of the event loop.
+\end{build}
+
+\begin{omsources}
+\item P.~K.~Clark, ``A subordinated stochastic process model with finite variance for speculative prices'',
+\emph{Econometrica} 41(1), 1973.
+\item T.~Ané and H.~Geman, ``Order flow, transaction clock, and normality of asset returns'', \emph{Journal of Finance} 55(5),
+2000.
+\item D.~Easley, M.~López de Prado and M.~O'Hara, ``The volume clock: insights into the high-frequency paradigm'',
+\emph{Journal of Portfolio Management} 39(1), 2012.
+\item M.~López de Prado, \emph{Advances in Financial Machine Learning}, Wiley, 2018, chapter 2 (information-driven bars).
+\item R.~Roll, ``A simple implicit measure of the effective bid--ask spread in an efficient market'', \emph{Journal of Finance}
+39(4), 1984.
+\item Nasdaq, \emph{TotalView-ITCH 5.0} specification, and the sample files on \texttt{emi.nasdaq.com}.
+\item US Energy Information Administration, NYMEX futures prices, crude oil contracts 1--4 (daily).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:1}
+Trades of 300 shares at 20.00, 500 at 20.02 and 200 at 19.99. What is their VWAP?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:2}
+A stock at USD~20 has a one-cent spread and trades 20\,000 times a day with a true daily volatility of 2\%. By
+\cref{prop:rs:market-data-for-research:bounce}, what daily volatility does the sum of squared trade-to-trade log returns report?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:3}
+A feed averages 40 bytes a message and an active instrument 1.5 million messages a day. How much raw data do 5\,000 such
+instruments produce in a year of 252 days?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:4}
+One-minute volumes have a coefficient of variation of 0.8. What kurtosis does \cref{prop:rs:market-data-for-research:mixture}
+predict for one-minute returns? What coefficient of variation gives a kurtosis of 6?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:5}
+A nearby contract settles at 70, 71, 72 on three days and the next contract at 73, 74, 76; the position rolls at the close of
+the second day. Give the held series, the back-adjusted and the ratio-adjusted series.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:6}
+A stock traded at USD~10 in 2015 and at USD~100 in 2025 with the same traded value every day. A \omterm{def:rs:market-data-for-research:bar}{volume-bar} threshold fixed in
+shares gives how many \omterm{def:rs:market-data-for-research:bar}{bars} a day in 2015 relative to 2025? And a \omterm{def:rs:market-data-for-research:bar}{dollar-bar} threshold?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:market-data-for-research:7}
+\emph{Coding.} Cut the chapter's day into \omterm{def:rs:market-data-for-research:imbalance}{imbalance bars}, starting from an expected 142 trades a \omterm{def:rs:market-data-for-research:bar}{bar}. How many \omterm{def:rs:market-data-for-research:bar}{bars} close, how
+many trades do they hold on average, and what is the kurtosis of their midquote returns? Why do the \omterm{def:rs:market-data-for-research:bar}{bars} shrink through the day?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:market-data-for-research:8}
+\emph{Find the flaw.} ``Our carry signal is the annualised log ratio of the back-adjusted second-month series to the
+back-adjusted front-month series, and our trend signal the percentage change of the back-adjusted front-month series over
+twelve months.''
+\end{exercise}
+
+\section{Problem: Which Clock?}
+
+\begin{problem}[{Weekend problem --- one day, four clocks and two prices}]\label{pb:rs:market-data-for-research:1}
+The chapter's simulated day: 6.5 hours, a U-shaped profile, a random activity level and a news burst at 12\,600 seconds, seed 3.
+
+\medskip\noindent\textbf{Part I --- The feed.}
+\begin{enumerate}
+\item How many messages and trades does the day have, and how many messages per trade?
+\item What share of the messages are additions, cancellations and executions, roughly, and why are additions and cancellations
+nearly equal?
+\item What is the raw size of the day at 36 bytes a message?
+\item Why does a research store keep the messages rather than the \omterm{def:rs:market-data-for-research:bar}{bars}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Clocks.}
+\begin{enumerate}[resume]
+\item How many \omterm{def:rs:market-data-for-research:bar}{bars} does each clock cut, with thresholds chosen for about 390?
+\item What are the kurtoses of close-to-close returns for the four clocks?
+\item What is the coefficient of variation of the one-minute \omterm{def:rs:market-data-for-research:bar}{bars}' volumes, and what kurtosis does the mixture proposition
+predict for them?
+\item Why are the event clocks' kurtoses above 3?
+\item Where in the day do \omterm{def:rs:market-data-for-research:bar}{volume bars} concentrate, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Prices.}
+\begin{enumerate}[resume]
+\item What are the realised variances from trades and from mids at 1, 5, 60 and 300 seconds?
+\item Which effect makes the trade series too high at one second?
+\item Which makes the mid series too low?
+\item From which interval on do the two agree within 5\%?
+\item What would you use to estimate the day's variance from the one-second data (Book 4, chapter 21)?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item Which clock would you use for a daily volatility estimate, and which for a model of short-term price moves?
+\item What does a one-minute \omterm{def:rs:market-data-for-research:bar}{time bar} lose that a \omterm{def:rs:market-data-for-research:bar}{volume bar} keeps?
+\item What does a \omterm{def:rs:market-data-for-research:bar}{volume bar} lose that a \omterm{def:rs:market-data-for-research:bar}{time bar} keeps?
+\item State the \emph{named result}: the kurtosis of one-minute \omterm{def:rs:market-data-for-research:bar}{time-bar} returns against \omterm{def:rs:market-data-for-research:bar}{dollar-bar} returns on the day, and the
+trade-to-mid variance ratio at one second.
+\item What in the simulator makes the \omterm{def:rs:market-data-for-research:bar}{time bars} heavy-tailed, and what would remove it?
+\item In one sentence: which representation is ``the'' price?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:rs:market-data-for-research:1}
+Why might you sample prices by volume rather than by time?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:rs:market-data-for-research:2}
+Your realised volatility from one-second trade prices is double the one from five-minute prices. What is going on?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:rs:market-data-for-research:3}
+How would you build a \omterm{def:rs:market-data-for-research:continuous}{continuous futures series} for a trend-following backtest, and what goes wrong with back-adjusted prices?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:rs:market-data-for-research:4}
+Design the storage of a year of order-by-order data for 5\,000 instruments for research use.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:rs:market-data-for-research:5}
+A colleague's model uses one-minute \omterm{def:rs:market-data-for-research:bar}{bars} of fifty stocks. What can go wrong because the \omterm{def:rs:market-data-for-research:bar}{bars} are \omterm{def:rs:market-data-for-research:bar}{time bars}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:rs:market-data-for-research:6}
+Show that if returns are normal given the volume traded, \omterm{def:rs:market-data-for-research:bar}{time-bar} returns have kurtosis $3(1 + \mathrm{CV}^2)$.
+\end{interviewq}

@@ -517,6 +517,50 @@ outline budget or the difference explained.
   Phase A, sync, four books, two re-sourcing passes — ran in one day of wall
   time.
 
+- **Book 7 complete (2026-09-25), written in the main session without
+  subagents: 345 pages** for 29 chapters (outline ~398, −13 %): 262 pages of
+  chapters (9.0 body pages each, 250–560 body lines), 68 of solutions (2.3
+  each), ~15 of front and back matter — **11.4 pages all-in per chapter**.
+  86 figures, 67 listings, 27 tables, 3 dated boxes, 16 predictor cards, 232
+  exercises, 29 weekend problems, 174 interview questions, 177 ledger rows,
+  1,306 term links (3.9 a page), 240 new Python tests (115 chapter, 125 in 30
+  new `firm` components, two also in C++20 and Rust), ~11,100 lines of tested
+  Python. The ch. 10 and ch. 20 checkpoints projected ~360 and ~350 pages.
+  A research-methods book whose numbers all come from simulation has small
+  ledgers (bibliographic rows, a few public datasets) and almost no dated
+  boxes; its page count is driven by tables of simulated results, which print
+  large for few source lines (chapters of 250–340 body lines still made 8–9
+  body pages).
+
+- **Book 8 complete (2026-09-25), written in the main session without
+  subagents: 330 pages** for 29 chapters (outline ~388, −15 %): 252 pages of
+  chapters (8.7 body pages each, 280–430 body lines), 66 of solutions (2.3
+  each), ~12 of front and back matter — **11.0 pages all-in per chapter**.
+  54 figures, 57 listings, 39 tables, 13 dated boxes, 118 strategy files (outline
+  ~117), 232 exercises, 29 weekend problems, 174 interview questions, 140 ledger
+  rows, 597 term links (1.8 a page: strategy vocabulary is mostly defined
+  elsewhere), 218 new Python tests (126 chapter, 92 in 30 new `firm`
+  components), ~7,100 lines of tested Python. The ch. 10 and ch. 20
+  checkpoints projected ~340 pages each. A strategies book writes one to three
+  figures a chapter because its results are tables of Sharpe ratios; its
+  chapters of 280–430 body lines print at 8–10 body pages.
+
+- **Book 9 complete (2026-09-25), written in the main session without
+  subagents: 333 pages** for 29 chapters (outline ~382, −13 %): 255 pages of
+  chapters (8.8 body pages each, 250–420 body lines), 64 of solutions (2.2
+  each), ~14 of front and back matter — **11.0 pages all-in per chapter**.
+  57 figures, 59 listings, 37 tables, 5 dated boxes, 118 strategy files (outline
+  ~114), 232 exercises, 29 weekend problems, 174 interview questions, 98 ledger
+  rows, 262 term links (0.8 a page), 226 new Python tests (132 chapter, 94 in 30
+  new `firm` components), ~9,800 lines of tested Python. The ch. 10 and ch. 20
+  checkpoints projected ~335 and ~325 pages. Real data came from public-domain
+  or openly licensed series only (Cboe index histories as derived statistics,
+  FRED/H.15/H.10/EIA, CFTC, TreasuryDirect, SMARD), recorded in
+  `data/strategies-2/LICENSES.md`; bank-desk chapters (20–29) are synthetic and
+  build on earlier books' engines (Book 5's autocallable and convertible
+  pricers, Book 6's OAS and energy models, Book 7's cost model, Book 4's deflated
+  Sharpe ratio).
+
 ## 9. Known traps (add to this list as books are written)
 
 - **Confident specifics from memory.** Fee levels, regions, rule numbers,
@@ -758,3 +802,124 @@ outline budget or the difference explained.
     rejects `bar width` in the group options (put it in each
     `\nextgroupplot`); a long label on the horizontal leg of a `-|` path runs
     over its start node.
+
+- **Book 7 (Research Craft), written chapter by chapter in the main session:**
+  - *Simulated evidence:* one simulated market is one draw. A planted effect
+    was invisible in one seed and found in seven of ten; a design's single
+    60-day experiment sat 2.7 standard errors from its truth. Report detection
+    rates over seeds and designs as mean and spread over many runs. Changing a
+    simulator's size (days, names) reruns the whole random stream: vary seeds,
+    not lengths. Check that a planned demonstration can show its effect before
+    writing it into a brief, and replace a hook the simulation does not
+    reproduce with the pathology it does produce (Book 7's hooks for ch. 25 and
+    26 were rewritten: "45 % of the book in two stocks" became a gross of 61
+    times capital; "a third of the gross for one basis point" became 0.03 %,
+    and 24 % for a redrawn forecast).
+  - *Point in time inside the simulator:* `firm.synthmkt`'s `Panel.style_x`
+    holds the last day's exposures (value moves daily, momentum monthly); a
+    risk model on them looked calibrated with a momentum factor of 3.3 %
+    volatility instead of 7.2 %. Use `point_in_time_styles`. A style whose
+    exposure is constant during a warm-up has a zero-variance factor, and any
+    ratio to its variance explodes (a regime multiplier of 2.5e7): start
+    models when every exposure exists.
+  - *Performance:* numpy's BLAS threads on many small matrices turned a
+    12-second study into 6.5 minutes and 135 CPU-minutes; `tools/test_code.sh`
+    and `tools/figdata.sh` now export `OPENBLAS_NUM_THREADS=1`. A figure
+    script that imports numpy before its study module escapes a pin set inside
+    the module.
+  - *Estimators:* a homoskedastic standard error on a cost fit whose noise
+    grows with order size was 2.9 standard errors off; use robust errors. The
+    unweighted mean of cluster means estimates a different quantity from the
+    rollout when clusters are unequal; weight by observations. A common shock
+    across clusters makes the cluster-robust error too small until the analysis
+    is stratified by it. An MA smoothing profile and its time reversal share
+    their autocorrelations: restrict to invertible profiles. Hierarchical risk
+    parity bisects by position in the dendrogram's order, not by cluster.
+  - *Honesty in text:* say both halves of a mixed result (a ranking that
+    correlates at 0.33 while its argmax concentrates noise); do not claim two
+    simulated streams have equal volatility when crash-dominated volatility
+    differs by seed; never print solver timings, which are machine-dependent.
+  - *Linker:* a definition that emphasises a word other than its indexed term
+    (`\emph{symmetrically}\index{symmetric orthogonalisation}`) becomes a
+    one-word linkable term; emphasise exactly the indexed phrase.
+  - *Rounding and typos, again:* 0.0825 → 0.082, 0.7885 → 0.788, 0.965 → 0.96:
+    print from the test's rounding; `\end{solution>` was typed four times.
+
+- **Book 8 (Strategies I), written chapter by chapter in the main session:**
+  - *Planted effects are too strong at first, every time.* The first setting
+    of a planted edge gave Sharpe ratios of 4 to 18 in eight chapters (options
+    signals 7, alternative data 18, news 7.6, cross-asset diffusion 4–6, a
+    trend book at 0.35 vol units 0.5 but a crash that drowned in noise). Tune
+    the plant until the strategy's Sharpe ratio is in the range the public
+    record suggests (0.3–1.5 after costs), then report the untoned version as
+    an exercise; say in the text when a synthetic number is an upper bound.
+  - *Real data contradicts hooks.* Three hooks from the outline (record
+    speculative longs precede falls; "trillions" in volatility targeting; a
+    pod shop's thresholds) had no citable source, and one was contradicted by
+    the book's own data (CFTC corn positioning 2017–2026). Rewrite the hook
+    around what the sources and data show.
+  - *Simple versus log returns.* `firm.synthmkt`'s `ret` is simple: summing
+    scaled simple returns as log increments gave high-volatility names a
+    variance drag that looked like reversal after limit-up days. Compound with
+    `log1p`.
+  - *Generic futures series.* EIA contract 1 changes identity the day after
+    each expiry; a spread on the generic series books the roll as P&L. Follow
+    contracts by serial number (`firm.curvestrat.serials`). Contract 1 was
+    negative on 20 April 2020: take logs only of contracts clear of expiry.
+  - *Evaluation grid.* A weekly report evaluated on a weekly grid makes a
+    three-day publication lag invisible (lag 0 and lag 3 fall between the same
+    evaluation days); evaluate daily and correct t-statistics for overlap.
+  - *pytest collects anything named `test_*`,* including a library function
+    `test_rules` imported into a test file: name library functions otherwise.
+  - *Intraday Sharpe ratios are meaningless* for thousands of trades a day
+    with a positive mean (a "Sharpe ratio" of 500): report per-trade edge,
+    hit rate and the share of days positive.
+  - *Hindsight parameters:* when a filter or threshold is chosen after seeing
+    the crisis it avoids (a storage filter chosen on 2020), print all the
+    candidates and say which one hindsight picked.
+  - *Message-level simulation is too slow for years of sessions:* use bars,
+    and take the trading cost from a tape session (half the time-weighted
+    spread).
+  - *PGF:* a legend placed inside the axis covers bars and lines more often
+    than not in these charts; put multi-entry legends below the axis
+    (`legend columns`, `at={(0.5,-0.3)}`); `xtick={1,...,12}` trips the
+    `...` gate; `scaled y ticks=false` for small ICs.
+- **Book 9 (Strategies II), written chapter by chapter in the main session:**
+  - *Measure path by path, not only in expectation.* Per-path present values of a
+    security are not a risk measure (hedging them made the spread larger in ch.
+    20); show hedged values against scenarios instead. Where a programme has a
+    pathwise guarantee (rolling intrinsic never below the static hedge without
+    costs), test the guarantee and then break it with costs, at equal costs for
+    both programmes.
+  - *Execution at the signal is a free lunch.* Index arbitrage executed at the
+    observed mispricing never lost; a one-minute lag turned the edge into a race,
+    five minutes into a loss. The same trap in daily data: Brent-WTI spot
+    assessments close at different times, so a spread's daily changes
+    autocorrelate (−0.36) and a same-close fade shows a Sharpe ratio of 0.85
+    that becomes 0.32 a day late. Always rerun a rule a day (or a tick) later.
+  - *Planted structure must leave room for the test to fail.* Tiering clients by
+    mark-out alone did not beat the best flat price when every client of a type
+    shared one competing quote; a surveillance detector caught 100 % of planted
+    spoofers until legitimate look-alikes (deep-book providers, quote
+    refreshers) were added. Plant the confounders the real world has.
+  - *Calibrate to a published figure, and say so.* The QIS chapter's true Sharpe
+    ratios were set so that the median backtest-to-live decay matched the 73 %
+    reported for bank strategies; the text states the calibration.
+  - *Sample estimation noise directly* (Sharpe ratio error 1/sqrt(T)) when only
+    statistics are needed: 2,000 simulated product teams in under a second.
+  - *Chapter gates run ruff on the chapter's code, not on `code/firm/`:* run
+    `ruff check code/firm/<component>` after every edit to a firm module, then
+    `omcode_ends.py` (docstring rewraps shift every listing below them).
+  - *`\euro` inside math mode prints a pound sign;* write `$-$\euro250`. A
+    straight quote in `\texttt{policy("flat", 0.8)}` fails the quote gate.
+  - *Blocked sources:* justice.gov and EUR-Lex refuse automated fetches; cite
+    the court opinion (media.ca7.uscourts.gov) and legislation.gov.uk's
+    as-adopted EU text instead. FRED's daily Henry Hub series is sparse before
+    2007. Crossref answers 429 when queried back to back: sleep between calls.
+  - *Manipulation chapters* follow section 6.3 with nine fields renamed (who is
+    harmed, how it works, why it is illegal, enforcement case, detector, how it
+    is caught, evaluating the detector honestly); plant only the patterns in the
+    enforcement records and model no manipulation's profit.
+  - *A one-page index can overflow* (a 26 pt overfull vbox while `\output` is
+    active with 74 entries); it cleared once the last chapters added entries.
+    Recheck the log gate after the final chapter, not only per chapter.

@@ -1,0 +1,335 @@
+\chapter{Harvesting the Variance Risk Premium}\label{ch:s2:harvesting-the-variance-risk-premium}
+
+At the end of 84\% of months since 1990 the VIX index, the market's price of the next month's S\&P 500 volatility, was higher than the volatility that
+followed: on average 19.5 against 15.4. Selling that price and delivering the realised volatility has been one of the most reliable trades in finance.
+Its losses come the other way, all at once. At the end of February 2020 the VIX stood at 40.1; the next month's realised volatility was 94.5. On this
+chapter's synthetic market a short-variance book earns a Sharpe ratio of 1.57 until its worst month, which then costs 7.7 of its monthly standard
+deviations: 22\% of capital at a 10\% volatility target, and more than the capital at 60\%. This chapter is about the implementations of short
+volatility and about sizing them for the month that matters. The build is two components: \texttt{firm.synthvol}, the synthetic option market that
+Part~I runs on, and \texttt{firm.shortvol}.
+
+\section{The premium and why it exists}
+
+The variance risk premium (Book~5, chapter~14) is the difference between the price of variance, the rate of a variance swap or the square of an index
+like the VIX, and the variance that is then realised. Carr and Wu measured it directly: they synthesised variance swap rates from option prices on
+five stock indexes and 35 stocks, and took the difference with realised variance as the premium. It is paid because variance is highest when
+investors are poorest: a long-variance position pays in crashes, and investors pay to hold it, as they pay for insurance.
+
+\begin{definition}[Short-volatility strategy]\label{def:s2:harvesting-the-variance-risk-premium:short}
+A \emph{short-volatility strategy}\index{short-volatility strategy} earns the variance risk premium by selling options or variance and delivering
+realised volatility: short variance swaps, delta-hedged short options, covered calls, short puts, or short volatility futures. Its returns are small and
+frequent in calm markets and large and negative when volatility jumps.
+\end{definition}
+
+The real record, from Cboe's data (\cref{fig:s2:harvesting-the-variance-risk-premium:gap}): over 440 month-ends from January 1990 to August 2026 the VIX
+averaged 19.5\% and the next month's realised volatility of the S\&P 500 15.4\%; the VIX was higher 84\% of the time, by 4.1 points on average; its
+square exceeded realised variance by 31\% on average. The six months when it fell furthest short tell the other side: February 2020 (VIX 40.1, realised
+94.5), September 2008 (39.4 and 82.3), August 2008 (20.6 and 54.3), March 2025 (22.3 and 47.7), July 2011 and June 2002.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.2cm,xlabel={\small year},ylabel={\small VIX minus realised (points)},tick label style={font=\footnotesize},
+  xmin=1990,xmax=2027,ymin=-15,ymax=15,grid=major,grid style={gray!25},table/col sep=comma,/pgf/number format/1000 sep={}]
+\addplot[omThm,thick] table[x=year,y=gap_pts]{figdata/strategies-2/01-harvesting-the-variance-risk-premium/gap.csv};
+\addplot[black!40,dashed] coordinates {(1990,0) (2027,0)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The S\&P 500 variance premium, 1990--2026: the twelve-month average, at each month-end, of the VIX minus the realised volatility of the S\&P
+500 over the following 21 trading days. Derived from Cboe's VIX and S\&P 500 index histories; the raw series are not redistributed. Data:
+\texttt{s2\_fetch\_cboe}.}\label{fig:s2:harvesting-the-variance-risk-premium:gap}
+\end{omfigure}
+
+\section{Implementations: variance, options, overwriting}
+
+\texttt{firm.synthvol} (\cref{lst:s2:harvesting-the-variance-risk-premium:synthvol}) simulates twenty years of an index and thirty member stocks: a common
+factor with stochastic variance around 16\% (mean reversion of four a year, a leverage correlation of $-0.7$), negative jumps once a year on average, and
+three planted crashes of 25\%, 20\% and 30\% over ten days each. The truth sets the surface: the index's at-the-money implied variance is the expected
+variance over the option's life times 1.3, and the smile falls with strike. Realised volatility over the twenty years is 19.0\%, crashes included, and
+the average one-month implied volatility 18.3\%.
+
+\begin{definition}[Option overwriting]\label{def:s2:harvesting-the-variance-risk-premium:overwrite}
+\emph{Option overwriting}\index{option overwriting} sells options against a position already held, most often calls against a long equity position
+(covered calls), collecting premium in exchange for giving up gains beyond the strike; it is a \omterm{def:s2:harvesting-the-variance-risk-premium:short}{short-volatility strategy} with the market's direction
+added.
+\end{definition}
+
+\texttt{firm.shortvol} runs five monthly implementations on the index, each rolled every 21 trading days:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+implementation, 239 months & Sharpe ratio & skewness & worst month (sd) & months up\\
+\midrule
+short variance swap & 0.69 & $-3.53$ & $-7.7$ & 79\%\\
+delta-hedged short straddle & 1.24 & $-2.32$ & $-6.4$ & 77\%\\
+covered calls, 2\% out of the money & 0.40 & $-4.24$ & $-8.1$ & 69\%\\
+short puts, 5\% out of the money & 0.08 & $-7.22$ & $-10.2$ & 92\%\\
+short variance sized by $1/\text{strike}$ & 0.09 & $-12.45$ & $-14.2$ & 79\%\\
+the index itself & 0.26 & $-1.82$ & $-6.8$ & 62\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every implementation has negative skewness, and the shape matches the premium's source: the short put wins in 92\% of months and loses ten standard
+deviations in one. Sizing short variance by the inverse of its strike (more when volatility is cheap) makes it worse: the planted crashes start from
+calm markets, when the book is largest. The synthetic crashes are harsher than recent history: on Cboe's indices from February 2007 to September 2026,
+PutWrite returned 7.2\% a year at 13.8\% volatility (a Sharpe ratio of 0.57 without a risk-free rate) and BuyWrite 6.0\% at 14.3\% (0.48), against
+9.0\% at 19.7\% (0.53) for the S\&P 500 price index, which omits dividends. PutWrite lost 27.6\% from September to November 2008 and 19.8\% in February
+and March 2020; BuyWrite 28.5\% and 21.3\%.
+
+\section{Delta-hedged option returns}
+
+\begin{definition}[Delta-hedged option return]\label{def:s2:harvesting-the-variance-risk-premium:hedged}
+A \emph{delta-hedged option return}\index{delta-hedged option return} is the gain of an option position whose delta is hedged in the underlying at
+regular intervals, relative to its premium; under a model with no volatility risk premium its expectation is close to zero, so its sign and size measure
+the premium.
+\end{definition}
+
+Bakshi and Kapadia used exactly this: in S\&P 500 options, a delta-hedged long option underperformed zero, less so away from the money, more when
+volatility was high, even after accounting for jump fears. The seller's side, a short at-the-money straddle hedged daily at the surface's current
+volatility (\cref{lst:s2:harvesting-the-variance-risk-premium:shortvol}), earns 0.53\% of the index a month on the synthetic market, about an eighth of the
+straddle's premium of 4.2\%, with a Sharpe ratio of 1.24, the best of the five, because the hedge removes the index's own direction and leaves the gap between
+implied and realised volatility.
+
+\section{Blow-ups and how to size for them}
+
+Short volatility is a sizing problem. \Cref{fig:s2:harvesting-the-variance-risk-premium:paths} scales the short-variance book to three volatility
+targets. Its Sharpe ratio before the worst month (the first crash, in year 5.9) is 1.57 at any size; the worst month costs 7.7 of its monthly standard
+deviations at any size:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+target volatility & 5\% & 10\% & 20\% & 40\% & 60\%\\
+\midrule
+Sharpe ratio before the worst month & 1.57 & 1.57 & 1.57 & 1.57 & 1.57\\
+worst month, share of capital & $-11.1\%$ & $-22.2\%$ & $-44.3\%$ & $-88.6\%$ & $-132.9\%$\\
+capital survives & yes & yes & yes & yes & no\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The record before the crash says nothing about the size of the crash: a manager who judged the risk from five years of monthly returns saw a Sharpe
+ratio above 1.5 and a worst month of a fraction of the one to come. The size that survives is set by the stress, not the volatility: a book that must
+not lose more than a quarter of its capital in a month can run the synthetic short-variance book at about 10\% volatility, whatever its history.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ymode=log,xlabel={\small year},ylabel={\small capital (log scale)},tick label style={font=\footnotesize},
+  xmin=0,xmax=20,ymin=0.3,ymax=50,ytick={0.5,1,2,5,10,20,50},yticklabels={0.5,1,2,5,10,20,50},grid=major,grid style={gray!25},legend columns=3,legend style={font=\scriptsize,at={(0.5,-0.3)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omExo,thick] table[x=year,y=v10]{figdata/strategies-2/01-harvesting-the-variance-risk-premium/paths.csv};
+\addplot[omDef,thick] table[x=year,y=v20]{figdata/strategies-2/01-harvesting-the-variance-risk-premium/paths.csv};
+\addplot[omThm,thick] table[x=year,y=v40]{figdata/strategies-2/01-harvesting-the-variance-risk-premium/paths.csv};
+\legend{10\% target,20\% target,40\% target}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The synthetic short-variance book scaled to three volatility targets, compounded monthly over twenty years; the planted crashes of years 6.0 and
+17.5 show as single-month falls, the smaller one of year 12.7 barely. Data: \texttt{s2\_vrp.paths}.}\label{fig:s2:harvesting-the-variance-risk-premium:paths}
+\end{omfigure}
+
+\section{Strategy files}
+
+\begin{strategyfile}{Short index variance}\label{strat:s2:harvesting-the-variance-risk-premium:variance}
+\sfield{Who pays you, and why} Investors who pay for protection against variance, which is highest in bad times.
+\sfield{Instruments and venues} Variance swaps over the counter; a strip of listed options.
+\sfield{Signal} The variance premium: implied variance against a forecast of realised variance.
+\sfield{Sizing and execution} Sized by a stress (the worst plausible month), not by volatility; monthly rolls.
+\sfield{Costs} Option spreads on the replicating strip; dealer margins on swaps.
+\sfield{How it dies} Crashes; crowding, which raises the crash's size.
+\sfield{Horizon, capacity, infrastructure} A month; large capacity in index variance; a surface and stress system.
+\sfield{Backtest honestly} Crash years in the sample; variance strikes as quoted; margin calls.
+\sfield{Sources} Carr and Wu (2009); Cboe VIX data; this chapter: 1.57 before the worst month, $-7.7$ standard deviations in it.
+\end{strategyfile}
+
+\begin{strategyfile}{Delta-hedged short straddle}\label{strat:s2:harvesting-the-variance-risk-premium:straddle}
+\sfield{Who pays you, and why} As for short variance, with the direction hedged away.
+\sfield{Instruments and venues} Listed at-the-money index options and futures for the hedge.
+\sfield{Signal} Implied against forecast volatility.
+\sfield{Sizing and execution} Sold monthly; delta hedged daily or on bands.
+\sfield{Costs} Option spreads and hedge trading.
+\sfield{How it dies} Gap moves the hedge cannot follow.
+\sfield{Horizon, capacity, infrastructure} A month; a hedging engine.
+\sfield{Backtest honestly} Hedges at executable prices; gaps and halts.
+\sfield{Sources} Bakshi and Kapadia (2003); this chapter: a Sharpe ratio of 1.24 on the synthetic index.
+\end{strategyfile}
+
+\begin{strategyfile}{Covered-call overwriting}\label{strat:s2:harvesting-the-variance-risk-premium:overwrite}
+\sfield{Who pays you, and why} Buyers of upside calls; the variance premium on calls.
+\sfield{Instruments and venues} An equity holding and listed calls on it.
+\sfield{Signal} None beyond the premium; strike and tenor chosen by rule.
+\sfield{Sizing and execution} Calls written against the whole holding each month.
+\sfield{Costs} Option spreads; the upside given up.
+\sfield{How it dies} It does not die; it lags in strong rallies and falls with the market.
+\sfield{Horizon, capacity, infrastructure} A month; very large capacity.
+\sfield{Backtest honestly} Include dividends in the comparison index.
+\sfield{Sources} Cboe BuyWrite index: 6.0\% a year at 14.3\% volatility, 2007--2026.
+\end{strategyfile}
+
+\begin{strategyfile}{Put writing}\label{strat:s2:harvesting-the-variance-risk-premium:putwrite}
+\sfield{Who pays you, and why} Buyers of crash protection, who pay most for out-of-the-money puts.
+\sfield{Instruments and venues} Listed index puts, collateralised with cash.
+\sfield{Signal} None beyond the premium.
+\sfield{Sizing and execution} Fully collateralised; one-month puts rolled at expiry.
+\sfield{Costs} Option spreads.
+\sfield{How it dies} Crashes: the short put wins most months and loses in a few.
+\sfield{Horizon, capacity, infrastructure} A month; very large capacity.
+\sfield{Backtest honestly} Collateral earning the bill rate; crash years in the sample.
+\sfield{Sources} Cboe PutWrite index: 7.2\% a year at 13.8\% volatility, 2007--2026; this chapter's harsher synthetic crashes.
+\end{strategyfile}
+
+\begin{strategyfile}{Volatility-targeted short volatility}\label{strat:s2:harvesting-the-variance-risk-premium:voltarget}
+\sfield{Who pays you, and why} As for short variance.
+\sfield{Instruments and venues} Variance swaps or straddles.
+\sfield{Signal} The premium, sized by current implied volatility.
+\sfield{Sizing and execution} Larger when implied volatility is low, smaller when high.
+\sfield{Costs} Extra turnover.
+\sfield{How it dies} Crashes that start from calm markets, when the book is largest.
+\sfield{Horizon, capacity, infrastructure} A month.
+\sfield{Backtest honestly} Crashes from low-volatility starts in the sample.
+\sfield{Sources} This chapter: sizing by the inverse of the strike cut the Sharpe ratio from 0.69 to 0.09.
+\end{strategyfile}
+
+\section{Tutorial: picking up nickels}\label{tut:s2:harvesting-the-variance-risk-premium:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the synthetic option market, run five short-volatility implementations, and size the short-variance book through its planted
+crashes; compare with the real variance premium and option-writing indices. \textbf{End state:} the tables and the two figures.
+\begin{tutsteps}
+\item \textbf{The market}: stochastic variance with leverage, jumps and crashes; members with specific returns.
+\omcode{code/firm/synthvol/firm_synthvol.py}{95}{120}{Twenty years of the synthetic index and its members.}\label{lst:s2:harvesting-the-variance-risk-premium:synthvol}
+\item \textbf{Two implementations}: the variance swap and the delta-hedged straddle.
+\omcode{code/firm/shortvol/firm_shortvol.py}{33}{58}{Short variance and a delta-hedged short straddle.}\label{lst:s2:harvesting-the-variance-risk-premium:shortvol}
+\item \textbf{Run} \texttt{s2\_fetch\_cboe.py} once for the real statistics, then \texttt{implementations()}, \texttt{leverage\_table()} and
+\texttt{fig\_vrp.py}.
+\end{tutsteps}
+\textbf{What to change next.} Hedge the straddle on bands instead of daily; add a crash that starts from high volatility and see whether inverse-strike
+sizing helps; buy a far out-of-the-money put against the short variance and measure what it costs and saves.
+\end{tutorial}
+
+\section{Build: the synthetic option market and short volatility}\label{bld:s2:harvesting-the-variance-risk-premium:shortvol}
+
+\begin{build}
+\bfield{Purpose} \texttt{firm.synthvol}: a deterministic index and member option market with stochastic variance, jumps, crashes and surfaces carrying
+a variance premium and a correlation premium, for Part~I. \texttt{firm.shortvol}: short-volatility implementations and leverage.
+\bfield{Interface} \texttt{VolConfig(\dots)}, \texttt{simulate\_vol(cfg)}, \texttt{expected\_var}, \texttt{atm\_iv}, \texttt{smile\_iv}, \texttt{bs\_price},
+\texttt{bs\_delta}; \texttt{periods}, \texttt{short\_variance}, \texttt{hedged\_straddle}, \texttt{overwrite}, \texttt{put\_write}, \texttt{lever}.
+\bfield{Rules} Implied volatilities from the truth known at the time; options priced at the surface; P\&L per unit of index at inception.
+\bfield{Acceptance tests} \texttt{code/firm/synthvol/tests/} and \texttt{code/firm/shortvol/tests/}: Black--Scholes by hand, expected variance and the
+premium, a planted crash; variance and straddle P\&L on a flat path, a wipe-out.
+\bfield{Stretch} Surfaces with term-structure premia; transaction costs on hedges; members' options.
+\end{build}
+
+\begin{omsources}
+\item P.~Carr and L.~Wu, ``Variance risk premiums'', \emph{Review of Financial Studies} 22(3), 2009.
+\item G.~Bakshi and N.~Kapadia, ``Delta-hedged gains and the negative market volatility risk premium'', \emph{Review of Financial Studies} 16(2), 2003.
+\item Cboe Global Markets, daily histories of the VIX, S\&P 500, PutWrite and BuyWrite indices.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:s2:harvesting-the-variance-risk-premium:1}
+An at-the-money straddle is worth about $0.8\,\sigma\sqrt{\tau}$ of the index. What is it worth for a month (21 trading days) at 20\% volatility?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:s2:harvesting-the-variance-risk-premium:2}
+Expected variance is $0.16^2$ and implied variance is 30\% higher. What are the implied variance and volatility?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:s2:harvesting-the-variance-risk-premium:3}
+Why does the short put win more often than the short variance swap but have the lower Sharpe ratio?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s2:harvesting-the-variance-risk-premium:4}
+A book at 10\% annual volatility loses 7.7 monthly standard deviations. What share of capital does it lose?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s2:harvesting-the-variance-risk-premium:5}
+Why does sizing short variance by the inverse of its strike make it worse on the synthetic market? When would it help?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:s2:harvesting-the-variance-risk-premium:6}
+Why does the VIX exceed realised volatility most of the time, and why is its average excess not the premium's full measure?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:s2:harvesting-the-variance-risk-premium:7}
+\emph{Coding.} Run \texttt{leverage\_table((0.3, 0.5))}. At which target volatility between them does the worst month take the whole capital?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:s2:harvesting-the-variance-risk-premium:8}
+\emph{Find the flaw.} ``Our short-volatility fund has a Sharpe ratio of 2 over five years and its worst month was $-3\%$; at 15\% volatility the risk
+is modest.''
+\end{exercise}
+
+\section{Problem: Picking Up Nickels}
+
+\begin{problem}[{Weekend problem --- short volatility, sized}]\label{pb:s2:harvesting-the-variance-risk-premium:1}
+The chapter's synthetic option market, Cboe's data and the public record.
+
+\medskip\noindent\textbf{Part I --- The premium.}
+\begin{enumerate}
+\item Define a \omterm{def:s2:harvesting-the-variance-risk-premium:short}{short-volatility strategy} and \omterm{def:s2:harvesting-the-variance-risk-premium:overwrite}{option overwriting}.
+\item What did Carr and Wu measure, and how?
+\item Give the VIX's record against realised volatility, 1990--2026.
+\item Name the months when realised volatility exceeded the VIX by most.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Implementations.}
+\begin{enumerate}[resume]
+\item Describe the synthetic market and how its surface is set.
+\item Give the five implementations' Sharpe ratios and skewness.
+\item Why is every skewness negative?
+\item What did the PutWrite and BuyWrite indices earn, and how did they fare in 2008 and 2020?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Hedged options.}
+\begin{enumerate}[resume]
+\item Define a \omterm{def:s2:harvesting-the-variance-risk-premium:hedged}{delta-hedged option return}.
+\item What did Bakshi and Kapadia find?
+\item What does the synthetic straddle earn, and why is its Sharpe ratio the highest?
+\item What would a hedge on bands change?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the short-variance book's Sharpe ratio before its worst month and its loss in that month, by leverage.
+\item Why does the record before the crash not measure the crash?
+\item How should a short-volatility book be sized?
+\item Why did inverse-strike sizing fail here?
+\item How would you backtest a \omterm{def:s2:harvesting-the-variance-risk-premium:short}{short-volatility strategy} honestly?
+\item Which strategy file wins most often, and which has the best Sharpe ratio?
+\item How does this chapter relate to Book~8, chapter~26's volatility targeting?
+\item In one sentence: what does a short-volatility trader sell?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:s2:harvesting-the-variance-risk-premium:1}
+What is the variance risk premium, and why does it exist?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:s2:harvesting-the-variance-risk-premium:2}
+You are short a delta-hedged straddle and the index gaps down 5\% overnight. What happened to your P\&L, and what do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:s2:harvesting-the-variance-risk-premium:3}
+How would you set limits on a short-volatility book?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:s2:harvesting-the-variance-risk-premium:4}
+Compare selling variance swaps, straddles and out-of-the-money puts as ways to earn the premium.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:s2:harvesting-the-variance-risk-premium:5}
+What does a daily delta-hedging engine for an option book need?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:s2:harvesting-the-variance-risk-premium:6}
+A delta-hedged option with gamma $\Gamma$ on an underlying at $S$ is hedged continuously. Show that its P\&L over a short interval is about
+$\tfrac12\Gamma S^2(\sigma_r^2 - \sigma_i^2)\,dt$, with $\sigma_r$ realised and $\sigma_i$ implied volatility, and explain what this implies for its sign.
+\end{interviewq}

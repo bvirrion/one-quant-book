@@ -50,6 +50,8 @@ def main():
                     f.write("- **Defines.** " + ", ".join(ch["defines"]) + ".\n")
                     if ch.get("uses"):
                         f.write("- **Uses (defined earlier).** " + ", ".join(ch["uses"]) + ".\n")
+                    if ch.get("strategies"):
+                        f.write("- **Strategy files.** " + "; ".join(ch["strategies"]) + ".\n")
                     f.write(f"- **Tutorial.** {ch['tutorial']}\n")
                     f.write(f"- **Build.** {ch['build']}\n")
                     f.write(f"- **Weekend problem.** {ch['problem']}\n")

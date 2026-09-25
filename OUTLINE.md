@@ -68,9 +68,9 @@ about 20 pages of front and back matter per book.
 | 4 | One Quant Book 4 — Quantitative Methods | 29 | 351 (written) | `outline/methods-derivatives.md` |
 | 5 | One Quant Book 5 — Derivatives and Volatility | 28 | 348 (written) | `outline/methods-derivatives.md` |
 | 6 | One Quant Book 6 — Rates, Credit, XVA and Risk | 29 | 314 (written) | `outline/methods-derivatives.md` |
-| 7 | One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios | 29 | ~398 | `outline/research-strategies.md` |
-| 8 | One Quant Book 8 — Strategies I: Equities and Futures | 29 | ~388 | `outline/research-strategies.md` |
-| 9 | One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks | 29 | ~382 | `outline/research-strategies.md` |
+| 7 | One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios | 29 | 345 (written) | `outline/research-strategies.md` |
+| 8 | One Quant Book 8 — Strategies I: Equities and Futures | 29 | 330 (written) | `outline/research-strategies.md` |
+| 9 | One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks | 29 | 333 (written) | `outline/research-strategies.md` |
 | 10 | One Quant Book 10 — Microstructure and Execution | 28 | ~378 | `outline/microstructure-hft-ml.md` |
 | 11 | One Quant Book 11 — Market Making and High-Frequency Trading | 29 | ~396 | `outline/microstructure-hft-ml.md` |
 | 12 | One Quant Book 12 — Machine Learning for Markets | 29 | ~392 | `outline/microstructure-hft-ml.md` |
@@ -85,10 +85,11 @@ Total: 524 chapters, about 7,070 pages, and about 300 strategy files
 (231 in Books 8–9, 75 in Book 11). Books 6 and 13 have the most headroom;
 Books 1, 2 and 18 run slightly over 400.
 
-Measured (2026-09-24): Books 1–6 are written, 2,082 pages against the
-outline's 2,390 for them (−13 %). Written books run 10.8–12.4 pages a chapter
-all-in; the per-chapter figures above overstate by 1–3 pages wherever they
-exceed 12, so the series total will land nearer 6,200 than 7,070.
+Measured (2026-09-25): Books 1–9 are written, 3,090 pages against the
+outline's 3,558 for them (−13 %), with 236 strategy files in Books 8–9 (outline
+231). Written books run 10.8–12.4 pages a chapter all-in; the per-chapter
+figures above overstate by 1–3 pages wherever they exceed 12, so the series
+total will land nearer 6,200 than 7,070.
 
 ## Reading paths
 

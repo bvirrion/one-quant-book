@@ -16,6 +16,9 @@ ENTRY = {
     4: "one_quant_book_04_methods.tex",
     5: "one_quant_book_05_derivatives.tex",
     6: "one_quant_book_06_rates_credit_risk.tex",
+    7: "one_quant_book_07_research.tex",
+    8: "one_quant_book_08_strategies_1.tex",
+    9: "one_quant_book_09_strategies_2.tex",
 }
 
 LANGS = {
@@ -25,6 +28,9 @@ LANGS = {
     4: ("en",),
     5: ("en",),
     6: ("en",),
+    7: ("en",),
+    8: ("en",),
+    9: ("en",),
 }
 
 
