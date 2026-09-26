@@ -1,0 +1,351 @@
+\chapter{The Feed Handler}\label{ch:ll:the-feed-handler}
+
+At the open the message rate jumps: on the simulator's busy instrument of this chapter, from about 570 messages a second at
+midday to more than 9\,000 in the first seconds; on the consolidated feed of U.S. options, OPRA published a peak of 63.9
+million messages in one second of July 2026 and 350\,000 in its busiest millisecond. A handler that falls behind lets its
+socket buffer fill; the kernel drops what does not fit; line A loses a packet that line B has also lost; and the firm's book
+is stale until the handler has recovered, by retransmission if the gap is small and recent, from the next snapshot if not.
+This chapter builds the first component of Part~IV's trading system, the \omterm{def:ll:the-feed-handler:handler}{feed handler}: it decodes and arbitrates the two
+lines of chapter~16, detects gaps and recovers from them, normalises every message into the firm's event record and publishes
+it on the rings of chapter~12, and says at every moment whether the book it feeds can be trusted.
+
+\section{Decode and arbitrate}
+
+\begin{definition}[Feed handler]\label{def:ll:the-feed-handler:handler}
+A \emph{feed handler}\index{feed handler} is the process that receives a venue's market-data feed (One Quant Book~1,
+chapter~4) and turns it into the firm's internal events: it reads the redundant lines, arbitrates them into one sequenced
+stream, detects and recovers lost messages, normalises each message into the firm's own record (Book~1, chapter~28), and
+publishes the records to the components that build books and make decisions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=gray!10] (a) at (0,0.6) {line A};
+\node[box,fill=gray!10] (b) at (0,-0.6) {line B};
+\node[box,fill=omDef!20,minimum width=2.1cm] (arb) at (2.6,0) {arbitrate by\\ sequence};
+\node[box,fill=omThm!15,minimum width=2.2cm] (gap) at (5.4,0) {gap? hold, wait\\ \qty{0.5}{\milli\second} for\\ the other line};
+\node[box,fill=omDef!20,minimum width=2.1cm] (norm) at (8.3,0) {normalise\\ (48-byte event)};
+\node[box,fill=omMeth!20] (ring) at (10.9,0) {firm.ring\\ (chapter~12)};
+\node[box,fill=omThm!8] (retx) at (5.4,-2.0) {retransmission\\ server};
+\node[box,fill=omThm!8] (snap) at (8.3,-2.0) {snapshot\\ channel};
+\node[box,fill=gray!8,align=left] (flag) at (5.4,1.7) {stale-book flag, counters,\\ staleness intervals};
+\draw[->] (a) -- (arb);
+\draw[->] (b) -- (arb);
+\draw[->] (arb) -- (gap);
+\draw[->] (gap) -- (norm);
+\draw[->] (norm) -- (ring);
+\draw[->,omThm] (gap) -- node[left,font=\scriptsize]{request} (retx);
+\draw[->,omThm,dashed] (retx.east) -- node[below,font=\scriptsize]{} ++(0.4,0) |- ([yshift=-0.2cm]gap.east);
+\draw[->,omThm] (snap) -- node[right,font=\scriptsize]{if the server cannot} (norm);
+\draw[gray,dashed] (gap) -- (flag);
+\end{tikzpicture}
+
+\omcaption{The build's \omterm{def:ll:the-feed-handler:handler}{feed handler}. Packets from both lines are merged by sequence number; a gap holds later messages and
+waits briefly for the other line, then asks the retransmission server, then falls back to the next snapshot; every message
+leaves as one fixed-size event on the firm's ring. While a gap is open, the \omterm{def:ll:the-feed-handler:stale}{stale-book flag} is up.}\label{fig:ll:the-feed-handler:design}
+\end{omfigure}
+
+The handler of the build is written first in Python, as the reference, then in C++20 and Rust, and all three publish exactly
+the same events (compared by a 64-bit hash of their 48-byte records) on the same inputs. Its time is the arrival time recorded
+with each packet, so that a recorded day replays exactly: the same inputs give the same events, the same staleness intervals
+and the same counters. Arbitration is chapter~16's; what the handler adds is what to do while a sequence number is missing.
+
+\section{Detect gaps and recover}
+
+A missing sequence number is usually not lost, only late: it is on its way on the other line, or reordered by a switch.
+The handler therefore holds the messages that arrive after it and waits a short time, here \qty{0.5}{\milli\second}, for the
+missing ones. If they come, the held messages are released in order. If not, the handler asks the retransmission server for
+the range (chapter~16; the simulator answers up to 1\,000 messages per request from its last 100\,000), and applies the answer
+when it arrives, a round trip later. If the server cannot help, because the gap is older than its window or the server is
+unreachable, the handler waits for the next snapshot of the instrument, loads it, discards the held messages it already
+reflects and continues from the sequence number it gives, the procedure CME's snapshot messages support with their last
+incremental sequence number processed.
+
+\omcode{code/firm/feedhandler/cpp/firm_feedhandler.hpp}{213}{237}{Each packet: drop it if every message is old, deliver the
+next expected message, hold the others; a held message opens a gap and starts its timer.}\label{lst:ll:the-feed-handler:incremental}
+
+The snapshot path is the delicate one: the snapshot must be at least as recent as the book, the held messages it already
+reflects must go, and a hole after it must be detected again.
+
+\omcode{code/firm/feedhandler/firm_feedhandler.py}{190}{204}{Loading a snapshot in the Python reference.}\label{lst:ll:the-feed-handler:snapshot}
+
+\begin{definition}[Stale-book flag, recovery latency]\label{def:ll:the-feed-handler:stale}
+The \emph{stale-book flag}\index{stale-book flag} is the handler's public statement that the book built from its events may
+differ from the venue's, raised when a gap is detected and lowered when it is closed. The \emph{recovery latency}\index{recovery
+latency} of a gap is the time from its detection to the moment the book is correct again: the other line's delay, a
+retransmission round trip, or the wait for and the loading of a snapshot.
+\end{definition}
+
+\Cref{fig:ll:the-feed-handler:minute} shows the handler at work on a simulated minute from the open, both lines impaired: 0.2\%
+of packets lost independently on each line, bursts of loss, \omterm{def:ll:where-latency-comes-from:tail}{jitter} that reorders packets, and an outage on each line
+overlapping for 15 milliseconds at 40 seconds. Out of 4\,232 gaps, 4\,224 are filled by the other line within the half
+millisecond; the retransmission server closes the other eight within \qty{2.7}{\milli\second}. Without the server, seven gaps
+need a snapshot, and with a snapshot every second the book stays stale for 0.3 to 1 second each time, five seconds of the
+minute in all. Staleness is then not a property of the network but of the recovery path.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=1 by 2,vertical sep=0.6cm,xlabels at=edge bottom},width=12cm,xmin=0,xmax=60,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[height=3.6cm,ymin=0,ymax=1000,ylabel={msgs / 100 ms},xticklabels={}]
+\addplot[omDef,const plot,fill=omDef!25,draw=omDef] table[x=t_s,y=messages]{figdata/low-latency/18-the-feed-handler/rate.csv} \closedcycle;
+\nextgroupplot[height=3.2cm,ymin=0.4,ymax=2.6,ytick={1,2},yticklabels={{snapshot only},{with retrans.}},
+  xlabel={seconds after the open},unbounded coords=jump]
+\addplot[omMeth,line width=6pt,mark=|,mark size=4pt,mark options={line width=1.2pt}] table[x=t_s,y=retx]{figdata/low-latency/18-the-feed-handler/stale_bars.csv};
+\addplot[omThm,line width=6pt] table[x=t_s,y=snapshot]{figdata/low-latency/18-the-feed-handler/stale_bars.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{A simulated minute from the open. Top: messages published per 100 ms, sixteen times busier at the open than at
+midday. Bottom: the gaps that the other line could not fill, with the retransmission server (each closed within
+\qty{3}{\milli\second}: a tick) and with snapshot recovery only (a snapshot a second: a bar from detection to recovery); the
+4\,224 gaps filled by the other line are too short to draw. Data: \texttt{fig\_stale.py} (deterministic: the simulator and the handler
+are).}\label{fig:ll:the-feed-handler:minute}
+\end{omfigure}
+
+\section{Normalise and publish}
+
+Every message leaves the handler as one 48-byte event: its kind, side, instrument, sequence number, timestamp, order reference,
+second reference (the new reference of a replace, the match number of an execution, the sequence number of a snapshot),
+price and quantity. A normalised record has three virtues downstream. Its size is fixed, so it fits a ring slot
+(chapter~12) and a consumer reads it without decoding. It is the same for every venue the firm reads, so the book builder
+(chapter~19) and the strategies (chapter~20) are written once. And it carries the venue's sequence number, so a consumer can
+tell exactly which events it has seen, and a snapshot's events can say which sequence number they reflect. The build's test
+publishes a whole run on an SPSC ring of 64-byte slots and reads it back, hash for hash.
+
+On the laptop the C++ handler takes about \qty{39}{\nano\second} per packet at the median, \qty{160}{\nano\second} at the p99
+and \qty{290}{\nano\second} at the p99.9, measured over the minute of \cref{fig:ll:the-feed-handler:minute} with the clock read
+around each input; the rare slow ones are gaps, whose held messages go through an ordered map, and retransmission answers.
+At 9\,000 messages a second the handler is busy about 0.04\% of the time: the burst of this simulated instrument is nothing
+for it. The real bursts are the ones of \cref{dat:ll:the-feed-handler:opra}.
+
+\begin{dated}{2026-09}{How bursty is a feed?}\label{dat:ll:the-feed-handler:opra}
+OPRA's published operating metrics for the consolidated U.S. options feed (August 2026 report) give, for July 2026, a peak of
+63.9 million messages in one second, 7.9 million in 100 milliseconds, 0.89 million in 10 milliseconds and 0.35 million in
+one millisecond: the busiest millisecond ran at 350 million a second, five and a half times the busiest second's rate. OPRA's capacity
+notice says why subscribers plan on 10-millisecond peaks (they ``reflect system utilization during bursts of traffic''), and
+that taking both redundant streams doubles the bandwidth.
+\end{dated}
+
+\section{Bursts, buffers and slow consumers}
+
+\begin{definition}[Message burst, receive buffer overrun]\label{def:ll:the-feed-handler:burst}
+A \emph{message burst}\index{message burst} is a period in which a feed's rate exceeds the rate its receiver sustains. A
+\emph{receive buffer overrun}\index{receive buffer overrun} is the loss of datagrams that arrive while the socket's receive
+buffer is full: the kernel drops them silently, and the handler sees only a gap.
+\end{definition}
+
+During a burst the difference between the arrival rate and the handler's service rate accumulates in the socket's receive
+buffer, the M/M/1 queue of One Quant Book~4, chapter~8, with a hard wall: whatever does not fit is dropped. The buffer's
+size is set with \texttt{SO\_RCVBUF}, and two details of Linux decide what it holds. The kernel ``doubles this value (to
+allow space for bookkeeping overhead)'' and returns the doubled value (socket(7)), capped by \texttt{net.core.rmem\_max},
+4~MiB on the laptop, so that asking for 4~MiB grants 8. And the buffer is charged with each datagram's whole memory footprint,
+not its payload. \Cref{fig:ll:the-feed-handler:rcvbuf} measures what a stalled reader keeps: 50\,000 datagrams sent on
+loopback while nobody reads, then the socket drained. Each 64-byte datagram costs 960 bytes of buffer and each 1\,000-byte
+datagram 2\,305: the largest buffer the laptop grants holds 8\,738 small datagrams, a fortieth of the messages of OPRA's
+busiest millisecond.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log basis x=2,xmin=20000,xmax=12000000,ymin=8,ymax=20000,
+  xlabel={buffer granted by the kernel (bytes, log scale; twice the size asked)},ylabel={datagrams kept (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  xtick={32768,131072,524288,2097152,8388608},xticklabels={32~KiB,128~KiB,512~KiB,2~MiB,8~MiB},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=granted,y=held,restrict expr to domain={\thisrow{payload}}{0:100}]{figdata/low-latency/18-the-feed-handler/measured_rcvbuf.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=granted,y=held,restrict expr to domain={\thisrow{payload}}{500:2000}]{figdata/low-latency/18-the-feed-handler/measured_rcvbuf.csv};
+\legend{64-byte datagrams,1\,000-byte datagrams}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{How many datagrams a UDP socket keeps for a reader that is not reading, by receive-buffer size: 50\,000 datagrams
+sent on loopback during the stall. The kernel grants twice the size asked and charges each datagram its full memory
+footprint. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2 (kernel 6.18); \texttt{rmem\_max} 4~MiB. Data:
+\texttt{bench\_feed.py}.}\label{fig:ll:the-feed-handler:rcvbuf}
+\end{omfigure}
+
+The handler is in turn a producer. Its consumers read the ring at their own pace, and a consumer slower than the feed (a
+\omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{slow consumer}, chapter~12) must not slow the handler down: the broadcast ring never waits, and a lapped consumer
+resynchronises. The two defences against bursts are therefore the same at both ends of the handler: enough buffer for the
+burst the data says to expect, and a way to recover when even that is not enough.
+
+\section{Monitoring a feed}
+
+A handler that is wrong silently is worse than one that stops. The build counts packets, messages, duplicates, gaps, gaps
+filled by the other line, retransmission requests and snapshot recoveries, and keeps every staleness interval with its start
+and end. Four of these numbers deserve alarms: the rate of gaps on each line (a line going bad, while the other hides it), the
+gaps filled by neither line (a common cause, chapter~16), any snapshot recovery (a book that was wrong for up to a snapshot
+interval), and the receive queue's high-water mark (a burst closer to the buffer than expected). The \omterm{def:ll:the-feed-handler:stale}{stale-book flag} itself goes
+to every consumer with each event, so that a strategy never quotes on a book that its handler knows to be wrong.
+
+\section{Tutorial: the handler on impaired lines}\label{tut:ll:the-feed-handler:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run the handler in three languages on the same impaired lines, recover by retransmission and by snapshot, and
+check the output against a clean run. \textbf{End state:} \cref{fig:ll:the-feed-handler:minute,fig:ll:the-feed-handler:rcvbuf},
+the handling-time quantiles, and green tests in Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Make the fixture.} \texttt{make\_feed\_fixtures.py} runs Book~10's simulator for three seconds with both lines
+impaired and writes the lines, the lossless stream (which the retransmission server holds) and the \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{snapshot channel}.
+\item \textbf{Three runs, three languages.} Clean, impaired with the server, impaired without it: the Python reference writes
+the expected counts, hashes and staleness, and the C++ and Rust tests reproduce them exactly.
+\item \textbf{Check what recovery means.} With retransmission, the impaired run publishes exactly the clean run's events. With
+a snapshot, it publishes the snapshot instead of the lost messages, then exactly the clean run's events after it, and the book
+at the end of the run is the same.
+\item \textbf{Measure} with \texttt{python bench\_feed.py}: the minute of \cref{fig:ll:the-feed-handler:minute} through the
+C++ handler with the clock read around each input (the script checks that it publishes what the reference publishes), and the
+stalled-reader experiment of \cref{fig:ll:the-feed-handler:rcvbuf}.
+\end{tutsteps}
+\textbf{What to change next.} Shorten the wait for the other line to \qty{50}{\micro\second} and count the retransmission requests
+that follow; lengthen the snapshot interval to five seconds and read the staleness again.
+\end{tutorial}
+
+\section{Build: the feed handler}\label{bld:ll:the-feed-handler:feedhandler}
+
+\begin{build}
+\bfield{Purpose} The first stage of the trading system: from the venue's lines to the firm's events. The book builder of
+chapter~19 consumes its events, the strategy engine of chapter~20 its \omterm{def:ll:the-feed-handler:stale}{stale-book flag}, and the monitoring of chapter~24 its
+counters.
+\bfield{Interface} Python reference \texttt{firm\_feedhandler}: \texttt{Handler(retx, gap\_timeout\_ns, rtt\_ns).run(events)},
+\texttt{.events}, \texttt{.hash}, \texttt{.stale}, \texttt{.counters}; \texttt{RetxServer}, \texttt{merge}, \texttt{recorded},
+\texttt{normalise}, \texttt{book}. C++20 \texttt{firm::feed2::Handler(retx, timeout, rtt)} with \texttt{run(a, b, snapshots)},
+\texttt{on\_event}, \texttt{hash}, \texttt{stale}, counters and optional timing hooks; \texttt{RetxServer}; \texttt{recorded}.
+Rust \texttt{firm\_feedhandler::Handler} with the same.
+\bfield{Rules} Each sequence number is published once, in order; held messages are released only in order; a gap waits for the
+other line, then retransmission (one request per hole, answers capped by the server), then a snapshot; the handler is a
+function of its timestamped inputs; the \omterm{def:ll:the-feed-handler:stale}{stale-book flag} is up exactly while a gap is open; no allocation per packet without a
+gap.
+\bfield{Acceptance tests} \texttt{code/firm/feedhandler/}: on the shared fixture, clean, retransmission and snapshot runs with
+identical event counts, hashes, staleness intervals and counters in Python, C++ and Rust; the retransmission run equal to the
+clean run event for event; the snapshot run equal to the clean run after the snapshot and in its final book; publication on
+\texttt{firm.ring} read back hash for hash; arbitration on scripted packets.
+\bfield{Stretch} One request for all the holes of a gap; per-instrument recovery on a multi-instrument feed; reading the lines
+from sockets (chapter~13's \omterm{def:ll:linux-tuning:polling}{busy polling}) with the receive queue's high-water mark as a counter.
+\end{build}
+
+\begin{omsources}
+\item Linux man page \texttt{socket(7)} (\texttt{SO\_RCVBUF}); Linux kernel documentation, ``Documentation for
+/proc/sys/net/'' (\texttt{rmem\_max}, \texttt{rmem\_default}, \texttt{netdev\_max\_backlog}).
+\item OPRA, \emph{Key Operating Metrics of U.S. Options Securities Information Processor} (August 2026); SIAC, \emph{Revised
+OPRA Capacity Projections} (September 2025).
+\item CME Group Client Systems Wiki, MDP~3.0: ``Market Data Snapshot -- Full Recovery''.
+\item The simulator's protocols and services, \path{code/firm/exchsim/PROTOCOL.md} (One Quant Book~10, chapter~26).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:1}
+The handler expects sequence number 1\,000 and receives packets starting at 1\,003 (3 messages) on line A, then 1\,000 (3
+messages) on line B. What does it publish, in what order, and what is the staleness interval if the second packet arrives
+\qty{40}{\micro\second} after the first?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:2}
+A handler asks for a 256~KiB receive buffer. What does \texttt{getsockopt} return, and how many 64-byte datagrams will the
+buffer hold, by the measurement of \cref{fig:ll:the-feed-handler:rcvbuf}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:3}
+With snapshots every 500 milliseconds and a snapshot that takes 5 milliseconds to receive, what are the mean and worst recovery
+latencies of an unrecoverable gap?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:4}
+Why does the handler wait for the other line before asking for a retransmission? What does a shorter wait cost, and a longer
+one?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:5}
+A burst arrives at 2 million datagrams a second for 30 milliseconds; the handler serves 1.2 million a second. How many
+datagrams queue, and what receive buffer (asked) holds them if each is charged 960 bytes?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:6}
+After a snapshot recovery the handler's event stream differs from the clean run's. In what sense is the output nevertheless
+``identical once recovered'', and how does the build test it?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-feed-handler:7}
+\emph{Coding.} Make the handler ask for all the holes of a gap in one request (a list of ranges), in the Python reference and
+the C++ handler, and check on the minute of \cref{fig:ll:the-feed-handler:minute} that the worst retransmission staleness falls.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-feed-handler:8}
+\emph{Find the flaw.} ``When our handler detects a gap it drops everything it holds and waits for the next snapshot; that way
+the book is always consistent.''
+\end{exercise}
+
+\section{Problem: The Opening Burst}
+
+\begin{problem}[{Weekend problem --- buffers for the open, staleness when they fail}]\label{pb:ll:the-feed-handler:1}
+A handler reads one line of a feed whose opening burst reaches 1.5 million datagrams a second for 20 milliseconds, one
+message per datagram; the handler serves one datagram in \qty{2}{\micro\second} (decoding, book update, publication). Take the
+kernel's charge per 64-byte datagram and its doubling of \texttt{SO\_RCVBUF} from \cref{fig:ll:the-feed-handler:rcvbuf}, a
+maximum \texttt{rmem\_max} of 4~MiB, and a snapshot every second.
+
+\medskip\noindent\textbf{Part I --- The queue.}
+\begin{enumerate}
+\item What is the handler's service rate, and its utilisation during the burst?
+\item How many datagrams are queued at the end of the burst?
+\item How long after the burst does the queue take to drain if the rate falls to 200\,000 a second?
+\item What is the queueing delay of the last datagram of the burst?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The buffer.}
+\begin{enumerate}[resume]
+\item How many bytes of receive buffer must the kernel grant to hold the queue?
+\item What must be asked with \texttt{SO\_RCVBUF}, and is it allowed on this machine?
+\item With the largest buffer allowed, how many datagrams are lost?
+\item What else could hold the burst?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- When it fails.}
+\begin{enumerate}[resume]
+\item Can the retransmission server fill the loss?
+\item If not, what staleness follows, on average and at worst?
+\item During that staleness, how many datagrams arrive and must be held?
+\item What should the strategy do meanwhile?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the receive buffer that absorbs the burst without loss, and the staleness a snapshot
+interval implies when it does lose.
+\item How much faster would the handler have to be to need no queue at all?
+\item Why does reading both lines double the problem?
+\item What does OPRA's millisecond peak say about a single-threaded handler for a whole options feed?
+\item What would you measure in production to size the buffer?
+\item Which counter tells you that a burst came close to the limit?
+\item Why is a snapshot interval a business decision of the venue with a latency cost for the firm?
+\item In one sentence: what does a \omterm{def:ll:the-feed-handler:handler}{feed handler} do when it cannot keep up?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:the-feed-handler:1}
+What does a market-data \omterm{def:ll:the-feed-handler:handler}{feed handler} do, from the network card to the strategy?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-feed-handler:2}
+A gap appears on line A. Walk through what the handler does until the book is correct again.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-feed-handler:3}
+How would you size a UDP socket's receive buffer for a feed? What does the kernel do with the value you set?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-feed-handler:4}
+How do you know, downstream, that the book you are reading is stale?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-feed-handler:5}
+Why normalise every venue's messages into one internal record? What does it cost?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:the-feed-handler:6}
+How would you test a \omterm{def:ll:the-feed-handler:handler}{feed handler}'s recovery paths before production, and prove that it recovers to the right book?
+\end{interviewq}

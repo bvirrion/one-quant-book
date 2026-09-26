@@ -1,0 +1,26 @@
+# 23. Retail Wholesaling — brief and source ledger
+
+## Brief
+
+- **Hook.** A retail order to buy fifty shares is routed from a phone to a wholesaler, which fills it at a price slightly better than the best offer on any exchange, keeps the trade, and pays the broker for the privilege.
+- **Sections.** The economics of retail flow; Segmentation and pricing; Price improvement and its measurement; Inventory from one-sided flow; Rules and the debate.
+- **Defines.** flow segmentation, retail liquidity programme, internalisation rate.
+- **Uses (defined earlier).** wholesaler (B1.10), payment for order flow (B1.10), price improvement (B1.10), internalisation (B1.10), Rule 605 report (B1.10), Rule 606 report (B1.10), best execution (B1.11), odd lot (B1.9), price-improvement auction (B1.24), market maker (B1.1), bid--ask spread (B1.1), adverse selection (B1.1), mid price (B1.1), inventory (B2.30), mark-out curve (B7.23), spread capture (B7.23), adverse-selection cost (B7.23), inventory P\&L (B7.23), fill rate (B7.23).
+- **Strategy files.** equity retail internalisation; retail options flow through price-improvement auctions; exchange retail liquidity programmes.
+- **Tutorial.** Simulate retail flow segmented from institutional flow on firm_tape, internalise it with price improvement against the national best bid and offer, hedge the one-sided residual, and decompose the wholesaler's P&L into capture, payment for flow and hedging.
+- **Build.** `firm.wholesale`: segmented flow simulation, price-improvement policy, internalisation and hedging of residual inventory, Rule 605-style statistics; Python.
+- **Weekend problem.** Fifty shares from a phone — named result: the wholesaler's capture per share net of payment for order flow and hedging, and the retail trader's price improvement against the displayed spread.
+- **Facts to verify.** Virtu and a second wholesaler's filings on retail market making (dated); SEC Rule 605 amendments 2024 and the status of the 2022 order-competition and best-execution proposals (dated); Ernst and Spatt 2022 Payment for order flow and asset choice (working paper); Schwarz, Barber, Huang, Jorion, Odean 2025 The actual retail price of equity trades (JF or working paper); SEC approval of the NYSE Retail Liquidity Program 2012 (dated).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Schwarz, Barber, Huang, Jorion and Odean (2025): 85,000 simultaneous market orders across six accounts at five brokers; mean account-level round-trip cost 0.07% to 0.46% excluding commissions; dispersion due to wholesalers giving different prices for the same trades to different brokers; PFOF variation does not explain it | Journal of Finance 80(5), 2025, 2507-2541 | https://api.crossref.org/works/10.1111/jofi.13467 | 2026-09-25 | Crossref abstract: "the mean account-level round-trip cost ranges from 0.07% to 0.46%, excluding any commissions. The dispersion is due to off-exchange wholesalers systematically giving different execution prices for the same trades to different brokers" | §3; strategy file |
+| F2 | Virtu 10-K FY2025: in June 2025 the SEC withdrew proposed Rule 615 (Order Competition Rule), Regulation Best Execution, ATS/Exchange definition amendments, Reg SCI amendments and a proposal to restrict volume-based tiered pricing; Rule 605 amendments' compliance date (previously about 15 Dec 2025) postponed to 1 Aug 2026 | Virtu Financial Form 10-K FY2025, SEC EDGAR | https://www.sec.gov/Archives/edgar/data/1592386/000159238626000009/virt-20251231.htm | 2026-09-25 | "In June of 2025, under Chair Atkins, the SEC withdrew the following previously pending proposals: (i) Proposed Rule 615 of Regulation NMS (i.e., the Order Competition Rule), (ii) Regulation Best Execution"; "adopted amendments to Rule 605 of Regulation NMS, which had a previous compliance date on or about December 15, 2025 but which has now been postponed until August 1, 2026" | dat:hf:retail-wholesaling:rules |
+| F3 | SEC Release 34-67347 (3 July 2012): approved NYSE and NYSE Amex Rule 107C Retail Liquidity Program on a pilot basis; Retail Price Improvement Orders priced better than the PBBO by at least $0.001 per share | SEC order | https://www.sec.gov/files/rules/sro/nyse/2012/34-67347.pdf | 2026-09-25 | pdftotext: "July 3, 2012"; "A Retail Price Improvement Order would be required to be priced better than the PBBO by at least $0.001 per share" | dat:hf:retail-wholesaling:rules; strategy file |
+| F4 | Ernst and Spatt (2022, working paper): option internalisation is imperfectly competitive (DMM assignments, tick size, auction allocation rules), protecting market-maker profits and allowing high PFOF for retail option flow | SSRN working paper 10.2139/ssrn.4056512 | https://api.crossref.org/works/10.2139/ssrn.4056512 | 2026-09-25 | Crossref abstract: "showing that option internalization is imperfectly competitive. These imperfectly competitive rules protect option market maker profits, and allow market makers to pay high prices for retail option order flow" | strategy file |
+
+## EXCLUDED
+
+- A second wholesaler's filings; Ernst-Spatt "Payment for order flow and asset choice" (no abstract via Crossref): not used.

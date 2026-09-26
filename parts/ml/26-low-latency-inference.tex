@@ -1,0 +1,317 @@
+\chapter{Low-Latency Inference}\label{ch:ml:low-latency-inference}
+
+A gradient-boosted model of 300 trees answers in 265 microseconds through its library's Python interface and in 2.6
+microseconds as generated C++, measured on the same laptop; the model did not change, and the two answers are equal to the
+last bit. Most of the first figure is not the model: it is the interpreter, the wrapper, the conversion of one row into an
+array and back. This chapter is about taking models out of that environment: compiling trees into code, shrinking small
+networks to eight-bit integers, deciding when to batch, and doing it in C++20 and Rust with the exact results of the Python
+reference. It rests on Book~13's method for measuring latency, and its timings are one laptop's, labelled as such; what the
+tests check is parity, and what the chapter concludes is about orders of magnitude.
+
+\section{The inference budget}
+
+\begin{definition}[Inference latency]\label{def:ml:low-latency-inference:latency}
+\emph{Inference latency}\index{inference latency} is the time from the moment a model's inputs are available to the moment
+its output is, measured per call and reported as a distribution (median and tail), within the strategy's latency budget
+(Book~13, chapter~1).
+\end{definition}
+
+A market-making or execution model decides inside a budget of a few microseconds to a few hundred, shared with feature
+computation (chapter~24), risk checks and the network. Inference must fit its share at the tail, not the median: the decision
+that arrives late is the one taken when the market moved. The chapter's two models are those of \texttt{firm.mlinfer}'s
+fixture, fitted to a synthetic problem with 16 features: a LightGBM forest (chapter~5) of 300 trees with 15 leaves each, 4\,200
+splits in all, and a \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{multilayer perceptron} (chapter~7) of $16\to32\to16\to1$ units. On 20\,000 new observations the forest's
+rank information coefficient is 0.224 and the network's 0.182.
+
+\section{Compiling trees}
+
+\begin{definition}[Model compilation]\label{def:ml:low-latency-inference:compile}
+\emph{Model compilation}\index{model compilation} translates a trained model into code or data structures specialised for
+inference on a target (generated source, a flat array layout, a hardware description), removing the training framework from
+the prediction path (Asadi, Lin and de Vries, 2014; Lucchese and co-authors, 2015, for ranking forests).
+\end{definition}
+
+The forest is exported two ways. As flat arrays of feature indices, thresholds and child indices, one entry per node, which a
+loop walks (\cref{lst:ml:inf:loop}): the same loop runs in Python, C++20 and Rust. And as generated C++ with one nested
+\texttt{if} per split and the thresholds as literals (\cref{lst:ml:inf:gen}), 17\,107 lines that the compiler turns into
+straight branches. Both reproduce LightGBM's predictions exactly on the 200 shared test vectors, because they visit the same
+leaves and add the leaf values in the same order in double precision; the thresholds survive the trip through text because
+they are written with the shortest representation that reads back to the same double.
+
+\Cref{fig:ml:inf:latency} shows the measured latencies. LightGBM's scikit-learn interface takes 265~µs per single-row call at
+the median and 544~µs at the 99th percentile; the same flat loop in Python is no faster (300~µs), because the interpreter's
+cost per node dominates. In C++ the loop takes 6.2~µs and the generated branches 2.6~µs (5.7~µs at the 99th percentile), a
+hundred times less than the library call at both the median and the tail; the Rust loop takes 7.8~µs. The branches win over
+the loop because the thresholds and child addresses are in the instruction stream rather than in memory, and the compiler
+can lay out the likely path; with 300 trees and 4\,200 splits the whole forest still fits in the caches (Book~13, chapter~3).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=7.5cm,xbar,bar width=5pt,bar shift=0pt,xmin=10,xmax=2e6,
+  xlabel={latency per call (nanoseconds)},ytick={0,1,2,3,4,5,6,7,8,9},
+  yticklabels from table={figdata/ml/26-low-latency-inference/measured_latency.csv}{path},y dir=reverse,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},area legend,
+  legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none},legend columns=2,
+  table/col sep=comma,enlarge y limits=0.06,log origin=infty]
+\addplot[fill=omThm,draw=none,bar shift=2.6pt] table[x=p99_ns,y=i]{figdata/ml/26-low-latency-inference/measured_latency.csv};
+\addplot[fill=omDef,draw=none,bar shift=-2.6pt] table[x=median_ns,y=i]{figdata/ml/26-low-latency-inference/measured_latency.csv};
+\legend{99th percentile,median}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Single-call latency of the same two models by execution path; 200\,000 calls in C++ and Rust, 5\,000 in Python (300
+for the pure-Python forest), timed one by one. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2 at low priority, no
+isolated cores; other jobs may have run. Data: \texttt{bench\_infer.py}, \texttt{measured\_latency.csv}.}\label{fig:ml:inf:latency}
+\end{omfigure}
+
+\section{Small networks: layout, fusion and quantisation}
+
+\begin{definition}[Operator fusion, quantisation, post-training quantisation, quantisation-aware training]\label{def:ml:low-latency-inference:quant}
+\emph{Operator fusion}\index{operator fusion} computes several consecutive operations (a matrix product, a bias, an
+activation, a rescaling) in one pass over the data. \emph{Quantisation}\index{quantisation} represents weights and
+activations as small integers with scale factors, so that inference runs in integer arithmetic (Jacob and co-authors, 2018).
+\emph{Post-training quantisation}\index{post-training quantisation} derives the integers and scales from a trained float model
+and a calibration sample; \emph{quantisation-aware training}\index{quantisation-aware training} fine-tunes the model with the
+rounding simulated in the forward pass, so that it learns weights that survive it (Nagel and co-authors, 2021).
+\end{definition}
+
+The chapter's network is quantised symmetrically, one scale per tensor: weights and activations to integers in $[-127, 127]$,
+biases to 32-bit integers at the product of the input and weight scales, and between layers a fixed-point multiplier and shift
+that bring the 32-bit accumulator back to eight bits, rounding half away from zero (\cref{lst:ml:inf:mlp}). Each layer is one
+fused pass: products, bias, rescaling and ReLU. The integer arithmetic makes parity exact by construction: the NumPy
+reference, the C++ kernel and the Rust kernel agree on every one of the 200 test vectors to the bit. The eight-bit weights
+take 1\,236 bytes against 4\,356 in float32, and one call takes 0.47~µs in C++ and 0.58~µs in Rust.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+& \multicolumn{3}{c}{bits per weight and activation}\\
+\cmidrule(l){2-4}
+rank IC on 20\,000 new observations & 8 & 6 & 4\\
+\midrule
+quantised after training & 0.182 & 0.181 & 0.143\\
+quantisation-aware \omterm{def:ml:representation-learning:ssl}{fine-tuning}, then quantised & 0.179 & 0.176 & 0.164\\
+\bottomrule
+\end{tabular}
+\caption{The network's information coefficient after \omterm{def:ml:low-latency-inference:quant}{quantisation} (float: 0.182; the forest: 0.224). Data:
+\texttt{ml\_infer.accuracy}.}\label{tab:ml:inf:quant}
+\end{table}
+
+\Cref{tab:ml:inf:quant} holds the second half of the chapter's named result. At eight bits, \omterm{def:ml:low-latency-inference:quant}{quantisation} after training costs
+nothing measurable (0.1817 against 0.1822; the integer model's outputs differ from the float model's by 4.5\% of their standard
+deviation, and the ranking barely moves); quantisation-aware \omterm{def:ml:representation-learning:ssl}{fine-tuning}, which spends ten \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epochs} adapting to the rounding,
+loses a little (0.179), because the \omterm{def:ml:representation-learning:ssl}{fine-tuning} itself moves the model. At six bits the story is the same. At four, \omterm{def:ml:low-latency-inference:quant}{post-training
+quantisation} loses a fifth of the signal (0.143) and \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training} recovers more than half of the loss (0.164).
+Eight bits is free for a network this small; fewer bits are where training for the rounding pays.
+
+\section{Batching against latency}
+
+\begin{definition}[Dynamic batching]\label{def:ml:low-latency-inference:batch}
+\emph{Dynamic batching}\index{dynamic batching} groups requests that arrive close together into one call of the model, trading
+the waiting time of the first request for a lower cost per request.
+\end{definition}
+
+For a library whose per-call overhead dwarfs its per-row cost, batching is a large lever (\cref{fig:ml:inf:batch}): LightGBM's
+call takes 273~µs for one row and 3.1~ms for 1\,024, so the cost per row falls from 273~µs to 3.0~µs. A research job scoring a
+universe each second should batch. A trading decision on one instrument cannot wait for others' requests to arrive, and a
+compiled model already costs a few microseconds per row: there, batching buys throughput the strategy does not need at the
+price of latency it cannot afford. When batching is used, latency is measured from each request's arrival, not from the
+batch's start, or the waiting time vanishes from the statistics (coordinated omission, Book~13, chapter~5).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10.5cm,height=6cm,xlabel={rows per call},ylabel={microseconds},tick label style={font=\small},
+  label style={font=\small},xmin=0.8,xmax=1300,grid=major,grid style={gray!25},legend cell align=left,
+  legend style={font=\footnotesize,at={(0.02,0.02)},anchor=south west,fill=white,draw=none},table/col sep=comma]
+\addplot[omThm,very thick,mark=*] table[x=batch,y=call_us]{figdata/ml/26-low-latency-inference/measured_batch.csv};
+\addplot[omDef,very thick,mark=square*] table[x=batch,y=per_row_us]{figdata/ml/26-low-latency-inference/measured_batch.csv};
+\legend{per call,per row}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{LightGBM's prediction latency (median) against batch size through its Python interface, per call and per row.
+Same machine and conditions as \cref{fig:ml:inf:latency}. Data: \texttt{bench\_infer.py},
+\texttt{measured\_batch.csv}.}\label{fig:ml:inf:batch}
+\end{omfigure}
+
+\section{Inference in C++, in Rust and on programmable hardware}
+
+The kernels load their model once, allocating, and then predict without touching the heap: fixed-size buffers on the stack, no
+exceptions, no virtual calls, the model's arrays read-only and shared. The Rust version (\cref{lst:ml:inf:rust}) is the same
+algorithm with bounds checks, which cost it about a quarter against C++ here; both could remove them with unchecked indexing
+once the model's arrays are validated at load time. Beyond the CPU, programmable hardware runs trees and small networks in a
+fixed number of clock cycles, laid out as a circuit: Duarte and co-authors (2018) compiled small networks for FPGAs in the
+trigger systems of particle physics, where decisions have fixed latency budgets of the same kind. The same parity discipline
+applies: a hardware model is validated against the Python reference on shared vectors, bit for bit where the arithmetic is
+integer.
+
+\begin{method}[Putting a model in the fast path]\label{met:ml:inf:method}
+\begin{enumerate}
+\item Measure the library call's median and tail on the target machine, one request at a time, before changing anything.
+\item Export the model to a portable form and compile it (trees to code or flat arrays; networks to fused integer kernels),
+with no allocation on the hot path.
+\item Test parity on shared vectors: exact for trees and integer networks, within stated tolerances for floating-point
+networks.
+\item Quantise after training and measure the loss of signal; use \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training} only when the loss matters.
+\item Register the compiled artefact with its parity report next to the model it came from (chapter~25).
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: two microseconds for a forest}\label{tut:ml:low-latency-inference:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Export a forest and a network, compile them to C++20 and Rust, check parity, quantise, and measure.
+\textbf{End state:} \cref{fig:ml:inf:latency,fig:ml:inf:batch}, \cref{tab:ml:inf:quant}.
+\begin{tutsteps}
+\item \textbf{Trees as generated code.}
+\omcode{code/firm/mlinfer/firm_mlinfer.py}{84}{103}{Generating nested C++ branches from the exported forest.}\label{lst:ml:inf:gen}
+\item \textbf{The flat forest in C++20.}
+\omcode{code/firm/mlinfer/cpp/mlinfer.hpp}{20}{27}{Walking the flat node arrays.}\label{lst:ml:inf:loop}
+\item \textbf{The int8 network in C++20.}
+\omcode{code/firm/mlinfer/cpp/mlinfer.hpp}{66}{94}{Integer inference with fixed-point requantisation.}\label{lst:ml:inf:mlp}
+\item \textbf{The flat forest in Rust.}
+\omcode{code/firm/mlinfer/rust/src/lib.rs}{15}{26}{The same loop in Rust.}\label{lst:ml:inf:rust}
+\item \textbf{Run} \texttt{make\_mlinfer\_fixture.py} (the fixture), the C++ and Rust parity tests (\texttt{make test-code}),
+\texttt{ml\_infer.accuracy()}, and, once, \texttt{bench\_infer.py} under \texttt{nice}.
+\end{tutsteps}
+\textbf{What to change next.} Store the forest's nodes in breadth-first order to improve locality, or evaluate several trees
+at once with vector instructions (Book~13, chapter~14), and measure.
+\end{tutorial}
+
+\section{Build: the inference kernels}\label{bld:ml:low-latency-inference:mlinfer}
+
+\begin{build}
+\bfield{Purpose} Models in the fast path with the Python reference's exact results.
+\bfield{Interface} Python: \texttt{export\_forest}, \texttt{forest\_predict}, \texttt{write\_forest}, \texttt{read\_forest},
+\texttt{cpp\_branches}, \texttt{MLP}, \texttt{fit\_mlp(model, X, y, epochs, seed, qat, lr, batch, bits)}, \texttt{quantise(model,
+X\_calib, bits)}, \texttt{int8\_forward}, \texttt{write\_mlp}; \texttt{make\_mlinfer\_fixture.py}. C++20: \texttt{mlinfer::Forest},
+\texttt{read\_forest}, \texttt{Mlp}, \texttt{read\_mlp}, the generated \texttt{forest\_branches}. Rust: \texttt{Forest},
+\texttt{Mlp}, \texttt{requant}.
+\bfield{Rules} No allocation, exception or virtual call on the prediction path; parity on shared vectors is exact; timings are
+measured, labelled with the machine, and never asserted.
+\bfield{Acceptance tests} \texttt{code/firm/mlinfer/tests/} (Python: export equals LightGBM, fixture reproducible, integer
+reference against the float model), \texttt{cpp/mlinfer\_test.cpp} and \texttt{rust} (\texttt{cargo test}): exact parity of the
+flat forest, the generated branches and the int8 network on the 200 vectors.
+\bfield{Stretch} SIMD evaluation of several trees; per-channel \omterm{def:ml:low-latency-inference:quant}{quantisation}; a hardware-description export of the int8 network.
+\end{build}
+
+\begin{omsources}
+\item B.~Jacob and co-authors, ``Quantization and training of neural networks for efficient integer-arithmetic-only
+inference'', arXiv:1712.05877, 2018.
+\item M.~Nagel and co-authors, ``A white paper on neural network quantization'', arXiv:2106.08295, 2021.
+\item N.~Asadi, J.~Lin and A.~P.~de Vries, ``Runtime optimizations for tree-based machine learning models'', \emph{IEEE
+Transactions on Knowledge and Data Engineering}, 2014.
+\item C.~Lucchese and co-authors, ``QuickScorer: a fast algorithm to rank documents with additive ensembles of regression
+trees'', \emph{SIGIR}, 2015.
+\item J.~Duarte and co-authors, ``Fast inference of deep neural networks in FPGAs for particle physics'', arXiv:1804.06913,
+2018.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:low-latency-inference:1}
+A symmetric int8 tensor has scale $s = \max|w|/127$. What is the largest rounding error of one weight, as a share of $\max|w|$?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:low-latency-inference:2}
+From \cref{fig:ml:inf:latency}, what is the ratio of the generated C++ forest's 99th-percentile latency to the library call's?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:low-latency-inference:3}
+Why can the compiled forest reproduce LightGBM's prediction exactly while a compiled float network usually cannot reproduce
+PyTorch's?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:low-latency-inference:4}
+Write the fixed-point multiplier and shift for a real multiplier of 0.0123. Why use integers for it at all?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:low-latency-inference:5}
+Why did \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training} lose a little at eight bits and win at four?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:low-latency-inference:6}
+\emph{Find the flaw.} ``Our compiled model's median latency is 800 nanoseconds, measured by timing 10\,000 predictions in a
+batch and dividing by 10\,000.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:low-latency-inference:7}
+\emph{Coding.} Quantise the network to four bits after training with one weight scale per output unit instead of one per
+tensor. How much of the loss against the float model does it recover?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:low-latency-inference:8}
+With symmetric scales $s_x$, $s_w$ and $s_y$ for a layer's input, weights and output, write the layer's float output in terms of
+the integers $X_i$, $W_i$ and an integer bias $B$, and derive the scale at which $B$ must be stored and the multiplier that maps
+the accumulator to the output's integers.
+\end{exercise}
+
+\section{Problem: Two Microseconds for a Forest}
+
+\begin{problem}[{Weekend problem --- the model is not the latency}]\label{pb:ml:low-latency-inference:1}
+The chapter's forest, network, kernels and measurements.
+
+\medskip\noindent\textbf{Part I --- The models.}
+\begin{enumerate}
+\item What are the two models, and how good are they?
+\item How is the forest exported, and in how many forms?
+\item Why are the kernels exact?
+\item How large is each model in memory?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Latency.}
+\begin{enumerate}[resume]
+\item Give the median and 99th-percentile latencies of each path.
+\item Where does the library call's time go?
+\item Why do the generated branches beat the loop?
+\item What does the Rust version cost against C++, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- \omterm{def:ml:low-latency-inference:quant}{Quantisation} and batching.}
+\begin{enumerate}[resume]
+\item What does int8 cost in information coefficient, after training and with \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training}?
+\item What changes at four bits?
+\item How does LightGBM's latency scale with batch size?
+\item When would you batch?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the ratio of the compiled model's tail latency to the library call's, and the IC lost to
+int8 \omterm{def:ml:low-latency-inference:quant}{quantisation} with and without \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training}.
+\item Which model would you deploy in a five-microsecond budget, and in what form?
+\item What must the registry hold for a compiled model?
+\item How would you make these measurements trustworthy on a production machine?
+\item What would change with 5\,000 trees?
+\item Where would programmable hardware be worth its cost?
+\item How would a feature-store skew (chapter~24) show up at this layer?
+\item In one sentence: where does inference time go?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{dev, mle}]\label{iq:ml:low-latency-inference:1}
+How would you make a gradient-boosted model predict in a few microseconds?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:low-latency-inference:2}
+Explain int8 \omterm{def:ml:low-latency-inference:quant}{quantisation}: scales, zero points, accumulators and requantisation.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{dev}]\label{iq:ml:low-latency-inference:3}
+What rules would you impose on code in the inference hot path?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:low-latency-inference:4}
+How do you test that a compiled model is the model you trained?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{dev}]\label{iq:ml:low-latency-inference:5}
+When does batching help \omterm{def:ml:low-latency-inference:latency}{inference latency}, and when does it hurt?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{mle}]\label{iq:ml:low-latency-inference:6}
+\omterm{def:ml:low-latency-inference:quant}{Post-training quantisation} or \omterm{def:ml:low-latency-inference:quant}{quantisation-aware training}? How would you decide?
+\end{interviewq}

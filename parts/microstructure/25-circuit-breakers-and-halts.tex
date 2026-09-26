@@ -1,0 +1,289 @@
+\chapter{Circuit Breakers and Halts}\label{ch:mx:circuit-breakers-and-halts}
+
+On 9 March 2020 the S\&P 500 fell seven per cent minutes after the open and all US equity trading stopped for fifteen minutes; it happened three
+more times that month. Whether stopping a falling market calms it or makes it fall faster toward the stop is an old argument with new data. This chapter
+sets out the designs, builds them as venue-side policies for the exchange simulator (\texttt{firm.halts}), and runs a crash through each, measuring in
+particular whether sellers rush toward a band before it stops them: the magnet effect.
+
+\section{Designs: bands, pauses, halts, limits}
+
+\begin{definition}[Static and dynamic price bands]\label{def:mx:circuit-breakers-and-halts:bands}
+A \emph{static price band}\index{static price band} limits trading to a range around a fixed reference (the previous close, the opening price) for the
+session. A \emph{dynamic price band}\index{dynamic price band} limits it to a range around a reference that follows recent trades, such as their
+average over the last minutes.
+\end{definition}
+
+\begin{definition}[Trading pause, reopening auction]\label{def:mx:circuit-breakers-and-halts:pause}
+A \emph{trading pause}\index{trading pause} suspends continuous trading in an instrument for a short, set time while orders may still be entered,
+modified and cancelled; it ends with a \emph{reopening auction}\index{reopening auction}, a call auction (One Quant Book 1, chapter~13) that sets the price at
+which trading resumes.
+\end{definition}
+
+A band stops trades from printing outside a range; a pause stops them altogether for a while; a halt (One Quant Book 8, chapter~17) stops them until the
+venue or the regulator decides; a price limit (One Quant Book 1, chapter~12) is a band that holds all day. They differ in what they protect against: a
+band against an erroneous or runaway order, a pause against a price moving faster than liquidity can return, a halt against news the market has not
+digested.
+
+\texttt{firm.halts} implements them as policies that \texttt{firm.exchsim} loads (the \texttt{halts} field of the venue's configuration): the policy
+watches the venue's
+engine every half second through a scheduled call and sends the engine's own controls, R to set a band (orders priced outside it are rejected and matching
+stops at it) and P to change the phase (halted, reopening call, trading). Leaving the call uncrosses it with chapter~10's auction.
+
+\omcode{code/firm/halts/firm_halts.py}{110}{138}{The limit up-limit down style policy's check: update the trades behind the reference price, reset the band, detect a limit state from the best quotes, and pause the stock with a reopening call if the state lasts.}\label{lst:mx:circuit-breakers-and-halts:luld}
+
+\section{Single-stock and market-wide mechanisms}
+
+In the United States, single stocks trade inside limit up-limit down bands (One Quant Book 1, chapter~31), and the whole equity market stops when the
+S\&P~500 falls far enough from the previous close.
+
+\begin{dated}{2026-09}{Market-wide circuit breakers in March 2020}\label{dat:mx:circuit-breakers-and-halts:mwcb}
+The market-wide circuit breaker halts all US cash equity and equity options markets for 15 minutes when the S\&P~500 falls 7\% (Level~1) or 13\%
+(Level~2) from the prior day's close before 3:25 p.m., each at most once a day, and for the rest of the day at 20\% (Level~3). Level~1 halts occurred
+on 9, 12, 16 and 18 March 2020; on 9 March the index crossed the threshold at 9:34:13 a.m. and \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auctions} began at 9:49:13 a.m.; on 18 March it
+crossed at 12:56:17 p.m. and reopened at 1:11:17 p.m. (report of the industry working group submitted to the SEC in March 2021).
+\end{dated}
+
+The simulation scales the mechanisms down to its five-minute sessions: a stock at USD~100.00 with a one-cent tick, a crash in which a seller sends
+40\,000 shares as sixty \omterm{def:mx:the-limit-order-book:orders}{market orders} over a minute, and four regimes: no mechanism; a dynamic band of 0.15\% around the last minute's average trade
+price, with a limit state (the best offer at or below the lower band, or the best bid at or above the upper) that pauses the stock for 20 seconds if it
+lasts 3; \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} (below); and a market-wide halt of 30 seconds at falls of 0.1\%, 0.2\% and 0.3\%.
+
+\section{Futures: velocity logic and stop logic}
+
+\begin{definition}[Velocity logic]\label{def:mx:circuit-breakers-and-halts:velocity}
+\emph{Velocity logic}\index{velocity logic} pauses matching in a futures contract for a few seconds when its price moves by more than a set number of
+ticks within a set short time; during the pause orders may be entered, modified and cancelled, and matching resumes with an auction.
+\end{definition}
+
+CME's Globex describes \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} as detecting market movement of a predefined number of ticks up or down within a predefined time, and moving the
+instrument into a reserved state in which customers can submit, modify and cancel orders. Stop logic does the same when the triggering of \omterm{def:mx:order-types-and-their-uses:stop}{stop orders}
+(chapter~2) would move the price by more than a set amount. The simulation's velocity policy pauses for 10 seconds after a move of 8 ticks within 2
+seconds (\texttt{firm\_halts.Velocity}).
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+mechanism & fall (ticks) & halted (s) & seller's fills & seller's cost (ticks) \\
+\midrule
+none & 27.4 & 0 & 17\,580 & 12.2 \\
+dynamic band and pause & 20.0 & 0 & 16\,440 & 9.6 \\
+\omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} & 24.9 & 79 & 11\,752 & 13.2 \\
+market-wide halt & 18.9 & 48 & 9\,279 & 6.6 \\
+\bottomrule
+\end{tabular}
+\caption{The same crash under four mechanisms, 20 sessions each: the largest fall of the mid from its start, the time trading was halted or paused,
+the crash seller's filled shares (of 40,000 sent as \omterm{def:mx:the-limit-order-book:orders}{market orders}) and its average sale price below the starting mid. Data:
+\texttt{mx\_halts.mechanisms\_study}.}\label{tab:mx:circuit-breakers-and-halts:mechs}
+\end{table}
+
+Each mechanism shortens the fall by taking orders out of the market (\cref{tab:mx:circuit-breakers-and-halts:mechs}). The band does it without a single
+pause: \omterm{def:mx:the-limit-order-book:orders}{market orders} stop at its lower edge and the rest of each order is cancelled, so the seller sells fewer shares at better prices. \omterm{def:mx:circuit-breakers-and-halts:velocity}{Velocity logic}
+pauses often (79 seconds of five minutes) and helps least: each \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auction} meets the same selling. The market-wide halt cuts the fall most and the
+seller's volume most, which is the policy question in one line: a mechanism that protects prices does so by refusing trades.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.6cm,xlabel={\small seconds},ylabel={\small price (USD)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=300,
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,thick] table[x=t,y=mid]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\addplot[omProp,thick,dashed] table[x=t,y=lo]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\addplot[omThm,thick,dashed] table[x=t,y=hi]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\legend{mid,lower band,upper band}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One crash session under the dynamic band, with anticipating sellers: the mid falls to within a few ticks of the lower band and rebounds
+without a pause, while the band, which follows the minute's average trade price, walks down behind it and back up. Data:
+\texttt{mx\_halts.example}.}\label{fig:mx:circuit-breakers-and-halts:example}
+\end{omfigure}
+
+\section{Magnet effects in the evidence}
+
+Subrahmanyam (1994) showed in a model that circuit breakers may cause agents to advance trades in time, and so increase price variability and
+exacerbate the moves they are meant to stop; Cho, Russell, Tiao and Tsay (2003) looked for this magnet effect of price limits in high-frequency data
+from the Taiwan Stock Exchange. The simulation adds the mechanism behind the argument: sellers who, when a band is published and enforced, sell faster
+the closer the best bid is to its lower edge (up to twice their base rate within one tick of it), for fear of being unable to sell once it binds.
+
+The measure is a first passage: for each session and each distance $x$ from the lower band, the first time the best bid comes within $x$ ticks; did it
+come within one tick of the band in the next 30 seconds? Three conditions, 80 sessions each: the band enforced with the anticipating sellers, the band
+enforced without them, and no band (the same band computed but not enforced, and no anticipation).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.6cm,xlabel={\small distance to the lower band (ticks)},ylabel={\small probability of reaching it in 30 s},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=1.5,xmax=12.5,ymin=0,ymax=1,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.4pt] table[x=x,y=both]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=x,y=band]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=1.6pt] table[x=x,y=none]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\legend{band and anticipators,band alone,no band}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The probability that the best bid comes within one tick of the lower band within 30 seconds of first coming within $x$ ticks of it, in three
+conditions, 80 crash sessions each. Data: \texttt{mx\_halts.magnet\_study}.}\label{fig:mx:circuit-breakers-and-halts:passage}
+\end{omfigure}
+
+\Cref{fig:mx:circuit-breakers-and-halts:passage} separates two effects. The magnet effect, the anticipators' contribution (band and anticipators minus band
+alone), averages $+0.03$ over distances of 3 to 7 ticks: at 5 ticks, 0.66 against 0.63, with standard errors of 0.05 and 0.06. It has the sign the
+theory predicts at nine of the eleven distances and is too small to tell from zero in 80 sessions. The band's own effect (band alone minus no band)
+averages $-0.12$, and is negative at ten of the eleven distances: at 5 ticks, 0.63 against 0.75. In this market the band repels more than it attracts, because it takes the sellers' \omterm{def:mx:the-limit-order-book:orders}{market orders} out of the book at its edge, which is
+stronger than the extra selling it invites. A real magnet needs more traders who anticipate, or a band that is not also a barrier; the simulation says
+how to look for one: condition on the distance, compare with a market without the mechanism, and separate the behaviour from the mechanics.
+
+\section{Reopening}
+
+A pause or halt ends in a \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auction}, and its design decides whether the pause did any good. Chapter~10's auctions apply: an indicative price
+published during the call, collars that stop the reopening price from jumping too far, and extensions when imbalance is too large. Brugler, Linton, Noss
+and Pedace (2018), with London Stock Exchange data, found that single-stock circuit breakers improved the liquidity and reduced the volatility of the
+other stocks that kept trading: the pause's benefit may be felt outside the paused stock. In the simulation, the velocity pauses' reopenings met the same
+selling and the fall resumed: a pause that ends before the other side of the market has arrived only postpones.
+
+\section{Tutorial: stopping a crash}\label{tut:mx:circuit-breakers-and-halts:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run a crash through bands, pauses, \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} and a market-wide halt in \texttt{firm.exchsim}, and measure the magnet effect.
+\textbf{End state:} \cref{tab:mx:circuit-breakers-and-halts:mechs}, \cref{fig:mx:circuit-breakers-and-halts:example,fig:mx:circuit-breakers-and-halts:passage}.
+\begin{tutsteps}
+\item \textbf{Policies.} \texttt{firm\_halts.LULD(pct, window\_s, limit\_state\_s, pause\_s)}, \texttt{Velocity}, \texttt{MarketWide},
+\texttt{Combined}; \texttt{ExchangeConfig(halts=policy)}; the simulator's \texttt{schedule\_call}.
+\item \textbf{Crash.} \texttt{mx\_halts.crash(policy, seed, anticipate)}, \texttt{Anticipator}.
+\item \textbf{Measure.} \texttt{first\_passage(policy.dist)}; \texttt{magnet\_study()}, \texttt{mechanisms\_study()}, \texttt{example()}; draw with
+\texttt{fig\_halts.py}.
+\end{tutsteps}
+\textbf{What to change next.} Let more agents anticipate the band; make the band a pause-only trigger (no rejections) to remove its barrier; replay a
+session's pause with Book~1's feed monitors.
+\end{tutorial}
+
+\section{Build: halts}\label{bld:mx:circuit-breakers-and-halts:halts}
+
+\begin{build}
+\bfield{Purpose} The venue-side stability mechanisms of \texttt{firm.exchsim}, for this chapter and for the stress scenarios of Books 11 to 13.
+\bfield{Interface} \texttt{LULD(pct, window\_s, limit\_state\_s, pause\_s, check\_s, locate, shadow)}, \texttt{MarketWide(levels, halt\_s, check\_s,
+reference)}, \texttt{Velocity(ticks, window\_s, pause\_s, check\_s)}, \texttt{Combined(*policies)}; \texttt{policy.log}, \texttt{.bands},
+\texttt{.dist}; \texttt{Simulator.schedule\_call(t\_ns, fn, *args)}.
+\bfield{Rules} Policies act only through the engine's controls R and P; bands on the tick grid; a pause is a reopening call ended by an uncross; a
+shadow policy computes without acting.
+\bfield{Acceptance tests} \texttt{code/firm/halts/tests/}: a band rejects orders outside it; a persistent limit state pauses and resumes the stock; the
+market-wide policy halts and resumes every instrument once per level; \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} pauses after a fast move.
+\bfield{Stretch} Stop logic; collars on the \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auction}; LULD's own reference-price rules.
+\end{build}
+
+\begin{omsources}
+\item A.~Subrahmanyam, ``Circuit breakers and market volatility: a theoretical perspective'', \emph{Journal of Finance} 49(1), 1994.
+\item K.~Cho, J.~R.~Russell, G.~C.~Tiao and R.~Tsay, ``The magnet effect of price limits: evidence from high-frequency data on Taiwan Stock
+Exchange'', \emph{Journal of Empirical Finance} 10(1--2), 2003.
+\item A.~Brugler, O.~Linton, J.~Noss and L.~Pedace, ``The cross-sectional spillovers of single stock circuit breakers'', \emph{Market Microstructure and
+Liquidity} 4(3--4), 2018.
+\item Report of the Market-Wide Circuit Breaker Working Group regarding the March 2020 MWCB events, submitted 31 March 2021 (SEC file, Release 34-92428).
+\item CME Group, Velocity Logic (client systems wiki).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:1}
+The minute's average trade price is USD~99.93. Where are the chapter's 0.15\% bands, on a one-cent grid?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:2}
+From the dated box, how long did the 9 March 2020 halt last, and when would a Level~2 decline after 3:25 p.m. have halted the market?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:3}
+From the table, what share of its 40,000 shares did the crash seller sell under each mechanism?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:4}
+Why does the dynamic band shorten the fall without ever pausing the stock?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:5}
+Why does \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} help least in this crash?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:6}
+How would you design a study of the magnet effect on real data, given what the simulation separates?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:circuit-breakers-and-halts:7}
+\emph{Coding.} Measure the magnet and barrier effects at a distance of 3 ticks with the chapter's 80 sessions. Are they distinguishable from zero?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:circuit-breakers-and-halts:8}
+\emph{Find the flaw.} ``After the band was introduced, stocks reached their limits less often, so the band calmed the market.''
+\end{exercise}
+
+\section{Problem: Fifteen Minutes of Silence}
+
+\begin{problem}[{Weekend problem --- fifteen minutes of silence}]\label{pb:mx:circuit-breakers-and-halts:1}
+A regulator asks whether its price bands and halts calm markets or pull prices toward them.
+
+\medskip\noindent\textbf{Part I --- Designs.}
+\begin{enumerate}
+\item Define static and dynamic bands, a pause and a \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auction}.
+\item How do bands, pauses, halts and limits differ in what they protect against?
+\item How does \texttt{firm.halts} act on the simulated venue?
+\item State the market-wide circuit breaker's levels and halt times, and the March 2020 events.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The crash.}
+\begin{enumerate}[resume]
+\item Describe the crash and the four regimes.
+\item Give each regime's fall, time halted, seller's fills and cost.
+\item Why does the market-wide halt cut the fall most?
+\item Define \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} and CME's reserved state.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The magnet.}
+\begin{enumerate}[resume]
+\item What did Subrahmanyam argue?
+\item Describe the anticipating sellers.
+\item Define the first-passage measure and the three conditions.
+\item \emph{State the named result}: the probability of reaching the band conditional on the distance to it, with and without the band, and the size of
+the simulated magnet effect.
+\item Why does the band repel more than it attracts here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Reopening and judgement.}
+\begin{enumerate}[resume]
+\item What makes a \omterm{def:mx:circuit-breakers-and-halts:pause}{reopening auction} work?
+\item What did Brugler, Linton, Noss and Pedace find?
+\item Why did the velocity pauses fail to stop the fall?
+\item What would make a magnet effect visible in the simulation?
+\item What trade-off does the table show?
+\item What would you tell the regulator?
+\item In one sentence: what does a circuit breaker buy, and at what price?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:circuit-breakers-and-halts:1}
+Your stock enters a limit state and then pauses with your sell order half done. What do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:circuit-breakers-and-halts:2}
+What is the magnet effect, and how would you test for it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:mx:circuit-breakers-and-halts:3}
+The market-wide circuit breaker triggers. What happens to your firm's hedges and risk limits during the fifteen minutes?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:circuit-breakers-and-halts:4}
+How should an \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm} handle a halt, a pause and a band rejection?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:circuit-breakers-and-halts:5}
+Compare \omterm{def:mx:circuit-breakers-and-halts:velocity}{velocity logic} in futures with limit up-limit down in equities.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{bank}]\label{iq:mx:circuit-breakers-and-halts:6}
+A regulator proposes wider bands and shorter pauses. What evidence would you bring, and what would you expect?
+\end{interviewq}

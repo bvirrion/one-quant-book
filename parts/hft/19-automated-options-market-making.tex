@@ -1,0 +1,326 @@
+\chapter{Automated Options Market Making}\label{ch:hf:automated-options-market-making}
+
+An options market maker quotes every strike and expiry of a stock at once, several thousand prices on a dozen exchanges, and a sweep can hit forty
+of them in the same millisecond; the exchange's protection is what stops the forty-first. In this chapter's chain of 170 series, a trader who
+knows the stock has moved 1\% and hits every stale quote, one every five microseconds, would take \$79,000 from a market maker without protection;
+a protection that pulls all quotes after thirteen executions holds the loss to \$12,900 and, on an ordinary day of multi-leg customer orders, costs
+three fills out of 8,235.
+
+\section{The live surface}
+
+An options market maker's theoretical values come from a volatility surface (One Quant Book 5, chapters 7 and 8): a parametrised smile per
+expiry, fitted to the market's quotes and trades, moved with the underlying according to a rule (sticky strike, sticky delta) and refitted when
+the market says the rule was wrong.
+
+\begin{definition}[Live surface fit]\label{def:hf:automated-options-market-making:live}
+A \emph{live surface fit}\index{live surface fit} is the continuous re-estimation of an options market maker's volatility surface during the trading
+day, updating each expiry's parameters from the latest quotes and trades as they arrive, fast enough that every quote the market maker sends is
+priced on a surface consistent with the current market.
+\end{definition}
+
+At high frequency the work is split: the underlying's price moves the whole surface through the rule, microsecond by microsecond, and the smile's
+shape is refitted on a slower clock, typically when enough new information has arrived. A raw SVI slice fitted by the quasi-explicit method
+(Book 5's \texttt{firm.svi}) to seventeen quoted volatilities, each with 0.2 volatility points of noise, recovers the true smile to 0.025 points: the
+fit averages the noise that individual quotes carry. Muravyev and Pearson showed why the fair value matters so much to takers too: option prices
+change predictably at high frequency, many traders time their executions to buy when the fair value is close to the ask and sell when it is close to
+the bid, and the effective spreads of those who time are under 40\% of conventional measures.
+
+\section{Mass quoting and quote protection}
+
+\begin{definition}[Mass quote]\label{def:hf:automated-options-market-making:mass}
+A \emph{mass quote}\index{mass quote} is a single message in which a market maker sends or replaces bids and offers in many option series at
+once, which the exchange processes as a unit, so that a market maker can update thousands of quotes after a move in the underlying without sending
+thousands of separate orders.
+\end{definition}
+
+A chain of 17 strikes and five expiries, calls and puts, is 170 series; quoted at half a volatility point either side of theo
+(\cref{lst:hf:automated-options-market-making:quote}), the 30-day at-the-money call at \$2.92 is 11 cents wide, and the widths range from the cent
+floor for deep options to 20 cents. Each quote rests on the exchange until the next \omterm{def:hf:automated-options-market-making:mass}{mass quote} replaces it; between the underlying's move and that
+replacement, all 170 are stale at once.
+
+The exchange's answer is protection: a set of counters per market maker and per class (count of executions, contracts, notional, or the percentage
+of quoted size executed) over a short window, and a rule that cancels all its quotes in the class when a counter reaches its limit.
+
+\begin{dated}{2026-09}{One exchange's risk parameters}\label{dat:hf:automated-options-market-making:cboe}
+Cboe's page on its options exchanges' risk management tools lists four parameter types: notional (contracts traded times premium), volume (contracts
+traded), count (number of executions) and percentage of quote (the sum across all series of a root of the percentage of quoted contracts
+executed), each over a period set anywhere from 100 milliseconds to a whole day; once a parameter is reached, no new trades are executed and any
+trades in route are rejected.
+\end{dated}
+
+The chapter's sweep (\cref{lst:hf:automated-options-market-making:sweep}): the stock moves 1\%; 150 of the 170 quotes are now mispriced; an informed
+trader hits them, most profitable first, one every five microseconds; the exchange pulls all quotes after $n$ executions within 100 milliseconds.
+The loss grows almost linearly in $n$, about \$1,000 an execution, because the most profitable targets are deep in-the-money options that move
+dollar for dollar with the stock. On an ordinary day, customer orders arrive every five seconds on average, 70\% of them for one series and the rest
+for spreads and strips of two, four and twelve legs executing within two milliseconds; each fill earns \$4. A threshold below twelve pulls the
+quotes on legitimate twelve-leg orders and leaves the market maker out for half a second each time
+(\cref{fig:hf:automated-options-market-making:protection}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,axis y line*=right,axis x line=none,xmode=log,log basis x=10,xmin=1.6,xmax=50,ymin=0,ymax=2600,
+  ylabel={\small ordinary-day fills lost},tick label style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.3pt] table[x=n,y=lost]{figdata/hft/19-automated-options-market-making/protection.csv};
+\label{plot:hf:protlost}
+\end{axis}
+\begin{axis}[width=11cm,height=5.4cm,axis y line*=left,xmode=log,log basis x=10,xmin=1.6,xmax=50,xtick={2,3,5,10,13,20,40},
+  xticklabels={2,3,5,10,13,20,40},xlabel={\small protection threshold (executions in 100 ms)},ylabel={\small sweep loss (\$ thousand)},ymin=0,
+  ymax=42,tick label style={font=\footnotesize},grid=major,grid style={gray!25},table/col sep=comma,
+  legend style={font=\scriptsize,at={(0.5,-0.3)},anchor=north},legend columns=2]
+\addplot[omThm,thick,mark=*,mark size=1.3pt] table[x=n,y=loss]{figdata/hft/19-automated-options-market-making/protection.csv};
+\addlegendentry{loss to a 1\% sweep (left)}
+\addlegendimage{/pgfplots/refstyle=plot:hf:protlost}\addlegendentry{fills lost on an ordinary day (right)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The market maker's loss to an informed sweep after a 1\% move in the stock (left axis, thousand dollars) and the customer fills it loses
+on an ordinary day while its quotes are pulled (right axis), against the exchange's count threshold; 170 series quoted ten contracts each; the
+sweep hits one series every five microseconds; ordinary orders of one to twelve legs, 8,235 fills a day without protection. Without protection the
+sweep takes \$79,370. Data: \texttt{hf\_options.protection\_table}.}\label{fig:hf:automated-options-market-making:protection}
+\end{omfigure}
+
+\section{Delta hedging at speed}
+
+The sweep leaves the market maker short about 13,000 shares of delta at a threshold of thirteen (it sold calls and bought puts after the stock
+rose). The loss is already made: the options were sold at prices below the new value. The hedge's job is to stop the next move adding to it, and at
+speed the hedge is sent the instant the fills arrive, in the underlying or in the most liquid correlated instrument, within the hedging band of
+One Quant Book 5, chapter 26. Muravyev showed that inventory matters for option prices more than was thought: decomposing the price impact of
+option trades into inventory risk and asymmetric information, he found both large and the inventory component larger, and order imbalances due to
+inventory risk moving option prices five times more than earlier estimates.
+
+\section{Per-strike and per-expiry risk}
+
+\begin{definition}[Strike risk limit]\label{def:hf:automated-options-market-making:strike}
+A \emph{strike risk limit}\index{strike risk limit} is a market maker's cap on the exposure (vega, gamma, or contracts) it will accumulate in one
+strike or one expiry of a chain; when a fill breaches it, the market maker cancels or widens its quotes in that strike or expiry until the
+exposure is reduced.
+\end{definition}
+
+Count-based protection counts executions, not risk. A volatility sweep, after implied volatility rises two points, hits 130 quotes of every
+expiry and leaves the market maker short \$10,600 of vega a volatility point for a loss of \$16,500. A limit of \$1,000 of vega per expiry,
+enforced by the market maker's own system 50 microseconds after the breaching fill, cuts the loss to \$9,900; enforced in 5 microseconds, to
+\$6,700. The limit's value depends on its speed: every microsecond of reaction is another stale quote hit.
+
+\section{What the major firms have published}
+
+Options market makers publish little about their quoting systems; what is public is the exchanges' rules and specifications (the protections of the
+dated box, the mass-quote messages), the regulators' filings, and academic work on the data those firms generate. The chapter cites only those.
+
+\section{Strategy files}
+
+\begin{strategyfile}{Surface-fitted quoting across a listed chain}\label{strat:hf:automated-options-market-making:surface}
+\sfield{Who pays you, and why} Options users (hedgers, directional traders, volatility traders) who need a price in any series at any time.
+\sfield{Instruments and venues} A stock's or index's listed chain on every options exchange.
+\sfield{Signal} Theoretical values from a live surface; the underlying's move through the surface's rule.
+\sfield{Sizing and execution} \omterm{def:hf:automated-options-market-making:mass}{Mass quotes} at a width set by vega and the surface's uncertainty; refit the smile on a slower clock.
+\sfield{Costs} Exchange fees, the width given up to competitors, adverse selection by traders who time executions.
+\sfield{How it dies} Stale quotes after moves; competitors with faster refits.
+\sfield{Horizon, capacity, infrastructure} Microseconds to the day; thousands of series; OPRA-scale market data.
+\sfield{Backtest honestly} The surface as it was known at each quote; fills where timing traders would have taken them.
+\sfield{Sources} Muravyev and Pearson (2020); One Quant Book 5, chapters 7, 8 and 26.
+\end{strategyfile}
+
+\begin{strategyfile}{Mass-quote making with quote protection}\label{strat:hf:automated-options-market-making:mass}
+\sfield{Who pays you, and why} As above, with the exchange's protections limiting the loss to sweeps.
+\sfield{Instruments and venues} Exchanges with mass-quote messages and risk parameters.
+\sfield{Signal} The same theos; the protection's thresholds set from the largest legitimate order.
+\sfield{Sizing and execution} Set the count threshold just above the largest multi-leg order (thirteen against twelve-leg orders in the model).
+\sfield{Costs} Fills lost when the protection trips on legitimate flow (326 a day at a threshold of ten, three at thirteen).
+\sfield{How it dies} Sweeps faster than the protection's first execution, and protections set too loose.
+\sfield{Horizon, capacity, infrastructure} Milliseconds; one protection per class and exchange.
+\sfield{Backtest honestly} The exchange's protection logic replayed on the day's executions, including multi-leg orders.
+\sfield{Sources} The dated box; this chapter.
+\end{strategyfile}
+
+\begin{strategyfile}{Delta-hedged options book}\label{strat:hf:automated-options-market-making:delta}
+\sfield{Who pays you, and why} Options customers through the spread; the hedge keeps the book's value from following the stock.
+\sfield{Instruments and venues} The options book and the underlying (or its future).
+\sfield{Signal} The book's delta after each fill.
+\sfield{Sizing and execution} Hedge immediately beyond a band, in the cheapest instrument; aggregate across the chain first.
+\sfield{Costs} The underlying's spread and fees; gamma between hedges.
+\sfield{How it dies} Correlated fills that move the book's delta faster than the hedge can follow.
+\sfield{Horizon, capacity, infrastructure} Microseconds to seconds; the underlying's order entry next to the options'.
+\sfield{Backtest honestly} Hedge prices after the fill's timestamp plus the hedge latency.
+\sfield{Sources} Muravyev (2016); One Quant Book 5, chapter 26.
+\end{strategyfile}
+
+\begin{strategyfile}{Event-aware options quoting}\label{strat:hf:automated-options-market-making:event}
+\sfield{Who pays you, and why} Traders positioning for earnings or macro events, who pay for the implied move.
+\sfield{Instruments and venues} Expiries spanning a known event.
+\sfield{Signal} The event variance in the term structure (Book 5's event-variance arithmetic), against the stock's history of moves.
+\sfield{Sizing and execution} Quote the event expiries on a surface with the event's variance; tighten vega limits before the event; pull or widen at
+the announcement (chapter 18).
+\sfield{Costs} Being wrong about the event's size; gamma across the announcement.
+\sfield{How it dies} Surprises larger than the implied move.
+\sfield{Horizon, capacity, infrastructure} Days to the event; seconds around it.
+\sfield{Backtest honestly} The event calendar as known at the time.
+\sfield{Sources} Chapter 18; One Quant Book 5, chapter 8.
+\end{strategyfile}
+
+\begin{strategyfile}{Vega-limited skew quoting}\label{strat:hf:automated-options-market-making:vega}
+\sfield{Who pays you, and why} Buyers of protection (puts) and sellers of calls who keep the skew rich.
+\sfield{Instruments and venues} Out-of-the-money puts and calls across expiries.
+\sfield{Signal} The skew's level against its history and the surface fit.
+\sfield{Sizing and execution} Quote the wings with per-strike and per-expiry vega limits enforced within microseconds.
+\sfield{Costs} Tail risk in the wings; hedges in the underlying and in other expiries.
+\sfield{How it dies} A volatility sweep: \$16,500 unprotected in the model; the limits' speed decides the loss (\$9,900 at 50 microseconds,
+\$6,700 at 5).
+\sfield{Horizon, capacity, infrastructure} Days; fast limit enforcement.
+\sfield{Backtest honestly} Limits applied with their real reaction time.
+\sfield{Sources} This chapter.
+\end{strategyfile}
+
+\section{Tutorial: forty strikes in a millisecond}\label{tut:hf:automated-options-market-making:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Quote a chain from a surface, then measure what an informed sweep takes against each protection threshold and what the threshold
+costs on ordinary days. \textbf{End state:} \cref{fig:hf:automated-options-market-making:protection} and the numbers of the text.
+\begin{tutsteps}
+\item \textbf{The \omterm{def:hf:automated-options-market-making:mass}{mass quote}} from Book 5's theoretical values.
+\omcode{code/firm/optquoter/firm_optquoter.py}{63}{74}{Theo and vega from \texttt{firm.optmm.theo}, a half-width in volatility points times vega, a cent floor.}\label{lst:hf:automated-options-market-making:quote}
+\item \textbf{The sweep} against the exchange's count and the market maker's vega limits.
+\omcode{code/firm/optquoter/firm_optquoter.py}{108}{126}{Stale quotes hit most profitable first; the exchange's count and the per-expiry vega limit stop it.}\label{lst:hf:automated-options-market-making:sweep}
+\item \textbf{An ordinary day}: multi-leg customer orders against the same thresholds (\texttt{hf\_options.protection\_table}).
+\item \textbf{The volatility sweep} with vega limits at two reaction speeds (\texttt{hf\_options.vol\_sweep}); the smile refit
+(\texttt{hf\_options.refit}).
+\end{tutsteps}
+\textbf{What to change next.} Replace the count by a percentage-of-quote parameter; let the sweep arrive on several exchanges at once, each with
+its own protection; run the chain on \texttt{firm.exchsim} with its mass-quote message.
+\end{tutorial}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+threshold (executions) & 2 & 5 & 10 & 13 & 20 & 40 & none\\
+\midrule
+loss to a 1\% sweep (\$) & 1,980 & 4,950 & 9,899 & 12,867 & 19,773 & 38,718 & 79,370\\
+ordinary-day fills lost & 2,441 & 1,052 & 326 & 3 & 0 & 0 & 0\\
+edge lost a day (\$) & 9,764 & 4,208 & 1,304 & 12 & 0 & 0 & 0\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Build: the options quoter}\label{bld:hf:automated-options-market-making:optquoter}
+
+\begin{build}
+\bfield{Purpose} Quote a chain from a live surface in \omterm{def:hf:automated-options-market-making:mass}{mass quotes}, and measure protections and limits against sweeps and ordinary flow.
+\bfield{Interface} \texttt{Chain(spot, strikes, expiries\_days)}, \texttt{surface(atm, term, skew, ref)}, \texttt{mass\_quote(chain, spot, surf,
+half\_width\_vol, size)}, \texttt{refit\_slice(strikes, spot, tau, vols)}, \texttt{Protection(count, window\_ms)}, \texttt{sweep(quotes, jump,
+chain, surf, protection, gap\_us, size, dvol, vega\_limit, react\_us)}, \texttt{normal\_day(n\_series, protection, seed)}, \texttt{bucket\_vega}.
+Built on Book 5's \texttt{firm.optmm}, \texttt{firm.volpnl}, \texttt{firm.svi} and \texttt{firm.bs}.
+\bfield{Rules} Prices per share, 100 shares a contract; the market maker is the counterparty of every sweep fill.
+\bfield{Acceptance tests} \texttt{code/firm/optquoter/tests/}: quotes bracket theo with widths proportional to vega; the sweep stops at the count and
+its loss equals the sum of the filled edges; a larger threshold never loses less; a vega limit reacting faster loses less; the ordinary day loses no
+fills when the threshold exceeds every order's legs; the SVI refit recovers a slice within its noise.
+\bfield{Stretch} Percentage-of-quote and notional parameters; several exchanges; the surface refit incrementally on each trade.
+\end{build}
+
+\begin{omsources}
+\item D.~Muravyev, Order flow and expected option returns, \emph{Journal of Finance} 71(2), 2016, 673--708.
+\item D.~Muravyev, N.~D.~Pearson, Options trading costs are lower than you think, \emph{Review of Financial Studies} 33(11), 2020, 4973--5014.
+\item Cboe, US Options risk management tools (web page, accessed 2026).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:hf:automated-options-market-making:1}
+The 30-day at-the-money call has a vega of 0.114 a volatility point. What is its width at half a point either side?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:automated-options-market-making:2}
+A deep in-the-money call with delta one is quoted at \$20.01 offered, ten contracts. The stock rises \$1. What does a sweeper gain on it?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:automated-options-market-making:3}
+Why must the count threshold exceed the largest legitimate multi-leg order?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:automated-options-market-making:4}
+Why does the sweep loss grow almost linearly in the threshold?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:automated-options-market-making:5}
+Why does a per-expiry vega limit enforced in 50 microseconds lose more than one enforced in 5?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:automated-options-market-making:6}
+Muravyev and Pearson found that timed executions pay under 40\% of conventional spreads. What does that mean for a market maker's widths?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:automated-options-market-making:7}
+\emph{Coding.} Rerun the sweep with a 2\% move. At a threshold of 13, what is the loss, and without protection?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:automated-options-market-making:8}
+\emph{Find the flaw.} ``Our protection threshold is forty executions; we have never lost more than \$5,000 to a sweep, so it is safe.''
+\end{exercise}
+
+\section{Problem: Forty Strikes in a Millisecond}
+
+\begin{problem}[{Weekend problem --- forty strikes in a millisecond}]\label{pb:hf:automated-options-market-making:1}
+An options market maker sets its protections and limits for a chain of 170 series.
+
+\medskip\noindent\textbf{Part I --- Quotes.}
+\begin{enumerate}
+\item Define a \omterm{def:hf:automated-options-market-making:live}{live surface fit} and how its work is split between clocks.
+\item How well does an SVI refit recover a noisy slice?
+\item Define a \omterm{def:hf:automated-options-market-making:mass}{mass quote}.
+\item Give the chain's widths.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Protection.}
+\begin{enumerate}[resume]
+\item Summarise the dated box.
+\item Describe the sweep and the ordinary day.
+\item Give the sweep loss and the fills lost at thresholds of 5, 10, 13 and 20.
+\item Why do the most profitable targets come first?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Risk.}
+\begin{enumerate}[resume]
+\item What delta does the sweep leave, and what does the hedge do?
+\item What did Muravyev find about inventory and option prices?
+\item Define a \omterm{def:hf:automated-options-market-making:strike}{strike risk limit}.
+\item Give the volatility sweep's losses with limits at two speeds.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the loss on a planted informed sweep as a function of the quote-protection threshold, and the fills given up by
+a tight threshold on normal days.
+\item Which threshold would you choose, and why?
+\item What would several exchanges, each with its own protection, change?
+\item Why are the market maker's own limits needed besides the exchange's?
+\item What did Muravyev and Pearson find about taking liquidity in options?
+\item Which strategy file is most exposed to sweeps?
+\item How would you set the vega limits per expiry?
+\item In one sentence: what does quote protection trade off?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:hf:automated-options-market-making:1}
+The stock jumps 3\% in a millisecond. What happens to your options quotes, in order?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:hf:automated-options-market-making:2}
+Design the path from an underlying tick to a \omterm{def:hf:automated-options-market-making:mass}{mass quote} of 5,000 series. Where does the time go?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:hf:automated-options-market-making:3}
+How would you decide when to refit a smile rather than move it with the underlying?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:hf:automated-options-market-making:4}
+Your protection tripped forty times today on one class. What do you investigate?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:hf:automated-options-market-making:5}
+Why might you quote puts wider than calls at the same vega?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:hf:automated-options-market-making:6}
+Derive the expected loss of a sweep against a count threshold $n$ when targets arrive in order of decreasing edge $e_1\ge e_2\ge\cdots$.
+\end{interviewq}

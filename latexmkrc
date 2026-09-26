@@ -11,6 +11,10 @@ $out_dir = 'build';
     'one_quant_book_07_research.tex',
     'one_quant_book_08_strategies_1.tex',
     'one_quant_book_09_strategies_2.tex',
+    'one_quant_book_10_microstructure.tex',
+    'one_quant_book_11_hft.tex',
+    'one_quant_book_12_ml.tex',
+    'one_quant_book_13_low_latency.tex',
 );
 # Many TikZ/pgfplots figures exceed pdfTeX's default main memory.
 $pdflatex = 'pdflatex -cnf-line=main_memory=12000000 -cnf-line=extra_mem_top=6000000 -cnf-line=extra_mem_bot=6000000 -interaction=nonstopmode -halt-on-error %O %S';

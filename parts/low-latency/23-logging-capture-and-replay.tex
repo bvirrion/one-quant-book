@@ -1,0 +1,357 @@
+\chapter{Logging, Capture and Replay}\label{ch:ll:logging-capture-and-replay}
+
+A regulator asks why one order left at 09:30:00.012345678 with that price and that size. There are two ways to answer. One is
+to search the logs for the lines around that time and reconstruct, from what the programmers chose to print, what the strategy
+probably saw. The other is to take the inputs the trading process received that morning, each with the time it received
+it, feed them to the same binary on a desk, and stop at the order: the book, the parameters in force and every value the
+decision used are there, exactly as they were, because the program is deterministic (chapter~20) and its inputs were kept.
+This chapter builds the second answer and the machinery it needs: a log that costs a few nanoseconds on the hot path because
+it writes raw numbers and formats them later, an \omterm{def:ll:logging-capture-and-replay:journal}{input journal} that records what arrived and when, and a replay driver that
+turns a production day into a reproducible experiment.
+
+\section{Why formatted logging is not for the hot path}
+
+A formatted log line does a surprising amount of work: it parses a format string, converts each number to decimal text,
+copies the result into a buffer, and, depending on the library, takes a lock and makes a system call. On the laptop, a line
+with four numbers costs about \qty{100}{\nano\second} at the median through \texttt{snprintf} into a buffer, about as much
+through \texttt{fprintf} into a fully buffered file, and \qty{210}{\nano\second} through a string stream
+(\cref{fig:ll:logging-capture-and-replay:calls}); and its tail is long, because the file's buffer fills and is written, and
+because the stream allocates. A strategy engine that handles an event in \qty{50}{\nano\second} (chapter~20) cannot afford one
+such line per event, and a system whose logging is switched off in production to save that time has nothing to look at when
+something goes wrong.
+
+The answer is not to log less but to do less when logging. Everything in a log line is known when the program is compiled
+except the numbers: the text, the positions of the arguments and their types. So the hot path can write only the numbers,
+with an identifier for the statement, and leave the formatting to a program that runs later, elsewhere, when someone reads
+the log. The \texttt{C++} standard library of the compiler used here (g++ 11) does not even provide \texttt{std::format}; it would not
+change the conclusion, since formatting is the cost being removed.
+
+\section{Binary logging and deferred formatting}
+
+\begin{definition}[Binary log, deferred formatting]\label{def:ll:logging-capture-and-replay:binlog}
+A \emph{binary log}\index{binary log} is a log whose records hold a statement identifier, a timestamp and the raw values of the
+statement's arguments, not text; the statements' format strings are stored once, in the log's header or alongside the binary.
+\emph{Deferred formatting}\index{deferred formatting} is the practice of turning such records into text only when the log is
+read, by a separate program, so that the program that writes the log never converts a number to text.
+\end{definition}
+
+The idea is established: NanoLog, presented at the 2018 USENIX Annual Technical Conference, extracts the static parts of log
+statements at compile time, writes a compacted \omterm{def:ll:logging-capture-and-replay:binlog}{binary log} at run time and re-inflates it offline, and reports an invocation
+cost of 8 nanoseconds in \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmarks} and 18 in applications. The build's \texttt{firm.binlog} does the same with nothing
+but the language. A statement is written \texttt{log.log<\textquotedbl{}fill \{\} of \{\} at \{\}, position \{\}\textquotedbl{}>(ts, id, qty, price, pos)}: the format
+string and the argument types are template arguments, so the statement's identifier is computed at compile time, a hash of both
+(\cref{lst:ll:logging-capture-and-replay:id}), and the statement registers its format in a table during static initialisation,
+before \texttt{main} runs. At run time, a call writes the identifier, the timestamp and the arguments' bytes into a slot of a
+single-producer ring (chapter~12), and returns (\cref{lst:ll:logging-capture-and-replay:log}). If the ring is full, the record
+is dropped and counted: the hot path never waits for the log.
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{62}{70}{A statement's identifier, computed by the compiler from its format and
+the types of its arguments.}\label{lst:ll:logging-capture-and-replay:id}
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{125}{141}{The hot path of a log call: encode the raw arguments behind a
+16-byte header and write the record into the ring, or drop it.}\label{lst:ll:logging-capture-and-replay:log}
+
+A writer thread on another core drains the ring into a file. The file starts with a header that lists every statement
+(identifier, argument types, format), sorted by identifier, then the records as they came out of the ring; the Python decoder
+reads the header, decodes each record with its statement's types and formats it. The format is simple enough to be written by
+three implementations: the Python reference encoder writes the fixture's sample log, and the C++ logger, through its ring and
+through its writer thread, and the Rust logger each write the same statements to the same bytes. A test also counts heap
+allocations during logging and finds none, and fills a small ring on purpose to check that the overflow is dropped and counted.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.75cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (hot) at (0,0) {hot path\\ \texttt{log<\textquotedbl{}fill \{\} of \{\}\textquotedbl{}>}};
+\node[box,fill=omMeth!15,minimum width=2.4cm] (ring) at (3.8,0) {ring (SPSC)\\ id $|$ len $|$ ts $|$ raw args};
+\node[box] (wr) at (7.1,0) {writer thread\\ (another core)};
+\node[box,fill=gray!10] (file) at (10.3,0) {file: statements\\ header $+$ records};
+\node[box,fill=omThm!15] (dec) at (10.3,-1.9) {decoder (Python):\\ text, offline};
+\node[box] (feed) at (0,-1.9) {inputs as received\\ (feed, reports, parameters)};
+\node[box,fill=gray!10] (jr) at (3.5,-1.9) {input journal\\ recv ts $|$ event};
+\node[box,fill=omThm!15] (rep) at (6.6,-1.9) {replay: same binary,\\ same inputs};
+\draw[->,thick] (hot) -- node[above]{\qty{5}{\nano\second}} (ring);
+\draw[->] (ring) -- (wr);
+\draw[->] (wr) -- (file);
+\draw[->] (file) -- (dec);
+\draw[->] (feed) -- (jr);
+\draw[->] (jr) -- (rep);
+\draw[<->,dashed] (rep) -- node[below=2pt]{compare} (dec);
+\end{tikzpicture}
+
+\omcaption{Logging, capture and replay. The hot path writes raw records into a ring and returns; a writer thread drains them
+to a file whose header holds every statement's format; formatting happens offline. The inputs are journaled as they arrive,
+and a replay of the journal through the same binary produces the same log.}\label{fig:ll:logging-capture-and-replay:flow}
+\end{omfigure}
+
+\Cref{fig:ll:logging-capture-and-replay:calls} is the result: about \qty{5}{\nano\second} per call at the median, twenty
+times less than \texttt{snprintf}, with a tail at the 99th percentile when the writer drains the ring and the \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} it
+reads move between the cores. The writer's manners matter. The first version polled the ring without pause, and every log
+call paid for the \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} the writer kept pulling away; the build's writer drains in batches and sleeps
+\qty{100}{\micro\second} when there is little to drain (\cref{lst:ll:logging-capture-and-replay:writer}). The price is paid by
+nobody on the hot path: the log reaches the file a fraction of a millisecond later.
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{206}{212}{The writer's loop: drain in batches, sleep when there is little to
+drain.}\label{lst:ll:logging-capture-and-replay:writer}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.6cm,ybar,bar width=12pt,ymode=log,ymin=1,ymax=2000,log origin=infty,
+  xmin=-0.6,xmax=3.6,xtick={0,1,2,3},xticklabels={firm.binlog,snprintf,fprintf,ostringstream},
+  ylabel={ns per call},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x expr={floor(\coordindex/3)},y=ns,
+  restrict expr to domain={mod(\coordindex,3)}{0:0}]{figdata/low-latency/23-logging-capture-and-replay/measured_logcall.csv};
+\addlegendentry{median}
+\addplot[fill=omMeth!40,draw=omMeth] table[x expr={floor(\coordindex/3)},y=ns,
+  restrict expr to domain={mod(\coordindex,3)}{1:1}]{figdata/low-latency/23-logging-capture-and-replay/measured_logcall.csv};
+\addlegendentry{99th percentile}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost of one log call carrying four numbers, by method (TSC-timed, 200\,000 calls each): the \omterm{def:ll:logging-capture-and-replay:binlog}{binary log} with
+its writer thread draining the ring on another core, \texttt{snprintf} into a buffer, \texttt{fprintf} into a fully buffered
+file, and a string stream. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2. Data:
+\texttt{bench\_log.py}.}\label{fig:ll:logging-capture-and-replay:calls}
+\end{omfigure}
+
+\section{Capture: inputs, outputs and time}
+
+\begin{definition}[Input journal]\label{def:ll:logging-capture-and-replay:journal}
+An \emph{input journal}\index{input journal} is the record, kept by a process, of every input it received, in the order it
+received them, each with the time of its reception: market events, order reports, timer firings that depend on the clock,
+parameter changes and control messages. Together with the program's version, it is enough to reproduce everything the
+process computed.
+\end{definition}
+
+A log of decisions says what the program did; only a journal of inputs says why, because it lets the decision be made again.
+The build's journal is deliberately dull: a short header, then fixed records of 56 bytes, the reception time followed by the
+48-byte event of the \omterm{def:ll:the-feed-handler:handler}{feed handler} (chapter~18). It is written by the thread that receives the inputs, at the point where they
+enter the engine, so that its order is the engine's order. Two things are easy to get wrong. The journal must hold what the
+process received, not what the exchange sent: the exchange's recording has no gaps, no retransmissions and no local arrival
+times, and a replay of it answers a different question. And the times must be the process's own, taken once, at reception,
+with the clock of chapter~5, because they are inputs too: a strategy that ages its quotes reads them. The exchange's time
+stamp and the receive time stamp of One Quant Book~1 (chapter~28) are both kept, one inside the event, the other in front of it.
+
+\begin{dated}{2026-09}{How long and how precisely records are kept}\label{dat:ll:logging-capture-and-replay:records}
+In the European Union (consulted September 2026), Commission Delegated Regulation (EU) 2017/589 requires firms engaged in
+high-frequency algorithmic trading to record their orders and keep the records for five years from the submission of each
+order (article 28). Commission Delegated Regulation (EU) 2017/574 requires members of a trading venue using a high-frequency
+algorithmic trading technique to keep their business clocks within 100 microseconds of UTC, with a time stamp granularity of
+1 microsecond or better, and to review their traceability to UTC at least once a year.
+\end{dated}
+
+Journals compress well, because consecutive events share most of their bytes: the same instrument, nearby prices and times,
+sequence numbers that count by one. \Cref{tab:ll:logging-capture-and-replay:journal} measures it on the two streams of the
+build: about 3.8 to 1 with the general-purpose compressor zlib at its default level, about 15 bytes per event.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+stream & events & recorded & journal & compressed & ratio \\
+\midrule
+large tick (the simulator's open) & 189\,875 & \qty{120}{\second} & 10.6 MB & 2.8 MB & 3.76 \\
+small tick (synthetic) & 6\,000 & \qty{6}{\milli\second} & 0.34 MB & 0.08 MB & 3.96 \\
+\bottomrule
+\end{tabular}
+\caption{The \omterm{def:ll:logging-capture-and-replay:journal}{input journal} of two event streams: 56 bytes per event raw, about 15 compressed with zlib at level 6. Data:
+\texttt{fig\_journal.py} (deterministic).}\label{tab:ll:logging-capture-and-replay:journal}
+\end{table}
+
+\section{Deterministic replay of a production day}
+
+\begin{definition}[Deterministic replay]\label{def:ll:logging-capture-and-replay:replay}
+A \emph{deterministic replay}\index{deterministic replay} runs a program on an \omterm{def:ll:logging-capture-and-replay:journal}{input journal}, in the journal's order, with time
+taken from the journal, and produces bit for bit the outputs that the program produced when the journal was recorded; it
+requires the program to be deterministic (chapter~20) and the journal to be complete.
+\end{definition}
+
+The replay driver reads the journal, rebuilds the events and gives them to the strategy engine with the simulated clock: the
+build's test journals the small-tick day, replays it, and obtains the committed output hash of chapter~20. A replay is also
+fast, because nothing waits for the market: on the laptop, the engine replays the simulator's two busy minutes around the open,
+189\,875 events, journal reading included, in under \qty{50}{\milli\second}, about 2\,800 times faster than they happened. A day
+replays in seconds, which changes what can be done with it: every change to the code can be replayed against last week, and
+every incident can be replayed as often as needed with a debugger attached.
+
+When two runs that should agree do not, the logs find where. Each run logs its actions; the two logs are compared record by
+record (\cref{lst:ll:logging-capture-and-replay:diff}), and the first record that differs points at the first event whose
+handling differed. The build's test plants a difference, a parameter change at event 3\,000 that the second run receives and
+the first does not, as a value read from outside the journal would; the comparison finds the first differing action,
+number 540 of 1\,084, just after the planted event, and nothing before it. This is the procedure of chapter~20's weekend problem,
+mechanised: the log says where to look, and the replay lets one look as often as needed.
+
+\omcode{code/firm/binlog/firm_binlog.py}{99}{107}{Offline: format the records, and find the first record at which two logs
+differ.}\label{lst:ll:logging-capture-and-replay:diff}
+
+\section{What must be kept, and for how long}
+
+Three things are kept. The \omterm{def:ll:logging-capture-and-replay:journal}{input journal}, because it is the only record from which everything else can be recomputed; the
+decision log, because it answers most questions without a replay and checks the replay when one is made; and the program:
+the exact binary, its configuration and the parameter snapshots, since a journal replayed through a different build answers
+nothing. The regulator's clocks and retention periods (the dated box) set the minimum: time stamps traceable to UTC with the
+granularity required, and five years of order records. The storage is modest by the standards of the data a quantitative firm
+keeps anyway, as the weekend problem computes, and the cost of not keeping it is the first sentence of this chapter.
+
+\section{Tutorial: log, journal, replay, bisect}\label{tut:ll:logging-capture-and-replay:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Log from the hot path at a few nanoseconds per call, journal a day's inputs, replay them to the bit, and find a
+planted difference between two runs. \textbf{End state:} \cref{fig:ll:logging-capture-and-replay:calls}, the journal table,
+the replay's speed, and green tests in three languages.
+\begin{tutsteps}
+\item \textbf{Log.} The C++ test logs the fixture's statements through the ring and through the writer thread and compares the
+bytes with \texttt{data/sample.blog}, which the Python reference wrote; the Rust test writes the same bytes; the Python decoder's \texttt{read} and \texttt{text} turn them into
+\texttt{data/sample.txt}.
+\item \textbf{Measure.} \texttt{python bench\_log.py} times a log call by each method and a replay of the open's journal.
+\item \textbf{Journal and replay.} The test journals the small-tick day, replays it through \texttt{firm.stratengine}, and
+checks the committed hash.
+\item \textbf{Bisect.} \texttt{ll\_bisect\_test.cpp} runs the engine twice, plants a change in the second run, logs both, and
+finds the first differing record.
+\end{tutsteps}
+\textbf{What to change next.} Replace the planted parameter change by a wall-clock read (chapter~20's defect) and watch the
+first difference move from run to run; compress the journal as it is written, in the writer thread.
+\end{tutorial}
+
+\section{Build: the binary log and the journal}\label{bld:ll:logging-capture-and-replay:binlog}
+
+\begin{build}
+\bfield{Purpose} Every component of the trading path logs through it: the \omterm{def:ll:the-feed-handler:handler}{feed handler}'s gaps (chapter~18), the engine's
+actions (chapter~20), the gateway's messages (chapter~21), the \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{risk gate}'s decisions (chapter~22); its journal is what the
+resilient architecture of chapter~24 replicates and what the tests of chapter~25 replay.
+\bfield{Interface} C++20 \texttt{firm::binlog}: \texttt{Logger(capacity)} with \texttt{log<\textquotedbl{}format\textquotedbl{}>(ts, arguments)},
+\texttt{drain}, \texttt{dropped}; \texttt{Writer(logger, path)}; \texttt{header()}; \texttt{Journal} with \texttt{add} and
+\texttt{records}. Python \texttt{firm\_binlog}: \texttt{site\_id}, \texttt{Writer}, \texttt{read}, \texttt{text},
+\texttt{first\_difference}, \texttt{journal\_write}, \texttt{journal\_read}. Rust \texttt{firm\_binlog}: \texttt{Logger},
+\texttt{read}, \texttt{text}, \texttt{site\_id}.
+\bfield{Rules} No formatting, lock, system call or allocation on the hot path; a full ring drops and counts; statement
+identifiers from the format and the types; the journal written where the inputs enter the engine, with reception times; the
+same bytes from the three implementations.
+\bfield{Acceptance tests} \texttt{code/firm/binlog/}: the fixture written byte for byte by Python, C++ (ring and writer thread)
+and Rust, and decoded to its text; random statements round-tripped; identifiers that depend on the types, and collisions
+refused; zero allocations while logging, and overflow counted; a journal replayed through the strategy engine to the committed
+hash; the first difference between two logs found.
+\bfield{Stretch} Compression in the writer thread; a statement per component with a severity filtered at compile time;
+time stamps from the TSC with calibration records in the log, converted offline; a journal of the gateway's reports next to
+the market data.
+\end{build}
+
+\begin{omsources}
+\item S.~Yang, S.~J.~Park and J.~Ousterhout, ``NanoLog: a nanosecond scale logging system'', \emph{USENIX Annual Technical
+Conference}, 2018.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS 6), article 28.
+\item Commission Delegated Regulation (EU) 2017/574 (RTS 25), article 4 and annex.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:1}
+How many bytes does a record of the statement \texttt{\textquotedbl{}fill \{\} of \{\} at \{\}, position \{\}\textquotedbl{}} with four 64-bit arguments take,
+and how many does its formatted line take for the values 40, 100, 999\,900 and $-200$ with a 14-digit time stamp? What, then,
+does the \omterm{def:ll:logging-capture-and-replay:binlog}{binary log} save?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:2}
+Why does the statement's identifier depend on the types of its arguments and not only on its format?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:3}
+The open's journal has 189\,875 records of 56 bytes plus a 12-byte header. Check its size, and the bytes per event after
+compression, from \cref{tab:ll:logging-capture-and-replay:journal}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:4}
+A component logs 2 million records a second during a burst; the writer thread is blocked for \qty{20}{\milli\second} by a slow
+disk. How many ring slots are needed so that nothing is dropped, and how much memory is that with 64-byte slots?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:5}
+The hot path stamps records with the TSC rather than with \texttt{clock\_gettime}. What must the log also contain so that the
+time stamps can be converted to UTC offline with a granularity of a microsecond?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:6}
+An engine handles an event in \qty{50}{\nano\second} and logs five lines per event. What does logging cost per event with the
+\omterm{def:ll:logging-capture-and-replay:binlog}{binary log} and with \texttt{snprintf}, at the medians of \cref{fig:ll:logging-capture-and-replay:calls}?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:logging-capture-and-replay:7}
+\emph{Coding.} Log the \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{risk gate}'s decisions (chapter~22) with a statement carrying the order's identifier, the code and the
+mask; replay the gate's fixture, and decode the log into a count of refusals by reason that matches \texttt{expected.txt}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:logging-capture-and-replay:8}
+\emph{Find the flaw.} ``We do not need an \omterm{def:ll:logging-capture-and-replay:journal}{input journal}. We log every decision with its reason, and to replay a day we run the
+strategy on the exchange's own recording of the market data.''
+\end{exercise}
+
+\section{Problem: To the Nanosecond}
+
+\begin{problem}[{Weekend problem --- what it costs to be able to answer}]\label{pb:ll:logging-capture-and-replay:1}
+A firm journals the inputs of its trading processes and must be able to replay any order of the last five years. Use
+\cref{tab:ll:logging-capture-and-replay:journal} and the measured replay speed.
+
+\medskip\noindent\textbf{Part I --- The rate.}
+\begin{enumerate}
+\item What is the average event rate of the open's stream?
+\item At that average rate, how many events does a trading day of 6.5 hours hold?
+\item How many bytes is that journal raw, and compressed at the measured ratio?
+\item Why is an average over a busy open a pessimistic estimate for a whole day, and why is it still the right one to plan
+with?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Five years.}
+\begin{enumerate}[resume]
+\item With 252 trading days a year, how much does five years of such journals take, compressed?
+\item The firm trades 200 instruments with similar streams. Scale the answer.
+\item What else must be kept for a journal to be replayable five years later?
+\item Why is the decision log, although smaller, not enough?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Replay.}
+\begin{enumerate}[resume]
+\item At the measured speed, how long does a replay of one instrument's day take?
+\item And of the 200 instruments, one after the other, on one core?
+\item What limits the replay speed, and what does not?
+\item Why must the replay read time from the journal rather than from the machine?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: journal storage per day at the measured rate and compression ratio, and replay speed
+against real time.
+\item What does a log call cost with \omterm{def:ll:logging-capture-and-replay:binlog}{deferred formatting}, and with \texttt{snprintf}?
+\item What must the replay reproduce to answer the regulator's question, and how do you check that it did?
+\item What happens to replayability when a component reads the wall clock?
+\item Where in the process must the journal be written, and why there?
+\item What does the planted-difference test demonstrate, and what would it take to find a real one?
+\item What time stamp precision does the dated box require, and does a TSC-stamped log meet it?
+\item In one sentence: what makes an order explainable years later?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:logging-capture-and-replay:1}
+Why is \texttt{printf}-style logging a problem on a hot path, and what do you do instead?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:logging-capture-and-replay:2}
+Design a logger whose call costs under ten nanoseconds. What happens when its buffer is full?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:logging-capture-and-replay:3}
+What would you record to be able to replay a trading day exactly, and where in the process would you record it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:logging-capture-and-replay:4}
+Two replays of the same day disagree. How do you find where?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, compliance}]\label{iq:ll:logging-capture-and-replay:5}
+A regulator asks why an order was sent three years ago. What do you need to answer, and how long does it take?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:logging-capture-and-replay:6}
+Design capture and replay for a firm with dozens of trading processes on several venues. What is journaled, where, in what
+format, for how long, and how is replay tested?
+\end{interviewq}

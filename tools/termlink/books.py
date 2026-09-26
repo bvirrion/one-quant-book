@@ -19,6 +19,10 @@ ENTRY = {
     7: "one_quant_book_07_research.tex",
     8: "one_quant_book_08_strategies_1.tex",
     9: "one_quant_book_09_strategies_2.tex",
+    10: "one_quant_book_10_microstructure.tex",
+    11: "one_quant_book_11_hft.tex",
+    12: "one_quant_book_12_ml.tex",
+    13: "one_quant_book_13_low_latency.tex",
 }
 
 LANGS = {
@@ -31,6 +35,10 @@ LANGS = {
     7: ("en",),
     8: ("en",),
     9: ("en",),
+    10: ("en",),
+    11: ("en",),
+    12: ("en",),
+    13: ("en",),
 }
 
 

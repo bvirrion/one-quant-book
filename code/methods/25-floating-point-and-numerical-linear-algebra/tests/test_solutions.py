@@ -57,7 +57,9 @@ def test_linear_algebra():
     assert (ch["ok"], ch["fail_index"], r(ch["pivot"]), r(ch["min_eig"]), ch["fixed_ok"]) == (False, 5, -0.14, -1.42, True)
     assert ch["jitter_needed"] == 2.0
     cg = cg_demo()
-    assert (r(cg["cond"] / 1e5, 1), cg["iters_plain"], cg["iters_pre"], round(cg["cond_pre"])) == (1.1, 1909, 102, 100)
+    # The plain count depends on BLAS summation order (1884 with one thread, 1909 multithreaded): the text says "about 1,900".
+    assert (r(cg["cond"] / 1e5, 1), round(cg["cond_pre"])) == (1.1, 100)
+    assert 1850 <= cg["iters_plain"] <= 1950 and 100 <= cg["iters_pre"] <= 104
     bound = 0.5 * math.sqrt(cg["cond"]) * math.log(2 / 1e-8)
     assert round(math.sqrt(cg["cond"])) == 328 and 3000 < bound < 3200 and cg["iters_plain"] < bound
 

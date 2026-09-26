@@ -1,0 +1,391 @@
+\chapter{Protocols I: FIX}\label{ch:ll:protocols-i-fix}
+
+An order sent this morning from a fund to its broker most likely travelled as a line of text: \texttt{35=D} for a new
+order, \texttt{55=ESZ6} for the instrument, \texttt{54=1} for a buy, \texttt{38=5} for the quantity, each pair ended by a
+control character. The format was first written in 1992 so that Fidelity Investments and Salomon Brothers could exchange
+equity trading information electronically, and it became the common language of orders between the buy side, brokers and
+many venues: the Financial Information eXchange protocol. It is old, verbose, slow to parse naively, and everywhere. This
+chapter builds a \omterm{def:ll:protocols-i-fix:engine}{FIX engine}: the codec that reads and writes the text without copying it, the session layer that keeps two
+firms' views of a conversation identical through disconnections, and the measurements that say what the protocol costs.
+
+\section{Tag-value encoding and the message}
+
+\begin{definition}[FIX protocol, tag-value encoding]\label{def:ll:protocols-i-fix:fix}
+The \emph{FIX protocol}\index{FIX protocol} is a standard for messages about trading (orders, executions, quotes, market
+data, allocations) between firms, maintained by the FIX Trading Community, with a session layer that delivers them in order
+and without loss. In its \emph{tag-value encoding}\index{tag-value encoding} a message is a sequence of fields
+\texttt{tag=value}, each ended by the byte SOH (value 1), where the tag is a number from the protocol's dictionary and the
+value is text.
+\end{definition}
+
+Three fields open every message, in a fixed order: BeginString (tag 8, the protocol version), BodyLength (9) and MsgType (35).
+One closes it: CheckSum (10), whose field and trailing SOH mark the end of the message. Between them come the rest of the
+standard header (the sender's and target's identifiers 49 and 56, the sequence number 34, the sending time 52 in UTC) and the
+body. BodyLength counts the bytes from the start of the MsgType field up to, not including, the CheckSum field, delimiters
+included; CheckSum is the sum of every byte before it modulo 256, written as three digits.
+\Cref{fig:ll:protocols-i-fix:anatomy} takes apart the example that the protocol's usual description works through, a logon
+whose body is 65 bytes long and whose checksum is 062; the build's tests reproduce both numbers.
+
+\begin{omfigure}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw=gray!60,inner sep=2pt,minimum height=0.5cm,font=\ttfamily\scriptsize}]
+\node[f,fill=gray!10,anchor=west] (a) at (0,0) {8=FIX.4.2|};
+\node[f,fill=gray!10,anchor=west] (b) at (a.east) {9=65|};
+\node[f,fill=omDef!20,anchor=west] (c) at (b.east) {35=A|};
+\node[f,fill=omDef!12,anchor=west] (d) at (c.east) {49=SERVER|};
+\node[f,fill=omDef!12,anchor=west] (e) at (d.east) {56=CLIENT|};
+\node[f,fill=omDef!12,anchor=west] (g) at (e.east) {34=177|};
+\node[f,fill=omDef!12,anchor=west] (h) at (g.east) {52=20090107-18:15:16|};
+\node[f,fill=omThm!12,anchor=west] (i) at (h.east) {98=0|};
+\node[f,fill=omThm!12,anchor=west] (j) at (i.east) {108=30|};
+\node[f,fill=gray!10,anchor=west] (k) at (j.east) {10=062|};
+\draw[decorate,decoration={brace,amplitude=4pt},thick] (c.north west) ++(0,0.08) -- ([yshift=0.08cm]j.north east)
+  node[midway,above=5pt]{BodyLength: 5 + 10 + 10 + 7 + 21 + 5 + 7 = 65 bytes, from \texttt{35=} up to \texttt{10=}};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror},thick] ([yshift=-0.08cm]a.south west) -- ([yshift=-0.08cm]j.south east)
+  node[midway,below=5pt]{CheckSum: every byte before \texttt{10=}, delimiters included, sums to 4\,158; $4\,158 \bmod 256 = 62$};
+\node[anchor=north west,align=left,font=\footnotesize] at (0,-1.35) {grey: framing (first two fields, last field); blue:
+  MsgType and the rest of the standard header; red: the body of a logon (encryption method 98, heartbeat interval 108)};
+\end{tikzpicture}}
+
+\omcaption{A FIX~4.2 logon as a byte string, with \texttt{|} standing for the SOH delimiter. BodyLength and CheckSum are
+computed over the spans shown; a receiver recomputes both and rejects the message if either differs.}\label{fig:ll:protocols-i-fix:anatomy}
+\end{omfigure}
+
+The checksum is a weak check, and knowing how weak tells a reader what it is for.
+
+\begin{proposition}[What the FIX checksum detects]\label{prop:ll:protocols-i-fix:checksum}
+Changing a single byte of a message always changes its checksum. Swapping two bytes, or two fields, never does; nor does any
+set of changes whose values sum to a multiple of 256.
+\end{proposition}
+
+\begin{proof}
+Changing byte $b$ into $b' \ne b$ changes the sum by $b' - b$, with $0 < |b' - b| < 256$, which is not a multiple of 256.
+A sum does not depend on the order of its terms, so a permutation leaves it unchanged; and changes $\delta_1, \dots, \delta_k$
+leave the sum modulo 256 unchanged exactly when $\sum_j \delta_j \equiv 0 \pmod{256}$.
+\end{proof}
+
+The transport underneath, TCP, already carries its own checksums on every segment. The FIX checksum and body length are
+therefore less a defence against corruption on the wire than a check on the framing: a program that has lost its place in a
+byte stream, or a message cut short or stitched together by a faulty gateway, is caught at the next message. Framing itself
+uses the first two fields: once \texttt{8=} and \texttt{9=} are read, the message's full length is known, the body plus the
+seven bytes of \texttt{10=nnn} and its delimiter.
+
+\section{The session layer: sequence numbers, heartbeats, resend and gap fill}
+
+\begin{definition}[FIX session, heartbeat, resend request, gap fill]\label{def:ll:protocols-i-fix:session}
+A \emph{FIX session}\index{FIX session} is the bidirectional conversation between two parties identified by their sender and
+target identifiers, from a logon to a logout, in which each side numbers the messages it sends 1, 2, 3, \dots\ and keeps
+them so that it can send them again. A \emph{heartbeat}\index{heartbeat} is a message sent when a side has sent nothing for
+an agreed interval, so that silence can be told from a dead connection. A \emph{resend request}\index{resend request} asks the
+other side to send again a range of its messages, after a gap in their sequence numbers has been detected. A \emph{gap
+fill}\index{gap fill} is a sequence-reset message, sent in answer to a resend request, that stands for a run of
+administrative messages that will not be sent again, moving the receiver's expected sequence number past them.
+\end{definition}
+
+Sequence numbers (One Quant Book~1, chapter~28, for market data) are the session layer's whole mechanism. Each side keeps two
+counters: the number of its next outgoing message and the number it expects next from the other side. A message with the
+expected number is processed and the counter moves on. A higher number means messages were lost: the receiver sends a
+ResendRequest (MsgType 2) from the expected number to ``infinity'' (EndSeqNo 0), and holds the later messages until the gap is
+filled. A lower number is either a duplicate, marked with PossDupFlag (43) and ignored, or a fatal error: the two sides no
+longer agree, and the receiver logs out. The answer to a \omterm{def:ll:protocols-i-fix:session}{resend request} contains the application messages again, marked
+PossDupFlag with their original sending time (122), and replaces administrative messages (\omterm{def:ll:protocols-i-fix:session}{heartbeats}, test requests, \omterm{def:ll:protocols-i-fix:session}{resend
+requests} themselves) by SequenceReset messages with GapFillFlag (123) set: a \omterm{def:ll:protocols-i-fix:session}{heartbeat} from half an hour ago means nothing
+now. \Cref{fig:ll:protocols-i-fix:sequence} draws the golden conversation of the build around its gap, and
+\cref{lst:ll:protocols-i-fix:trace} is the same conversation as the engine traces it.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\def\L{0}\def\R{7.5}
+\node[font=\footnotesize\bfseries] at (\L,0.45) {FIRM (us)};
+\node[font=\footnotesize\bfseries] at (\R,0.45) {BROKER};
+\draw[gray,thick] (\L,0.15) -- (\L,-9.6);
+\draw[gray,thick] (\R,0.15) -- (\R,-9.6);
+\newcommand{\msgR}[3]{\draw[->,#3] (\L,#1) -- node[above,sloped]{#2} (\R,#1-0.25);}
+\newcommand{\msgL}[3]{\draw[<-,#3] (\L,#1-0.25) -- node[above,sloped]{#2} (\R,#1);}
+\msgR{-0.1}{Logon, seq 1}{omDef}
+\msgL{-0.75}{Logon, seq 1}{omDef}
+\msgR{-1.4}{NewOrderSingle, seq 2}{omDef}
+\msgL{-2.05}{ExecutionReport (new), seq 2}{omDef}
+\msgL{-2.7}{Heartbeat, seq 3}{gray}
+\draw[omThm,dashed,->] (\R,-3.3) -- (5.6,-3.45) node[left,font=\scriptsize]{lost: seq 4 (partial fill), seq 5 (heartbeat)};
+\msgL{-4.0}{ExecutionReport (filled), seq 6}{omDef}
+\node[anchor=east,omThm,align=right] at (-0.15,-4.25) {gap: expected 4,\\ hold seq 6};
+\msgR{-4.65}{ResendRequest 7=4 16=0, seq 3}{omThm,thick}
+\msgL{-5.3}{ExecutionReport (partial), seq 4, PossDup}{omDef}
+\msgL{-5.95}{SequenceReset-GapFill, seq 5, NewSeqNo 6}{omMeth}
+\node[anchor=east,omMeth,align=right] at (-0.15,-6.2) {deliver 4, then the\\ held 6; expect 7};
+\msgL{-6.6}{ExecutionReport, seq 6 again, PossDup: ignored}{gray}
+\msgR{-7.25}{OrderCancelRequest, seq 4}{omDef}
+\msgL{-7.9}{ResendRequest 7=3 16=0 (the broker lost ours)}{omThm}
+\msgR{-8.55}{GapFill seq 3 (our resend request), NewSeqNo 4}{omMeth}
+\msgR{-9.2}{OrderCancelRequest again, seq 4, PossDup}{omDef}
+\end{tikzpicture}
+
+\omcaption{The build's golden conversation around its gap. Two of the broker's messages are lost; the next one reveals the
+gap, which a \omterm{def:ll:protocols-i-fix:session}{resend request} closes: the application message comes again marked as a possible duplicate, the \omterm{def:ll:protocols-i-fix:session}{heartbeat} is
+replaced by a \omterm{def:ll:protocols-i-fix:session}{gap fill}, and the message held back is delivered in order. Later the broker asks for ours, and our
+administrative message is gap-filled in turn.}\label{fig:ll:protocols-i-fix:sequence}
+\end{omfigure}
+
+\omcode{code/low-latency/15-protocols-i-fix/python/trace_short.txt}{7}{22}{The golden conversation around the gap, as
+\texttt{ll\_fix.short} prints the engine's trace (the full trace is \texttt{expected\_trace.txt} in the build's data).}\label{lst:ll:protocols-i-fix:trace}
+
+\omterm{def:ll:protocols-i-fix:session}{Heartbeats} make silence meaningful. At logon both sides agree an interval, HeartBtInt (108), here 30 seconds. A side that has
+sent nothing for that long sends a \omterm{def:ll:protocols-i-fix:session}{Heartbeat} (0). A side that has heard nothing for somewhat longer (the build waits 1.2
+intervals) sends a TestRequest (1) with an identifier that the answering \omterm{def:ll:protocols-i-fix:session}{heartbeat} must carry, and if that answer does not
+come within another interval it declares the connection dead. The detection time is the price of a long interval: with 30
+seconds, a silently dead connection is noticed after about 66, during which the counterparty's messages go nowhere and must be
+resent.
+
+\omcode{code/firm/fixengine/cpp/firm_fixengine.hpp}{267}{289}{The C++ engine's sequence check: a gap asks for a resend and
+holds the message; a duplicate is ignored; a number too low ends the session.}\label{lst:ll:protocols-i-fix:seq}
+
+\section{The application layer: orders and execution reports}
+
+On top of the session, each application message carries one business event. A NewOrderSingle (35=D) carries the firm's order
+identifier ClOrdID (11), the instrument (55), the side (54), the quantity (38), the order type (40) and, for a limit order,
+the price (44); an OrderCancelRequest (35=F) names the order to cancel by its original identifier (41) and gives the request
+its own new one. The answer to each is an execution report (35=8), which the specification uses ``to confirm the receipt of
+an order'', to confirm changes, to relay status and fills and to reject orders; One Quant Book~10, chapter~26, describes it
+from the venue's side. Its OrdStatus (39) walks the order lifecycle of One Quant Book~7, chapter~17: \texttt{0} new,
+\texttt{1} partially filled, \texttt{2} filled, \texttt{4} cancelled, \texttt{8} rejected; LastQty (32) and LastPx (31)
+describe the latest fill, CumQty (14) and LeavesQty (151) the totals. A partial fill of 2 of 5 contracts at 5723.25 therefore
+reads \texttt{39=1}, \texttt{32=2}, \texttt{31=5723.25}, \texttt{14=2}, \texttt{151=3}.
+
+The session and application layers meet in one place: resent messages. An execution report that arrives with PossDupFlag
+may or may not have been processed before (the original might have arrived and only its successor been lost). The application
+must therefore make processing idempotent, recognising a fill it has already booked by its execution identifier (17), or it
+books a fill twice. The session layer delivers each sequence number once; it cannot know what the application did with
+the original.
+
+\section{Parsing fast}
+
+\begin{definition}[FIX engine]\label{def:ll:protocols-i-fix:engine}
+A \emph{FIX engine}\index{FIX engine} is the software that implements the \omterm{def:ll:protocols-i-fix:session}{FIX session} layer for an application: it frames
+and validates incoming messages, maintains sequence numbers, \omterm{def:ll:protocols-i-fix:session}{heartbeats} and the store of sent messages, answers \omterm{def:ll:protocols-i-fix:session}{resend
+requests}, and hands application messages to the program in order.
+\end{definition}
+
+A naive parser splits the message on SOH, converts each tag to an integer and copies each value into a map from tag to
+string: several allocations per field (chapter~6), a tree insertion per field, and one pass per byte. The build's parser does
+none of that. It finds every delimiter of the message with the vector scan of chapter~14, parses each tag in place, and
+records for each field only its tag, offset and length in a fixed array: the values stay where they are, in the receive
+buffer, and are read as string views. Body length and checksum are verified in the same pass.
+
+\omcode{code/firm/fixengine/cpp/firm_fixengine.hpp}{40}{73}{The zero-copy parse: delimiters from the vector scan, tags parsed
+in place, then the order of the framing fields, the body length and the checksum.}\label{lst:ll:protocols-i-fix:parse}
+
+\Cref{fig:ll:protocols-i-fix:parse} measures both on execution reports of about 205 bytes. The zero-copy view parses one in
+about \qty{80}{\nano\second}, some twelve million a second on one core; the map-based parser takes about
+\qty{900}{\nano\second}, eleven times longer; the Python reference about \qty{5}{\micro\second}. Building is symmetric: the
+fixed-buffer builder, which writes digits itself and computes the length and checksum in place, produces a new order in about
+\qty{60}{\nano\second}, against about \qty{330}{\nano\second} for the same message assembled by string concatenation.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,ybar,bar width=14pt,ymode=log,log origin y=infty,ymin=20,ymax=20000,
+  symbolic x coords={view,map,python,builder,concat},xtick=data,
+  xticklabels={{parse:\\ zero-copy view},{parse:\\ std::map},{parse:\\ Python reference},{build:\\ fixed buffer},{build:\\ concatenation}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.12,
+  ylabel={ns per message (log scale)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},nodes near coords,every node near coord/.append style={font=\scriptsize},
+  point meta=explicit symbolic,table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=key,y=ns_per_msg,meta=ns_per_msg]{figdata/low-latency/15-protocols-i-fix/measured_fix.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Parsing and building FIX execution reports of about 205 bytes (1\,000 distinct messages, median of 40 passes).
+Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores; C++ with GCC~11 at \texttt{-O2}, Python
+3.10. Data: \texttt{bench\_fix.py}.}\label{fig:ll:protocols-i-fix:parse}
+\end{omfigure}
+
+Parsing is rarely the whole cost of a FIX connection: the session layer writes each sent message to its store, often on disk,
+before or after sending it, and the counterparty's engine, network and matching take far longer than
+\qty{80}{\nano\second}. But on a gateway that carries a broker's whole flow, or on a market maker's order path through a venue
+that speaks only FIX, the difference between \qty{80}{\nano\second} and a microsecond per message is the difference between a
+component that disappears from the \omterm{def:ll:where-latency-comes-from:budget}{latency budget} of chapter~1 and one that owns part of it.
+
+\section{Where FIX is still used}
+
+FIX is the language of order routing between firms: from asset managers' order management systems to brokers, from brokers'
+algorithms to venues, and for direct market access (One Quant Book~1, chapter~4), where a client's orders reach the venue
+through the broker's infrastructure. Some venues accept it for order entry and drop copies, as the dated box below shows for one of them. Where speed is the
+product, venues
+have moved to binary protocols with fixed-offset fields (chapter~16), and the FIX Trading Community itself has standardised
+binary alternatives: Simple Binary Encoding for the messages, and FIXP, a ``lightweight point-to-point protocol'' for the
+session, whose own introduction names as its basis the \omterm{def:ll:protocols-i-fix:session}{FIX session} layer and exchange protocols such as SoupBinTCP. The
+tag-value engine remains the one every trading firm needs somewhere.
+
+\begin{dated}{2026-09}{FIX order entry today}\label{dat:ll:protocols-i-fix:today}
+Coinbase Exchange documents three ways to trade (consulted September 2026): a REST interface ``for lower-frequency
+trading'', a FIX order-entry interface ``for higher-frequency trading'', and FIX and WebSocket market data. Its FIX baseline
+is FIX 5.0 SP2; sessions are logged out every Saturday; and ``\omterm{def:ll:protocols-i-fix:session}{resend requests} are not supported'': each connection starts a
+new session with new sequence numbers, so a client that loses its connection recovers the state of its orders by other
+means, such as the venue's drop-copy sessions. The FIXP session standard reached version 1.0 in April 2021.
+\end{dated}
+
+\section{Tutorial: a FIX engine in three languages}\label{tut:ll:protocols-i-fix:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Parse and build FIX messages without copying them, replay a conversation with a gap through the session layer
+in Python and C++, and measure the parsers. \textbf{End state:} \cref{fig:ll:protocols-i-fix:parse}, the trace of
+\cref{lst:ll:protocols-i-fix:trace}, and green tests in Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Check the published example.} The tests decode the logon of \cref{fig:ll:protocols-i-fix:anatomy} and find a
+body of 65 bytes and a checksum of 062, then change one byte (checksum error) and the declared length (body-length error).
+\item \textbf{Replay the golden conversation.} \texttt{make\_fix\_fixtures.py} scripts the broker's side (a lost fill and a
+lost \omterm{def:ll:protocols-i-fix:session}{heartbeat}, a \omterm{def:ll:protocols-i-fix:session}{resend request} from the broker, a silent broker); \texttt{firm\_fixengine.replay} runs our session through
+it and writes the trace; the C++ test runs the C++ session through the same conversation and compares its trace with the
+Python one, line for line; the Rust tests parse and rebuild every message of it byte for byte.
+\item \textbf{Shorten the trace} with \texttt{python ll\_fix.py}, which prints \cref{lst:ll:protocols-i-fix:trace}.
+\item \textbf{Measure} with \texttt{python bench\_fix.py}: the C++ parsers and builders on 1\,000 execution reports, and the
+Python reference on the same messages.
+\end{tutsteps}
+\textbf{What to change next.} Delete the \omterm{def:ll:protocols-i-fix:session}{gap fill} from the broker's answer in the conversation and replay it: the session
+waits for message 5 forever. Then make the session answer a message whose tag is not a number with a Reject (35=3).
+\end{tutorial}
+
+\section{Build: the FIX engine}\label{bld:ll:protocols-i-fix:fixengine}
+
+\begin{build}
+\bfield{Purpose} The firm's FIX connections: broker and venue order entry where FIX is the protocol, drop copies, and the
+test counterparties of chapter~25. The order gateway of chapter~21 uses its codec for FIX venues.
+\bfield{Interface} Python reference \texttt{firm\_fixengine}: \texttt{checksum}, \texttt{encode}, \texttt{decode},
+\texttt{frame}, \texttt{Session} (\texttt{logon}, \texttt{send}, \texttt{on\_bytes}, \texttt{on\_timer}, \texttt{logout},
+\texttt{trace}), \texttt{replay}. C++20 \texttt{firm::fix}: \texttt{View::parse}, \texttt{get}, \texttt{frame},
+\texttt{Builder} (\texttt{start}, \texttt{add}, \texttt{finish}), \texttt{Session} with the same methods and trace. Rust
+\texttt{firm\_fixengine}: \texttt{View::parse}, \texttt{get}, \texttt{frame}, \texttt{encode}, \texttt{checksum}.
+\bfield{Rules} The parser copies nothing and rejects a message whose framing fields, body length or checksum are wrong; the
+builder allocates nothing; the session numbers every message, stores every one it sends, answers \omterm{def:ll:protocols-i-fix:session}{resend requests} with
+application messages marked PossDupFlag and \omterm{def:ll:protocols-i-fix:session}{gap fills} for administrative ones, holds messages received ahead of a gap, and
+ends the session on a sequence number too low without PossDupFlag.
+\bfield{Acceptance tests} \texttt{code/firm/fixengine/}: the published example's body length and checksum; checksum,
+body-length and field-order corruptions caught; framing of concatenated and partial streams; the golden conversation's trace
+reproduced by the Python reference and, line for line, by the C++ session; every message of that trace parsed and rebuilt byte
+for byte in Rust; \omterm{def:ll:protocols-i-fix:session}{heartbeat}, test request and timeout; logout on a sequence number too low; reset mode.
+\bfield{Stretch} A persistent message store (chapter~23's binary log), a Reject for malformed messages, FIXT~1.1 sessions
+carrying FIX~5.0 application messages, and the session layer in Rust.
+\end{build}
+
+\begin{omsources}
+\item FIX Trading Community, FIX Latest (Extension Pack 312) message and field dictionary, as published by the Orchimate
+browser (fields 7, 8, 9, 10, 16, 34, 35, 36, 43, 49, 52, 56, 108, 112, 123; messages 0, 1, 2, 4, 5, 8, A, D, 9).
+\item FIX Trading Community, \emph{FIX Performance Session Layer (FIXP)} specification (GitHub, versions 1.0 and 1.1).
+\item Wikipedia, ``Financial Information eXchange'' (history; the worked body-length and checksum example).
+\item Coinbase Developer Documentation, Exchange FIX API: connectivity.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:1}
+Compute the body length and checksum of the \omterm{def:ll:protocols-i-fix:session}{heartbeat} \texttt{8=FIX.4.4|9=?|35=0|49=A|56=B|34=2|52=20260925-14:30:00.000|10=?|},
+where \texttt{|} is SOH, and check your answer with \texttt{firm\_fixengine.encode}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:2}
+With a \omterm{def:ll:protocols-i-fix:session}{heartbeat} interval of 30 seconds and the build's rules, the broker falls silent at 10:00:00. When does our session send a
+test request, and when does it declare the connection dead if nothing comes back?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:3}
+Our session expects sequence number 52 and receives 57. What does it send, what does it do with message 57, and what must the
+broker send back?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:4}
+Give two different, well-formed messages of the same length with the same checksum, and explain with
+\cref{prop:ll:protocols-i-fix:checksum} why the protocol accepts the risk.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:5}
+Why are \omterm{def:ll:protocols-i-fix:session}{heartbeats} and test requests gap-filled instead of sent again? What would go wrong if they were resent?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:6}
+A gateway receives 200\,000 execution reports a second at peak. Using the measured costs, how much of a core does parsing take
+with the zero-copy view, the map-based parser and the Python reference?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-i-fix:7}
+\emph{Coding.} Make the Python and C++ sessions answer a message whose tag is not a number with a Reject (35=3) carrying
+RefSeqNum (45), without advancing past it, and add the case to the golden conversation so that both traces still agree.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-i-fix:8}
+\emph{Find the flaw.} ``To keep things simple our engine resets both sequence numbers to 1 at every reconnection, so it never
+needs resend logic.''
+\end{exercise}
+
+\section{Problem: The Weekend Gap}
+
+\begin{problem}[{Weekend problem --- resynchronising after a disconnection}]\label{pb:ll:protocols-i-fix:1}
+A broker's engine keeps writing to its store the messages of a session whose connection to us is down, and resends them when
+we reconnect. Assume messages of 205 bytes, a 1~Gb/s link with a round trip of \qty{1}{\milli\second}, a \omterm{def:ll:protocols-i-fix:session}{heartbeat} interval of
+30 seconds, and the measured parsing costs (\texttt{measured\_fix.csv}). Consider two disconnections: a busy one, a link that
+dies silently while the broker sends 200 execution reports a second, and a quiet one, 48 hours over a weekend with one
+application message an hour and a \omterm{def:ll:protocols-i-fix:session}{heartbeat} whenever 30 seconds pass without one.
+
+\medskip\noindent\textbf{Part I --- The busy outage.}
+\begin{enumerate}
+\item How long does the build's session take to notice the dead link, and why?
+\item How many messages must the broker resend (\texttt{ll\_fix.sender\_stream})? How many are \omterm{def:ll:protocols-i-fix:session}{heartbeats}?
+\item How many bytes is that, and how long do they take on the wire?
+\item How long does resynchronising take with the C++ engine, and with the Python reference?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The quiet weekend.}
+\begin{enumerate}[resume]
+\item How many messages sit in the broker's store for us after 48 hours? How many are application messages?
+\item How many messages does the answer to our \omterm{def:ll:protocols-i-fix:session}{resend request} contain, with \omterm{def:ll:protocols-i-fix:session}{gap fill} and without?
+\item How long does resynchronising take with the Python reference, each way?
+\item Why does \omterm{def:ll:protocols-i-fix:session}{gap fill} change nothing in the busy case?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The design.}
+\begin{enumerate}[resume]
+\item Why may administrative messages never be resent as they were?
+\item What must the application do with a resent execution report marked PossDupFlag?
+\item A venue that supports no \omterm{def:ll:protocols-i-fix:session}{resend requests} starts a new session at each connection. How do you learn about fills that
+happened while you were disconnected?
+\item What must the engine persist to survive its own restart without a gap?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: messages resent and time to resynchronise in both cases, with and without \omterm{def:ll:protocols-i-fix:session}{gap fill}.
+\item Would a 1-second \omterm{def:ll:protocols-i-fix:session}{heartbeat} interval help the busy case? At what cost?
+\item What if the broker's store kept only its last 10\,000 messages?
+\item Should the strategy act on resent execution reports as if they had just happened?
+\item How would you test the resend logic before connecting to a broker?
+\item Can the Python reference keep up with the busy session in normal running?
+\item Which of the two cases would you design the engine for?
+\item In one sentence: what is the session layer for?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:1}
+Describe the structure of a FIX message. How does a receiver know where a message ends?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:2}
+Walk through what happens when a \omterm{def:ll:protocols-i-fix:session}{FIX session} detects a gap in incoming sequence numbers.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:3}
+How would you write a FIX parser that does not allocate? What does it return?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:4}
+What are \omterm{def:ll:protocols-i-fix:session}{heartbeats} and test requests for, and how would you choose the \omterm{def:ll:protocols-i-fix:session}{heartbeat} interval?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:5}
+Why do many venues use binary protocols for order entry instead of FIX tag-value? What do they give up?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:protocols-i-fix:6}
+Your engine restarted in the middle of the day and the broker says your sequence number is too low. What happened, and how do
+you recover without losing or duplicating fills?
+\end{interviewq}

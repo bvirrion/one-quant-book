@@ -1,0 +1,459 @@
+\chapter{Order Gateway and Order Management}\label{ch:ll:order-gateway-and-order-management}
+
+A strategy cancels a resting buy order of 100 lots and, in the same microsecond, sends its replacement one tick lower. On the
+way to the exchange the cancel crosses a fill: a seller has just taken the old order. The exchange rejects the cancel as too
+late, accepts the new order, and a second seller takes it too. For the few microseconds between the strategy's decision and the
+fill report, the firm held twice the position it believed it held, and a gateway that counted only the orders it knew to be
+live would have let the strategy send a third. Nothing in this story is a bug in the ordinary sense: every message was valid,
+and every party did what the protocol says. It is what happens when two machines a network apart each change an order's state
+without waiting for the other. This chapter builds the component that keeps the firm's view of its orders honest while
+this goes on: the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}, with a state machine that has names for ``I asked and have not heard back'', an exposure count
+that assumes the worst about every order still in flight, a throttle that keeps the venue's message budget, and a
+reconciliation against the exchange's own copy of the day.
+
+\section{The order state machine}
+
+\begin{definition}[Order gateway, order state machine]\label{def:ll:order-gateway-and-order-management:gateway}
+An \emph{order gateway}\index{order gateway} is the component between a firm's strategies and a venue's order-entry session:
+it turns the strategies' requests into the venue's messages, the venue's reports into order states, and refuses what the firm's
+limits or the venue's rules forbid. An \emph{order state machine}\index{order state machine} is the set of states an order can
+be in, as the firm sees it, with the events that move it from one to another; the firm's view includes the \emph{pending}
+states, entered when the firm has sent a request and not yet heard its answer.
+\end{definition}
+
+The venue's order has few states: live, partially filled, and then filled, cancelled or expired (Book 10's simulator, its
+\texttt{PROTOCOL.md}). The firm's has more, because the firm is always a little behind. After it sends a new order, the order is
+\emph{pending new} until the acknowledgement arrives; after it asks for a cancel or a replace, it is \emph{pending cancel} or
+\emph{pending replace} until the answer arrives, and in the meantime the order can still fill. FIX names the same states in its
+order status field (\emph{PendingNew}, \emph{PendingCancel}, \emph{PendingReplace}, next to \emph{New}, \emph{PartiallyFilled},
+\emph{Filled}, \emph{Canceled} and \emph{Rejected}; chapter~15): the protocol itself admits that the two sides disagree for a
+while. \Cref{fig:ll:order-gateway-and-order-management:states} draws the firm's machine.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,st/.style={draw,rounded corners=3pt,minimum width=1.9cm,minimum height=0.62cm,
+  align=center,fill=omDef!12},pend/.style={st,fill=omMeth!18,dashed},term/.style={st,fill=gray!12,double}]
+\node[pend] (pn) at (0,0) {pending new};
+\node[st] (live) at (3.3,0) {live};
+\node[st] (part) at (6.6,0) {partial};
+\node[term] (fil) at (9.9,0) {filled};
+\node[term] (rej) at (0,-2.4) {rejected};
+\node[pend] (pc) at (3.3,-2.4) {pending cancel};
+\node[pend] (pr) at (6.6,-2.4) {pending replace};
+\node[term] (cxl) at (9.9,-2.4) {cancelled};
+\draw[->] (pn) -- node[above]{ack} (live);
+\draw[->] (live) -- node[above]{fill} (part);
+\draw[->] (part) -- node[above]{last fill} (fil);
+\draw[->] (pn) -- node[left]{reject} (rej);
+\draw[->] (live) -- node[left,align=right]{cancel\\ sent} (pc);
+\draw[->] (part) -- node[right,align=left]{replace\\ sent} (pr);
+\draw[->] (pr.north west) -- node[below,sloped]{replaced} (live.south east);
+\draw[->] (pr) -- node[above]{cancelled} (cxl);
+\draw[->,omThm,thick] (pr.north east) -- node[below,sloped,text=omThm]{last fill} (fil.south west);
+\draw[->] (pc.south) -- ++(0,-0.7) -| node[pos=0.25,above]{cancelled} (cxl.south);
+\draw[->,draw=omThm,thick] ([xshift=-4mm]pc.south) |- node[pos=0.75,below,text=omThm]{last fill, then ``too late''}
+  (11.5,-3.9) |- (fil.east);
+\draw[->,omThm,thick] (pc.west) .. controls +(-0.9,0.8) and +(-0.2,0.9) .. node[pos=0.3,above left,text=omThm,inner sep=1pt]{partial fill} ([xshift=-6mm]pc.north);
+\end{tikzpicture}
+
+\omcaption{The firm's view of an order. Dashed boxes are the pending states, entered when a request is sent and left when its
+answer arrives; in red, the fills that reach an order after the firm has asked to cancel it. Not drawn: every open state can also be
+cancelled by the venue on its own (a lost connection, a halt, an expiry), and pending new can fill or be cancelled before
+its acknowledgement. Only the terminal states, doubled, are final; the table of \cref{lst:ll:order-gateway-and-order-management:table} is the whole
+machine.}\label{fig:ll:order-gateway-and-order-management:states}
+\end{omfigure}
+
+The build writes the machine as a table, one row per state and one column per event, with a marker for the transitions that
+are not allowed (\cref{lst:ll:order-gateway-and-order-management:table}). A table has three advantages over a nest of
+conditions. It is complete by construction: every pair of state and event has an entry, so the question ``what if a fill
+arrives while a replace is pending?'' has an answer that someone wrote down. It is data: the Python reference, the C++ gateway
+and the Rust gateway each hold a copy, and the tests check that the three copies are the same table, entry for entry,
+against \texttt{data/table.txt}. And an impossible event is detected, not absorbed: a report that the table does not allow
+is returned as an error, which is how the first version of the build found that it had no arrow from \emph{live} to
+\emph{cancelled}. The venue cancels orders on its own when a session is lost, when trading halts or when an order expires, and
+the conformance test against Book 10's live server, which cuts a connection on purpose, hit the missing entry on its first run.
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{28}{38}{The order state machine as a table: the next state for every state
+and event, and a marker for what is not allowed.}\label{lst:ll:order-gateway-and-order-management:table}
+
+A replace deserves a word. The simulator, like most venues, gives the replaced order a new client identifier, and the gateway
+keeps the order's history under it; while the replace is pending, the order can fill under its old identifier, so the gateway
+keeps both until the answer arrives. Whether the order keeps its place in the queue is the venue's rule (the report says
+whether priority was kept); the gateway only records it.
+
+\section{Acknowledgements, in-flight orders and races}
+
+\begin{definition}[In-flight order, cancel--fill race]\label{def:ll:order-gateway-and-order-management:inflight}
+An \emph{in-flight order}\index{in-flight order} is an order in a pending state: a request about it has been sent and its
+answer has not arrived, so the order may have changed at the venue in ways the firm does not know yet. A \emph{cancel--fill
+race}\index{cancel--fill race} occurs when a fill and a request to cancel or replace the same order cross: the fill happens at
+the venue before the request arrives there, and its report reaches the firm after the request was sent.
+\end{definition}
+
+\Cref{fig:ll:order-gateway-and-order-management:race} draws one. The strategy sends its cancel at time $c$; it arrives at the
+venue a one-way latency $L$ later; each fill report takes $d$ to come back. Any fill in the interval from $c - d$ to $c + L$
+races the cancel: the fills before $c - d$ were known when the strategy decided, and the ones after $c + L$ cannot happen,
+because the order is gone. If fills arrive at a Poisson rate $\lambda$ on a resting order, the probability that a cancel meets
+at least one is
+\[
+P(\text{race}) = 1 - e^{-\lambda (L + d)} \approx \lambda (L + d),
+\]
+as long as the order has rested longer than $L + d$ before the cancel (an order cancelled sooner has had less time exposed, and
+the weekend problem computes the exact probability). The race is not a failure of the venue or of the gateway. It is the
+latency of the path, seen from the order's point of view, and the only ways to make it rarer are to shorten the path or to
+cancel less.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[thick] (0,0) node[above]{strategy and gateway} -- (0,-4.4);
+\draw[thick] (6.4,0) node[above]{venue} -- (6.4,-4.4);
+\fill[omThm!12] (6.3,-1.1) rectangle (6.5,-2.9);
+\draw[gray] (6.3,-1.1) -- (6.5,-1.1) node[pos=0,left,gray]{$c - d$};
+\draw[->,omDef,thick] (0,-1.9) node[left]{cancel sent, $c$} -- node[above,sloped,pos=0.22]{cancel, latency $L$} (6.4,-2.9);
+\draw[->,omThm,thick] (6.4,-1.6) node[right]{fill} -- node[above,sloped,pos=0.4]{fill report, delay $d$} (0,-2.9);
+\node[left,align=right] at (0,-2.9) {fill arrives:\\ state pending cancel};
+\draw[->,omDef] (6.4,-2.9) -- node[below,sloped,pos=0.35]{``too late''} (0,-3.9);
+\node[right,align=left,omDef] at (6.4,-3.25) {cancel arrives at $c + L$:\\ nothing left to cancel};
+\node[left] at (0,-3.9) {filled};
+\draw[decorate,decoration={brace,amplitude=4pt}] (7.1,-1.1) -- node[right=4pt,align=left]{a fill here races the\\ cancel: from $c - d$\\ to $c + L$} (7.1,-2.9);
+\end{tikzpicture}
+
+\omcaption{A \omterm{def:ll:order-gateway-and-order-management:inflight}{cancel--fill race}. The cancel leaves at $c$ and arrives $L$ later; a fill at the venue between $c - d$ and $c + L$
+is reported after the cancel was sent. The gateway, in the state \emph{pending cancel}, applies the fill and then the ``too
+late'' answer, and ends in \emph{filled}.}\label{fig:ll:order-gateway-and-order-management:race}
+\end{omfigure}
+
+The build measures it. \texttt{firm\_ordergw\_sim.py} runs the Python gateway against Book 10's matching engine: a strategy
+keeps one buy order working, holds it for an exponentially distributed time of mean \qty{1}{\milli\second} and cancels it; a
+counterparty sells into it at random, 200 times a second; every report takes \qty{20}{\micro\second} to come back.
+\Cref{fig:ll:order-gateway-and-order-management:races} gives the fraction of cancels that met a fill, for one-way latencies
+from \qty{10}{\micro\second} to \qty{3}{\milli\second}. At \qty{100}{\micro\second}, 2.1\% of the cancels raced, against 2.2\%
+from the exact formula; at \qty{10}{\micro\second} it is 0.65\%. At \qty{1}{\milli\second} the simple formula would say 18\%
+and the engine says 12\%: the orders are held for about as long as the path takes, so the window is often shorter than $L + d$.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,xmin=8,xmax=4000,ymin=0,ymax=0.5,
+  xlabel={one-way latency of the cancel $L$ ($\mu$s)},ylabel={fraction of cancels that raced},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\scriptsize,cells={anchor=west}},table/col sep=comma,
+  yticklabel style={/pgf/number format/fixed}]
+\addplot[omMeth,thick,dashed] table[x=latency_us,y=rested]{figdata/low-latency/21-order-gateway-and-order-management/race_curves.csv};
+\addlegendentry{$1 - e^{-\lambda (L + d)}$ (orders rested at least $L + d$)}
+\addplot[omDef,thick] table[x=latency_us,y=exact]{figdata/low-latency/21-order-gateway-and-order-management/race_curves.csv};
+\addlegendentry{exact, orders held \qty{1}{\milli\second} on average}
+\addplot[only marks,mark=*,omThm,mark size=2.2pt] table[x=latency_us,y=simulated]{figdata/low-latency/21-order-gateway-and-order-management/races.csv};
+\addlegendentry{gateway against the matching engine}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:order-gateway-and-order-management:inflight}{Cancel--fill races} against the latency of the cancel, with fills at $\lambda = 200$ per second and reports
+delayed $d = \qty{20}{\micro\second}$. The points are the Python gateway against Book 10's matching engine (two seeded runs of
+2\,000 orders each per point); the solid curve is the exact probability for orders held \qty{1}{\milli\second} on average,
+the dashed one the formula for orders that have rested at least $L + d$ when cancelled. Data: \texttt{fig\_races.py}
+(deterministic).}\label{fig:ll:order-gateway-and-order-management:races}
+\end{omfigure}
+
+What the gateway does with a race decides whether it is harmless. The hook's story is the classic failure: the gateway counted
+an order as gone when it \emph{sent} the cancel, so the replacement fitted under the position limit, and both filled. The rule
+that prevents it is \emph{worst-case accounting}: until the venue has answered, an order counts for everything it could still
+do. An order pending cancel counts its whole remaining quantity; an order pending replace counts the larger of its old and its
+new quantity, because either may fill; an order pending new counts in full. The long exposure is then the position plus the
+worst remaining quantity of every open buy order, and a new order is sent only if it fits under the limit on top of it. With a
+limit of 100 lots, the hook's gateway refuses the replacement until the cancel's answer arrives, and the firm's position never
+exceeds 100. The price is paid in opportunity: for one round trip, the strategy cannot use the quantity it is trying to
+withdraw.
+
+The gateway keeps this exposure as running sums, one per side, updated whenever an order changes: take the order's worst
+remaining quantity out, change the order, put it back (\cref{lst:ll:order-gateway-and-order-management:change}). The check
+before a new order is then one addition and one comparison (\cref{lst:ll:order-gateway-and-order-management:new}), whatever
+the number of open orders. A gateway that recomputes the exposure by walking its orders pays for every one of them on every
+new order: \cref{fig:ll:order-gateway-and-order-management:exposure} measures about \qty{0.4}{\micro\second} for a thousand
+open orders kept in an array and about \qty{1.6}{\micro\second} in a hash map, where the running sums cost less than the timer
+can resolve. A market maker quoting a few hundred instruments has thousands of open orders all day.
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{218}{225}{Worst-case exposure kept as running sums: every change to an order
+goes through \texttt{change}.}\label{lst:ll:order-gateway-and-order-management:change}
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{83}{98}{A new order: the exposure check against the worst case, the throttle,
+then the venue's message written in place with the codec of chapter~16.}\label{lst:ll:order-gateway-and-order-management:new}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,xmode=log,ymode=log,xmin=0.7,xmax=15000,ymin=0.5,ymax=40000,
+  xlabel={open orders},ylabel={exposure check (ns)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=north west,legend style={font=\scriptsize,cells={anchor=west}},
+  table/col sep=comma]
+\addplot[omThm,thick,mark=square*] table[x=open_orders,y=map_ns]{figdata/low-latency/21-order-gateway-and-order-management/measured_exposure.csv};
+\addlegendentry{scan of a hash map}
+\addplot[omMeth,thick,mark=*] table[x=open_orders,y=array_ns]{figdata/low-latency/21-order-gateway-and-order-management/measured_exposure.csv};
+\addlegendentry{scan of an array}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost of the worst-case exposure check before each new order, recomputed by scanning the open orders, against
+their number (median of timed calls). Kept as running sums, as in \texttt{firm.ordergw}, it costs one addition, below the
+timer's resolution at every size. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2. Data:
+\texttt{bench\_gateway.py}.}\label{fig:ll:order-gateway-and-order-management:exposure}
+\end{omfigure}
+
+The same benchmark times the gateway's whole work for each step of an order's life: writing a new order, applying its
+acknowledgement, a partial fill, writing the cancel and applying its answer, each decoded from the venue's binary report.
+Every step costs 4 to \qty{5}{\nano\second} at the median and 5 to \qty{6}{\nano\second} at the 99th
+percentile: the gateway's logic is not where the microseconds of an order's path go. They go to the network and the kernel
+(chapter~13 and One Quant Book~14), and to the risk checks of the next chapter.
+
+\section{Throttles and message budgets}
+
+\begin{definition}[Token bucket]\label{def:ll:order-gateway-and-order-management:bucket}
+A \emph{token bucket}\index{token bucket} is a rate limiter that holds up to $b$ tokens and gains $r$ tokens a second; a
+message may be sent only if a token is available, and sending it spends one. It allows bursts of up to $b$ messages and, over
+any interval of length $T$, at most $b + rT$ messages.
+\end{definition}
+
+Venues limit how many messages a session may send: a rate per second, sometimes a burst, sometimes a weight per message type
+or a ratio of orders to trades (the message throttle of One Quant Book~11, chapter~10, and Book 10's simulator, which rejects
+the excess with reason \texttt{T}). A gateway that relies on the venue to enforce the limit learns about it from rejections,
+after the fact, and a venue may disconnect a session that keeps exceeding it. The gateway therefore keeps its own budget, set
+a little below the venue's, and refuses locally what would be rejected remotely. The build's bucket counts in integer
+nano-tokens, so that the Python, C++ and Rust gateways agree to the last message on the same journal
+(\cref{lst:ll:order-gateway-and-order-management:bucket}).
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{43}{50}{The token bucket in integer nano-tokens: refill for the time elapsed,
+then spend one token or refuse.}\label{lst:ll:order-gateway-and-order-management:bucket}
+
+What to do with a refused message is the strategy's decision, not the gateway's. A cancel refused by the throttle is the worst
+case: the order stays in the market while the strategy wanted it out. Gateways therefore keep part of the budget for cancels,
+or let cancels through ahead of new orders when the budget is short; the build's gateway reports the reason for each refusal
+(throttle, exposure, state) so that the strategy can tell a full budget from a limit. The build's replace fixture runs a
+strategy that replaces its order every millisecond on average against a budget of 300 messages a second with a burst of two:
+the gateway refuses 111 of its requests for the budget, and the strategy retries.
+
+\section{Sessions: login, sequence numbers, cancel on disconnect}
+
+The venue's order-entry session (Book 10, chapter~26) carries the gateway's messages. Book 10's simulator speaks SoupBinTCP:
+the client logs in with a user name and a password; its messages go unsequenced; the server's reports are sequenced, numbered
+from one per session, but the numbers are not on the wire: each side counts. A client that loses its connection logs in again
+asking for the next report it has not seen, and the server replays every report from that number. The client's half of the
+protocol is short (\cref{lst:ll:order-gateway-and-order-management:session}): count the sequenced messages, ask for the next
+one at login, check that the server starts there, send a \omterm{def:ll:protocols-i-fix:session}{heartbeat} after a second of silence, and consider the server dead
+after fifteen.
+
+\omcode{code/firm/ordergw/firm_ordergw.py}{291}{305}{The client side of the order-entry session: a login accepted at the
+wrong sequence number is an error, not a detail.}\label{lst:ll:order-gateway-and-order-management:session}
+
+A lost connection is where worst-case accounting earns its keep. While the gateway is disconnected, it does not know what its
+orders are doing: they may be filling, or the venue may have cancelled them. Most venues offer, and many require, a cancel on
+disconnect: the venue cancels the session's resting orders when it detects that the connection is lost (the simulator does it
+by default, with cancel reason \texttt{D}). The gateway still counts them in full until the reports say otherwise, because
+cancel on disconnect is a feature of the venue, not a guarantee to the firm: it acts only on the orders it covers, when it
+detects the loss, and a fill can precede it. The conformance test does exactly this against Book 10's live server on the
+loopback interface: three orders go out, one fills, the connection is cut, the exposure stays at 300 lots while the gateway is
+away, and after the new login the replayed reports cancel the other two and bring it back to 100.
+
+\begin{dated}{2026-09}{Cancel on disconnect and drop copy at one exchange}\label{dat:ll:order-gateway-and-order-management:cme}
+CME Group's client documentation (consulted September 2026) describes Cancel On Disconnect for its iLink order-entry
+sessions: when a lost connection is detected, it cancels all resting futures and options orders of the disconnected session,
+except good-till-cancelled and good-till-date orders, and new sessions are created with it enabled by default. Its Drop Copy
+service sends real-time copies of the execution reports and acknowledgements sent over iLink sessions on a separate,
+dedicated path.
+\end{dated}
+
+\section{Drop copies and reconciliation}
+
+\begin{definition}[Drop copy]\label{def:ll:order-gateway-and-order-management:dropcopy}
+A \emph{drop copy}\index{drop copy} is a separate session on which the venue sends copies of the reports of a firm's trading
+sessions (at least its executions and cancellations) as it sends the originals; it is read-only, and serves as an independent
+record of the firm's orders and fills.
+\end{definition}
+
+The gateway's view of the firm's orders is built from the reports it received, applied in order; any lost, duplicated or
+misapplied report makes it wrong, and a wrong view is found only by comparing it with another. The \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} is that other
+view, from the venue, on a different connection, often read by a different process (Book 10's simulator offers one session of
+this kind per firm). Reconciliation compares the two: for every order, the filled quantity and whether it was cancelled
+(\cref{lst:ll:order-gateway-and-order-management:reconcile}). Each difference is a \emph{break}, and a break is investigated,
+not fixed by overwriting one side: an order the \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} shows filled and the gateway shows live is a lost report and an
+unknown position; the opposite is a report applied twice.
+
+\omcode{code/firm/ordergw/firm_ordergw.py}{189}{203}{Reconciliation against the drop copy: filled quantities and cancellations,
+order by order; every difference is a break.}\label{lst:ll:order-gateway-and-order-management:reconcile}
+
+In the build, every simulated run and the live test end with zero breaks, and the property tests make sure that this is not
+luck: over random interleavings of fills, cancels, replaces and latencies from \qty{5}{\micro\second} to \qty{2}{\milli\second},
+no order ever has more filled than ordered, no remaining quantity is negative, the position equals the sum of the fills, and
+the worst-case exposure is never below the position; and with a limit of 100 lots, the position against the matching engine
+never exceeds 100. The firm reconciles at several speeds: continuously against the \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy}, every morning against
+the broker's records (One Quant Book~1, chapter~7), and the order management system above the gateway (Book~10,
+chapter~20) against the portfolio's books.
+
+\section{Tutorial: races, throttles and a reconciliation}\label{tut:ll:order-gateway-and-order-management:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run the gateway against the matching engine, count its races, replay its journal in three languages, and
+reconcile it against the \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} of a live session. \textbf{End state:}
+\cref{fig:ll:order-gateway-and-order-management:races}, the replays equal to \texttt{data/expected.txt}, and a reconciliation
+with zero breaks.
+\begin{tutsteps}
+\item \textbf{Races.} \texttt{python fig\_races.py} runs \texttt{firm\_ordergw\_sim.run} at six latencies and writes the
+fractions of \cref{fig:ll:order-gateway-and-order-management:races}, next to the exact formula of \texttt{ll\_gateway.py}.
+\item \textbf{Journals.} \texttt{make\_ordergw\_fixtures.py} records two runs (cancel and new; cancel--replace under a tight
+budget) as journals of requests and reports; the C++ and Rust gateways replay them, re-making every request with the same
+result, and print the summaries the Python reference printed. The C++ test also feeds the reports as encoded binary messages,
+and counts no allocation.
+\item \textbf{Session.} \texttt{tests/test\_live\_session.py} starts Book 10's live server, logs in a trading session, a \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop
+copy} and a counterparty, cuts the trading session's connection, logs in again, and reconciles.
+\item \textbf{Costs.} \texttt{python bench\_gateway.py} times each step of an order's life and the exposure check against the
+number of open orders.
+\end{tutsteps}
+\textbf{What to change next.} Lower the replace fixture's budget to 100 messages a second and watch the refusals; make the
+counterparty's fills arrive in bursts instead of at a constant rate and compare the race count with the formula.
+\end{tutorial}
+
+\section{Build: the order gateway}\label{bld:ll:order-gateway-and-order-management:ordergw}
+
+\begin{build}
+\bfield{Purpose} The firm's single path to the venue's order entry: every order from the strategy engine (chapter~20) passes
+through it, after the risk gate (chapter~22); its journal is logged (chapter~23), and its state survives a failover
+(chapter~24).
+\bfield{Interface} Python reference \texttt{firm\_ordergw}: \texttt{TABLE}, \texttt{transition}, \texttt{TokenBucket},
+\texttt{Gateway(rate, burst, max\_long, max\_short)} with \texttt{new}, \texttt{cancel}, \texttt{replace}, \texttt{on\_report},
+\texttt{worst\_long}, \texttt{worst\_short}, \texttt{races}; \texttt{Session}, \texttt{frames}, \texttt{reconcile},
+\texttt{replay}, \texttt{summary}; \texttt{firm\_ordergw\_sim.run} against Book 10's engine. C++20 \texttt{firm::ogw}:
+\texttt{Gateway(Limits)} with \texttt{new\_order}, \texttt{cancel}, \texttt{replace} writing the venue's messages in place,
+\texttt{on\_report} and \texttt{on\_wire}, \texttt{summary}. Rust \texttt{firm\_ordergw}: \texttt{Gateway}, \texttt{replay}.
+\bfield{Rules} Every open order counts for the worst it can still do; nothing is sent past the exposure limit or the budget;
+a report the table does not allow is an error; an order is kept until a terminal report; the three gateways hold the same
+table; no allocation per message.
+\bfield{Acceptance tests} \texttt{code/firm/ordergw/}: the table identical in three languages; both journals replayed to the
+committed summaries in Python, C++ (from fields and from the wire) and Rust; property tests over random runs against the
+matching engine; the exposure limit held against the engine; the naive gateway's double position reproduced and refused by
+worst-case accounting; the race fraction within a point of the formula; the live session with cancel on disconnect, replay
+and a zero-break reconciliation.
+\bfield{Stretch} Mass cancel and mass quotes; a budget reserved for cancels; the session layer in C++ on Book 10's
+\texttt{exchsim\_client.hpp}; \omterm{def:ll:protocols-i-fix:session}{FIX sessions} through the engine of chapter~15.
+\end{build}
+
+\begin{omsources}
+\item CME Group Client Systems Wiki, \emph{Cancel on Disconnect}, and \emph{Drop Copy 4.0 Service for iLink}.
+\item FIX Trading Community, FIX Latest, code set \emph{OrdStatus}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:1}
+An order is pending cancel. A fill for its whole remaining quantity arrives, then the venue's rejection of the cancel as too
+late. Give the order's state after each report, and say what the gateway should count as its remaining quantity in between.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:2}
+A \omterm{def:ll:order-gateway-and-order-management:bucket}{token bucket} gains 300 tokens a second and holds at most 2; it is full at time 0. Messages are sent at 0, 0, 0, 1, 4 and
+5 milliseconds. Which go through?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:3}
+The long limit is 500 lots. The position is 200 lots long, and two buy orders of 100 lots are live. The strategy asks to
+replace one of them with a buy of 300. Does the gateway send the replace? What is the largest new quantity it would send?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:4}
+Fills arrive at 50 per second on a resting order, the cancel takes \qty{300}{\micro\second} to reach the venue and reports
+take \qty{50}{\micro\second} to come back. What fraction of cancels race a fill? How many races should a strategy that cancels
+20\,000 orders a day expect?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:5}
+The \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} shows two executions of 60 lots for order 17, both with match number 88\,412; the gateway shows order 17 filled
+for 60. Which side is wrong, and what should the reconciliation have done?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:6}
+A gateway recomputes the exposure by scanning a hash map of its open orders before each new order. With a thousand open orders,
+what does that add to each order according to \cref{fig:ll:order-gateway-and-order-management:exposure}, and how does it compare
+with the gateway's own work per message?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:order-gateway-and-order-management:7}
+\emph{Coding.} Add mass cancel to the gateway: one request that cancels every open order of a side. Which states does each order
+enter, what does the exposure count until the answers arrive, and how do you test it against Book 10's engine?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:order-gateway-and-order-management:8}
+\emph{Find the flaw.} ``To keep the order table small, our gateway frees an order's slot as soon as it sends the cancel: the
+strategy does not want the order any more.''
+\end{exercise}
+
+\section{Problem: The Cancel That Crossed a Fill}
+
+\begin{problem}[{Weekend problem --- the window in which a cancel can lose}]\label{pb:ll:order-gateway-and-order-management:1}
+A market maker quotes buy orders of 100 lots, holds each for a millisecond on average and then cancels it. Fills arrive at
+$\lambda = 200$ per second on a resting order, reports take $d = \qty{20}{\micro\second}$ to come back, and the cancel takes
+$L$ to reach the venue. Use \cref{fig:ll:order-gateway-and-order-management:races} (\texttt{races.csv}).
+
+\medskip\noindent\textbf{Part I --- The window.}
+\begin{enumerate}
+\item Explain why a fill at the venue between $c - d$ and $c + L$ races a cancel sent at $c$, and why fills outside that
+interval do not.
+\item Derive $P(\text{race}) = 1 - e^{-\lambda(L + d)}$ for an order that has rested at least $L + d$ when the cancel is sent.
+\item Compute it for $L = \qty{10}{\micro\second}$, \qty{100}{\micro\second} and \qty{1}{\milli\second}.
+\item Show that it is approximately $\lambda (L + d)$ when that product is small, and say how small.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The measurement.}
+\begin{enumerate}[resume]
+\item Read the simulated fractions at the same three latencies from the figure's data.
+\item Why does the simple formula overestimate them at \qty{1}{\milli\second}?
+\item For an order held a time $h$, the window is $\min(h, L + d)$. What happens to the race probability as $L$ grows much
+larger than the holding time?
+\item The committed cancel journal (latency \qty{100}{\micro\second}) has 6 races in 245 cancels. Is that consistent with the
+figure?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The damage.}
+\begin{enumerate}[resume]
+\item A naive gateway counts an order as gone when it sends the cancel, and the strategy sends a replacement at once. What
+position can the firm reach after one race, with a limit of 100 lots?
+\item With $n$ races whose replacements are all still working, what is the worst over-position?
+\item What does worst-case accounting do instead, and what does it cost the strategy?
+\item At \qty{100}{\micro\second}, how many races does a strategy that cancels 40\,000 times a day expect?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the race probability per cancel, and the worst over-position without in-flight
+accounting.
+\item Which two quantities does a firm control to reduce races, and which does it not?
+\item Why does halving the one-way latency not halve the races when $d$ is large?
+\item Why is a race not an error to be reported to the venue?
+\item Why must the gateway keep a cancelled order in its table until the terminal report?
+\item What does a replace change in the analysis?
+\item How would you check, on a production day, that the races observed match the formula?
+\item In one sentence: what is the rule that makes races harmless?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:order-gateway-and-order-management:1}
+What states does an order go through in an \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}, and why are there more than at the exchange?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:order-gateway-and-order-management:2}
+You send a cancel and receive a fill for the same order. What happened, and what should your system do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:order-gateway-and-order-management:3}
+Implement a rate limiter for an exchange session. What do you do with a cancel when the budget is exhausted?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:ll:order-gateway-and-order-management:4}
+Your connection to the exchange drops for two seconds. What do you know about your orders, and what do you do when you
+reconnect?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:order-gateway-and-order-management:5}
+How do you check a position limit in constant time with thousands of open orders?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:order-gateway-and-order-management:6}
+Design the order management layer for a market maker on three venues. What is the source of truth for positions, and how do
+you know it is right?
+\end{interviewq}

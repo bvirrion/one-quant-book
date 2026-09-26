@@ -1,0 +1,29 @@
+# 13. Metaorders, Latent Liquidity and Cross-Impact — brief and source ledger
+
+## Brief
+
+- **Hook.** Why should impact grow like the square root of size, whatever the stock, the decade or the market? The answer most models now give is that the book a trader sees is a small part of the liquidity that exists: the rest is latent, waiting to be revealed at prices a large order has not yet reached.
+- **Sections.** Why impact is concave; Latent liquidity and the locally linear book; Fair pricing and the end of a metaorder; Cross-impact; Arbitrage-free cross-impact.
+- **Defines.** latent liquidity, latent order book, locally linear order book, fair pricing condition, cross-impact, cross-impact matrix.
+- **Uses (defined earlier).** metaorder (B7.9), square-root impact law (B7.27), permanent impact (B7.27), propagator model (ch12), no-dynamic-arbitrage condition (ch12), impact curve (ch11), Kyle model (ch4), covariance matrix (B4.22), principal component analysis (B4.22), factor model (B4.22), order-flow imbalance (B7.8).
+- **Tutorial.** Simulate a latent-order-book market (reaction-diffusion of latent orders) and recover a square-root impact from its linear book; check the fair-pricing condition on metaorders of random length; estimate cross-impact on two correlated simulated assets and project it onto the arbitrage-free set. Data: simulated.
+- **Build.** `firm.crossimpact`: latent-order-book simulator, fair-pricing check, cross-impact estimation (returns on order-flow imbalances, eigenliquidity decomposition), symmetrisation and positive-definite projection; Python.
+- **Weekend problem.** Selling the stock, moving its neighbour -- named result: the share of each asset's price move explained by the other asset's order flow, and the cost saved by a cross-impact-aware liquidation.
+- **Facts to verify.** Donier, Bonart, Mastromatteo, Bouchaud 2015 a fully consistent, minimal model for non-linear market impact (QF); Farmer, Gerig, Lillo, Waelbroeck 2013 how efficiency shapes market impact (QF); Benzaquen, Mastromatteo, Eisler, Bouchaud 2017 dissecting cross-impact on stock markets (J. Stat. Mech.); Schneider and Lillo 2019 cross-impact and no-dynamic-arbitrage (QF); Pasquariello and Vega 2015 strategic cross-trading in the US stock market (Review of Finance); Bucci et al. 2019 crossover from linear to square-root market impact (PRL).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | J. Donier, J. Bonart, I. Mastromatteo and J.-P. Bouchaud, "A fully consistent, minimal model for non-linear market impact", Quantitative Finance 15(7) (2015) 1109-1121 | Crossref record | https://doi.org/10.1080/14697688.2015.1040056 | 2026-09-25 | bibliographic record | §2, omsources |
+| F2 | J. D. Farmer, A. Gerig, F. Lillo and H. Waelbroeck, "How efficiency shapes market impact", Quantitative Finance 13(11) (2013) 1743-1758: a fair pricing condition, the average transaction price of a metaorder equal to the price after trading is completed | Crossref record; abstract of the working paper (SSRN 2235751) | https://doi.org/10.1080/14697688.2013.848464 | 2026-09-25 | "derive a fair pricing condition, which says that the average transaction price of the metaorder is equal to the price after trading is completed" | §3, omsources |
+| F3 | M. Benzaquen, I. Mastromatteo, Z. Eisler and J.-P. Bouchaud, "Dissecting cross-impact on stock markets: an empirical analysis", Journal of Statistical Mechanics (2017) 023406: a multivariate linear propagator; liquidity shares the sectorial structure of correlations (eigenvalues and eigenvectors); transactions account for a significant fraction of the covariance of returns | Crossref record with abstract | https://doi.org/10.1088/1742-5468/aa53f7 | 2026-09-25 | "Transactions in fact mediate a significant part of the correlation between different instruments"; "accounts for a significant fraction of the covariance of stock returns" | §4, omsources |
+| F4 | M. Schneider and F. Lillo, "Cross-impact and no-dynamic-arbitrage", Quantitative Finance 19(1) (2019) 137-154: for bounded decay kernels cross-impact must be odd and linear in trading intensity and symmetric (i to j equals j to i) | Crossref record; abstract of the working paper (SSRN 2889029) | https://doi.org/10.1080/14697688.2018.1467033 | 2026-09-25 | "cross-impact must be an odd and linear function of trading intensity and cross-impact from asset i to asset j must be equal to the one from j to i" | §5, omsources |
+| F5 | P. Pasquariello and C. Vega, "Strategic cross-trading in the U.S. stock market", Review of Finance 19(1) (2015) 229-282: daily order imbalance in one industry or stock has a significant, persistent impact on other industries' or stocks' returns, often negative | Crossref record with abstract | https://doi.org/10.1093/rof/rft055 | 2026-09-25 | "daily order imbalance in one industry or random stock has a significant, persistent, and robust impact on daily returns of other (even unrelated) industries or random stocks; (2) cross-price impact is often negative" | §4, omsources |
+| F6 | F. Bucci, M. Benzaquen, F. Lillo and J.-P. Bouchaud, "Crossover from linear to square-root market impact", Physical Review Letters 122 (2019) 108302 | Crossref record | https://doi.org/10.1103/physrevlett.122.108302 | 2026-09-25 | bibliographic record | §2, omsources |
+
+## EXCLUDED
+
+- Donier et al.'s quantitative results (the square-root prefactor, the decay after completion): the chapter derives the regimes on its own simulation and cites the model.
+- The two-asset data are simulated with a known cross-impact matrix; no real cross-impact estimate is quoted.
+- All simulated statistics (latent-book impacts and exponents, fair-pricing times, cross-impact estimates, explained shares, liquidation costs) are computed with firm.crossimpact and tested.

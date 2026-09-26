@@ -1,0 +1,295 @@
+\chapter{Rust for Low Latency}\label{ch:ll:rust-for-low-latency}
+
+The Rust twin of this book's feed decoder decodes a message in about eleven nanoseconds on this laptop, within a fifth
+of the C++ original from one run to the next. Both check every length before reading, neither allocates per message, and the
+Rust version was written without a single \texttt{unsafe} block. What Rust changes is not speed but where mistakes are
+caught: a \omterm{def:ll:rust-for-low-latency:race}{data race} or a dangling reference is a compile error, an out-of-bounds index a controlled panic instead of a
+silent read of someone else's memory. This chapter looks at Rust on the hot path the way chapters~6 to~8 looked at
+C++: which abstractions really cost nothing, where the checks are and when the compiler removes them, how to write
+\texttt{unsafe} code that stays \omterm{def:ll:rust-for-low-latency:sound}{sound}, how to control allocation and threads, and where Rust's async machinery belongs
+in a trading system and where it does not.
+
+\section{Zero-cost abstractions, checked}
+
+\begin{definition}[Zero-cost abstraction]\label{def:ll:rust-for-low-latency:zero}
+A \emph{zero-cost abstraction}\index{zero-cost abstraction} compiles to the code a programmer would have written by hand
+without it: the abstraction's convenience is resolved at compile time and leaves no run-time trace. The formulation comes
+from C++: ``what you don't use, you don't pay for; and what you do use, you couldn't hand code any better''
+(Stroustrup).
+\end{definition}
+
+Iterators, closures, generics and \texttt{Option} are designed to be zero-cost in Rust: they are monomorphised like C++
+templates and inlined. The claim is checked the same way as in chapter~7, in the assembly. Safe Rust adds one thing C++
+does not: every slice index is checked against the slice's length.
+
+\begin{definition}[Bounds-check elimination]\label{def:ll:rust-for-low-latency:bce}
+\emph{Bounds-check elimination}\index{bounds-check elimination} is the compiler's removal of an index check it can prove
+always passes: a loop counter bounded by the slice's own length, an index already compared, an iterator that yields only
+valid positions.
+\end{definition}
+
+\Cref{lst:ll:rust-for-low-latency:counted} is the assembly of a loop \texttt{for i in 0..v.len() \{ s += v[i] \}} compiled
+by \texttt{rustc -O}: no comparison against the length and no call to the panic handler remain, and LLVM has vectorised the
+loop four elements at a time. \Cref{lst:ll:rust-for-low-latency:checked} reads one element at an index the compiler knows
+nothing about: a comparison, a predicted branch, and the panic path out of line. When the check cannot be removed it costs
+little, as long as it is predicted and the load it guards is the slow part: in
+\cref{fig:ll:rust-for-low-latency:twins} a gather of 65\,536 elements through a table of scattered indices costs the same,
+within noise, with and without the check, in both languages.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/asm/sum_counted.s}{1}{40}{A counted loop over a slice, rustc 1.97 -O: no bounds check, vectorised.}\label{lst:ll:rust-for-low-latency:counted}
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/asm/get_checked.s}{1}{12}{One indexed read at an unknown index: a comparison and a branch to the panic handler.}\label{lst:ll:rust-for-low-latency:checked}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=dec,width=4.6cm,height=5.4cm,ybar,bar width=12pt,ymin=0,symbolic x coords={decode},xtick=data,
+  enlarge x limits=0.8,title={\small ns per message},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=task,y=cpp]{figdata/low-latency/09-rust-for-low-latency/measured_decode.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=task,y=rust]{figdata/low-latency/09-rust-for-low-latency/measured_decode.csv};
+\end{axis}
+\begin{axis}[at={(dec.east)},anchor=west,xshift=1.5cm,width=8.6cm,height=5.4cm,ybar,bar width=10pt,ymin=0,
+  symbolic x coords={counted loop,gather checked,gather unchecked},xtick=data,enlarge x limits=0.25,
+  xticklabels={{counted\\loop},{gather\\checked},{gather\\unchecked}},xticklabel style={align=center},
+  title={\small ns per element},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.3,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=task,y=cpp]{figdata/low-latency/09-rust-for-low-latency/measured_loops.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=task,y=rust]{figdata/low-latency/09-rust-for-low-latency/measured_loops.csv};
+\legend{C++ (g++ -O2),Rust (rustc -O)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The C++ and Rust twins: decoding Book~1's sample with each language's feed decoder (left), and summing 65\,536
+integers in order, and through a table of scattered indices with and without bounds checks (right). Measured on a laptop
+(Intel Core Ultra 7 155H) under WSL2, no isolated cores, pinned to one CPU. Data: \texttt{bench\_rust.py}.}\label{fig:ll:rust-for-low-latency:twins}
+\end{omfigure}
+
+\section{Unsafe code and its boundaries}
+
+Rust's guarantees hold for safe code; \texttt{unsafe} blocks are where the programmer takes over the compiler's proof
+obligations: dereferencing raw pointers, calling C functions, skipping bounds checks, implementing lock-free structures
+(chapter~11).
+
+\begin{definition}[Sound abstraction]\label{def:ll:rust-for-low-latency:sound}
+An abstraction built on \texttt{unsafe} code is \emph{sound}\index{sound abstraction} if no sequence of calls to its safe
+interface, however unusual, can cause \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour}: the invariants the unsafe code relies on are established and
+maintained by the abstraction itself, not assumed of its callers.
+\end{definition}
+
+The discipline is to keep the unsafe region small and to write down, next to each block, why it is \omterm{def:ll:rust-for-low-latency:sound}{sound}. The gather of
+\cref{lst:ll:rust-for-low-latency:sound} skips the per-element check only after the indices have been validated once, and
+refuses a slice whose length is not the one they were validated against: however it is called, it cannot read out of
+bounds. A function whose safety depends on its caller is itself marked \texttt{unsafe}, with a \texttt{\# Safety} section
+stating the contract; \texttt{clippy} rejects a public function that dereferences a raw pointer argument without it. The
+same questions apply to C++ code, where every line is unsafe; Rust makes them local.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/src/lib.rs}{58}{72}{A sound interface over an unchecked gather.}\label{lst:ll:rust-for-low-latency:sound}
+
+\section{Controlling allocation}
+
+\begin{definition}[Global allocator]\label{def:ll:rust-for-low-latency:alloc}
+The \emph{global allocator}\index{global allocator} of a Rust program is the allocator behind \texttt{Box}, \texttt{Vec},
+\texttt{String} and every standard collection; a program can replace it with any type implementing \texttt{GlobalAlloc},
+declared with \texttt{\#[global\_allocator]}, for example one that counts allocations in tests.
+\end{definition}
+
+Rust's standard types allocate in slightly different places from C++'s, and the differences matter on a hot path. A
+\texttt{String} has no inline buffer, so even a four-letter symbol allocates; a \texttt{Vec} reserves room for four small
+elements at its first push, so three fills cost one allocation instead of three; \texttt{HashMap::entry} moves the key into
+the map instead of copying it. Counted with \texttt{firm\_arena::CountingAlloc}, the Rust version of chapter~6's first-draft
+handler (\cref{lst:ll:rust-for-low-latency:naive}) allocates five times per message where the C++ one allocated nine, and the
+fixed version none. The remedy is the same as in C++: fixed arrays, pools of indices, byte arrays for identifiers, no boxed
+closures on the hot path, and a test that asserts the count.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/src/lib.rs}{89}{102}{Chapter 6's first draft in Rust: five allocations per message.}\label{lst:ll:rust-for-low-latency:naive}
+
+\section{Threads, pinning and what the type system guarantees}
+
+\begin{definition}[Data race]\label{def:ll:rust-for-low-latency:race}
+A \emph{data race}\index{data race} occurs when two threads access the same memory location concurrently, at least one
+access is a write, and at least one is not atomic. In C++ it is \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour}; in safe Rust it cannot be written:
+the traits \texttt{Send} and \texttt{Sync}, which mark the types that may be moved or shared between threads, and the rule
+that a mutable reference is exclusive, are checked when compiling.
+\end{definition}
+
+The chapter's crate carries a documentation test marked \texttt{compile\_fail}: a thread that increments an element of a
+vector while its owner also writes it. The test passes only if the compiler rejects the program, which it does, because
+the spawned thread borrows the vector mutably while it is still in use. What the type system does not provide is
+placement: the standard library cannot pin a thread to a CPU. \texttt{firm.affinity} declares the two C functions it needs,
+calls them inside \texttt{unsafe} blocks with the reason stated, and verifies the result with \texttt{sched\_getcpu}
+(\cref{lst:ll:rust-for-low-latency:pin}); its C++ twin does the same with \texttt{pthread\_setaffinity\_np}. Both read the
+role-to-CPU plan that \texttt{firm.coreplan} writes (chapter~4).
+
+\omcode{code/firm/affinity/rust/src/lib.rs}{36}{45}{Pinning the calling thread from Rust through the C library.}\label{lst:ll:rust-for-low-latency:pin}
+
+\section{Where async does and does not belong}
+
+\begin{definition}[Async runtime]\label{def:ll:rust-for-low-latency:async}
+An \emph{async runtime}\index{async runtime} runs many tasks written as \texttt{async} functions on a few threads: a task
+that would wait (for a socket, a timer) returns control to the runtime's scheduler, which resumes it when the event
+arrives, possibly on another thread.
+\end{definition}
+
+Async code is how Rust serves many slow connections cheaply, and a trading firm has many: venue REST interfaces, websocket
+market data from dozens of crypto venues (chapter~17), drop-copy sessions, internal services. The hot path is the opposite
+case: one busy thread per role, pinned, spinning on its input, never yielding. A scheduler that may move a task between
+threads, or delay it behind another, adds exactly the \omterm{def:ll:where-latency-comes-from:tail}{jitter} the hot path exists to avoid. The authors of the most
+widely used runtime say so themselves: it is designed for applications whose tasks spend most of their time waiting for
+input and output, not for speeding up computation. The usual split is a synchronous, pinned hot path, fed and drained by
+lock-free rings (chapter~12), with async services around it for everything that can wait.
+
+\section{Tutorial: the Rust twin, measured}\label{tut:ll:rust-for-low-latency:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Check Rust's abstractions in the assembly, count its allocations, pin a thread, and compare the twins.
+\textbf{End state:} the two listings of assembly, the allocation counts, and \cref{fig:ll:rust-for-low-latency:twins}.
+\begin{tutsteps}
+\item \textbf{Assembly.} \texttt{python ll\_rustasm.py} compiles the crate with \texttt{rustc -O --emit asm} and extracts
+\texttt{sum\_counted} and \texttt{get\_checked}, exported with \texttt{\#[no\_mangle]} so that their names are stable.
+\item \textbf{Soundness and a compile-time race.} \texttt{cargo test} runs the unit tests and the \texttt{compile\_fail}
+documentation test; clippy runs with \texttt{-D warnings}.
+\item \textbf{Allocations.} The test installs \texttt{CountingAlloc} as the \omterm{def:ll:rust-for-low-latency:alloc}{global allocator} and asserts five allocations
+per message for the draft and none for the fixed handler.
+\item \textbf{Pinning.} \texttt{firm\_affinity::apply(plan, role)} pins a thread and verifies its CPU.
+\item \textbf{Measure} with \texttt{python bench\_rust.py}: it builds the crate's benchmark with \texttt{cargo build
+--release} and the C++ twin with g++ and runs both pinned.
+\end{tutsteps}
+\textbf{What to change next.} Replace the fixed handler's linear search with a small open-addressing table and keep the
+allocation count at zero; compile the C++ twin with \texttt{-O3} and see which language's counted loop is faster then.
+\end{tutorial}
+
+\section{Build: thread placement by role}\label{bld:ll:rust-for-low-latency:affinity}
+
+\begin{build}
+\bfield{Purpose} Every hot thread of Part~IV is pinned to the CPU the placement plan gives its role, and says so; the
+measurements of chapter~26 record where each thread ran.
+\bfield{Interface} Rust \texttt{firm\_affinity}: \texttt{read\_plan(text)}, \texttt{read\_plan\_file(path)},
+\texttt{pin\_current(cpu)}, \texttt{current\_cpu()}, \texttt{allowed()}, \texttt{apply(plan, role)}. C++20
+\texttt{firm::affinity}: \texttt{read\_plan(path)}, \texttt{pin\_current}, \texttt{current\_cpu}, \texttt{name\_current},
+\texttt{apply}. Python \texttt{firm\_coreplan.write\_plan} and \texttt{read\_plan} produce and read the plan file.
+\bfield{Rules} A thread is pinned before it allocates or touches its data; \texttt{apply} fails, rather than continuing
+unpinned, if the role is missing, the kernel refuses, or the thread is not on its CPU afterwards; every \texttt{unsafe}
+call carries its safety argument.
+\bfield{Acceptance tests} \texttt{code/firm/affinity/}: the example plan read in both languages; a thread pinned to an
+allowed CPU and verified; a missing role refused. \texttt{code/firm/coreplan/}: the plan file round trip.
+\bfield{Stretch} Set the thread's name for \texttt{top} and \texttt{perf}; refuse to start when the plan puts two hot roles
+on siblings.
+\end{build}
+
+\begin{omsources}
+\item B.~Stroustrup, ``Abstraction and the C++ machine model'', 2005.
+\item The Rustonomicon, ``Send and Sync''; The Rust Reference, ``Unsafety''.
+\item Tokio, tutorial, ``When not to use Tokio''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:1}
+From \cref{fig:ll:rust-for-low-latency:twins}, by what factor is the Rust decoder slower or faster than the C++ one, and
+what does that cost at 5 million messages a second?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:2}
+Which of these allocate in Rust: \texttt{\textquotedbl{}ESZ6\textquotedbl{}.to\_string()}; \texttt{Vec::<u64>::new()}; the first
+\texttt{push} into it; \texttt{[0u8; 24]}; \texttt{Box::new(3)}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:3}
+Why does the Rust draft handler allocate five times where the C++ one allocated nine? Account for the difference item by
+item.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:4}
+Read \cref{lst:ll:rust-for-low-latency:counted}: how many elements does the vector loop add per iteration, and what handles
+lengths that are not a multiple of four?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:5}
+Why does removing the bounds check from the gather not make it faster here? When would it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:6}
+Is \texttt{CheckedIndex} still \omterm{def:ll:rust-for-low-latency:sound}{sound} if \texttt{sum} does not compare \texttt{v.len()} with \texttt{len}? Give a calling
+sequence that would break it.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:rust-for-low-latency:7}
+\emph{Coding.} Write the Rust decoder's hot loop over \texttt{decode(\&data).flatten()} with an explicit \texttt{match} on
+the result instead, count allocations with \texttt{CountingAlloc}, and check the assembly for panics. What differs?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:rust-for-low-latency:8}
+\emph{Find the flaw.} ``Our market-data handler is an async task on a multi-threaded runtime so that it scales with the
+number of cores.''
+\end{exercise}
+
+\section{Problem: The Port}
+
+\begin{problem}[{Weekend problem --- rewriting the feed path in Rust}]\label{pb:ll:rust-for-low-latency:1}
+A firm considers porting its feed handler and order-book builder from C++ to Rust. The team measures the twins
+(\cref{fig:ll:rust-for-low-latency:twins}), counts allocations, and reads the assembly.
+
+\medskip\noindent\textbf{Part I --- Speed.}
+\begin{enumerate}
+\item What does each decoder cost per message, and what is the ratio?
+\item Why is the Rust counted loop faster than the C++ one with the flags used?
+\item What would make the C++ loop match it?
+\item What do the gather measurements say about bounds checks on this workload?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Allocation.}
+\begin{enumerate}[resume]
+\item How many allocations per message does each draft make, and each fixed handler?
+\item Which Rust type allocates where the C++ one did not?
+\item How does the test enforce zero allocations in Rust?
+\item What happens if a dependency allocates on the hot path without the team knowing?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Safety.}
+\begin{enumerate}[resume]
+\item Which class of bugs does the port remove at compile time?
+\item Where does \texttt{unsafe} remain in the firm's Rust code, and why?
+\item What does a \omterm{def:ll:rust-for-low-latency:sound}{sound abstraction} promise its callers?
+\item What does a panic on the hot path mean in production, and how should it be handled?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The decision.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the Rust-to-C++ ratio of time per message for the decoder, and the allocations per
+message of each draft and fixed handler.
+\item Is the speed difference a reason not to port?
+\item What would you port first, and why?
+\item Where does async Rust belong in the firm's systems?
+\item How do the two languages share the firm's placement plan and fixtures?
+\item What would the team lose by porting, apart from speed?
+\item How would you keep both implementations equivalent during the transition?
+\item In one sentence: what does Rust change for a low-latency team?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:1}
+What does ``\omterm{def:ll:rust-for-low-latency:zero}{zero-cost abstraction}'' mean, and how would you verify the claim for an iterator chain?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:2}
+Do bounds checks make Rust slow? When do they cost, and how do you remove them safely?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:3}
+What makes an \texttt{unsafe} abstraction \omterm{def:ll:rust-for-low-latency:sound}{sound}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:4}
+How does Rust prevent \omterm{def:ll:rust-for-low-latency:race}{data races}, and what does it not prevent?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:5}
+Would you use async Rust on a trading hot path? Why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:rust-for-low-latency:6}
+How would you prove that a Rust component makes no heap allocation after start-up, including inside its dependencies?
+\end{interviewq}

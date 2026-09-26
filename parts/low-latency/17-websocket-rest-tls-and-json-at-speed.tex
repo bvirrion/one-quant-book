@@ -1,0 +1,369 @@
+\chapter{WebSocket, REST, TLS and JSON at Speed}\label{ch:ll:websocket-rest-tls-and-json-at-speed}
+
+Crypto venues and many brokers do not speak FIX or binary protocols to most of their clients: market data arrives as JSON
+text inside \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket frames} inside TLS records, and orders leave as signed HTTP requests or as JSON over the same kind of
+connection. A trading server placed in the venue's cloud region (One Quant Book~3, chapter~26) sits a fraction of a
+millisecond from its matching engine. On this book's laptop, the Python reference of this chapter's build spends almost
+\qty{50}{\micro\second} of processor time to receive one depth update and send one order (opening and sealing TLS records,
+unmasking and masking frames, decoding the JSON, signing); the C++ components spend about one. The first is a tenth of a
+half-millisecond round trip; the second disappears in it. This chapter takes the web stack apart layer by layer: HTTP and
+the cost of opening connections, TLS and what its handshake and records cost, \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} framing, JSON decoding with a
+structural index, and request signatures computed without rehashing the key.
+
+\section{HTTP, REST and connection reuse}
+
+\begin{definition}[REST interface, persistent connection, connection pool]\label{def:ll:websocket-rest-tls-and-json-at-speed:rest}
+A \emph{REST interface}\index{REST interface} exposes a service as resources addressed by URLs and manipulated by HTTP
+requests (GET to read, POST to create, DELETE to remove), each request carrying everything the server needs to process it. A
+\emph{persistent connection}\index{persistent connection} carries many HTTP requests and responses over one TCP (and TLS)
+connection instead of opening one per request. A \emph{connection pool}\index{connection pool} keeps a set of open persistent
+connections to a server and lends an idle one to each request.
+\end{definition}
+
+A crypto venue's order entry is typically a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:rest}{REST interface}: an order is a POST with the order's parameters, the client's API
+key and a signature (One Quant Book~3, chapter~15), and the answer is JSON. The expensive part is not the request but the
+connection under it. Opening one costs a TCP handshake, one round trip, then a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:tls}{TLS handshake}, another round trip plus the
+cryptography of key exchange and certificate verification; a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} adds an HTTP upgrade, a third. HTTP/1.1 ``defaults to
+the use of \omterm{def:ll:websocket-rest-tls-and-json-at-speed:rest}{persistent connections}'' (RFC~9112), and a client that uses them pays these costs once per connection instead of
+once per order. The build's pool keeps a fixed number of connections open and passes every request through Book~3's rate-limit
+governor first, since a venue's limits count requests and weights (Book~3, chapter~15), not connections.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\def\L{0}\def\R{7.5}
+\node[font=\footnotesize\bfseries] at (\L,0.45) {client};
+\node[font=\footnotesize\bfseries] at (\R,0.45) {venue};
+\draw[gray,thick] (\L,0.15) -- (\L,-8.1);
+\draw[gray,thick] (\R,0.15) -- (\R,-8.1);
+\newcommand{\msgR}[3]{\draw[->,#3] (\L,#1) -- node[above,sloped]{#2} (\R,#1-0.3);}
+\newcommand{\msgL}[3]{\draw[<-,#3] (\L,#1-0.3) -- node[above,sloped]{#2} (\R,#1);}
+\msgR{-0.1}{TCP SYN}{gray}
+\msgL{-0.8}{SYN-ACK}{gray}
+\msgR{-1.5}{ACK, TLS ClientHello with a key share}{omDef}
+\msgL{-2.2}{ServerHello, certificate, Finished}{omDef}
+\msgR{-2.9}{Finished, HTTP GET with Upgrade: websocket}{omMeth}
+\msgL{-3.6}{101 Switching Protocols}{omMeth}
+\msgL{-4.5}{depth update: TLS record [WebSocket frame [JSON]]}{omThm,thick}
+\msgR{-5.2}{order: TLS record [masked frame [JSON, signature]]}{omThm,thick}
+\msgL{-6.4}{ping (every 20 s at one venue)}{gray}
+\msgR{-7.1}{pong}{gray}
+\draw[decorate,decoration={brace,amplitude=4pt,mirror},thick] (-0.25,-0.1) -- (-0.25,-3.9)
+  node[midway,left=5pt,align=right]{three round trips\\ before the first\\ message};
+\draw[decorate,decoration={brace,amplitude=4pt},thick] (7.75,-4.5) -- (7.75,-5.5)
+  node[midway,right=5pt,align=left]{on an open\\ connection: one\\ record each way};
+\end{tikzpicture}
+
+\omcaption{A \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} connection over TLS~1.3: one round trip for TCP, one for TLS, one for the HTTP upgrade; then each
+message is a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket frame} inside a TLS record. A REST order on a new connection pays the first two round trips; on a
+\omterm{def:ll:websocket-rest-tls-and-json-at-speed:rest}{persistent connection}, none.}\label{fig:ll:websocket-rest-tls-and-json-at-speed:setup}
+\end{omfigure}
+
+\section{TLS: the handshake and the record layer}
+
+\begin{definition}[TLS handshake, session resumption]\label{def:ll:websocket-rest-tls-and-json-at-speed:tls}
+The \emph{TLS handshake}\index{TLS handshake} is the exchange that opens a TLS connection: the two sides agree on a protocol
+version and cipher, exchange key shares, the server proves its identity with its certificate, and both derive the keys that
+protect the records that follow; in TLS~1.3 it takes one round trip. \emph{Session resumption}\index{session resumption}
+opens a new connection with a key derived from an earlier one (a pre-shared key sent to the client as a ticket), skipping
+the certificate and part of the key exchange.
+\end{definition}
+
+TLS~1.3 (RFC~8446) cut the full handshake to one round trip and replaced the older session identifiers and tickets by
+resumption with a pre-shared key: ``the key derived from the initial handshake is used to bootstrap the cryptographic state
+instead of a full handshake''. A zero-round-trip mode lets a resuming client send data with its first message, ``at the cost
+of certain security properties'' (the data can be replayed), which is why an order must never travel in it. After the
+handshake, the record layer cuts the stream into records of at most $2^{14}$ bytes and protects each with an authenticated
+cipher.
+
+\Cref{tab:ll:websocket-rest-tls-and-json-at-speed:tls} gives the costs on the laptop's loopback, where the network costs
+almost nothing and what remains is processing. A full TLS~1.3 handshake with an elliptic-curve certificate takes about
+\qty{2.1}{\milli\second} with Python's \texttt{ssl} module (both ends on the same machine), a resumed one about
+\qty{1.6}{\milli\second}. A round trip of 300 bytes on an open connection takes about \qty{45}{\micro\second} over TLS and
+\qty{33}{\micro\second} over plain TCP, both in Python; the protection itself, one AES-128-GCM seal or open of a 300-byte
+record with OpenSSL called from C++, is under \qty{0.2}{\micro\second}. The handshake is ten thousand times dearer than a record:
+the reason to keep connections open.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lr}
+\toprule
+Operation (loopback, laptop) & Cost \\
+\midrule
+TLS~1.3 full handshake (Python \texttt{ssl}, both ends) & \qty{2.1}{\milli\second} \\
+TLS~1.3 resumed handshake (Python \texttt{ssl}, both ends) & \qty{1.6}{\milli\second} \\
+Round trip of 300 bytes over TLS (Python) & \qty{45}{\micro\second} \\
+Round trip of 300 bytes over plain TCP (Python) & \qty{33}{\micro\second} \\
+AES-128-GCM seal of a 300-byte record (OpenSSL, C++) & \qty{0.16}{\micro\second} \\
+AES-128-GCM open of a 300-byte record (OpenSSL, C++) & \qty{0.15}{\micro\second} \\
+\bottomrule
+\end{tabular}
+\caption{TLS on the laptop's loopback: medians of 300 handshakes each way and of 5\,000 round trips, and of 21 passes of
+1\,000 records. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores; OpenSSL~3.0.2, Python~3.10.
+Data: \texttt{bench\_web.py}, \texttt{measured\_tls.csv} and \texttt{measured\_web.csv}.}\label{tab:ll:websocket-rest-tls-and-json-at-speed:tls}
+\end{table}
+
+\section{WebSocket framing}
+
+\begin{definition}[WebSocket, WebSocket frame]\label{def:ll:websocket-rest-tls-and-json-at-speed:ws}
+A \emph{WebSocket}\index{WebSocket} is a bidirectional message channel over one TCP connection (usually inside TLS), opened by
+an HTTP request that asks to upgrade the connection (RFC~6455). A \emph{WebSocket frame}\index{WebSocket frame} is its unit
+on the wire: a two-byte header (a final-fragment bit, an opcode for text, binary, continuation, close, ping or pong, a mask
+bit and a 7-bit length), an extended length of 2 or 8 bytes when the payload exceeds 125 bytes, a 4-byte masking key on frames
+from the client, and the payload.
+\end{definition}
+
+Three rules of RFC~6455 shape a client. ``A client MUST mask all frames that it sends to the server'', with a new random key
+per frame, even over TLS: the payload is XORed with the key repeated, a defence of intercepting proxies, not of the data. A
+message may be split into fragments (a first frame with the opcode, continuation frames, the last with its final bit), and
+control frames (ping, pong, close) may arrive between fragments, carry at most 125 bytes and are never fragmented. And the
+venue checks the connection with pings that the client must answer: one large venue sends a ping every 20 seconds and drops
+a connection that has not answered within a minute. The build's decoder unmasks in place eight bytes at a time.
+
+\omcode{code/firm/wsclient/cpp/firm_wsclient.hpp}{26}{39}{Unmasking a payload with the 4-byte key repeated in a 64-bit
+word.}\label{lst:ll:websocket-rest-tls-and-json-at-speed:unmask}
+
+Framing costs little in C++: about \qty{24}{\nano\second} to decode and unmask a 300-byte frame, \qty{16}{\nano\second} to
+encode and mask one. The build's Python reference, which XORs the payload one byte at a time, takes about
+\qty{16}{\micro\second} for the same frame: several hundred times more, and the largest item of its budget.
+
+\section{JSON at speed}
+
+\begin{definition}[Structural index]\label{def:ll:websocket-rest-tls-and-json-at-speed:index}
+A \emph{structural index} of a JSON text is the array of the positions of its structural characters (braces, brackets,
+colons, commas) and quotes, computed in one vectorised pass; a decoder then walks the index instead of the bytes, reading each
+value directly between two known positions.
+\end{definition}
+
+The parser of Langdale and Lemire (chapter~14) works in two stages: the first writes ``the location of all structural
+characters \dots\ as integer indexes in a separate array'', the second walks that index. The build applies the idea to one
+message shape, the depth update a large venue documents for its diff-depth stream: an event time, a symbol, the first and last
+update identifiers (\texttt{U}, \texttt{u}) that Book~3's book builder checks for gaps, and arrays of bids and asks as
+\texttt{[price, quantity]} strings. The first stage is chapter~14's \texttt{positions\_any} over the seven characters
+\texttt{\{\}[]:,} and the double quote; the second walks the positions with the shape known in advance, reads each number where it stands, and
+parses prices into integers of $10^{-8}$ without floating point. Anything unexpected (an escape, a missing key) makes it
+return false, and a general parser takes over.
+
+\omcode{code/firm/wsclient/cpp/firm_wsclient.hpp}{177}{204}{The second stage: walking the structural index of a depth
+update.}\label{lst:ll:websocket-rest-tls-and-json-at-speed:walk}
+
+On the fixture's 1\,000 depth updates (about 286 bytes each, up to ten levels a side), the indexed decoder takes about
+\qty{0.39}{\micro\second} per update; a general parser that builds a tree of maps, vectors and strings and converts prices
+with \texttt{strtod} about \qty{2.6}{\micro\second}, seven times more; Python's \texttt{json} module and the conversion to
+integers about \qty{10}{\micro\second}. The decoded levels, divided by the instrument's tick and lot, are what Book~3's
+\texttt{firm.wsbook} applies.
+
+\section{Signing requests off the hot path}
+
+\begin{definition}[Request signature]\label{def:ll:websocket-rest-tls-and-json-at-speed:signature}
+A \emph{request signature} is a message authentication code computed by the client over a request's parameters with a secret
+shared with the venue (typically HMAC-SHA-256 of the query string and body, sent in hexadecimal with the API key), which lets
+the venue check that the request comes from the key's owner and was not altered; a timestamp and a validity window inside the
+signed payload stop old requests from being replayed.
+\end{definition}
+
+HMAC (RFC~2104) computes $H\big((K \oplus \mathit{opad}) \,\|\, H((K \oplus \mathit{ipad}) \,\|\, m)\big)$. Both padded keys
+are one 64-byte block, so the hash's state after absorbing each of them depends only on the key; the RFC notes that these
+intermediate results ``can be precomputed only once at the time of generation of the key''. A signer that does so absorbs the
+key once, copies the two states for each request and hashes only the message. The build's signer does this in C++, Rust and
+Python, and is checked against RFC~4231's vectors and against the worked example of a large venue's documentation, whose
+published key and order payload give a published signature.
+
+\omcode{code/firm/wsclient/cpp/firm_wsclient.hpp}{279}{301}{The key's pads hashed once, at construction; each signature
+copies two states.}\label{lst:ll:websocket-rest-tls-and-json-at-speed:hmac}
+
+The costs teach two lessons. Precomputing the pads saves about two-fifths with the build's portable SHA-256 (about
+\qty{0.64}{\micro\second} against \qty{1.1}{\micro\second} for a 119-byte order), and four-fifths with OpenSSL (about
+\qty{0.19}{\micro\second} against \qty{0.92}{\micro\second} for its one-shot \texttt{HMAC()}). And the library is several times
+faster than a portable implementation because it uses the processor's SHA instructions: cryptography is the one place where
+the fast path is someone else's code, called well.
+
+\begin{dated}{2026-09}{A venue's signing and streams}\label{dat:ll:websocket-rest-tls-and-json-at-speed:venue}
+Binance's spot API documentation (GitHub, consulted September 2026) signs each request with HMAC-SHA-256 of the query string
+and body, keyed by the API key's secret, and bounds its validity with a timestamp and a window, \texttt{recvWindow}, of 5\,000
+milliseconds by default and 60\,000 at most. Its \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} streams send a ping every 20 seconds, drop a connection that has not
+answered within a minute, and end any connection after 24 hours; its diff-depth stream publishes updates every 100 or 1\,000
+milliseconds.
+\end{dated}
+
+\Cref{fig:ll:websocket-rest-tls-and-json-at-speed:budget} puts the pieces together: the processor time of receiving one depth
+update and sending one order, step by step, for the build's C++ components and for its Python reference.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=9pt,ymode=log,log origin y=infty,ymin=0.01,ymax=100,
+  symbolic x coords={tls_open,frame_decode,json,sign,frame_encode,tls_seal},xtick=data,
+  xticklabels={{open TLS\\ record},{decode\\ frame},{decode\\ JSON},{sign\\ order},{encode and\\ mask frame},{seal TLS\\ record}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.1,
+  ylabel={\si{\micro\second} (log scale)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=step,y=cpp]{figdata/low-latency/17-websocket-rest-tls-and-json-at-speed/measured_budget_steps.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=step,y=python]{figdata/low-latency/17-websocket-rest-tls-and-json-at-speed/measured_budget_steps.csv};
+\legend{C++ components (0.9~\si{\micro\second} in all),Python reference (48~\si{\micro\second} in all)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The processor time of one websocket order: receiving a depth update (TLS record, frame, JSON) and sending an order
+(signature, masked frame, TLS record). C++: the build's decoders and OpenSSL; Python: the build's reference and \texttt{ssl}
+(its record cost estimated as a quarter of the extra round-trip time over TLS). Measured on a laptop (Intel Core Ultra 7 155H)
+under WSL2, no isolated cores. Data: \texttt{bench\_web.py}.}\label{fig:ll:websocket-rest-tls-and-json-at-speed:budget}
+\end{omfigure}
+
+\section{Tutorial: the web stack, measured}\label{tut:ll:websocket-rest-tls-and-json-at-speed:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build and check each layer, then measure the cost of one websocket order. \textbf{End state:}
+\cref{tab:ll:websocket-rest-tls-and-json-at-speed:tls}, \cref{fig:ll:websocket-rest-tls-and-json-at-speed:budget}, and
+green tests in Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Frames.} The tests encode RFC~6455's own examples (an unmasked and a masked ``Hello'', lengths needing 16 and 64
+bits) and decode the fixture stream written by \texttt{make\_ws\_fixtures.py}: fifty depth updates, some fragmented in three
+with a ping between the fragments, and a close. Python, C++ and Rust deliver the same messages in the same order.
+\item \textbf{Depth updates.} The C++ indexed decoder reproduces, level for level, the Python reference's decoding of the
+fixture's 1\,000 updates.
+\item \textbf{Signatures.} All three signers reproduce RFC~4231's test cases and the venue's published example.
+\item \textbf{TLS.} \texttt{bench\_web.py} makes a self-signed certificate with the \texttt{openssl} command, runs a TLS~1.3
+server in a thread, and times full and resumed handshakes (it checks that every resumption was accepted) and round trips.
+\end{tutsteps}
+\textbf{What to change next.} Unmask with 32-byte vector XORs (chapter~14) and measure a 16-kilobyte frame; replace the Python
+reference's masking with a bytes-level XOR over integers and measure again.
+\end{tutorial}
+
+\section{Build: the web client}\label{bld:ll:websocket-rest-tls-and-json-at-speed:wsclient}
+
+\begin{build}
+\bfield{Purpose} The firm's connection to venues that speak JSON over \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} and REST: depth updates decoded for Book~3's
+\texttt{firm.wsbook}, orders signed and sent through a pool of \omterm{def:ll:websocket-rest-tls-and-json-at-speed:rest}{persistent connections} that respects the venue's rate limits.
+\bfield{Interface} Python reference \texttt{firm\_wsclient}: \texttt{encode\_frame}, \texttt{decode\_frame},
+\texttt{Reassembler}, \texttt{decode\_depth}, \texttt{to\_book\_levels}, \texttt{Signer}, \texttt{Pool}. C++20
+\texttt{firm::ws}: \texttt{encode\_frame}, \texttt{decode\_frame} (unmasking in place), \texttt{Reassembler},
+\texttt{decode\_depth} into a fixed \texttt{Depth}, \texttt{Sha256}, \texttt{HmacSha256}. Rust \texttt{firm\_wsclient}:
+\texttt{encode\_frame}, \texttt{decode\_frame}, \texttt{Sha256}, \texttt{HmacSha256}.
+\bfield{Rules} Client frames are always masked; control frames are never fragmented and carry at most 125 bytes; lengths are
+minimally encoded; prices and quantities are integers of $10^{-8}$, never floats; the key's pads are hashed once; the pool
+never opens more than its size and asks the governor before every request.
+\bfield{Acceptance tests} \texttt{code/firm/wsclient/}: RFC~6455's frame examples; the fixture stream reassembled identically
+in the three languages; the 1\,000 fixture updates decoded identically in Python and C++; RFC~4231 test cases 1, 2 and 6 and
+the venue's example signature in the three languages; the pool's reuse, capacity and throttling.
+\bfield{Stretch} Vectorised unmasking; a general structural-index JSON reader; per-message deflate; the order path through
+the simulator's crypto preset of One Quant Book~10.
+\end{build}
+
+\begin{omsources}
+\item IETF RFC~6455 (WebSocket), RFC~8446 (TLS~1.3), RFC~2104 (HMAC), RFC~4231 (HMAC-SHA-256 test vectors), RFC~9112
+(HTTP/1.1).
+\item G.~Langdale and D.~Lemire, ``Parsing gigabytes of JSON per second'', \emph{The VLDB Journal} 28(6), 2019.
+\item Binance spot API documentation (GitHub): REST request security, WebSocket streams.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:1}
+How many bytes does a client frame carrying 300 bytes of payload occupy? And 70\,000 bytes? And a server frame of 100 bytes?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:2}
+A REST order on a new connection pays TCP and TLS setup. With a round trip of \qty{0.5}{\milli\second} to the venue and the
+measured handshake, how much later does it arrive than on a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:rest}{persistent connection}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:3}
+Why must a client never send an order in TLS~1.3's zero-round-trip data?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:4}
+Why can the two padded keys of HMAC be hashed in advance, and how many SHA-256 compressions does signing a 119-byte payload
+take with and without that precomputation?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:5}
+A depth update's price is the string \texttt{64123.2}. What does the indexed decoder return at $10^{-8}$, and what can go wrong if a
+decoder converts it with \texttt{strtod} and multiplies by $10^8$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:6}
+A ping arrives between the first and second fragments of a depth update. What must the client do, and in what order?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:7}
+\emph{Coding.} Replace the Python reference's byte-by-byte masking with one XOR of two large integers built with
+\texttt{int.from\_bytes}, check the fixture tests, and measure the frame costs again.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:websocket-rest-tls-and-json-at-speed:8}
+\emph{Find the flaw.} ``Each strategy thread opens its own HTTPS connection for each order, so that no two threads ever
+contend for a connection.''
+\end{exercise}
+
+\section{Problem: Cloud to Venue}
+
+\begin{problem}[{Weekend problem --- where the time of a websocket order goes}]\label{pb:ll:websocket-rest-tls-and-json-at-speed:1}
+A strategy runs in the same cloud region as a crypto venue. Assume a one-way network hop of \qty{250}{\micro\second} and a
+decision of negligible cost; take the measured costs of \cref{fig:ll:websocket-rest-tls-and-json-at-speed:budget} and
+\cref{tab:ll:websocket-rest-tls-and-json-at-speed:tls} (\texttt{measured\_budget.csv}, \texttt{measured\_tls.csv}).
+
+\medskip\noindent\textbf{Part I --- The budget.}
+\begin{enumerate}
+\item What is the total processor time of one order with the C++ components, and with the Python reference?
+\item Which step dominates each?
+\item What share of the path venue, host, venue is the host's processing, in each case?
+\item What would the Python share be with the C++ framing alone (the rest unchanged)?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Connections.}
+\begin{enumerate}[resume]
+\item What does opening a new connection for each REST order add, with a full handshake, and with a resumed one?
+\item What does a new \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket} add before its first message?
+\item How many orders a second could one connection carry if each took a new connection?
+\item What does the venue's 24-hour connection limit imply for a strategy that runs for days?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Signatures and data.}
+\begin{enumerate}[resume]
+\item Why can the signature not be computed before the decision, and what can be?
+\item At 100 depth updates a second per instrument over 50 instruments, how much of a core does decoding take with each
+decoder?
+\item What does the update identifier pair \texttt{(U, u)} let the client detect, and what does it do then?
+\item Why is the timestamp inside the signed payload?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the share of the tick-to-trade spent in decryption, framing, JSON and signing against the
+network hop, and what connection reuse saves per order.
+\item When does the Python reference suffice?
+\item Where would you put the TLS work if the budget were tighter still?
+\item What would you measure on the real server before trusting these laptop numbers?
+\item Why does the network hop not appear in the processor budget, and why does it still matter?
+\item What part of this stack does a venue's binary protocol remove?
+\item How would you test the pool's behaviour when the venue answers 429?
+\item In one sentence: what is fast about a web stack that is fast?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:1}
+Why reuse HTTP connections for order entry? What does a new connection cost?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:2}
+Describe a \omterm{def:ll:websocket-rest-tls-and-json-at-speed:ws}{WebSocket frame}. Why are client frames masked, and what does masking cost?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:3}
+How would you parse a venue's JSON depth updates as fast as possible?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:4}
+How is an HMAC request signature computed, and how would you make signing cheap?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:5}
+What does TLS~1.3 \omterm{def:ll:websocket-rest-tls-and-json-at-speed:tls}{session resumption} save, and what does zero-round-trip data risk?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:websocket-rest-tls-and-json-at-speed:6}
+Your crypto strategy's orders arrive 3~ms after the market data that triggered them, although the venue is 0.3~ms away. Where
+do you look?
+\end{interviewq}

@@ -1,0 +1,443 @@
+\chapter{Vector Instructions and Data-Parallel Code}\label{ch:ll:vector-instructions-and-data-parallel-code}
+
+A parser that reads one byte at a time looks at a message the way a person reads a page letter by letter. In 2019 Geoff
+Langdale and Daniel Lemire published a JSON parser that looks at 32 or 64 bytes per instruction instead, and described it as
+the first standard-compliant JSON parser ``to process gigabytes of data per second on a single core'', using a quarter or
+fewer of the instructions of a widely used reference parser. On the laptop of this book, the loop that looks for the end of a
+field one byte at a time scans about four bytes a nanosecond; the same search written with 256-bit \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector instructions} scans
+about eighty, some eighteen times faster, and splits a 159-byte FIX order into its sixteen fields in about \qty{11}{\nano\second}
+instead of a hundred. Market data and order messages are text or packed binary, read field by field on every tick: this
+chapter shows what \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector instructions} are, when the compiler uses them by itself and what stops it, how to write them by
+hand with a scalar fallback that the tests hold them to, and how to lay out data so that they apply.
+
+\section{SIMD registers and instruction sets}
+
+\begin{definition}[SIMD, vector instruction]\label{def:ll:vector-instructions-and-data-parallel-code:simd}
+\emph{SIMD}\index{SIMD} (single instruction, multiple data) is the execution of one operation on several data elements at
+once. A \emph{vector instruction}\index{vector instruction} is such an operation on a vector register holding several
+elements side by side: on x86-64, 16-byte \texttt{xmm} registers (SSE2, part of every x86-64 processor), 32-byte
+\texttt{ymm} registers (AVX2) and, on processors that have it, 64-byte \texttt{zmm} registers (AVX-512).
+\end{definition}
+
+A 32-byte register holds 32 bytes, 16 two-byte integers, 8 four-byte integers or floats, or 4 doubles, and one instruction
+adds, compares or multiplies all of them. The instruction that matters most for parsing is the byte comparison:
+\texttt{VPCMPEQB} compares the 32 bytes of two \texttt{ymm} registers and sets each byte of the result to all ones where they
+are equal, and \texttt{VPMOVMSKB} gathers the top bit of each of those bytes into a 32-bit integer in an ordinary register. A
+message chunk compared with a register full of the delimiter byte therefore becomes a 32-bit mask with one bit per position,
+and ``where is the first delimiter'' becomes ``how many trailing zeros does the mask have'', one more instruction
+(\cref{fig:ll:vector-instructions-and-data-parallel-code:mask}). The loop does in three instructions what the scalar loop
+does in 32 comparisons and 32 branches.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,c/.style={draw=gray!60,minimum width=0.34cm,minimum height=0.42cm,inner sep=0pt}]
+\foreach \ch [count=\j from 0] in {3,5,=,D,|,5,5,=,E,S,Z,6,|,5,4,=,1,|,3,8,=,5,|,4,4,=,5,7,2,3,|,6} {
+  \pgfmathtruncatemacro{\i}{\j}
+  \pgfmathtruncatemacro{\hit}{(\i==4)||(\i==12)||(\i==17)||(\i==22)||(\i==30)}
+  \ifnum\hit=1
+    \node[c,fill=omThm!25] at (0.36*\i,0) {\ch};
+    \node[c,fill=omThm!55,text=white] at (0.36*\i,-1.3) {1};
+  \else
+    \node[c,fill=gray!8] at (0.36*\i,0) {\ch};
+    \node[c] at (0.36*\i,-1.3) {0};
+  \fi
+  \node[c,fill=omDef!12] at (0.36*\i,-0.65) {|};
+}
+\node[anchor=east,font=\footnotesize] at (-0.3,0) {32 bytes of a message};
+\node[anchor=east,font=\footnotesize] at (-0.3,-0.65) {delimiter, broadcast};
+\node[anchor=east,font=\footnotesize] at (-0.3,-1.3) {\texttt{movemask} bits};
+\foreach \i in {0,8,16,24,31} {\node[font=\tiny,gray] at (0.36*\i,0.38) {\i};}
+\draw[-Stealth,thick,omThm] (0.36*4,-1.55) -- ++(0,-0.45) node[below,align=center,font=\footnotesize]
+  {trailing zeros $= 4$:\\ first delimiter};
+\node[anchor=west,align=left,font=\footnotesize] at (3.4,-2.25) {clear the lowest bit and count again: 12, 17, 22, 30\\
+  (one \texttt{VPCMPEQB}, one \texttt{VPMOVMSKB}, one count per field)};
+\end{tikzpicture}
+
+\omcaption{Finding the field delimiters of a FIX message with one comparison of 32 bytes. The byte \texttt{|} stands for the
+SOH delimiter (byte 1). The comparison sets a byte to all ones where the message equals the delimiter; the mask
+instruction collects one bit per byte; counting trailing zeros gives each position in
+turn.}\label{fig:ll:vector-instructions-and-data-parallel-code:mask}
+\end{omfigure}
+
+The laptop's processor has SSE2 through AVX2 and fused multiply-add (One Quant Book~4, chapter~25), but not AVX-512, as its
+feature flags in \path{/proc/cpuinfo} show. That is the ordinary situation for a trading firm's code: it is compiled once
+and runs on machines of several generations, so the widest instruction set cannot be assumed, and a binary that executes an
+AVX2 instruction on a processor without it dies with an illegal-instruction signal. Section~3 deals with that.
+
+\section{Auto-vectorisation and what blocks it}
+
+\begin{definition}[Auto-vectorisation]\label{def:ll:vector-instructions-and-data-parallel-code:auto}
+\emph{Auto-vectorisation}\index{auto-vectorisation} is the compiler's transformation of a scalar loop into \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector
+instructions} that process several iterations at once, done when it can prove the result unchanged and estimates it
+profitable.
+\end{definition}
+
+The compiler vectorises by itself more often than people expect, and less often than they hope. GCC does it at
+\texttt{-O3}; from GCC~12 it also does it at \texttt{-O2}, with a cost model that accepts only very cheap
+transformations (the release notes), so a loop that GCC~11 at \texttt{-O2} leaves scalar may be vectorised by GCC~13 at the
+same flag: the compiler version is part of the performance. \texttt{-fopt-info-vec-all} makes it report each decision.
+\Cref{lst:ll:vector-instructions-and-data-parallel-code:report} is its report on five small loops under the laptop's GCC~11.
+
+\omcode{code/low-latency/14-vector-instructions-and-data-parallel-code/cpp/vecreport/gxx11.txt}{1}{20}{The vectorisation
+report of GCC~11 for \texttt{ll\_vecdemo.cpp}: the revaluation over columns (line 13), over records (20--21), a search that
+leaves early (27), and integer and double sums (34, 40).}\label{lst:ll:vector-instructions-and-data-parallel-code:report}
+
+Each line is a lesson. At \texttt{-O2} nothing is vectorised. The revaluation over separate arrays is vectorised at
+\texttt{-O3}, two doubles per instruction, four with \texttt{-mavx2}, but only after the compiler ``versioned'' the loop:
+the output pointer might overlap an input, so it checks at run time and keeps a scalar copy of the loop for that case
+(\texttt{\_\_restrict}, which promises no overlap, removes the check). The same computation over 80-byte records is not
+vectorised at all: the five fields of consecutive options are 80 bytes apart, and GCC~11 finds no vector type for such
+strided loads. The search is refused because it may leave the loop early (``control flow in loop''): GCC~11 does not vectorise a loop
+with an early exit. The integer sum is vectorised. The double sum is reported
+vectorised too, and its assembly shows why that means nothing: the additions stay in their original order, one element at a
+time, because floating-point addition is not associative and reordering it would change the result (chapter~8, where
+\texttt{-ffast-math} allowed it and changed the answer). Blockers, in short: possible aliasing, strided or scattered data,
+early exits, calls that cannot be inlined, and reductions whose order matters.
+
+\section{Intrinsics and CPU feature dispatch}
+
+\begin{definition}[Compiler intrinsic, CPU feature dispatch]\label{def:ll:vector-instructions-and-data-parallel-code:intrinsic}
+A \emph{compiler intrinsic}\index{compiler intrinsic} is a function the compiler knows and translates into one specific
+instruction (\texttt{\_mm256\_cmpeq\_epi8} into \texttt{VPCMPEQB}), letting a program use an instruction without writing
+assembly while the compiler still allocates registers and schedules around it. \emph{CPU feature
+dispatch}\index{CPU feature dispatch} selects at run time, from the features the processor reports, which of several
+compiled versions of a function to call.
+\end{definition}
+
+When the compiler will not vectorise a loop, intrinsics do it by hand. The build's search for a byte loads 32 bytes, compares
+them with the broadcast delimiter, takes the mask and counts its trailing zeros; a message whose length is not a multiple of
+32 ends with one more load that finishes exactly at its last byte and overlaps the previous block, with the bytes already
+seen shifted out of the mask, so that no byte beyond the message is ever read. That last point is not pedantry: a read past
+the end of a buffer that ends at a page boundary faults, and the sanitiser of chapter~8 reports any such read.
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{64}{79}{The AVX2 search for a byte, with an overlapping last
+block.}\label{lst:ll:vector-instructions-and-data-parallel-code:find}
+
+The function is compiled for AVX2 by a \texttt{target} attribute, without compiling the whole program for it, and is called
+only after a check. GCC's \texttt{\_\_builtin\_cpu\_supports(\textquotedbl{}avx2\textquotedbl{})} returns non-zero when the running processor has the
+feature; the build checks once, at the first call, and keeps the answer. Chapter~8's \omterm{def:ll:cpp-for-latency-iii-the-compiler:fmv}{function multiversioning} does the same
+automatically for a whole function; the explicit version keeps the choice visible and testable, and the tests call every
+version directly on the same inputs.
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{196}{210}{Dispatch: detect the features once, then call the widest
+version.}\label{lst:ll:vector-instructions-and-data-parallel-code:dispatch}
+
+Rust expresses the same contract in its types. An intrinsic-using function is declared \texttt{unsafe} with the attribute \texttt{target\_feature} enabling \texttt{avx2}, and calling it is \omterm{def:ll:rust-for-low-latency:sound}{sound}
+only once the macro \texttt{is\_x86\_feature\_detected!} has returned true for \texttt{avx2}, as the standard library's own example puts it: the
+\texttt{unsafe} block ``is safe because we're testing that the \texttt{avx2} feature is indeed available on our CPU''.
+
+\omcode{code/firm/simdscan/rust/src/lib.rs}{86}{98}{The same dispatch in Rust: the unsafe call is guarded by the run-time
+check.}\label{lst:ll:vector-instructions-and-data-parallel-code:rust}
+
+Numbers need a second trick. Eight ASCII digits loaded as one 64-bit integer can be turned into their value without a loop:
+subtract the character \texttt{0} from every byte at once, then combine neighbouring digits into two-digit numbers in 16-bit
+lanes, those into four-digit numbers in 32-bit lanes, and those into the result, three multiplications in all. This is \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{SIMD}
+within an ordinary register, and it needs no special instruction; a version with SSE4.1 multiply-adds does the same in vector
+registers.
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{134}{144}{Eight digits in three multiply-add steps inside one 64-bit
+register.}\label{lst:ll:vector-instructions-and-data-parallel-code:swar}
+
+\begin{proposition}[The eight-digit combination]\label{prop:ll:vector-instructions-and-data-parallel-code:swar}
+Let bytes $b_0,\dots,b_7$ hold digits $d_0,\dots,d_7$ (after subtracting the character zero), $b_0$ the lowest. After the
+step $v \leftarrow (10v + (v \gg 8)) \wedge \mathtt{0x00FF00FF00FF00FF}$, the 16-bit lane $k$ holds $10 d_{2k} + d_{2k+1}$;
+after the two analogous steps with 100 and 10\,000, the low 32 bits hold $\sum_{j=0}^{7} d_j\, 10^{7-j}$.
+\end{proposition}
+
+\begin{proof}
+Before the mask, byte $2k$ of $10v + (v \gg 8)$ is $10 d_{2k} + d_{2k+1} \le 99 < 256$, since the shift brings byte $2k+1$
+down to position $2k$; no carry leaves the byte, and the mask discards the odd bytes, which hold unwanted sums. The same
+argument on 16-bit lanes (values up to $99 \times 100 + 99 < 2^{16}$) and on 32-bit lanes (up to $9\,999 \times 10\,000 +
+9\,999 < 2^{32}$) gives the four-digit and eight-digit values, the earlier digit always in the higher place.
+\end{proof}
+
+On the laptop an eight-digit field costs about \qty{2.0}{\nano\second} with the scalar loop, \qty{1.0}{\nano\second} with the
+register trick and \qty{0.7}{\nano\second} with SSE4.1, against about \qty{5}{\nano\second} for the standard library's
+\texttt{std::from\_chars}, which also validates and handles any length. A price parsed into an integer number of
+ten-thousandths costs about \qty{7}{\nano\second}, and the same price read as a double by \texttt{strtod} about
+\qty{43}{\nano\second}. Lemire's number-parsing paper makes the point for floating-point parsing: a 64-bit float needs at most
+17 significant digits, which fit in one 64-bit word, and parsing done that way is several times faster than the C library's.
+
+\section{Where vectorisation pays in a trading system}
+
+\Cref{fig:ll:vector-instructions-and-data-parallel-code:scan} measures the search for a delimiter placed at the end of a
+message of each length. The scalar loop costs about a quarter of a nanosecond per byte; SSE2 about a fortieth, AVX2 about an
+eightieth, on top of a fraction of a nanosecond per call. Below 16 bytes both vector versions hand the message to the scalar loop
+and cost the same. Splitting a whole FIX order message into its fields (16 fields, 159 bytes) takes about
+\qty{95}{\nano\second} one byte at a time and about \qty{11}{\nano\second} with the mask loop, about nine times less.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,xmode=log,ymode=log,log basis x=2,xmin=6,xmax=5500,ymin=0.4,ymax=2000,
+  xlabel={message length (bytes, log scale)},ylabel={ns per search (log scale)},
+  xtick={8,16,32,64,128,256,512,1024,4096},xticklabels={8,16,32,64,128,256,512,1024,4096},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=bytes,y=scalar]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\addplot[omMeth,thick,mark=square*,mark size=1.2pt] table[x=bytes,y=sse2]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=1.6pt] table[x=bytes,y=avx2]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\legend{scalar loop,SSE2 (16 bytes),AVX2 (32 bytes)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Time to find a delimiter at the end of a message, by message length: median of batches of a thousand searches of
+a message in the first-level cache. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores. Data:
+\texttt{bench\_simd.py}.}\label{fig:ll:vector-instructions-and-data-parallel-code:scan}
+\end{omfigure}
+
+Where does this matter? Wherever bytes are examined one by one on the hot path: splitting FIX messages on their delimiter
+(chapter~15), finding the structural characters of JSON messages from venues that publish in it (chapter~17), validating and
+parsing numeric fields, checksums, and copying. It matters less for binary protocols whose fields sit at fixed offsets
+(chapter~16), where there is nothing to search for; there, \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector instructions} pay in bulk work on arrays instead: the risk
+checks of many orders, the revaluation of a book of positions, the statistics a strategy updates. Three conditions decide:
+enough elements to fill a register, the same operation on each, and data laid out contiguously. The first two are properties
+of the problem; the third is a design decision.
+
+\section{Structure of arrays}
+
+\begin{definition}[Structure of arrays]\label{def:ll:vector-instructions-and-data-parallel-code:soa}
+A \emph{structure of arrays}\index{structure of arrays} stores a collection of records as one array per field, so that the
+same field of consecutive records is contiguous in memory; the usual layout, one record after another, is called an
+array of structures.
+\end{definition}
+
+An options book revalued from its Greeks shows the difference
+(\cref{fig:ll:vector-instructions-and-data-parallel-code:layout}). Each option's record carries an identifier, a symbol, its
+quantity and four Greeks, an expiry and some flags: 80 bytes, of which the revaluation $q(\Delta\,\delta S + \tfrac12
+\Gamma\,\delta S^2 + \mathcal{V}\,\delta\sigma + \Theta\,\delta t)$ reads 40. Stored as records, four consecutive deltas lie
+80 bytes apart and no instruction loads them together; stored as columns, they are 32 consecutive bytes, one load. Half of
+every \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} fetched for the records is wasted as well.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize]
+\node[anchor=west,font=\footnotesize\bfseries] at (-0.1,1.0) {array of structures (80-byte records)};
+\foreach \r in {0,1,2} {
+  \pgfmathsetmacro{\x}{\r*4.3}
+  \draw[fill=gray!10] (\x,0) rectangle ++(0.8,0.5) node[midway]{id};
+  \draw[fill=gray!10] (\x+0.8,0) rectangle ++(1.1,0.5) node[midway]{symbol};
+  \foreach \f/\k in {q/0,$\Delta$/1,$\Gamma$/2,$\mathcal{V}$/3,$\Theta$/4} {
+    \draw[fill=omDef!25] (\x+1.9+0.4*\k,0) rectangle ++(0.4,0.5) node[midway]{\f};
+  }
+  \draw[fill=gray!10] (\x+3.9,0) rectangle ++(0.35,0.5);
+}
+\foreach \r in {0,1,2} {\draw[-Stealth,omThm,thick] (\r*4.3+2.5,-0.05) -- (\r*4.3+2.5,-0.45);}
+\node[anchor=west,omThm] at (-0.1,-0.7) {deltas 80 bytes apart: one load each, half of every line unused};
+\node[anchor=west,font=\footnotesize\bfseries] at (-0.1,-1.45) {structure of arrays (one array per field)};
+\foreach \f/\y in {$\Delta$/-2.15,$\Gamma$/-2.75} {
+  \node[anchor=east] at (-0.15,\y+0.25) {\f};
+  \foreach \k in {0,...,15} {\draw[fill=omDef!25] (0.4*\k,\y) rectangle ++(0.4,0.5);}
+}
+\draw[very thick,omThm] (0,-2.15) rectangle ++(1.6,0.5);
+\node[anchor=west,omThm] at (6.6,-1.9) {four deltas, 32 contiguous bytes:};
+\node[anchor=west,omThm] at (6.6,-2.3) {one \texttt{ymm} load, one fused multiply-add};
+\end{tikzpicture}
+
+\omcaption{The same options book as records and as columns. Revaluation reads five of the record's fields; as columns, each
+field of four consecutive options fills one 256-bit register.}\label{fig:ll:vector-instructions-and-data-parallel-code:layout}
+\end{omfigure}
+
+\Cref{fig:ll:vector-instructions-and-data-parallel-code:reval} measures both layouts at three flag sets. With 1\,024
+options, which fit in the caches, the records cost about \qty{0.8}{\nano\second} per option whatever the flags, since no
+compiler vectorises them; the columns cost the same at \texttt{-O2} (GCC~11 does not vectorise there), half at \texttt{-O3}
+(two doubles per instruction) and a quarter with \texttt{-mavx2 -mfma}, four doubles per instruction and one fused
+multiply-add for each multiplication and addition pair. With a million options the data no longer fit in the caches and the
+bytes moved decide: 88 bytes per option for records (the record and the result), 48 for columns, and the measured cost is
+about three times lower for columns whatever the flags, the vector width now mattering little.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=8pt,ymin=0,ymax=6.5,
+  symbolic x coords={O2,O3,O3avx2},xtick=data,xticklabels={\texttt{-O2},\texttt{-O3},\texttt{-O3 -mavx2 -mfma}},
+  enlarge x limits=0.25,ylabel={ns per option},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=gray!35,draw=gray] table[x=key,y=rows_1k]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=cols_1k]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=gray!70,draw=gray!80!black] table[x=key,y=rows_1m]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=key,y=cols_1m]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\legend{{records, 1\,024 options},{columns, 1\,024 options},{records, $2^{20}$ options},{columns, $2^{20}$ options}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Revaluing an options book from its Greeks, stored as 80-byte records or as columns, compiled at three flag sets by
+GCC~11: in cache (1\,024 options) and from memory ($2^{20}$ options, 80~MB of records). Measured on a laptop (Intel Core
+Ultra 7 155H) under WSL2, no isolated cores. Data: \texttt{bench\_simd.py}.}\label{fig:ll:vector-instructions-and-data-parallel-code:reval}
+\end{omfigure}
+
+Columns have costs. Adding or removing one option touches every array; code that handles one option at a time (an order
+arriving, a fill) reads one element from each of several arrays, which is more \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} than one record; and the
+layout is less natural to write. The usual compromise is to keep records where single items are handled and columns where
+many items are computed on, or blocks of columns (eight options' deltas, then their gammas) that give both. A book of orders
+handled one message at a time (chapter~19) wants records; a risk engine revaluing every position on every move (chapter~22)
+wants columns.
+
+\section{Tutorial: scan, parse and lay out}\label{tut:ll:vector-instructions-and-data-parallel-code:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Scan and parse with \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector instructions} behind a feature check, held byte for byte to a scalar reference; read
+the compiler's decisions; measure layouts. \textbf{End state:}
+\cref{fig:ll:vector-instructions-and-data-parallel-code:scan,fig:ll:vector-instructions-and-data-parallel-code:reval},
+\cref{lst:ll:vector-instructions-and-data-parallel-code:report}, and green tests in C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Hold the vector code to the scalar code.} The build's C++ test runs every length from 0 to 200 bytes with
+delimiters at random positions (and none), twenty messages per length, through the scalar, SSE2, AVX2 and dispatched
+searches and the position finders, and requires identical answers; it parses 200\,000 eight-digit numbers four ways. The
+buffers are exactly as long as the messages, so a run under AddressSanitizer catches any read past the end.
+\item \textbf{Read the compiler's report}: \texttt{python ll\_vecreport.py} compiles \texttt{ll\_vecdemo.cpp} at three flag
+sets and writes \cref{lst:ll:vector-instructions-and-data-parallel-code:report} for the installed GCC; run it with a newer
+GCC and compare the \texttt{-O2} lines.
+\item \textbf{Measure} with \texttt{python bench\_simd.py}: searches by length, the split of FIX messages, the parsers, and
+the revaluation built at three flag sets.
+\item \textbf{The same in Rust}: \texttt{cargo test} in \path{code/firm/simdscan/rust} runs the twin's scans for every length
+and its parsers on the same values.
+\end{tutsteps}
+\textbf{What to change next.} Add \texttt{\_\_restrict} to the pointers of \texttt{reval\_columns} and check that the
+report's versioning line disappears; write the double sum with four separate accumulators and see whether the compiler
+vectorises it for real.
+\end{tutorial}
+
+\section{Build: the firm's scanner}\label{bld:ll:vector-instructions-and-data-parallel-code:simdscan}
+
+\begin{build}
+\bfield{Purpose} The byte-level primitives of every text protocol the firm reads: the FIX engine splits messages on the
+delimiter with it (chapter~15), and the WebSocket client finds JSON's structural characters and parses prices and sizes with
+it (chapter~17).
+\bfield{Interface} C++20 \texttt{firm::simdscan}: \texttt{find\_byte(p, n, c)}, \texttt{positions(p, n, c, out, cap)},
+\texttt{positions\_any(p, n, set, m, out, cap)}, each with \texttt{\_scalar}, \texttt{\_sse2} (search) and \texttt{\_avx2}
+versions; \texttt{parse8\_scalar}, \texttt{parse8\_swar}, \texttt{parse8\_sse}, \texttt{is8digits},
+\texttt{parse\_uint(p, n, value, used)}, \texttt{parse\_fixed(p, n, scale, out)}; \texttt{level()}. Rust
+\texttt{firm\_simdscan}: \texttt{find\_byte}, \texttt{positions}, \texttt{parse8\_swar}, \texttt{parse\_uint},
+\texttt{parse\_fixed}, with the scalar references.
+\bfield{Rules} Every vector routine returns what its scalar reference returns for every input, never reads outside
+$[p, p+n)$, and is called only after the run-time feature check; the AVX2 code is compiled by function attributes, never by
+compiling the program for AVX2; prices are parsed into integers of a declared scale, never into doubles.
+\bfield{Acceptance tests} \texttt{code/firm/simdscan/}: every length from 0 to 200 bytes against the scalar references in
+C++ and Rust, the capacity limit of the position finders respected, 200\,000 eight-digit values parsed identically by every
+method, integers of 19 digits, prices with and without decimals, negative prices, and the rejection of malformed ones.
+\bfield{Stretch} An AVX-512 version selected by the same dispatch; a classifier for JSON's structural characters with a
+table lookup (one shuffle instead of one comparison per character); a validator for eight digits inside the vector path.
+\end{build}
+
+\begin{omsources}
+\item G.~Langdale and D.~Lemire, ``Parsing gigabytes of JSON per second'', \emph{The VLDB Journal} 28(6), 2019.
+\item D.~Lemire, ``Number parsing at a gigabyte per second'', \emph{Software: Practice and Experience} 51(8), 2021.
+\item GCC 12 release notes (vectorisation at \texttt{-O2}); GCC manual, x86 built-in functions
+(\texttt{\_\_builtin\_cpu\_supports}).
+\item Intel 64 and IA-32 Architectures Software Developer's Manual, instructions \texttt{PCMPEQB} and \texttt{PMOVMSKB} (as
+transcribed in the x86 instruction reference at felixcloutier.com).
+\item The Rust standard library, \texttt{core::arch} and \texttt{is\_x86\_feature\_detected}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:1}
+How many doubles, 32-bit integers and bytes does a 256-bit register hold? How many 256-bit comparisons does it take to look
+at every byte of a 1\,500-byte packet?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:2}
+The mask of a 32-byte block is \texttt{0x00041010} (bit 0 the first byte). Where are the delimiters in the block?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:3}
+Apply \cref{prop:ll:vector-instructions-and-data-parallel-code:swar} by hand to the digits \texttt{20260925}: give the
+16-bit lanes after the first step and the 32-bit lanes after the second.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:4}
+A message of 70 bytes is scanned with 32-byte blocks and an overlapping last block. Which bytes does each load cover, how
+many bits must be shifted out of the last mask, and why is the result still correct if the delimiter is at byte 60?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:5}
+Explain each of the three reasons the compiler gives in \cref{lst:ll:vector-instructions-and-data-parallel-code:report}
+for not vectorising, or for vectorising only after a check, and how you would remove each.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:6}
+From the measured scan, estimate how long AVX2 takes to search the whole of a 4\,096-byte buffer and what that is in bytes
+per nanosecond. What limits it once the buffer no longer fits in the first-level cache?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:7}
+\emph{Coding.} Add \texttt{positions\_any\_sse2} to \texttt{firm.simdscan} (16-byte blocks, overlapping last block), use it
+in the dispatch when AVX2 is absent, and extend the C++ test to compare it with the scalar reference for every length.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:8}
+\emph{Find the flaw.} ``Our build machine has AVX-512, so we compile with \texttt{-march=native}; it passed every test in
+continuous integration and ran fine on the new servers.''
+\end{exercise}
+
+\section{Problem: Thirty-Two Bytes at a Time}
+
+\begin{problem}[{Weekend problem --- when does a vector scan pay?}]\label{pb:ll:vector-instructions-and-data-parallel-code:1}
+The measured scan (\texttt{measured\_scan.csv}) gives the cost of each search by message length; the split and parser
+measurements are in \texttt{measured\_split.csv} and \texttt{measured\_parse.csv}. A FIX order gateway receives execution
+reports of about 200 bytes with 20 fields, 200\,000 a second at peak.
+
+\medskip\noindent\textbf{Part I --- The costs.}
+\begin{enumerate}
+\item From the measurements at 4\,096 bytes, what does each method cost per byte?
+\item Fit a line $a + bL$ to the AVX2 costs for $L \ge 32$ (\texttt{ll\_simd.fit}). What are $a$ and $b$?
+\item Charging the scalar loop only its cost per byte, above what length is the AVX2 search cheaper? And SSE2?
+\item Why is charging the scalar loop no fixed cost generous to it?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The gateway.}
+\begin{enumerate}[resume]
+\item What does splitting one 200-byte report cost with each method, scaled from the measured split?
+\item How much core time per second does splitting take at peak, each way?
+\item Each report carries four prices and quantities to parse. Using \texttt{parse\_fixed} rather than \texttt{strtod}, what
+is saved per report?
+\item Which is the larger saving per report: the split or the parsing?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The limits.}
+\begin{enumerate}[resume]
+\item Why does the vector search not help a binary protocol with fields at fixed offsets?
+\item What happens on a processor without AVX2?
+\item Why must the last block overlap rather than read the 32 bytes beyond the start of the tail?
+\item What would AVX-512 change in the cost per byte, and what would it not change?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the message length below which the vector scan does not repay its setup, from the
+measured cost per byte and per call.
+\item Is any FIX field shorter than that?
+\item What measurement would you add before trusting the break-even on a server?
+\item Why are the scalar references kept in the build?
+\item How would you test that the dispatch picks the scalar path on a machine without AVX2, on a machine that has it?
+\item Where else in a trading system would the same thirty-two-bytes-at-a-time pattern apply?
+\item What layout change would let the risk checks of chapter~22 use the same instructions?
+\item In one sentence: when do \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{vector instructions} pay?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:vector-instructions-and-data-parallel-code:1}
+What is \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{SIMD}? Give an example of a loop that benefits and one that does not.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:vector-instructions-and-data-parallel-code:2}
+How would you find the first occurrence of a byte in a buffer as fast as possible?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:vector-instructions-and-data-parallel-code:3}
+What stops a compiler from vectorising a loop? How do you find out why it did not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:vector-instructions-and-data-parallel-code:4}
+Your binary uses AVX2 and must run on older machines. How do you ship it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:ll:vector-instructions-and-data-parallel-code:5}
+Array of structures or \omterm{def:ll:vector-instructions-and-data-parallel-code:soa}{structure of arrays} for a position book that is revalued on every price move? Why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:vector-instructions-and-data-parallel-code:6}
+Parse an ASCII decimal price into a fixed-point integer without a loop over characters. What must you validate?
+\end{interviewq}

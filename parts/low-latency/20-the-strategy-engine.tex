@@ -1,0 +1,340 @@
+\chapter{The Strategy Engine}\label{ch:ll:the-strategy-engine}
+
+Run the same quoting strategy twice on the same recorded day and compare what it sent. If one component stamps its orders
+with the wall clock, the two runs never agree, a hundred reruns give a hundred different outputs. If another keeps its quotes
+in a hash set whose seed is drawn at start-up and walks them in the set's order, 93 reruns out of a hundred differ. If two
+threads feed its queue, 49 do. Remove all three and the hundred runs agree to the last bit, and from then on every bug seen in
+production can be replayed on a desk. This chapter builds the component that runs the firm's strategies: a single thread
+that processes market events, order reports, timers and parameter changes one at a time, each to completion, in an order
+fixed by rules rather than by the operating system, with time injected rather than read, and with nothing on its hot path that
+can wait, allocate or vary.
+
+\section{The event loop}
+
+\begin{definition}[Event loop, run-to-completion processing]\label{def:ll:the-strategy-engine:loop}
+An \emph{event loop}\index{event loop} is a thread that repeatedly takes the next event from its inputs and hands it to the code
+that handles it. \emph{Run-to-completion processing}\index{run-to-completion processing} handles each event entirely, including
+everything it causes, before the next event is taken: no handler is interrupted by another, so a handler never sees a state
+that another has half changed.
+\end{definition}
+
+The engine's inputs are the rings of chapter~12: market events from the \omterm{def:ll:the-feed-handler:handler}{feed handler} (through the \omterm{def:ll:the-order-book-builder:builder}{book builder} of
+chapter~19), reports from the order gateway (chapter~21), and control messages; its own timers come from a timing wheel. Its
+outputs go to the gateway's ring and to the log. One thread owns all the strategy's state, so nothing needs a lock, and the
+order in which events are handled is decided by one rule: before an event with time $t$ is handled, every timer due at or
+before $t$ fires, in order of time and then of identifier; parameter changes effective at or before $t$ are applied; then the
+event. \Cref{fig:ll:the-strategy-engine:loop} draws it, and \cref{lst:ll:the-strategy-engine:run} is the whole loop.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=omDef!15] (mkt) at (0,1.2) {market events\\ (book builder)};
+\node[box,fill=omDef!15] (rep) at (0,0) {order reports\\ (gateway)};
+\node[box,fill=omDef!15] (ctl) at (0,-1.2) {parameter\\ snapshots};
+\node[box,fill=omMeth!15] (wheel) at (3.6,-2.5) {timing wheel};
+\node[box,fill=omThm!12,minimum width=4.2cm,minimum height=2.4cm] (loop) at (4.6,0) {};
+\node[align=center] at (4.6,0.7) {\textbf{one thread}};
+\node[align=left,font=\scriptsize,anchor=north] at (4.6,0.35) {1. timers due by $t$\\ 2. parameters effective by $t$\\ 3. the event at $t$};
+\node[box,fill=omDef!15] (gw) at (9.0,0.6) {orders\\ (gateway ring)};
+\node[box,fill=gray!10] (log) at (9.0,-0.6) {log};
+\draw[->] (mkt) -- (loop);
+\draw[->] (rep) -- (loop);
+\draw[->] (ctl) -- (loop);
+\draw[->] (wheel.north) -- (wheel.north |- loop.south);
+\draw[->,dashed] ([xshift=0.9cm]loop.south) |- node[pos=0.75,below,font=\scriptsize]{schedule} (wheel.east);
+\draw[->] (loop) -- (gw);
+\draw[->] (loop) -- (log);
+\node[font=\scriptsize,align=left,anchor=west] at (7.4,-2.0) {clock: injected\\ (simulated or real)};
+\end{tikzpicture}
+
+\omcaption{The strategy engine. Every input reaches one thread, which handles each event to completion in an order fixed by
+rule: the timers due by the event's time, then the parameters effective by it, then the event. Time is whatever clock the
+engine was given: a recorded day's in replay, the machine's live.}\label{fig:ll:the-strategy-engine:loop}
+\end{omfigure}
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{128}{136}{The event loop: timers first, then parameters, then the
+event, each handled to completion.}\label{lst:ll:the-strategy-engine:run}
+
+The design is old and deliberately plain. The retail exchange whose architecture Martin Fowler described in 2011 ran its
+business logic on one thread, in memory, with the state ``entirely derivable by processing the input events'' kept in a
+durable store; and because ``the business logic is deterministic'', its outputs did not even need to be stored. A strategy
+engine gains the same two things: speed, because one thread with its data in its own caches does not coordinate with
+anyone, and replay, because the same inputs in the same order produce the same outputs.
+
+\section{Single-threaded determinism}
+
+A program is reproducible bit for bit (the bitwise reproducibility of One Quant Book~4, chapter~25) only as a whole, and any
+one of its parts can break it. \Cref{fig:ll:the-strategy-engine:reruns} counts the damage on the build's small quoting engine, run a hundred times as a new
+process on the same 6\,000 recorded events, with one source of nondeterminism switched on at a time.
+
+\begin{itemize}
+\item \emph{A read of the wall clock}, here to stamp each action and to date its quotes: every run reads different times, so a
+hundred runs give a hundred outputs. Any decision that compares the real time with something (a quote's age, a timeout) makes
+the difference reach the orders themselves.
+\item \emph{Iteration over a hash container with a per-process seed}: the engine keeps its ten quotes in a hash set whose hash
+is seeded at start-up and requotes them in the set's order, so the identifiers and the order of the actions follow the seed.
+Rust's standard hash map does exactly this by design (its algorithm ``is randomly seeded''); 93 of the hundred runs
+differ.
+\item \emph{Two threads feeding one queue}, each carrying half of the events: the order in which the consumer sees them depends
+on scheduling, the book passes through states that never existed, and 49 of the hundred runs differ.
+\end{itemize}
+
+Switched off, all three give one output in a hundred runs; so does the firm's engine. The rules that achieve it are few. Time
+comes from the events, through an \omterm{def:ll:the-strategy-engine:wheel}{injected clock} (next section). Containers that are iterated have a defined order: arrays,
+ordered maps, or hash maps whose order does not decide anything. One thread owns the state; other threads only move data
+through rings, and the merge of several inputs follows a rule (by time, then by source, then by sequence), not the arrival
+order. Floating-point sums are done in a fixed order (chapter~8), and the example strategy stays in integers, which is also why
+the C++ and Rust engines of the build produce the same output hash.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=16pt,ymin=0,ymax=115,
+  symbolic x coords={firm,none,wall_clock,hash_order,two_threads,all},xtick=data,
+  xticklabels={{firm's\\ engine},{no\\ defect},{wall\\ clock},{seeded\\ hash order},{two\\ threads},{all\\ three}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.1,ylabel={distinct outputs in 100 runs},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=distinct]{figdata/low-latency/20-the-strategy-engine/measured_nondet.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Distinct output hashes in a hundred reruns (each a new process) of the same 6\,000 recorded events, for the firm's
+engine and for the small engine of \texttt{ll\_nondet.hpp} with each source of nondeterminism switched on. Measured on a laptop
+(Intel Core Ultra 7 155H) under WSL2. Data: \texttt{bench\_engine.py}.}\label{fig:ll:the-strategy-engine:reruns}
+\end{omfigure}
+
+\section{Timers and the injected clock}
+
+\begin{definition}[Timer wheel, injected clock]\label{def:ll:the-strategy-engine:wheel}
+A \emph{timer wheel}\index{timer wheel} is a circular array of slots, each covering an interval of time (its granularity): a
+timer is filed in the slot of its expiry time modulo the wheel's span, and advancing the wheel visits the slots of the time that
+has passed and fires the timers due in them; scheduling costs a constant time whatever the number of timers. An \emph{injected
+clock}\index{injected clock} is a clock passed to the code that needs the time instead of being read by it: the same code runs
+on the simulated clock of a recorded day (One Quant Book~7, chapter~17) or on the machine's real clock.
+\end{definition}
+
+A strategy is full of timers: an order that must be acknowledged within a delay, a quote that must be pulled if the market data
+stops, a refresh every few seconds, a \omterm{def:ll:protocols-i-fix:session}{heartbeat}. A priority queue would do, at a logarithmic cost per timer; the hashed timing
+wheel of Varghese and Lauck (1987) does it in constant time, which matters when every order schedules and cancels timers.
+The build's wheel has 1\,024 slots of \qty{100}{\micro\second}: a timer goes to slot $\lfloor t/100\,\mu\text{s}\rfloor \bmod 1\,024$,
+and a timer further away than the wheel's span of about \qty{0.1}{\second} simply stays in its slot until its time comes round.
+Two details make it deterministic: the timers due in a slot fire sorted by time and then by identifier, never in insertion
+order; and a timer scheduled while another fires, if due in the same slot, fires in the same pass.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \i in {0,...,15} {
+  \pgfmathsetmacro{\a}{90 - 22.5*\i}
+  \pgfmathtruncatemacro{\busy}{(\i==2)||(\i==3)||(\i==7)||(\i==12)}
+  \ifnum\busy=1 \draw[fill=omMeth!25,draw=omMeth] (\a+11.25:1.4) arc (\a+11.25:\a-11.25:1.4) -- (\a-11.25:2.3) arc (\a-11.25:\a+11.25:2.3) -- cycle;
+  \else \draw[fill=gray!6,draw=gray!50] (\a+11.25:1.4) arc (\a+11.25:\a-11.25:1.4) -- (\a-11.25:2.3) arc (\a-11.25:\a+11.25:2.3) -- cycle; \fi
+  \node at (\a:1.85) {\i};
+}
+\draw[->,very thick,omThm] (0,0) -- (45:1.35);
+\node[align=center] at (0,-0.35) {now: slot 2};
+\node[anchor=west,align=left] at (2.9,1.4) {slot $= \lfloor t / g \rfloor \bmod 16$ ($g$: granularity)};
+\node[anchor=west,align=left] at (2.9,0.7) {slot 3: ack of quote 41 at $t_0 + 50\,\mu$s;\\ stale check at $t_0 + 20$ ms};
+\node[anchor=west,align=left] at (2.9,-0.2) {advancing to $t$: visit slots 2, 3, \dots\ up to $t$'s,\\ fire the timers due by $t$ in (time, id) order;};
+\node[anchor=west,align=left] at (2.9,-1.1) {a timer more than a revolution away\\ (the stale check) waits in its slot};
+\end{tikzpicture}
+
+\omcaption{A hashed timing wheel of 16 slots (the build's has 1\,024 of \qty{100}{\micro\second}). Scheduling puts a timer in
+the slot of its expiry time; advancing visits the slots passed and fires only the timers due, sorted; a timer further than one
+revolution stays in its slot until its time comes round.}\label{fig:ll:the-strategy-engine:wheel}
+\end{omfigure}
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{82}{101}{Advancing the wheel: visit the slots passed, fire the timers
+due in time and identifier order.}\label{lst:ll:the-strategy-engine:wheel}
+
+The wheel knows no clock. It is advanced to the time of each event, and the engine's code asks an \omterm{def:ll:the-strategy-engine:wheel}{injected clock} for the time:
+the simulated clock returns the event's time, the real clock reads \texttt{CLOCK\_MONOTONIC} (chapter~5) and maps it onto the
+day. Replaying a day with the simulated clock gives, event for event, what the live engine would have done with the same inputs
+at the same times; the real clock is used live, and only there.
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{46}{58}{The two clocks the engine can be given.}\label{lst:ll:the-strategy-engine:clock}
+
+\section{Configuration and parameters at run time}
+
+\begin{definition}[Parameter snapshot]\label{def:ll:the-strategy-engine:snapshot}
+A \emph{parameter snapshot} is a complete, versioned set of a strategy's parameters that takes effect at a stated time, between
+two events and never during one; every action the strategy takes records the version of the parameters it was taken under.
+\end{definition}
+
+Traders change parameters during the day: a wider spread before a number, a smaller size in a thin market. Changing a field of
+a live structure from another thread while the engine reads it is a \omterm{def:ll:rust-for-low-latency:race}{data race} (chapter~11), and even a correct atomic update of
+one field leaves a moment where half the parameters are new. The build applies whole snapshots, in the loop, between events:
+the control path publishes a snapshot with an effective time on the engine's control ring, and the loop installs it before the
+first event at or after that time. The version stamped on every action says which parameters produced it, and in replay the
+snapshots are inputs like any other event: the build's test applies one half-way through the day and checks that every action
+before it is unchanged and every later one carries the new version.
+
+\section{Hot-path discipline}
+
+The hot path of chapter~1 runs through this thread, and it is disciplined by rules the earlier chapters have measured. No
+allocation per event (chapter~6): the build's test counts heap allocations while the engine replays its fixture and finds none,
+because the action log, the wheel's slots and the book are sized at start-up. No system call: the simulated clock is a field,
+and even the real clock is read through the vDSO (chapter~5). No lock and no waiting: inputs and outputs are rings, and a full
+output ring is an error to report, not a reason to wait. No formatting of text: the log receives binary records (chapter~23). No
+unbounded work in a handler: the wheel's work is bounded by the slots passed, the book's by its structure.
+
+The result on the laptop: the engine takes about \qty{53}{\nano\second} per event at the median on the large-tick stream of
+chapter~18, book update included, and about \qty{57}{\nano\second} on the small-tick one where it requotes at almost every
+event; the p99 is about \qty{130}{\nano\second} and \qty{200}{\nano\second}. A decision in tens of nanoseconds leaves the
+\omterm{def:ll:where-latency-comes-from:budget}{latency budget} to the network and the gateway.
+
+\section{Tutorial: replay a day, then break it}\label{tut:ll:the-strategy-engine:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Replay a recorded input through the engine to the same output every time, then switch on each source of
+nondeterminism and count the outcomes. \textbf{End state:} \cref{fig:ll:the-strategy-engine:reruns}, the engine's time per
+event, and green tests in C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Replay.} The C++ test runs the engine twice on the \omterm{def:ll:the-order-book-builder:builder}{book builder}'s small-tick fixture and compares the output
+hashes, the actions and the profit, then checks them against \texttt{data/expected.txt}; the Rust engine, written against the
+same rules, reproduces the same hash.
+\item \textbf{Change the parameters half-way} with a snapshot and check that only the actions after it change.
+\item \textbf{Count the zero:} the test counts heap allocations during the replay.
+\item \textbf{Break it} with \texttt{python bench\_engine.py}: a hundred new processes per configuration of \texttt{ll\_nondet},
+each printing its output hash, then the distinct hashes counted.
+\end{tutsteps}
+\textbf{What to change next.} Replace the small engine's seeded hash set by one with a fixed seed and count again; feed the two
+threads' events through a merge by timestamp instead of a shared queue.
+\end{tutorial}
+
+\section{Build: the strategy engine}\label{bld:ll:the-strategy-engine:stratengine}
+
+\begin{build}
+\bfield{Purpose} The thread on which the firm's strategies run: it consumes the \omterm{def:ll:the-order-book-builder:builder}{book builder}'s view (chapter~19), sends orders
+through the gateway (chapter~21) past the risk gate (chapter~22), and logs everything it does (chapter~23).
+\bfield{Interface} C++20 \texttt{firm::strat}: \texttt{Engine<Clock>(tick, Params, clock)} with \texttt{run(events, snapshots)},
+\texttt{actions}, \texttt{hash}, \texttt{position}, \texttt{cash}, \texttt{pnl()}; \texttt{TimerWheel(granularity, slots)} with
+\texttt{schedule} and \texttt{advance}; \texttt{SimClock}, \texttt{RealClock}; \texttt{Params}, \texttt{Snapshot},
+\texttt{Action}. Rust \texttt{firm\_stratengine}: \texttt{Engine}, \texttt{TimerWheel}, \texttt{Params}, \texttt{Action},
+\texttt{read\_events}.
+\bfield{Rules} One thread owns the state; each event is handled to completion; timers due by an event fire before it, in (time,
+identifier) order; parameter snapshots apply between events; time comes from the \omterm{def:ll:the-strategy-engine:wheel}{injected clock}; the example strategy computes
+in integers; no allocation per event.
+\bfield{Acceptance tests} \texttt{code/firm/stratengine/}: two replays with identical actions, hash and profit, equal to the
+committed hash; the Rust engine equal to it; a snapshot changing only what follows it; zero allocations during the replay; the
+wheel firing in order across slots and revolutions.
+\bfield{Stretch} A hierarchical wheel for long timers; order reports from the simulator of One Quant Book~10 in place of the venue
+stub; several strategies on one engine with a fixed scheduling order.
+\end{build}
+
+\begin{omsources}
+\item G.~Varghese and T.~Lauck, ``Hashed and hierarchical timing wheels: data structures for the efficient implementation of a
+timer facility'', \emph{Proceedings of the 11th ACM Symposium on Operating Systems Principles}, 1987.
+\item M.~Fowler, \emph{The LMAX Architecture}, 2011.
+\item The Rust standard library, \texttt{std::collections::HashMap}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:1}
+A wheel has 1\,024 slots of \qty{100}{\micro\second}. In which slot does a timer due at 34\,200.012345 seconds after midnight go,
+and how many revolutions away is a timer due in 5 seconds?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:2}
+Three timers are due in the same slot at 120, 121 and 120 microseconds with identifiers 7, 3 and 9. In what order do they fire?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:3}
+Why is the time of an event the right ``now'' for a strategy in replay, and what must be true of the live system for replay to
+match it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:4}
+If an outcome depends on which of $k$ equally likely orders a hash set produces, how many distinct outcomes should a hundred
+reruns show on average? What does the measured 93 suggest about $k$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:5}
+A trader changes the spread from two ticks to four at 10:30:00.000. An event arrives at 10:29:59.999 and the next at
+10:30:00.004. Under which parameters is each handled, and what does the log show?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:6}
+The engine takes \qty{53}{\nano\second} per event at the median. At the open, events arrive at 2 million a second for 50
+milliseconds. Does it keep up, and what is its utilisation?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-strategy-engine:7}
+\emph{Coding.} Add a refresh timer to the engine: every quote older than \qty{5}{\second} is re-sent at the same price. Check
+that two replays still agree and that the Rust engine, changed the same way, still produces the C++ hash.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-strategy-engine:8}
+\emph{Find the flaw.} ``Our engine is deterministic: it is single-threaded and uses no randomness. It stamps each order with
+\texttt{std::chrono::system\_clock::now()} for the audit trail.''
+\end{exercise}
+
+\section{Problem: Two Runs, Two Profits}
+
+\begin{problem}[{Weekend problem --- counting the ways a program can disagree with itself}]\label{pb:ll:the-strategy-engine:1}
+A research team replays the same recorded day through its quoting engine twice and gets two profits. Use the measurements of
+\cref{fig:ll:the-strategy-engine:reruns} (\texttt{measured\_nondet.csv}).
+
+\medskip\noindent\textbf{Part I --- The sources.}
+\begin{enumerate}
+\item List the three sources measured and the number of distinct outputs each gave in a hundred runs.
+\item Why does the wall clock give a hundred?
+\item Why does the seeded hash set give fewer than a hundred?
+\item Why does the two-thread feed give fewer still, and what would make it give more?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Finding them.}
+\begin{enumerate}[resume]
+\item How would you find the first action at which two runs differ?
+\item What does each source leave as a clue at that point?
+\item Why must each rerun be a new process to see the seeded hash's effect?
+\item Which of the three sources would a single run inside a debugger never show?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The fixes.}
+\begin{enumerate}[resume]
+\item Fix the wall clock.
+\item Fix the hash order without giving up hash maps.
+\item Fix the two-thread feed.
+\item After the fixes, how many distinct outputs should a hundred reruns give, and how many did the firm's engine give?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the number of distinct outcomes in a hundred reruns with each source switched on, and after
+the fixes.
+\item Why is ``the profit differs by a little'' not a reason to accept nondeterminism in a backtest?
+\item What else can break bitwise reproducibility between two machines, even with all three fixes?
+\item Why does integer arithmetic in the strategy make the C++ and Rust engines agree?
+\item What should the continuous-integration pipeline run to keep determinism?
+\item What does determinism give the production support team?
+\item When is a nondeterministic component acceptable in a trading system?
+\item In one sentence: what makes an engine replayable?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:the-strategy-engine:1}
+Why run a strategy on a single thread? What does it cost?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-strategy-engine:2}
+How would you implement timers for thousands of orders, each with its own timeouts?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-strategy-engine:3}
+Your backtest and your production run disagree on the same day. Where do you look?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-strategy-engine:4}
+How do you change a strategy's parameters while it runs, safely?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-strategy-engine:5}
+What must never happen on the hot path of a strategy engine, and how do you check?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:the-strategy-engine:6}
+Design a strategy engine that is both live and replayable bit for bit. What are the rules, and how are they enforced?
+\end{interviewq}

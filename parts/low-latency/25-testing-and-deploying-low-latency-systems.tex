@@ -1,0 +1,342 @@
+\chapter{Testing and Deploying Low-Latency Systems}\label{ch:ll:testing-and-deploying-low-latency-systems}
+
+A release of a trading system can pass every functional test and still be worse than the one it replaces: a log statement
+that moved inside the hot loop, a container that now allocates, a lock taken on a path that used to be free. None of these
+changes an output, so no functional test fails; each adds tens or hundreds of nanoseconds at the 99th percentile, which is
+where a latency-sensitive strategy lives. Catching them takes a different kind of test, one that measures, on a machine that
+is never perfectly quiet, and decides whether a difference is real. This chapter assembles the tests a low-latency system
+needs, from the ones that check what it computes (properties, differences, random inputs, the venue's own scripts) to the one
+that checks how fast it computes, and ends with the way a release reaches production: gradually, reversibly, and only onto
+machines that have been checked.
+
+\section{The test pyramid for a trading system}
+
+\begin{definition}[Property-based test, differential test, fuzz testing]\label{def:ll:testing-and-deploying-low-latency-systems:tests}
+A \emph{property-based test}\index{property-based test} generates many random inputs and checks that a stated property holds
+for every one of them, rather than comparing one input with one expected output. A \emph{differential
+test}\index{differential test} runs two implementations of the same specification on the same inputs and checks that their
+outputs are identical. \emph{Fuzz testing}\index{fuzz testing} feeds a program large numbers of malformed or mutated inputs to
+find those that make it crash, hang or violate its invariants.
+\end{definition}
+
+The components of this book have been tested in these ways all along. The gateway of chapter~21 is checked by properties over
+random interleavings against the matching engine (no order fills more than it asked for, no position exceeds the limit); the
+\omterm{def:ll:the-order-book-builder:builder}{book builder} of chapter~19 and the engines of chapters~20 to 24 by \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{differential tests}, since the Python reference, the C++ and
+the Rust implementations must agree on every fixture, byte for byte or hash for hash. Property-based testing is the idea of
+QuickCheck (Claessen and Hughes, 2000): the property is the specification, and the generator explores inputs no one would have
+written by hand. \Cref{fig:ll:testing-and-deploying-low-latency-systems:pyramid} puts the kinds of test in the order in which a
+release meets them: many cheap ones at the bottom, run on every change, and a few expensive ones at the top, run before
+production.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize]
+\foreach \y/\w/\t/\c in {0/11/{unit, property and differential tests: every change, seconds}/omDef,
+  0.9/9.2/{fuzzing with sanitisers: every change, minutes}/omDef,
+  1.8/7.4/{simulator-backed scenarios and replays of recorded days}/omMeth,
+  2.7/5.6/{certification scripts against the venue's test system}/omMeth,
+  3.6/3.8/{performance gate: interleaved runs}/omThm,
+  4.5/2.2/{staged rollout}/omThm} {
+  \fill[\c!18,draw=\c!60] (-\w/2,\y) rectangle (\w/2,\y+0.8);
+  \node[align=center] at (0,\y+0.4) {\t};
+}
+\draw[->] (6.3,0.2) -- node[right,align=left]{fewer, slower,\\ closer to production} (6.3,5.1);
+\end{tikzpicture}
+
+\omcaption{The tests a low-latency trading system meets on its way to production. The lower layers check what it computes and
+run on every change; the upper ones check how it behaves against the venue and how fast it is, and run on candidates for
+release.}\label{fig:ll:testing-and-deploying-low-latency-systems:pyramid}
+\end{omfigure}
+
+\section{Tests backed by the exchange simulator}
+
+Unit tests stop at the process boundary; the bugs that cost money live at it: a report that arrives before the acknowledgement
+of its order, a cancel that crosses a fill, a session that drops in the middle of a burst, a venue that rejects a message the
+firm thought valid. Book 10's simulator makes these reproducible: the same seed gives the same interleaving, a scripted fault
+(a dropped session, a halt, a pause) happens at the same moment, and the matching engine applies the venue's rules exactly.
+Chapter~21's property tests and chapter~24's \omterm{def:ll:resilience:failover}{failover} table are simulator-backed tests in this sense: a scenario, a set of
+seeds or cut points, and properties checked after each run. Replays of recorded days (chapter~23) complete them: they check
+that a new build takes the decisions the old one took, except where a change was intended.
+
+Random inputs reach places scenarios do not. \Cref{lst:ll:testing-and-deploying-low-latency-systems:trusting} is a checksum
+reader with a classic bug: it believes the message's BodyLength field and reads the checksum where the field says, without
+checking that the message is that long. The chapter's fuzzer mutates the golden FIX messages of chapter~15 (a byte flipped,
+a digit changed, a field duplicated, a tail cut off) and copies each into a buffer of exactly its size, so that
+AddressSanitizer sees any read past it. Against this reader it stops at the first truncated message: within 12 inputs for
+each of ten seeds. Against the firm's own parser it ran a million inputs without a bad read. It did find a real bug there,
+through an invariant rather than a crash: two mutations, a tag 11 turned into 10 and a sequence number raised by one, left the
+checksum unchanged, and the parser accepted a message with a CheckSum field in the middle of its body. The Python, C++ and Rust
+parsers of \texttt{firm.fixengine} now refuse it, and a test keeps the message.
+
+\omcode{code/low-latency/25-testing-and-deploying-low-latency-systems/cpp/ll_fuzz.hpp}{67}{78}{A checksum reader that trusts
+BodyLength: the fuzzer's first truncated message makes it read past the buffer.}\label{lst:ll:testing-and-deploying-low-latency-systems:trusting}
+
+\section{Exchange certification and conformance}
+
+\begin{definition}[Exchange certification]\label{def:ll:testing-and-deploying-low-latency-systems:cert}
+\emph{Exchange certification}\index{exchange certification} is the process by which a venue checks, before granting access to
+production, that a client's system handles its protocols correctly: the client runs a script of scenarios against the venue's
+test system, which verifies each message and response.
+\end{definition}
+
+Venues certify the systems that connect to them, and regulators ask firms to test their conformance with each venue before
+trading and after every material change (the dated box). A certification script is a list of steps, each a message and the
+responses it must produce: an order accepted, a replace, a cancel, a cancel that comes too late, a reused identifier, a price
+off the tick grid, an immediate-or-cancel order with nothing to trade, a post-only order that would cross, a \omterm{def:ll:pre-trade-risk-and-kill-switches:mass}{mass cancel}, a
+disconnect that cancels resting orders. \texttt{firm.perfgate}'s runner plays such a script against Book 10's matching engine
+(\cref{lst:ll:testing-and-deploying-low-latency-systems:certify}); the build's seventeen steps pass, and a script that expects
+the wrong behaviour of a single step fails at that step and no other. The same runner, pointed at a new version of the
+simulator or of the firm's gateway, is a conformance test in the regulator's sense.
+
+\omcode{code/firm/perfgate/firm_perfgate.py}{121}{142}{The certification runner: each step sends one message and compares the
+responses, in order, with the script's.}\label{lst:ll:testing-and-deploying-low-latency-systems:certify}
+
+\begin{dated}{2026-09}{Conformance testing and certification}\label{dat:ll:testing-and-deploying-low-latency-systems:cert}
+In the European Union (consulted September 2026), Commission Delegated Regulation (EU) 2017/589 requires firms to establish
+methodologies to develop and test algorithmic trading systems before deployment or substantial update; to test their
+conformance with a trading venue's system when becoming a member, when connecting through sponsored access for the first time,
+when the venue's systems change materially and before deploying or materially updating an algorithm, verifying that it
+interacts with the venue's matching logic as intended; and to test in an environment separated from production. CME Group
+requires client systems that route orders to or process market data from its Globex platform to be certified with AutoCert+,
+its automated testing tool.
+\end{dated}
+
+\section{Performance regression gates}
+
+\begin{definition}[Performance regression gate]\label{def:ll:testing-and-deploying-low-latency-systems:gate}
+A \emph{performance regression gate}\index{performance regression gate} is a test that runs a benchmark on the current build
+and on a candidate, on the same machine, and refuses the candidate if a latency statistic is worse by more than a stated
+tolerance with a stated confidence.
+\end{definition}
+
+A single benchmark run says little, even on an otherwise idle laptop. \Cref{fig:ll:testing-and-deploying-low-latency-systems:runs} shows 800
+runs of the gate's benchmark (the strategy engine on the small-tick day of chapter~19, timed per event), alternating between the
+current build and one with a planted regression. The 99th percentile of a run moves by tens of percent from one run to the
+next with the operating system's and the hypervisor's own activity; the regression, which adds about 18\% at the median of
+the runs, is invisible in
+any single pair. The gate is built for this noise. It interleaves the runs (A, B, B, A, \dots), so that a slow drift of the
+machine affects both builds alike; it takes one statistic per run, the 99th percentile, and compares their medians across runs;
+it decides with a permutation test, which assumes nothing about the distribution, and reports a bootstrap interval of the rise
+(\cref{lst:ll:testing-and-deploying-low-latency-systems:compare}); and it flags a regression only if the rise is both significant
+and larger than a tolerance of 2\%, so that a real but negligible change does not block a release.
+
+\omcode{code/firm/perfgate/firm_perfgate.py}{62}{83}{The gate's decision: the rise of the median 99th percentile, a one-sided
+permutation test, a bootstrap interval, and a tolerance.}\label{lst:ll:testing-and-deploying-low-latency-systems:compare}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=0,xmax=800,ymin=150,ymax=700,xlabel={run (interleaved: A B B A \dots)},
+  ylabel={99th percentile of the run (ns)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend pos=north east,legend style={font=\scriptsize},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.7pt,omDef,restrict expr to domain={\thisrow{isb}}{0:0}]
+  table[x=run,y=p99_ns]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate_runs_plot.csv};
+\addlegendentry{A: current build}
+\addplot[only marks,mark=*,mark size=0.7pt,omThm,restrict expr to domain={\thisrow{isb}}{1:1}]
+  table[x=run,y=p99_ns]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate_runs_plot.csv};
+\addlegendentry{B: planted regression}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The 99th percentile of each of 800 runs of the gate's benchmark (18\,000 timed events each), alternating between
+the current build and one with a planted regression, on a laptop (Intel Core Ultra 7 155H, WSL2), the machine otherwise idle.
+Data: \texttt{bench\_gate.py}.}\label{fig:ll:testing-and-deploying-low-latency-systems:runs}
+\end{omfigure}
+
+How many runs does the gate need? \Cref{fig:ll:testing-and-deploying-low-latency-systems:power} answers from the machine's own
+noise. It draws gates of $n$ runs per side from the measured pools: two disjoint draws from the current build's runs give the
+false-alarm rate, which stays near the test's level of 5\% (3 to 9\% over a hundred gates); two draws of which one is shifted
+by 5\% of the median give the detection rate of a 5\% rise; and the planted regression against the current build gives its
+detection rate. The planted regression, at about 18\%, is caught 99\% of the time with 40 runs per side. A 5\% rise needs far
+more: 73\% at 120 runs, 84\% at 160 and 91\% at 200, so about 200 runs per side for 90\%; the normal approximation of
+\texttt{runs\_needed}, from the runs' spread of about 14\%, says about 220. At some 30 milliseconds a run, that is about twelve
+seconds of benchmark per gate on this laptop, and on
+a production-like machine with isolated cores (chapter~13), whose runs vary less, it is far fewer.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.5cm,height=5.6cm,xmode=log,xmin=4,xmax=250,ymin=0,ymax=1.05,
+  xlabel={runs per side},ylabel={fraction of gates that flag B},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=outer north east,legend style={font=\scriptsize,cells={anchor=west}},
+  table/col sep=comma,xtick={5,10,20,40,80,200},xticklabels={5,10,20,40,80,200}]
+\addplot[omThm,thick,mark=*] table[x=runs,y=detect_planted]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{planted regression (about 18\%)}
+\addplot[omMeth,thick,mark=square*] table[x=runs,y=detect_5pct]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{a 5\% rise}
+\addplot[omDef,thick,mark=triangle*] table[x=runs,y=false_alarm]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{no change (false alarms)}
+\addplot[gray,dashed] coordinates {(4,0.9) (250,0.9)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The gate's detection and false-alarm rates against the number of runs per side, from 100 gates drawn from the
+measured runs of \cref{fig:ll:testing-and-deploying-low-latency-systems:runs} for each point; the dashed line is 90\% power.
+Data: \texttt{fig\_gate.py} (deterministic, from the measured pools).}\label{fig:ll:testing-and-deploying-low-latency-systems:power}
+\end{omfigure}
+
+\section{Staged rollouts and rollback}
+
+A release that has passed the gate still meets production gradually: the canary deployment and staged rollout of One Quant
+Book~7 (chapter~21), with paper trading where the strategy allows it. Low-latency systems add three habits. The host is checked
+before the process starts: \texttt{firm.perfgate.preflight} runs the tuning audit of chapter~13 against the core placement plan
+and stops the deployment on any failure, because a strategy tested on isolated cores and deployed on a host whose interrupts land
+on them is not the strategy that was tested (this laptop fails 7 of the audit's 11 rules, which is why its measurements carry
+the words ``no isolated cores''). The new build runs first next to the old one, on the same inputs, in shadow: the replay of
+chapter~23 made live, with its outputs compared and discarded. And rollback is a deployment like any other, prepared and
+tested before it is needed, since the moment it is needed is the moment the team has the least time; the \omterm{def:ll:resilience:failover}{failover} of
+chapter~24 is the same lesson for machines.
+
+\section{Tutorial: fuzz, certify, gate}\label{tut:ll:testing-and-deploying-low-latency-systems:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Fuzz the FIX parser under the sanitisers, run a certification script against the simulator, and gate a planted
+regression on this laptop. \textbf{End state:} the fuzzing results, a passing certification, and
+\cref{fig:ll:testing-and-deploying-low-latency-systems:power}.
+\begin{tutsteps}
+\item \textbf{Fuzz.} \texttt{ll\_fuzz\_test.cpp} runs 200\,000 mutations through the firm's parser and checks that every
+accepted message lies within its buffer and carries a correct checksum; \texttt{python bench\_fuzz.py} builds the fuzzer with
+AddressSanitizer and UndefinedBehaviorSanitizer and runs it against both parsers.
+\item \textbf{Certify.} \texttt{firm\_perfgate.certify(load\_script(\textquotedbl{}data/cert\_script.json\textquotedbl{}))}
+plays the seventeen steps against Book 10's engine.
+\item \textbf{Gate.} \texttt{python bench\_gate.py} measures 400 interleaved pairs; \texttt{python fig\_gate.py} turns them into
+detection and false-alarm rates.
+\item \textbf{Preflight.} \texttt{firm\_perfgate.preflight} on the tuning audit's two fixture hosts: the tuned one passes, the
+mistuned one does not.
+\end{tutsteps}
+\textbf{What to change next.} Gate on the median of the runs' medians instead of their 99th percentiles and compare the number
+of runs needed; add a step to the certification script for the venue's throttle.
+\end{tutorial}
+
+\section{Build: the performance gate}\label{bld:ll:testing-and-deploying-low-latency-systems:perfgate}
+
+\begin{build}
+\bfield{Purpose} The last checks before production for every component of the book: its speed against the current build, its
+behaviour against the venue's script, and the host it will run on.
+\bfield{Interface} Python \texttt{firm\_perfgate}: \texttt{interleave}, \texttt{run\_pairs(cmd\_a, cmd\_b, n\_pairs, parse)},
+\texttt{compare(a, b, tolerance, alpha)} returning a \texttt{Verdict} with \texttt{rise}, \texttt{p\_value}, \texttt{low},
+\texttt{high}, \texttt{regression} and \texttt{report()}; \texttt{power}, \texttt{runs\_needed}; \texttt{certify(script)},
+\texttt{load\_script}; \texttt{preflight(root, plan)}.
+\bfield{Rules} Runs interleaved, never all of A then all of B; one statistic per run; a permutation test and a tolerance; the
+number of runs set from the machine's measured noise; no deployment on a host that fails the audit.
+\bfield{Acceptance tests} \texttt{code/firm/perfgate/}: a clear rise flagged and noise or a rise under the tolerance not; false
+alarms near the test's level on synthetic noise; power that grows with the number of runs; the certification script passing,
+and failing at exactly the altered step; the preflight passing the tuned fixture host and failing the mistuned one.
+\bfield{Stretch} A gate on the whole latency distribution (a two-sample test on pooled samples, with care for dependence within
+runs); certification steps for sessions and throttles; the gate in continuous integration on a dedicated machine.
+\end{build}
+
+\begin{omsources}
+\item K.~Claessen and J.~Hughes, ``QuickCheck: a lightweight tool for random testing of Haskell programs'', \emph{ICFP}, 2000.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS 6), articles 5 to 7.
+\item CME Group Client Systems Wiki, \emph{Client Application Testing and Certification}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:1}
+State two properties that a test over random interleavings should check for the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway} of chapter~21, and one that it
+cannot check without the venue's \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:2}
+Why does the fuzzer copy each input into a buffer of exactly its size before parsing it?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:3}
+The runs of A and B are interleaved A, B, B, A. What goes wrong if all the runs of A come first, then all the runs of B?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:4}
+With runs whose 99th percentiles vary by 14\%, how many runs per side does the normal approximation ask for to detect a 10\%
+rise with 90\% power, and a 2.5\% rise?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:5}
+A gate runs 20 times a day at a level of 5\%. How many false alarms should the team expect in a month of 21 trading days, and
+what does the tolerance of 2\% change?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:6}
+Two mutations changed a tag from 11 to 10 and a sequence number from 2 to 3, and the checksum did not change. Explain why, and
+say what the FIX checksum does and does not protect against.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:7}
+\emph{Coding.} Add certification steps for the venue's throttle: configure the engine with a rate, send a burst, and check the
+rejections with reason \texttt{T}. What does the step need that the others did not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:8}
+\emph{Find the flaw.} ``Our performance test runs the benchmark once on the release candidate and fails if the 99th percentile
+is more than 5\% above last week's number, which we keep in a file.''
+\end{exercise}
+
+\section{Problem: A Few Hundred Nanoseconds}
+
+\begin{problem}[{Weekend problem --- how many runs a gate needs on a noisy machine}]\label{pb:ll:testing-and-deploying-low-latency-systems:1}
+Use \cref{fig:ll:testing-and-deploying-low-latency-systems:runs,fig:ll:testing-and-deploying-low-latency-systems:power}
+(\texttt{measured\_gate\_runs.csv}, \texttt{gate.csv}, \texttt{gate\_summary.csv}).
+
+\medskip\noindent\textbf{Part I --- The noise.}
+\begin{enumerate}
+\item What is the median 99th percentile of the current build's runs, and how much do runs vary (the robust coefficient of
+variation)?
+\item What does the planted regression add, at the median of the runs?
+\item Why is the 99th percentile of a run so much noisier than its median?
+\item Why is a single A/B pair useless on this machine?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The gate.}
+\begin{enumerate}[resume]
+\item Why compare medians across runs rather than means?
+\item What does the permutation test assume, and what does it not assume?
+\item What is the false-alarm rate at every $n$, and why is it near the test's level?
+\item How many runs per side detect the planted regression 99\% of the time?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Power.}
+\begin{enumerate}[resume]
+\item Read the detection rate of a 5\% rise at 80, 120 and 160 runs per side.
+\item Interpolate the number of runs for 90\% power.
+\item Compare with the normal approximation, and explain the difference.
+\item How long does a gate of that size take on this laptop, at about 30 milliseconds a run?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the number of interleaved runs the gate needs to detect a 5\% rise in the 99th percentile
+with 90\% power at this machine's measured noise.
+\item What would isolated cores (chapter~13) change, and why?
+\item Why is a tolerance needed on top of the test?
+\item What would a gate on the median latency need, and why is it not enough?
+\item How would you make the gate a routine step of continuous integration without making every change wait?
+\item What kinds of regression can no benchmark of the engine alone catch?
+\item Why keep the pools of runs as committed data?
+\item In one sentence: what makes a performance gate trustworthy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:testing-and-deploying-low-latency-systems:1}
+What is a \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{property-based test}? Give an example for an order book.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:testing-and-deploying-low-latency-systems:2}
+How would you fuzz a market-data parser, and what would you check besides crashes?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:testing-and-deploying-low-latency-systems:3}
+Your benchmark says the new build is 3\% slower at the 99th percentile. How do you decide whether to believe it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:testing-and-deploying-low-latency-systems:4}
+What does an exchange's certification test, and what does it not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:ll:testing-and-deploying-low-latency-systems:5}
+How would you roll out a new version of a strategy engine, and how would you roll it back?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:testing-and-deploying-low-latency-systems:6}
+Design the test and release pipeline for a low-latency trading system, from a commit to production, and say what each stage
+catches.
+\end{interviewq}

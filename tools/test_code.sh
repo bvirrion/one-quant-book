@@ -31,7 +31,8 @@ say "C++"
 n=0
 while IFS= read -r t; do
   n=$((n+1)); d=$(dirname "$t"); mkdir -p "$d/bin"; exe="$d/bin/$(basename "${t%.cpp}")"
-  if g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$d" "$t" -o "$exe" && "$exe"; then
+  # timeout: a hung lock-free stress test must fail, not hang CI (Book 13).
+  if g++ -std=c++20 -O2 -Wall -Wextra -Werror -I"$d" "$t" -o "$exe" && timeout 600 "$exe"; then
     echo "ok   $t"; else echo "FAIL $t"; fail=1; fi
 done < <(find "${roots[@]}" -name '*_test.cpp' | sort)
 [ $n -eq 0 ] && echo "(no C++ tests)"

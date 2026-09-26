@@ -1,0 +1,370 @@
+\chapter{The Order Book Builder}\label{ch:ll:the-order-book-builder}
+
+On a small-tick instrument, a book kept in balanced trees takes about \qty{70}{\nano\second} per update on this book's
+laptop; an array of price levels around the touch takes about \qty{30}{\nano\second}. The array wins, until the day the
+stock moves thirty percent: an array of 256 ticks must then be moved and refilled almost twenty thousand times, and the
+day's book costs \qty{0.7}{\second} of processor time instead of four milliseconds. The \omterm{def:ll:the-order-book-builder:builder}{book builder} turns the \omterm{def:ll:the-feed-handler:handler}{feed
+handler}'s events into the answer every strategy asks first, what is the best price and how much is there, and the answer
+must be right, fast and still fast on the day that matters. This chapter states what the book must answer, compares the
+structures that answer it by feed type and tick regime, builds an order-by-order book on an open-addressing order map and a
+recentring price ladder, and tests it against two books written earlier in the series.
+
+\section{What the book must answer, and how fast}
+
+\begin{definition}[Book builder]\label{def:ll:the-order-book-builder:builder}
+A \emph{book builder}\index{book builder} maintains the limit order book (One Quant Book~10, chapter~1) of an instrument from
+the \omterm{def:ll:the-feed-handler:handler}{feed handler}'s events: from a market-by-order feed (Book~1, chapter~19) it keeps every resting order and aggregates
+them into price levels; from a market-by-price feed it keeps the levels directly. It answers level-1 and level-2 queries
+(Book~1, chapter~28) after every event, and knows when its book cannot be trusted.
+\end{definition}
+
+A strategy asks three kinds of question. Level~1, the best bid and ask and their sizes, after every event: the microprice of
+One Quant Book~7, chapter~8, needs nothing more. Level~2, the first few levels on each side, for depth imbalance and queue
+estimates. And, for its own orders, level~3: where is my order in its queue. The builder serves all three from one structure,
+at a rate of one update per event of the feed, and the update is on the critical path of chapter~1's budget: a book that
+takes \qty{100}{\nano\second} longer per event delays every decision by that much, and at the open, when events come in
+bursts (chapter~18), it delays them by the queue of events behind it.
+
+Each event names an order by its reference, so every update starts with a lookup: which order, at what price and side.
+Then it changes one price level: adds to it, reduces it, removes it when it empties. An add at a new price creates a level;
+a replace (Nasdaq's specification: the original order's ``remaining shares \dots\ must be removed'' and a new reference
+``will be used henceforth'') removes an order and adds another. The two costs of a book are therefore the order lookup and
+the level update, and the structures below differ in both.
+
+\section{Structures by feed type and tick regime}
+
+\begin{definition}[Dense price ladder]\label{def:ll:the-order-book-builder:ladder}
+A \emph{dense price ladder} keeps the price levels of a book in an array indexed by the distance in ticks from a base
+price, one slot per tick whether or not a level exists there, covering a window around the touch; levels outside the window
+live in a sparse structure, and the window is moved (recentred) when the touch approaches its edge.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\def\u{0.38}
+\foreach \i in {0,...,23} {
+  \pgfmathtruncatemacro{\q}{(\i==6)||(\i==8)||(\i==9)||(\i==11)}
+  \pgfmathtruncatemacro{\a}{(\i==13)||(\i==14)||(\i==16)||(\i==19)}
+  \ifnum\q=1 \draw[fill=omDef!40] (\u*\i,0) rectangle ++(\u,0.5);
+  \else\ifnum\a=1 \draw[fill=omThm!35] (\u*\i,0) rectangle ++(\u,0.5);
+  \else \draw[fill=gray!6,draw=gray!50] (\u*\i,0) rectangle ++(\u,0.5); \fi\fi
+}
+\fill[gray!25,opacity=0.5] (0,0) rectangle (\u*6,0.5);
+\fill[gray!25,opacity=0.5] (\u*18,0) rectangle (\u*24,0.5);
+\draw[decorate,decoration={brace,amplitude=4pt},thick] (\u*6,0.6) -- (\u*18,0.6) node[midway,above=5pt]{middle half: the touch stays here};
+\draw[->,omDef,thick] (\u*11.5,-0.7) node[below left=-2pt]{best bid (index 11)} -- (\u*11.5,-0.05);
+\draw[->,omThm,thick] (\u*13.5,-0.7) node[below right=-2pt]{best ask (index 13)} -- (\u*13.5,-0.05);
+\node[draw,rounded corners=2pt,fill=gray!8,align=center,anchor=west] (far) at (\u*24+0.4,0.25) {sparse map:\\ far levels};
+\node[draw,rounded corners=2pt,fill=omMeth!15,align=center,anchor=north west] (map) at (0,-1.6) {order map (open addressing):\\ reference $\to$ slot in the pool};
+\node[draw,rounded corners=2pt,fill=omMeth!8,align=center,anchor=west] (pool) at ([xshift=0.8cm]map.east) {order pool:\\ price, quantity, side};
+\draw[->] (map) -- (pool);
+\node[anchor=north west,align=left] at (0,-2.7) {price $=$ base $+$ index $\times$ tick};
+\end{tikzpicture}
+
+\omcaption{The build's book. Levels live in a dense array indexed by ticks from a base price (blue: bids, red: asks, grey:
+empty); the best bid and ask are indices kept up to date. When a best price leaves the middle half of the array, the base is
+moved to centre the touch and the orders are filed again. Orders are found through an open-addressing map from their
+reference to a slot in a fixed pool.}\label{fig:ll:the-order-book-builder:ladder}
+\end{omfigure}
+
+Three structures compete for the levels. A balanced tree per side, the textbook answer (\texttt{std::map}, whose search,
+removal and insertion are logarithmic and which is ``usually implemented as red-black trees''), allocates a node for each new
+level and walks a few of them for each update. A vector of levels sorted best first finds a level by binary search and keeps
+the touch at its front, but inserting a level in the middle shifts all the levels behind it. A dense ladder
+(\cref{fig:ll:the-order-book-builder:ladder}) finds a level by one subtraction and one division and never allocates; its
+costs are elsewhere: the memory of the whole window, the scan to the next non-empty level when the best one empties, and the
+recentring when the touch drifts.
+
+The feed type and the tick regime decide. On a large-tick instrument, whose spread is one tick most of the time and whose
+levels are all occupied near the touch, every structure is fast, because the book is small and the touch rarely moves: on the
+simulator's minute from chapter~18 the three builders take about \qty{28}{\nano\second} (ladder), \qty{36}{\nano\second}
+(sorted vector) and \qty{37}{\nano\second} (tree) at the median. On a small-tick instrument, whose orders spread over hundreds
+of ticks with gaps between them, the tree and the vector pay for the larger book, 65 to \qty{72}{\nano\second}, while the
+ladder stays at about \qty{31}{\nano\second} (\cref{fig:ll:the-order-book-builder:update}). The ladder's tail, about
+\qty{150}{\nano\second} at the p99 on the large-tick stream, is its scan: when the best level empties, the next one may be
+several empty slots away.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=9pt,ymin=0,ymax=320,
+  symbolic x coords={large-tree,large-vector,large-ladder,small-tree,small-vector,small-ladder},xtick=data,
+  xticklabels={{tree},{sorted\\ vector},{ladder},{tree},{sorted\\ vector},{ladder}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.1,ylabel={ns per event},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=q50]{figdata/low-latency/19-the-order-book-builder/measured_update_keyed.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=q99]{figdata/low-latency/19-the-order-book-builder/measured_update_keyed.csv};
+\legend{median,p99}
+\node[font=\footnotesize,anchor=north] at (axis cs:large-vector,315) {large tick (simulator)};
+\node[font=\footnotesize,anchor=north] at (axis cs:small-tree,315) {small tick (synthetic)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Time to apply one event with three book structures, on the simulator's minute of chapter~18 (a large-tick
+instrument, about 190\,000 events) and on 100\,000 synthetic small-tick events (orders up to 300 ticks from the mid). The
+timer's own cost is subtracted. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores. Data:
+\texttt{bench\_books.py}.}\label{fig:ll:the-order-book-builder:update}
+\end{omfigure}
+
+\section{Order lookup: hash tables and open addressing}
+
+\begin{definition}[Open addressing]\label{def:ll:the-order-book-builder:open}
+\emph{Open addressing}\index{open addressing} stores a hash table's entries in one flat array: a key goes to the slot its hash
+selects or, if that slot is taken, to the next free one in a fixed probe sequence (linear probing: the following slots), and a
+lookup follows the same sequence until it finds the key or an empty slot.
+\end{definition}
+
+\texttt{std::unordered\_map}, the standard library's hash table, keeps each entry in a node of its own, allocated on insertion
+and reached through a bucket's pointer: one allocation per order and a pointer to follow per lookup. \omterm{def:ll:the-order-book-builder:open}{Open addressing} keeps
+the order references and their pool slots in two flat arrays, sized once at start-up to at least twice the largest number of
+live orders expected; a lookup is a multiplication, a mask and usually one \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line}. Deletion is the delicate part: emptying
+a slot would cut the probe sequences that pass through it, so the build shifts the later entries of the run back into the hole
+when their home slot allows it, instead of leaving a tombstone, and lookups stay as short after a day of cancels as at the
+open.
+
+\omcode{code/firm/bookbuilder/cpp/firm_bookbuilder.hpp}{37}{53}{Deletion by backward shift: the probe runs stay unbroken
+without tombstones.}\label{lst:ll:the-order-book-builder:erase}
+
+The orders themselves live in a pool of fixed-size records allocated at start-up, with a \omterm{def:ll:cpp-for-latency-i-memory:pool}{free list} (chapter~6); the map stores
+a slot index, not a pointer. After start-up, applying an event allocates nothing: the build's test counts the heap allocations
+while both fixtures are applied, and finds none.
+
+\section{Correctness under gaps, crosses and recovery}
+
+\begin{definition}[Book invariant]\label{def:ll:the-order-book-builder:invariant}
+A \emph{book invariant} is a property every correct book satisfies after every event, checked by the builder in its debug
+builds: each level's quantity equals the sum of its orders' quantities, no empty level is reported, and the best bid is below
+the best ask.
+\end{definition}
+
+A book is wrong far more often because of its inputs than because of its structure. An event may name an unknown order (a
+reference lost in a gap), reduce an order by more than it holds, or arrive while the handler has flagged the book as stale.
+The build's rules follow the \omterm{def:ll:the-feed-handler:handler}{feed handler} of chapter~18: during a snapshot (between its begin and end events) the book is
+emptied, rebuilt from the snapshot's orders and flagged stale; an event for an unknown order is ignored and counted; a
+reduction larger than the order removes the order. Invariants catch the rest: the Python reference checks them after every
+event of both fixtures, and the C++ builder's \texttt{check()} recomputes every level from the pool.
+
+A crossed book deserves a word. The venue never publishes one in continuous trading, so a crossed book in the builder means
+a lost event or a bug, and must be treated as stale, not traded on. In auctions and in some consolidated views crosses are
+legitimate; the builder then reports them rather than repairing them.
+
+The ladder has one correctness hazard of its own, recentring. When the touch leaves the middle half of the window, the builder
+moves the base so that the mid is at the centre and files every live order again: the only pass over all the orders, done in
+place.
+
+\omcode{code/firm/bookbuilder/cpp/firm_bookbuilder.hpp}{220}{244}{Recentring: when a best price leaves the middle half, centre
+the ladder on the mid and file the live orders again.}\label{lst:ll:the-order-book-builder:recentre}
+
+How often? For a price that moves like a Brownian motion, one expected exit time answers it.
+
+\begin{proposition}[Recentrings of a ladder]\label{prop:ll:the-order-book-builder:recentre}
+Let the price, in ticks, be a Brownian motion with standard deviation $\sigma$ per day, and let the ladder be recentred
+whenever the price moves $a$ ticks from the centre ($a$ is a quarter of the width). The time between recentrings has mean
+$a^2/\sigma^2$ days, so the long-run rate is $\sigma^2/a^2$ recentrings a day. A price that trends by $D$ ticks in a day causes
+about $D/a$.
+\end{proposition}
+
+\begin{proof}
+Let $X_t$ be the move from the centre and $\tau$ the first time $|X_\tau| = a$. Since $X_t^2 - \sigma^2 t$ is a martingale and
+$\tau$ has finite mean, optional stopping gives $\E[X_\tau^2] = \sigma^2 \E[\tau]$, and $X_\tau^2 = a^2$, so $\E[\tau] =
+a^2/\sigma^2$. The recentrings form a renewal process whose long-run rate is $1/\E[\tau]$. A steady trend travels $a$ ticks
+between recentrings, $D/a$ of them in $D$ ticks.
+\end{proof}
+
+A stock at 100 with a tick of $10^{-4}$ that moves 1\% a day has $\sigma = 10\,000$ ticks: a ladder of 4\,096 ticks
+($a = 1\,024$) recentres about 95 times a day, one of 65\,536 ticks about once every three days. The same stock moving thirty
+percent in one day travels 300\,000 ticks: about 290 recentrings with the narrower ladder, and every one of them refiles every
+live order. \Cref{fig:ll:the-order-book-builder:width}
+measures that day, on synthetic events whose mid drifts thirty percent: 256 recentrings with 4\,096 ticks, fifteen with
+65\,536, none with a million, and a total processing time that falls from \qty{0.7}{\second} with a 256-tick ladder to
+\qty{4}{\milli\second} at 65\,536 ticks, then rises again as the ladder outgrows the caches.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log basis x=2,xmin=180,xmax=12000000,ymin=1,ymax=3000,
+  xlabel={ladder width (ticks, log scale)},ylabel={ms for the day (log scale)},
+  xtick={256,1024,4096,16384,65536,262144,1048576,4194304},
+  xticklabels={256,1\,024,4\,096,16\,384,65\,536,$2^{18}$,$2^{20}$,$2^{22}$},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,point meta=explicit symbolic,every node near coord/.append style={font=\scriptsize,anchor=south west},
+  table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.6pt] table[x=width,y=total_ms,meta=recentrings]{figdata/low-latency/19-the-order-book-builder/measured_width.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The day a small-tick stock moves thirty percent (100\,000 synthetic events, the mid drifting 300\,000 ticks):
+processing time of the ladder book by width, each point labelled with its number of recentrings. Measured on a laptop (Intel
+Core Ultra 7 155H) under WSL2, no isolated cores. Data: \texttt{bench\_books.py}.}\label{fig:ll:the-order-book-builder:width}
+\end{omfigure}
+
+\section{Testing a book}
+
+A \omterm{def:ll:the-order-book-builder:builder}{book builder} is tested against other books. The build's Python reference, a dictionary of orders and one of levels per side
+with nothing clever about it, is compared event by event with the book of One Quant Book~1, chapter~28 (\texttt{firm.feed}),
+on its sample of order-by-order messages: the same ten levels on each side after every message. It is compared with the book
+behind One Quant Book~7's feature engine (\texttt{firm.lobfeat}) on that engine's fixture: the same best prices and sizes after
+every message. The C++ and Rust ladders are then compared with the Python reference on two fixtures, the simulator's events
+and a synthetic small-tick stream, through a 64-bit hash of the top five levels on each side, chained over every event; the
+comparison runs with the ordinary ladder and with a narrow one that recentres and spills orders into its sparse map, because a
+structure's rare paths are where its bugs live. And the tree and sorted-vector builders of the benchmark are checked against
+the ladder in the same way before any of them is timed.
+
+\section{Tutorial: three books, two regimes}\label{tut:ll:the-order-book-builder:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the ladder book, prove it against earlier books, and time it against a tree and a sorted vector on a
+large-tick and a small-tick instrument. \textbf{End state:}
+\cref{fig:ll:the-order-book-builder:update,fig:ll:the-order-book-builder:width}, and green tests in Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{The fixtures.} \texttt{make\_book\_fixtures.py} writes the \omterm{def:ll:the-feed-handler:handler}{feed handler}'s events for the simulator's three seconds
+(chapter~18) and 6\,000 synthetic small-tick events, and the level-2 hashes the reference computes over them.
+\item \textbf{Differential tests.} The reference against Book~1's \texttt{firm.feed} and Book~7's \texttt{firm.lobfeat}; the C++
+and Rust ladders against the reference (hash after every event), with widths of 4\,096 and 256 ticks; the order map's deletion
+on keys that collide; the invariants after every event; zero allocations after construction.
+\item \textbf{Measure} with \texttt{python bench\_books.py}: the three structures on the simulator's minute and on 100\,000
+small-tick events, then the ladder by width on the day the mid drifts thirty percent.
+\end{tutsteps}
+\textbf{What to change next.} Replace the ladder's scan for the next non-empty level by a bitmap of occupied levels and a
+count-trailing-zeros instruction, and measure the p99 on the large-tick stream again.
+\end{tutorial}
+
+\section{Build: the book builder}\label{bld:ll:the-order-book-builder:bookbuilder}
+
+\begin{build}
+\bfield{Purpose} The book behind every strategy of the trading system: it consumes the \omterm{def:ll:the-feed-handler:handler}{feed handler}'s events (chapter~18) and
+serves level 1 and level 2 to the strategy engine (chapter~20) and the risk gate (chapter~22).
+\bfield{Interface} Python reference \texttt{firm\_bookbuilder.Book}: \texttt{apply(event)}, \texttt{best()},
+\texttt{depth(side, n)}, \texttt{stale}, \texttt{check()}; \texttt{l2\_hash}; \texttt{recentrings},
+\texttt{expected\_recentrings}. C++20 \texttt{firm::book::LadderBook(tick, width, max\_orders)}: \texttt{apply},
+\texttt{best}, \texttt{depth}, \texttt{check}, \texttt{stale}, \texttt{recentrings}; \texttt{OrderMap}; \texttt{l2\_hash}. Rust
+\texttt{firm\_bookbuilder::LadderBook} and \texttt{OrderMap} with the same.
+\bfield{Rules} Order lookup through \omterm{def:ll:the-order-book-builder:open}{open addressing} into a fixed pool; levels in a dense ladder with a sparse fallback; the
+ladder recentred when a best price leaves its middle half; the book emptied and flagged stale from a snapshot's begin to its
+end; no allocation per event after construction unless an order lands outside the ladder.
+\bfield{Acceptance tests} \texttt{code/firm/bookbuilder/}: level 2 identical to Book~1's \texttt{firm.feed} after every message
+of its sample and to Book~7's \texttt{firm.lobfeat} after every message of its fixture (reference); the C++ and Rust ladders equal
+to the reference after every event of both fixtures, with a normal and a narrow ladder; invariants after every event; zero
+allocations; the order map's backward-shift deletion; the recentring model against a simulated Brownian price.
+\bfield{Stretch} A bitmap of occupied levels for the scan; level~3 with queue positions for the firm's own orders; a
+market-by-price mode; recentring in the background into a second ladder.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{TotalView-ITCH 5.0} specification, section 1.4.5 (Order Replace).
+\item cppreference.com, \texttt{std::map}.
+\item The earlier books' order books: \texttt{firm.feed} (One Quant Book~1, chapter~28) and \texttt{firm.lobfeat} (One Quant
+Book~7, chapter~8).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:1}
+A ladder of 4\,096 ticks with a tick of 0.01 is centred on 50.00. What is its base price, which index holds 49.73, and where
+must the best bid be for the ladder to stay put?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:2}
+How much memory does a ladder of 65\,536 ticks take with 16 bytes per level and two sides? Does it fit the second-level cache
+of chapter~3?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:3}
+An order of 500 at 20.10 is replaced by one of 300 at 20.11. Which events does the book apply, and what happens to the order's
+place in its queue?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:4}
+Keys 1\,024, 2\,048, 3\,072 hash to the same home slot 5 in a table of 16. They are inserted in that order, then 1\,024 is
+erased. Show the table before and after the backward shift. What would a tombstone have cost instead?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:5}
+A stock trades at 40 with a tick of 0.01 and a daily volatility of 2\%. With a ladder of 1\,024 ticks, how many recentrings
+per day does \cref{prop:ll:the-order-book-builder:recentre} predict? And with 4\,096?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:6}
+The builder receives a reduction of 300 for an order that holds 200. What does it do, and what does it tell the monitoring?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-order-book-builder:7}
+\emph{Coding.} Add a bitmap of occupied levels to the C++ ladder (one bit per tick and side) and use count-trailing-zeros to
+find the next best level; check the fixtures' hashes and measure the large-tick p99.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-order-book-builder:8}
+\emph{Find the flaw.} ``We sized the ladder at 512 ticks because it fits in the first-level cache, and our tests on a quiet
+day showed no recentring.''
+\end{exercise}
+
+\section{Problem: The Stock That Moved Thirty Percent}
+
+\begin{problem}[{Weekend problem --- how wide a ladder}]\label{pb:ll:the-order-book-builder:1}
+A small-tick stock trades at 100 with a tick of $10^{-4}$. On an ordinary day its volatility is 1.5\%; on the day of this
+problem it moves thirty percent. Use \cref{prop:ll:the-order-book-builder:recentre} and the measurements of
+\cref{fig:ll:the-order-book-builder:width} (\texttt{measured\_width.csv}).
+
+\medskip\noindent\textbf{Part I --- The ordinary day.}
+\begin{enumerate}
+\item What is $\sigma$ in ticks per day?
+\item How many recentrings a day does a ladder of 4\,096 ticks expect? Of 65\,536?
+\item What width expects one recentring a day?
+\item Why is the ordinary day a poor guide to sizing?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The day that matters.}
+\begin{enumerate}[resume]
+\item How many ticks does the price travel, and how many recentrings does a steady trend cause with 4\,096 ticks?
+\item How many did the measurement count, and why fewer?
+\item With 256 ticks the measurement counts far more than the trend alone predicts. Why?
+\item What does one recentring cost, from the measurements at 4\,096 and 65\,536 ticks?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The trade-off.}
+\begin{enumerate}[resume]
+\item Which width minimises the day's measured total, and what does it cost?
+\item Why does the total rise again beyond it?
+\item How much memory does that width take for both sides?
+\item What does the median update time say about the width?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the ladder width against the recentrings of the day and its total cost, and the width that
+minimises it.
+\item How would you choose the width per instrument?
+\item What would recentring in the background, into a second ladder, change?
+\item Why must the tests include a narrow ladder?
+\item How does a large-tick instrument change the answer?
+\item What should the builder report to monitoring about recentrings?
+\item What does the day cost with a balanced tree instead?
+\item In one sentence: what does a dense ladder buy, and what must it be protected against?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:the-order-book-builder:1}
+Design an order book for a market-by-order feed. Which operations must be fast, and how fast?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-order-book-builder:2}
+Tree, sorted vector or array of price levels: when would you choose each?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-order-book-builder:3}
+How would you look up orders by reference without allocating? How do you delete from an open-addressing table?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-order-book-builder:4}
+Your book is crossed. What could have happened, and what do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:the-order-book-builder:5}
+How do you test a \omterm{def:ll:the-order-book-builder:builder}{book builder} so that you trust it on the day that matters?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:the-order-book-builder:6}
+A dense ladder is fast until the price moves far. Quantify how far, and design around it.
+\end{interviewq}

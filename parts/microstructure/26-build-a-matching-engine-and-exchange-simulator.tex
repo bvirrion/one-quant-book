@@ -1,0 +1,247 @@
+\chapter{Build: A Matching Engine and Exchange Simulator}\label{ch:mx:build-a-matching-engine-and-exchange-simulator}
+
+Every tutorial in the books that follow needs a venue: something that accepts orders, matches them, publishes what happened in a feed that can drop
+packets, and does exactly the same thing every time it is run with the same inputs. This chapter describes the one this book has used since
+chapter~1, \texttt{firm.exchsim}: what an exchange does, in messages; the \omterm{def:mx:the-limit-order-book:engine}{matching engine}; the feed and its recovery; the \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{order-entry sessions}; and
+the clock that makes it deterministic. It then certifies it: the conformance suite, the byte-identity of its three engines, and their speed on this
+laptop.
+
+\section{What an exchange does, in messages}
+
+\begin{definition}[Exchange simulator]\label{def:mx:build-a-matching-engine-and-exchange-simulator:sim}
+An \emph{exchange simulator}\index{exchange simulator} is a program that behaves toward its participants as a venue does: it accepts and acknowledges
+orders through \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{order-entry sessions}, matches them by the venue's rules, and publishes the resulting \omterm{def:mx:the-limit-order-book:event}{order-book events} in a sequenced market-data feed,
+with the latencies, losses and failures of a real connection, and with results that depend only on its inputs.
+\end{definition}
+
+\begin{definition}[Order-entry protocol, order-entry session, execution report]\label{def:mx:build-a-matching-engine-and-exchange-simulator:oe}
+An \emph{order-entry protocol}\index{order-entry protocol} is the message set a participant uses to send, modify and cancel orders and the venue uses to
+answer. An \emph{order-entry session}\index{order-entry session} is one logged-in connection that carries it, with its own sequence of messages, limits and
+state. An \emph{execution report}\index{execution report} is the venue's message on that session about one order: accepted, executed (partly or fully),
+cancelled, rejected, replaced.
+\end{definition}
+
+\texttt{firm.exchsim} speaks four binary protocols, all generated from one table, \texttt{MESSAGES} in the codec module, with a machine-readable copy
+in \texttt{schema.json} from which One Quant Book 13 builds its codecs. The \emph{feed} has fourteen message types in an ITCH-like layout (Book~1's add,
+execute, cancel, delete and trade messages byte for byte, plus replace, execute-at-price, cross, imbalance, system event, trading action,
+stock directory, snapshot header and trailer); order entry has five (new order, replace, cancel, mass cancel, mass quote); \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{execution reports} six (accepted, executed,
+cancelled, rejected, replaced, system); and a control protocol of ten messages drives the venue (system events, logins and drops, phases, bands,
+indicatives, crosses, cut-offs, expiries, reference quotes). \texttt{PROTOCOL.md} gives every rule; Nasdaq's TotalView-ITCH~5.0 specification is the model for the
+feed (big-endian integers, a stock locate at the same place in every message, nanosecond timestamps since midnight).
+
+A client's day, in process (\texttt{mx\_exchsim.scenario}), shows the reports: a buy of 300 at 100.00 is accepted; a sell of 100 at 100.00 from the
+same session trades against it (\omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{self-trade prevention} is off for this session) and both sides get an execution; an immediate-or-cancel sell of 500 at
+99.99 executes 200 against the rest and its remaining 300 are cancelled with reason ``I''; a post-only buy of 200 at 100.02 rests; a sell of 100 at
+100.01 executes against it at 100.02; a buy at 100.015 is rejected as off the tick grid (``X''); a cancel of the already-filled sell is rejected as too
+late (``L''); at the end of the day the post-only order's last 100 shares expire (``E'').
+
+\section{The matching engine}
+
+The engine (\texttt{firm\_exchsim\_engine}) keeps one book per instrument (chapter~1's \texttt{firm.lob}) and applies chapter~2's order types through
+\texttt{firm.ordertypes}: limit and \omterm{def:mx:the-limit-order-book:orders}{market orders}, immediate-or-cancel and fill-or-kill, post-only, hidden and \omterm{def:mx:order-types-and-their-uses:hidden}{iceberg orders}, midpoint and primary pegs,
+stops, minimum quantities, and \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{self-trade prevention}.
+
+\begin{definition}[Self-trade prevention, cancel on disconnect]\label{def:mx:build-a-matching-engine-and-exchange-simulator:stp}
+\emph{Self-trade prevention}\index{self-trade prevention} stops two orders of the same participant (or group) from trading with each other, by cancelling
+the resting order, the incoming one, both, or decrementing them. \emph{Cancel on disconnect}\index{cancel on disconnect} cancels a session's resting
+orders when the session is lost.
+\end{definition}
+
+Matching gives price priority, then allocates a \omterm{def:mx:the-limit-order-book:tick}{price level} by its rule: first in, first out (price-time priority, Book~1, chapter~19), or pro rata with an
+optional top-order share (Book~1's \texttt{firm.match}); it stops at a price band (chapter~25) and at the order's limit.
+
+\omcode{code/firm/exchsim/firm_exchsim_engine.py}{331}{355}{The allocation of one price level in the engine: the eligible resting orders (minimum quantities respected), filled in time order for price-time priority or by Book 1's configurable pro-rata rule, each fill an execution at the resting price.}\label{lst:mx:build-a-matching-engine-and-exchange-simulator:match}
+
+Phases come from a schedule: pre-open and opening call, continuous trading or \omterm{def:mx:auction-mechanics-and-theory:fba}{frequent batch auctions} (chapter~10), closing call and auction, halts and
+pauses with reopening calls (chapter~25's \texttt{firm.halts} policies act through the same controls), all uncrossed by chapter~10's auction
+(\texttt{firm.auctionsim}). Throttles limit each session's message rate with a token bucket; fees are charged per execution by liquidity flag.
+
+\section{The market-data feed: sequencing, redundancy, recovery}
+
+\begin{definition}[Redundant feed lines, snapshot recovery, retransmission request]\label{def:mx:build-a-matching-engine-and-exchange-simulator:feed}
+\emph{Redundant feed lines}\index{redundant feed lines} carry the same sequenced packets twice, on separate paths, so that a receiver can take each packet
+from whichever line delivers it first. \emph{Snapshot recovery}\index{snapshot recovery} rebuilds a book from a periodic snapshot of its state, tagged with
+the last incremental sequence number it includes, followed by the incremental messages after it. A \emph{retransmission request}\index{retransmission
+request} asks the venue's recovery service for messages by sequence number.
+\end{definition}
+
+The feed travels in MoldUDP64 packets (a session name, the sequence number of the first message, a message count; a count of zero is a heartbeat) on two
+lines, A and B, each with its own impairments drawn from counter-based random streams: independent loss, bursts of loss by a two-state Gilbert--Elliott
+channel, duplication, jitter, outages. CME's MDP~3.0 documentation describes the same practice: process both feeds, take each sequence number from
+whichever arrives first, and treat a gap on both as loss that needs recovery; its snapshot messages carry the last incremental sequence number processed
+so that a receiver can splice the two.
+
+Ten minutes of Book~7's synthetic tape through the venue (\texttt{mx\_exchsim.recovery}), with bursts of loss drawn independently on each line and a
+ten-second outage on line B: of 5,793 messages, line A lost 308 and line B 517 (166 of them in the outage); taking each message from either line left 30 missing, and 30 \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{retransmission requests} filled them,
+so the receiver had every message. A snapshot from the middle of the day (the venue took one every 30 seconds) plus the incremental messages after
+it rebuilt a book identical, ten levels deep on each side, to the engine's own.
+
+\omcode{code/microstructure/26-build-a-matching-engine-and-exchange-simulator/python/mx_exchsim.py}{118}{123}{Line arbitration's leftovers: the sequence numbers neither line delivered, each asked of the retransmission service, whose MoldUDP64 packet carries the missing message.}\label{lst:mx:build-a-matching-engine-and-exchange-simulator:gaps}
+
+\section{The order-entry protocol and its sessions}
+
+Participants connect through sessions: an agent in process has one per venue with its own latency model (entry, acknowledgement and data delays, jitter,
+spikes); a live client connects to the C++20 server on this machine over SoupBinTCP, Nasdaq's point-to-point session protocol over TCP (login with a
+requested sequence number, sequenced data, heartbeats), and receives the feed by loopback multicast. Sessions carry the venue's rules: \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{cancel on
+disconnect}, self-trade groups, throttles, and client order identifiers numbered per session (a multi-venue agent must make its own unique across venues,
+as chapter~18's router did). \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{Execution reports} go only to the session that owns the order; the feed goes to everyone, a drop copy to whoever asks.
+
+\section{Clock, latency and determinism}
+
+The simulator is a discrete-event loop on a simulated clock (One Quant Book 7, chapter~17): every message, timer and control is an event at a nanosecond
+time, and ties are broken by a fixed order of event classes and insertion. Every random number (latencies, feed impairments, the background's flow) comes
+from a counter-based generator (One Quant Book 4, chapter~26) keyed by the seed and by what it is for, so that adding a participant does not change the
+random numbers any other one sees. Running the same two-minute day twice gives the same bytes: the SHA-256 of line A's recording and of the engine's
+journal agree (\texttt{f7ede7cfa7b3\dots}).
+
+The engine exists three times: the Python reference, a C++20 engine and a Rust engine. A shared fixture (four minutes of tape flow plus a chaos agent
+that sends every message type and every control: 17,059 journal records) is replayed by each, and each must reproduce the Python engine's output, feed
+messages, reports and final snapshots, byte for byte. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, with no isolated cores, the Python
+engine processes the fixture at about 60,000 records a second; the C++20 test program (which also decodes and checks 4,866 golden messages and compares
+every byte) runs through it at more than 500,000 a second. The live C++20 server serves the same engine to clients on localhost.
+
+\section{Tutorial: certification day}\label{tut:mx:build-a-matching-engine-and-exchange-simulator:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Trade on the simulator in process and through its server, recover a lossy feed, and certify the three engines.
+\textbf{End state:} the numbers of sections 1, 3 and 5.
+\begin{tutsteps}
+\item \textbf{In process.} \texttt{Simulator(ExchangeConfig)}, an \texttt{Agent} with \texttt{on\_report}; \texttt{mx\_exchsim.scenario()}.
+\item \textbf{Feed.} \texttt{FeedConfig(burst\_loss, outages, snapshot\_every\_ns)}; \texttt{res.recorded(line)}, \texttt{res.retransmit(venue, seq, count)},
+the snapshots; \texttt{recovery()}.
+\item \textbf{Determinism and identity.} \texttt{determinism()}; \texttt{code/firm/exchsim/cpp/exchsim\_engine\_test.cpp} and \texttt{cargo test} in
+\texttt{code/firm/exchsim/rust} on the fixture; \texttt{throughput()}.
+\item \textbf{Live.} \texttt{code/firm/exchsim/cpp/build.sh}, then \texttt{bin/exchsim\_server --config cfg.json} and a SoupBinTCP client
+(\texttt{code/firm/exchsim/tests/test\_serve.py} shows one in Python).
+\end{tutsteps}
+\textbf{What to change next.} Add implied calendar-spread matching (chapter~21 priced it outside the engine); feed the simulator from chapter~27's agents
+as a background; certify a fourth engine against the fixture.
+\end{tutorial}
+
+\section{Build: exchange simulator}\label{bld:mx:build-a-matching-engine-and-exchange-simulator:exchsim}
+
+\begin{build}
+\bfield{Purpose} The venue under every simulated market of Books 10 to 13: matching, phases and auctions, halts, fees, feeds, sessions.
+\bfield{Interface} \texttt{ExchangeConfig(venue, instruments, fees, phases, halts, throttle, engine\_ns, speed\_bump\_ns, batch\_interval\_ns, feed,
+faults, reference)}, \texttt{Simulator(venues, sip, seed)} with \texttt{add\_background}, \texttt{add\_agent}, \texttt{add\_events},
+\texttt{schedule\_call}, \texttt{run}; \texttt{Result} with \texttt{tape}, \texttt{feed\_messages}, \texttt{recorded}, \texttt{retransmit},
+\texttt{snapshot\_bytes}, \texttt{reports}, \texttt{sip}; presets; the C++20 engine, codec and server; the Rust engine and codec (contract:
+\texttt{code/firm/INTERFACES.md}, section~7).
+\bfield{Rules} Big-endian binary messages generated from one table; prices in 1/10,000 of a currency unit; counter-based randomness keyed by purpose;
+no wall clock anywhere in the engine.
+\bfield{Acceptance tests} \texttt{code/firm/exchsim/tests/}: thirteen engine-rule scenarios; codec round trips and the schema; Book~1's decoder on the
+feed; determinism by hash; the Python engine against the fixture's SHA-256; sequencing, loss and recovery; snapshot rebuild; agents and tape export;
+consolidated feed and dark venues; the C++20 and Rust engines byte-identical on the fixture; the Python and C++20 servers round trip.
+\bfield{Stretch} Implied spreads; a FIX gateway; a second feed layout in Simple Binary Encoding.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, TotalView-ITCH 5.0 specification; MoldUDP64 protocol specification; SoupBinTCP specification.
+\item CME Group, MDP~3.0: incremental feed arbitration; market data snapshot full recovery (client systems wiki).
+\item FIX Trading Community, Simple Binary Encoding.
+\item E.~N.~Gilbert, ``Capacity of a burst-noise channel'', \emph{Bell System Technical Journal} 39(5), 1960.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:1}
+A MoldUDP64 packet has sequence number 5,001 and a count of 12. What sequence number does the next data packet carry?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:2}
+From the recovery run, what share of the messages did each line lose, and what share did both lose?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:3}
+In the scenario, why was the cancel at 7 seconds rejected, and what reason would a cancel of an unknown order get?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:4}
+Why must each random stream be keyed by what it is for, not drawn from one generator in event order?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:5}
+Why does \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{snapshot recovery} need the snapshot's last sequence number, and what goes wrong without it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:6}
+What does byte-identity of three engines on a fixture prove, and what does it not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:7}
+\emph{Coding.} Run the recovery with line B's outage but no burst loss on either line. How many messages does each line lose, and how many
+\omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{retransmission requests} are needed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:8}
+\emph{Find the flaw.} ``The C++ engine is eight times faster than the Python one, so the simulator's sessions will run eight times faster in C++.''
+\end{exercise}
+
+\section{Problem: Certification Day}
+
+\begin{problem}[{Weekend problem --- certification day}]\label{pb:mx:build-a-matching-engine-and-exchange-simulator:1}
+Before other teams rely on the simulator, it must be certified: rules, recovery, determinism, identity across implementations and speed.
+
+\medskip\noindent\textbf{Part I --- Messages.}
+\begin{enumerate}
+\item Define an \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:sim}{exchange simulator}, an \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{order-entry protocol}, a session and an \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{execution report}.
+\item List the four protocols and their message counts.
+\item Walk through the scenario's reports.
+\item Define \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{self-trade prevention} and \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{cancel on disconnect}.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The engine.}
+\begin{enumerate}[resume]
+\item How does the engine allocate a \omterm{def:mx:the-limit-order-book:tick}{price level} under each rule?
+\item What stops matching?
+\item Which phases can the venue be in, and what uncrosses a call?
+\item How do \texttt{firm.halts} policies act on the venue?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The feed.}
+\begin{enumerate}[resume]
+\item Describe a MoldUDP64 packet and the two lines.
+\item How are losses and outages drawn?
+\item Give the recovery run's losses, gaps after arbitration and retransmissions.
+\item How was the book rebuilt from a snapshot, and how was it checked?
+\item What does CME's MDP~3.0 documentation recommend for its A and B feeds?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Certification.}
+\begin{enumerate}[resume]
+\item What makes the simulator deterministic?
+\item Describe the fixture.
+\item \emph{State the named result}: the conformance suite passed by each engine, the byte-identity of the three engines' feeds on the fixture, and the
+engines' messages per second on this laptop.
+\item Why is the C++ number a lower bound on the engine's speed?
+\item Which parts of the simulator are not certified by the fixture?
+\item What would you add before a live trading team used it?
+\item In one sentence: why does a simulator need to be deterministic?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:1}
+How does a feed handler recover from a gap in a UDP multicast feed?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:2}
+Design a \omterm{def:mx:the-limit-order-book:engine}{matching engine}'s data structures for price-time priority with fast cancels.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:3}
+How would you make a market simulator reproducible to the byte, including its randomness?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:4}
+Your IOC order was partly filled and the rest cancelled. What reports do you receive, in what order?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:5}
+Why do venues offer \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{cancel on disconnect} and \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{self-trade prevention}, and what risks does each control?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:6}
+Two implementations of the same engine disagree on one message out of a million. How do you find out which is wrong?
+\end{interviewq}

@@ -1,0 +1,317 @@
+\chapter{Sequence Models on Order Books}\label{ch:ml:sequence-models-on-order-books}
+
+A widely cited paper reports that a convolutional-recurrent network reading the raw states of a ten-level order book
+outperforms all existing algorithms on a benchmark order-book dataset, and delivers stable out-of-sample accuracy on a
+year of London Stock Exchange quotes. On a laptop,
+on a few hours of a simulated book, with labels built honestly and every test session kept out of training, the best
+sequence model reaches an information coefficient of 0.43, and a \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} on ten hand-made features (the
+order-flow imbalance, the queue imbalance, recent flow and moves) reaches 0.54. The paper is not wrong about its data; the result is that
+raw books are a hard input, sequence models need a lot of them, and the claim ``deep learning finds the features by
+itself'' has a data cost that must be paid in sessions. This chapter builds the four standard sequence architectures,
+trains them on order-book windows, and measures what they buy.
+
+\section{Order-book streams as inputs}
+
+The chapter's data are ten-minute \texttt{firm.tape} sessions (Book~7, chapter~2), each on its own seed: eight for
+training, three for \omterm{def:ml:trees-and-boosting:early}{early stopping}, eight for testing, and eight more to double the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set} later. Every half
+second the book is rebuilt from the messages and summarised level by level: for each of the ten best levels on each side,
+the distance of the price from the mid, in ticks, and the logarithm of the size in lots, forty numbers per snapshot. An
+input is a window of the last 20 snapshots (ten seconds); its label is the direction of the mean mid over the next ten
+seconds against the current mid, down, flat or up, with a dead band of a quarter tick (\cref{fig:ml:lobseq:window}).
+Windows never cross sessions, and the scaling of the forty columns is fitted on training sessions only.
+
+\begin{omfigure}
+\begin{tikzpicture}[x=0.42cm,y=0.42cm,font=\footnotesize]
+\foreach \t in {0,...,19} { \foreach \l in {0,...,9} {
+  \fill[omDef!15] (\t,\l) rectangle ++(0.85,0.85); } }
+\draw[omDef,thick] (-0.2,-0.2) rectangle (19.95,10.05);
+\node[anchor=east,align=right] at (-0.5,5) {10 levels $\times$ 4\\(distance, log size,\\bid and ask)};
+\node at (10,-1.1) {20 snapshots, one every half second (ten seconds)};
+\draw[->,thick] (20.4,5) -- (23.3,5) node[midway,above] {model};
+\node[draw=omThm,fill=omThm!10,rounded corners=2pt,align=center,anchor=west] at (23.5,5) {$\P(\text{down})$, $\P(\text{flat})$,\\ $\P(\text{up})$};
+\draw[omProp,thick,->] (19.9,11.2) -- (26.5,11.2);
+\node[omProp,anchor=south] at (23.2,11.3) {next 10 s: mean mid $-$ mid};
+\draw[omProp,dashed] (19.9,10.2) -- (19.9,11.6);
+\node[anchor=south] at (10,10.2) {decision time $t$ at the window's end};
+\end{tikzpicture}
+
+\omcaption{An input window and its label. The label compares the average mid over the next ten seconds with the mid at
+the decision time and is flat within a quarter tick; the smoothing follows the DeepLOB literature and makes the label
+easier to predict than the next move itself.}\label{fig:ml:lobseq:window}
+\end{omfigure}
+
+The classes are unbalanced: 73\% of the test windows are flat, 15\% down and 13\% up. Always predicting ``flat'' is
+right 73\% of the time, so accuracy is a poor score; the chapter reports it for comparison with the literature and ranks
+the models by the information coefficient of $\P(\text{up}) - \P(\text{down})$ with the forward change, session by
+session.
+
+\section{Convolutional and recurrent models}
+
+\begin{definition}[Convolutional neural network]\label{def:ml:sequence-models-on-order-books:cnn}
+A \emph{convolutional neural network}\index{convolutional neural network} applies the same small filter at every
+position of its input: a one-dimensional convolutional layer maps a sequence $z_1,\dots,z_T$ of $d$-vectors to
+$u_t = \mathrm{act}(\sum_{j=0}^{k-1}B_jz_{t+j-\lfloor k/2\rfloor} + c)$, with $k$ filter matrices $B_j$ shared across $t$.
+\end{definition}
+
+\begin{definition}[Recurrent neural network, long short-term memory]\label{def:ml:sequence-models-on-order-books:rnn}
+A \emph{recurrent neural network}\index{recurrent neural network} reads a sequence one step at a time and carries a hidden
+state, $h_t = \mathrm{act}(A x_t + C h_{t-1} + c)$. A \emph{long short-term memory}\index{long short-term memory} network
+(LSTM) adds a cell state updated through gates (input, forget and output, each a sigmoid of $x_t$ and $h_{t-1}$), which
+lets gradients flow over long sequences (Hochreiter and Schmidhuber, 1997).
+\end{definition}
+
+The CNN of the chapter has two convolutional layers of 32 filters of width five, averages over the window and classifies;
+the LSTM has 32 units and classifies from its last state. Both read the forty columns of every snapshot of the window.
+
+\section{Temporal convolutions and attention}
+
+\begin{definition}[Causal convolution, temporal convolutional network]\label{def:ml:sequence-models-on-order-books:tcn}
+A \emph{causal convolution}\index{causal convolution} uses only the current and earlier positions:
+$u_t = \sum_{j=0}^{k-1}B_jz_{t - jr}$, with dilation $r$. A \emph{temporal convolutional network}\index{temporal
+convolutional network} (TCN) stacks causal convolutions with dilations $1, 2, 4,\dots$, so that the receptive field grows
+exponentially with depth, usually with residual connections (Bai, Kolter and Koltun, 2018).
+\end{definition}
+
+\begin{definition}[Attention mechanism, transformer]\label{def:ml:sequence-models-on-order-books:attention}
+An \emph{attention mechanism}\index{attention mechanism} lets each position of a sequence form its output as a weighted
+average of all positions: with queries $\mathsf Q = ZA_{\mathsf Q}$, keys $\mathsf K = ZA_{\mathsf K}$ and values
+$\mathsf V = ZA_{\mathsf V}$ computed from the sequence $Z$ ($T\times h$), the output is
+$\mathrm{softmax}(\mathsf Q\mathsf K^\top/\sqrt h)\mathsf V$. A \emph{transformer}\index{transformer} layer combines
+several attention heads, a position-wise network, residual connections and \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{layer normalisation}; positions are encoded
+by adding learned or fixed vectors to the inputs (Vaswani et al., 2017).
+\end{definition}
+
+The TCN has four causal blocks (dilations 1 to 8, filters of width three, receptive field 31 snapshots, more than the
+window) and classifies from the last position; the attention model is one \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} layer with two heads of width 32
+and learned positions, also read at the last position.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.4cm,ybar,bar width=14pt,ylabel={test information coefficient},
+  symbolic x coords={logistic,CNN,LSTM,TCN,attention},xtick=data,
+  xticklabels={{logistic on\\features},CNN,LSTM,TCN,attention},xticklabel style={align=center},tick label style={font=\small},
+  label style={font=\small},ymin=-0.2,ymax=0.7,grid=major,grid style={gray!25},enlarge x limits=0.14,
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef,error bars/.cd,y dir=both,y explicit]
+  table[x=model,y=ic,y error=sd]{figdata/ml/08-sequence-models-on-order-books/models.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Information coefficient of $\P(\text{up}) - \P(\text{down})$ with the forward change, averaged over eight test
+sessions (and two seeds for the sequence models); bars show the standard deviation across sessions and seeds. The
+\omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} reads ten hand-made features at the decision time; the sequence models read the raw ten-level book
+over ten seconds. Data: \texttt{ml\_lobseq.table}.}\label{fig:ml:lobseq:models}
+\end{omfigure}
+
+\section{What the literature replicates}
+
+On the chapter's data (\cref{fig:ml:lobseq:models}), the multinomial \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} on the hand-built features of
+Book~8 (chapter~14; order-flow imbalance over three windows, queue imbalance, flow and past moves) reaches an accuracy of
+0.781 and an IC of 0.543. Among the sequence models the \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} does best (accuracy 0.775, IC 0.426), then the TCN
+(0.766, 0.366), the LSTM (0.729, 0.292) and the CNN (0.727, 0.060): the CNN averages its filters over the window and so
+cannot tell the last snapshot from the first, and it barely beats always predicting ``flat''. The spread across sessions
+and seeds (0.15 to 0.20 of IC for the sequence models, 0.09 for the \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression}) is as large as the gaps.
+
+The models were early-stopped after one to four \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epochs}: eight sessions are 8\,808 windows, and a model with thousands
+of parameters that reads 800 numbers per window fits their noise quickly. Doubling the data helps (\cref{fig:ml:lobseq:scaling}):
+the TCN's IC goes from 0.13 on four sessions to 0.30 on eight and 0.44 on sixteen, while the \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} stays
+between 0.54 and 0.57 throughout. The sequence models are learning from the raw book what the hand-made features give the
+linear model directly, and they are still learning it at sixteen sessions.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.5cm,height=5.2cm,xlabel={training sessions (ten minutes each)},ylabel={test IC},
+  tick label style={font=\small},label style={font=\small},xmin=2,xmax=18,ymin=0,ymax=0.7,xtick={4,8,16},
+  grid=major,grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*] table[x=sessions,y=tcn]{figdata/ml/08-sequence-models-on-order-books/scaling.csv};
+\addplot[omThm,very thick,mark=square*] table[x=sessions,y=logistic]{figdata/ml/08-sequence-models-on-order-books/scaling.csv};
+\legend{TCN on the raw book,logistic on hand-made features}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Test IC as the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set} grows from four to sixteen sessions (one seed; the same eight test sessions). Data:
+\texttt{ml\_lobseq.scaling}.}\label{fig:ml:lobseq:scaling}
+\end{omfigure}
+
+The published evidence points the same way once the evaluation is strict. Zhang, Zohren and Roberts's DeepLOB outperformed
+the earlier algorithms on the FI-2010 benchmark (Ntakaris et al.) and kept a stable out-of-sample accuracy on a year of
+London Stock Exchange quotes, including instruments it was not trained on. Sirignano and Cont, training on
+billions of US quotes, found a stable, universal relation between order-flow history and the direction of the next
+move, and that a model pooled across stocks beats stock-specific ones: scale is what made the raw input work. Kolm,
+Turiel and Westray, on 115 Nasdaq stocks, found that simpler networks trained on order flow significantly outperform
+most models trained directly on order books. The LOBCAST benchmark of fifteen published deep models (Prata et al., 2024)
+found that all of them lose a large part of their performance on data they were not tuned on. Two lessons carry over to
+any order-book model: build the stationary features the microstructure literature already knows (order flow, imbalance,
+Book~7, chapter~8), and judge a model on sessions, days and instruments it has never seen.
+
+\begin{method}[Training a sequence model on order books]\label{met:ml:lobseq:method}
+\begin{enumerate}
+\item Split by session (day, instrument), never by window; fit every normalisation on training sessions.
+\item Fix the label's horizon and dead band from the trade the model serves; report the class shares and a score that
+does not reward predicting the majority class (the IC, or a cost-aware P\&L).
+\item Start from a linear model on order-flow and imbalance features; give the sequence model the same features as extra
+channels before asking it to find them.
+\item Report the spread across sessions and seeds, and a learning curve in sessions.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: DeepLOB on a laptop}\label{tut:ml:sequence-models-on-order-books:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Turn simulated sessions into order-book windows, train four sequence models and a logistic baseline, and
+measure the learning curve in sessions. \textbf{End state:} \cref{fig:ml:lobseq:models,fig:ml:lobseq:scaling}.
+\begin{tutsteps}
+\item \textbf{Windows and labels}, inside each session.
+\omcode{code/firm/lobseq/firm_lobseq.py}{57}{73}{Windows of snapshots, smoothed direction labels, and a scaler fitted on training windows.}\label{lst:ml:lobseq:windows}
+\item \textbf{The TCN and the attention model.}
+\omcode{code/firm/lobseq/firm_lobseq.py}{97}{136}{Causal dilated convolutions and a one-layer transformer.}\label{lst:ml:lobseq:models}
+\item \textbf{Run} \texttt{ml\_lobseq.table()}, \texttt{scaling(4)}, \texttt{scaling(8)}, \texttt{scaling(16)} and
+\texttt{fig\_lobseq.py}.
+\end{tutsteps}
+\textbf{What to change next.} Feed the TCN the hand-made features as ten extra channels and see how much of the gap to the
+\omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} closes; replace the smoothed label by the sign of the next mid change.
+\end{tutorial}
+
+\section{Build: order-book sequence datasets and models}\label{bld:ml:sequence-models-on-order-books:lobseq}
+
+\begin{build}
+\bfield{Purpose} Order-book sequence models trained and scored the same way on simulated sessions today and on Book~10's
+exchange simulator's recorded tapes when they are available.
+\bfield{Interface} \texttt{snapshots(tape, step, levels, start)}, \texttt{windows(S, mid, T, horizon, threshold)},
+\texttt{Scaler}, \texttt{CNN}, \texttt{LSTMNet}, \texttt{TCN}, \texttt{Attention}, \texttt{train(model, X, y, Xv, yv,
+epochs, lr, batch, patience, seed)}, \texttt{evaluate(model, X, y, fwd)}.
+\bfield{Rules} A session's windows stay in one split; the book is rebuilt from messages with nothing after the snapshot's
+time; one CPU thread, deterministic algorithms.
+\bfield{Acceptance tests} \texttt{code/firm/lobseq/tests/}: snapshots match a book rebuilt by hand at a given time and use
+no later message; windows and labels by hand on a short series; the TCN's output at a step does not depend on later
+inputs (causality); each model trains on a planted pattern and beats chance.
+\bfield{Stretch} Market-by-order inputs (each order's age and queue position); a model pooled across several simulated
+instruments, in the spirit of Sirignano and Cont.
+\end{build}
+
+\begin{omsources}
+\item Z.~Zhang, S.~Zohren and S.~Roberts, ``DeepLOB: deep convolutional neural networks for limit order books'',
+\emph{IEEE Transactions on Signal Processing} 67(11), 2019.
+\item J.~Sirignano and R.~Cont, ``Universal features of price formation in financial markets: perspectives from deep
+learning'', \emph{Quantitative Finance} 19(9), 2019.
+\item P.~N.~Kolm, J.~Turiel and N.~Westray, ``Deep order flow imbalance: extracting alpha at multiple horizons from the
+limit order book'', \emph{Mathematical Finance} 33(4), 2023.
+\item M.~Prata et al., ``LOB-based deep learning models for stock price trend prediction: a benchmark study'',
+\emph{Artificial Intelligence Review} 57, 2024.
+\item A.~Ntakaris, M.~Magris, J.~Kanniainen, M.~Gabbouj and A.~Iosifidis, ``Benchmark dataset for mid-price forecasting of
+limit order book data with machine learning methods'', \emph{Journal of Forecasting} 37(8), 2018.
+\item S.~Hochreiter and J.~Schmidhuber, ``Long short-term memory'', \emph{Neural Computation} 9(8), 1997; S.~Bai, J.~Z.~Kolter
+and V.~Koltun, ``An empirical evaluation of generic convolutional and recurrent networks for sequence modeling'', arXiv,
+2018; A.~Vaswani et al., ``Attention is all you need'', \emph{NeurIPS}, 2017.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:1}
+A TCN has filters of width three and dilations 1, 2, 4 and 8. What is its receptive field in snapshots? With width five?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:2}
+The test windows are 72.7\% flat, 14.7\% down and 12.5\% up. What accuracy does always predicting ``flat'' reach, and what
+does a random guess in the class proportions reach?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:3}
+One attention head over $T = 20$ positions of width $h = 32$: how many multiplications does $\mathsf Q\mathsf K^\top$
+take, and how does it scale with $T$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:4}
+Why does the CNN, which averages over the window, do so badly, and what small change would fix it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:5}
+The label averages the mid over the next ten seconds. Why does that make it easier to predict than the next mid change,
+and what does it mean for trading?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:6}
+\emph{Find the flaw.} ``We cut our 50 days of order-book windows into train and \omterm{def:ml:why-financial-machine-learning-is-different:sets}{test sets} at random and our network is 88\%
+accurate.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:sequence-models-on-order-books:7}
+\emph{Coding.} Train the LSTM on sixteen sessions (\texttt{scaling(16, name='LSTM')}). Report its IC and compare with the
+TCN's at sixteen sessions.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:sequence-models-on-order-books:8}
+Show that a stack of \omterm{def:ml:sequence-models-on-order-books:tcn}{causal convolutions} of width $k$ with dilations $1, 2,\dots,2^{L-1}$ has a receptive field of
+$1 + (k - 1)(2^L - 1)$ positions and that its output at $t$ depends on no input after $t$.
+\end{exercise}
+
+\section{Problem: DeepLOB on a Laptop}
+
+\begin{problem}[{Weekend problem --- the raw book against hand-made features}]\label{pb:ml:sequence-models-on-order-books:1}
+The chapter's sessions: eight to train, three to stop, eight to test, eight more to grow the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set}.
+
+\medskip\noindent\textbf{Part I --- The data.}
+\begin{enumerate}
+\item What is in one snapshot and one window?
+\item How is the label built, and what are the class shares?
+\item Why is accuracy a poor score here, and what does the chapter use instead?
+\item Why must windows never cross the split between sessions?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The models.}
+\begin{enumerate}[resume]
+\item What are the four sequence models' receptive fields over the window?
+\item What does each score (accuracy and IC)?
+\item What does the \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} on hand-made features score?
+\item How large is the spread across sessions and seeds?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Data.}
+\begin{enumerate}[resume]
+\item After how many \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epochs} do the models stop, and why?
+\item What does the TCN score with four, eight and sixteen training sessions?
+\item Does the \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} gain from more sessions? Why not?
+\item What would the curve need to do for the TCN to overtake the baseline?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item What did Kolm, Turiel and Westray find about raw books against order flow?
+\item What did the LOBCAST benchmark find about published models on new data?
+\item What made Sirignano and Cont's raw-input model work?
+\item State the \emph{named result}: the best sequence model's IC and accuracy against the \omterm{def:ml:linear-and-regularised-baselines:logistic}{logistic regression} on order-flow
+imbalance, with the spread across seeds and sessions.
+\item What would you put in production for a ten-second forecast, and what would you try next?
+\item How would you turn the IC into a trading decision, given chapter~2's labels?
+\item What changes on Book~10's simulator with several instruments?
+\item In one sentence: what does a sequence model need to beat a good feature?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle, researcher}]\label{iq:ml:sequence-models-on-order-books:1}
+What is a \omterm{def:ml:sequence-models-on-order-books:tcn}{causal convolution}, and why does it matter for a trading model?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:sequence-models-on-order-books:2}
+Explain self-attention in a few equations. What does it cost in the length of the sequence?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:sequence-models-on-order-books:3}
+Your order-book model is 80\% accurate on a three-class mid-price label. What questions do you ask before you are
+impressed?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:sequence-models-on-order-books:4}
+Raw order-book levels or order-flow features as inputs? Argue from the evidence.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:sequence-models-on-order-books:5}
+How do you split order-book data for training and testing, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, mle}]\label{iq:ml:sequence-models-on-order-books:6}
+Why might an LSTM underperform a TCN on short windows of order-book data, and when would you expect the opposite?
+\end{interviewq}

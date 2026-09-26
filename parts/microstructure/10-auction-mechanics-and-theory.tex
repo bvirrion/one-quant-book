@@ -1,0 +1,283 @@
+\chapter{Auction Mechanics and Theory}\label{ch:mx:auction-mechanics-and-theory}
+
+In the minutes before a closing auction the exchange publishes an indicative price and imbalance every few seconds, and much of the auction's volume
+arrives in its last seconds. Every participant watches the same numbers and decides when to show its hand. The closing auction sets the prices that
+index funds track and that funds are valued at, so its design, what is published, when orders are accepted and when exactly it ends, decides who can
+move the close and who pays for it. This chapter runs closing calls in the exchange simulator, measures how the indicative converges to the final
+price, prices a late order under a fixed and a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end}, and replays the sniping race that \omterm{def:mx:auction-mechanics-and-theory:fba}{frequent batch auctions} were proposed to stop.
+
+\section{Uncrossing rules revisited}
+
+A call auction (One Quant Book 1, chapter~13) collects orders without matching them and clears them all at one price: the price that maximises the
+executed volume, then minimises the surplus, then follows the side with the surplus, then stays closest to a reference price (Book~1's
+\texttt{firm.auction}). With buys of 300 shares at market, 200 at 10.02 and 400 at 10.00, and sells of 500 at 10.00, 300 at 10.01 and 200 at 10.03, the volume
+is 500 at 10.00, 10.01 and 10.02; the surplus is 400 to buy at 10.00 and 300 to sell at the other two, and the sell pressure picks the lower, 10.01.
+Madhavan (1992) compared the mechanisms: a periodic auction offers greater price efficiency and can function where continuous mechanisms fail, but traders
+give up continuity and bear higher information costs.
+
+\texttt{firm.exchsim}'s engine runs the calls: orders are accepted without matching, market-on-close and limit-on-close orders (tif C) are kept aside, the
+engine publishes an indicative price and imbalance on a schedule (feed message I), and the uncross calls \texttt{firm.auction}. \texttt{firm.auctionsim}
+states a design as a policy and turns it into the simulator's configuration.
+
+\omcode{code/firm/auctionsim/firm_auctionsim.py}{45}{57}{A closing auction as a policy: the call's phases, and a collar as a price band from the start of the call.}\label{lst:mx:auction-mechanics-and-theory:policy}
+
+\section{Indicative prices and imbalance publication}
+
+The indicative is the price the auction would clear at if it ended now, and the imbalance the shares that would be left on one side. Publishing them
+invites the other side: a large buy imbalance at a price above value is an offer to whoever will sell. The chapter's closing call lasts five minutes with
+an indicative every second. Standing limit-on-close interest of 500 shares a tick sits on each side of 100.00; random market-on-close orders of 100 to 1\,000
+shares arrive five times a minute until five seconds before the end; a fund sends a market-on-close buy of 10\,000 shares a minute into the call.
+Responders read each indicative and, half the time, when the price has been pushed more than a tick from 100.00, offer the other side at 100.01 (or 99.99)
+in proportion to the distance, 250 shares a tick up to 3\,000: they supply the imbalance at the price they believe, not at the price it has been pushed to.
+
+\omcode{code/microstructure/10-auction-mechanics-and-theory/python/mx_auction.py}{57}{68}{A responder to the published imbalance: it offers the other side at its own value plus a tick, in proportion to the push.}\label{lst:mx:auction-mechanics-and-theory:resp}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},width=6.6cm,height=5cm,
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma,
+  x dir=reverse,xlabel={seconds to the cross}]
+\nextgroupplot[title={\small indicative price, one session},xmin=0,xmax=300,ymin=99.97,ymax=100.22,
+  yticklabel style={/pgf/number format/.cd,fixed,precision=2}]
+\addplot[omDef,very thick,const plot] table[x=s,y=price]{figdata/microstructure/10-auction-mechanics-and-theory/path.csv};
+\nextgroupplot[title={\small $|$indicative $-$ final$|$ (ticks)},xmode=log,xmin=0.7,xmax=150,ymin=0,ymax=6]
+\addplot[omThm,very thick,mark=*,error bars/.cd,y dir=both,y explicit] table[x=s,y=gap,y error=se]{figdata/microstructure/10-auction-mechanics-and-theory/gap.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{The closing call. Left: the indicative price of one simulated session; the fund's buy pushes it up, responders pull it back, and late orders
+set the close. Right: the distance between the last indicative and the final price, against the time left, mean over 24 sessions. Data:
+\texttt{mx\_auction.auction\_study}.}\label{fig:mx:auction-mechanics-and-theory:path}
+\end{omfigure}
+
+Over 24 simulated sessions (\cref{fig:mx:auction-mechanics-and-theory:path}) the last indicative is 4.7 ticks from the final price 120 seconds before the
+cross, 3.5 at 60 seconds, 2.2 at 30 and 1.0 at 10; in the last five seconds, when no more orders arrive, it is the final price. Paired volume arrives
+earlier than price information: 76\% of the final paired shares are already paired 120 seconds before the cross, 89\% at 60 and 95\% at 30. The volume is
+set early and the price late, because the price is set by the marginal orders.
+
+\begin{dated}{2026-09}{Closing-auction rules on two exchanges}\label{dat:mx:auction-mechanics-and-theory:rules}
+Nasdaq publishes closing cross net order imbalance information between 3:50 and 4:00 p.m. ET; its imbalance-only close orders, which exist to offset
+imbalances, must be priced and execute only at or above (buy) or below (sell) the 4:00 p.m. bid or ask. On the London Stock Exchange each auction call and
+each extension is followed by a random period of up to 30 seconds (the exchange's guide of March 2020).
+\end{dated}
+
+\section{Cut-offs, collars and random ends}
+
+\begin{definition}[Auction cut-off time]\label{def:mx:auction-mechanics-and-theory:cutoff}
+An \emph{auction cut-off time}\index{auction cut-off time} is the moment after which some orders can no longer be entered, modified or cancelled for the
+auction, typically market-on-close and limit-on-close orders, while orders that offset the published imbalance may still be accepted.
+\end{definition}
+
+\begin{definition}[Auction collar]\label{def:mx:auction-mechanics-and-theory:collar}
+An \emph{auction collar}\index{auction collar} is a price range around a reference price outside which the auction may not clear, or orders may not be
+priced; if the uncross would fall outside it, the venue extends the call or clears at the collar.
+\end{definition}
+
+\begin{definition}[Random end]\label{def:mx:auction-mechanics-and-theory:randomend}
+A \emph{random end}\index{random end} ends an auction call at a random moment within a known window after its scheduled end, so that nobody can be sure
+to be the last to enter an order.
+\end{definition}
+
+The three answer the same problem: the last order into a call can move its price and nobody can respond. A cut-off stops the orders that would create
+imbalances late; a collar bounds how far any order can move the price; a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} takes away the certainty of being last. \texttt{firm.auctionsim}
+implements the collar as a price band from the start of the call (orders outside it are rejected, \texttt{Out\_J} with reason B), the cut-off with the
+engine's freeze control, and the \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} with the simulator's uniform end time.
+
+\section{Strategic behaviour near the uncross}
+
+What is the last second worth? The experiment adds one more market-on-close buy of 3\,000 shares to each session, sent 60, 10 or 1 second before the
+scheduled end, and measures how far it moves the closing price against the same session without it (\cref{fig:mx:auction-mechanics-and-theory:late}).
+With a fixed end, the order moves the close by 3.0 ticks (standard error 0.6) sent a minute early, 3.5 ten seconds early and 4.7 (0.4) in the last second:
+sent late, it walks the standing interest with no time for responders to offer. With a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} of up to 30 seconds, the late order moves the close by
+3.7 ticks (0.6): the responders get the rest of the random window. The gain from submitting last, 1.75 ticks with a fixed end, falls to 0.75 with a random
+one. That gain is what a participant who wants to move the close (to mark a portfolio, or to trigger something priced off it) buys by waiting; it is also
+the price a legitimate late order pays, which is why providers wait too.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.2cm,xmode=log,x dir=reverse,xtick={1,10,60},xticklabels={1,10,60},xlabel={\small seconds before the scheduled end},
+  ylabel={\small move of the close (ticks)},tick label style={font=\footnotesize},ymin=0,ymax=6,xmin=0.7,xmax=90,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,error bars/.cd,y dir=both,y explicit] table[x=tau,y=fixed,y error=fixed_se]{figdata/microstructure/10-auction-mechanics-and-theory/late.csv};
+\addplot[omThm,very thick,mark=square*,error bars/.cd,y dir=both,y explicit] table[x=tau,y=random,y error=random_se]{figdata/microstructure/10-auction-mechanics-and-theory/late.csv};
+\legend{fixed end,random end (up to 30 s)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{How far a 3,000-share market-on-close buy moves the closing price, against when it is sent, mean and standard error over 24 simulated
+sessions. The last second is worth most with a fixed end. Data: \texttt{mx\_auction.auction\_study}.}\label{fig:mx:auction-mechanics-and-theory:late}
+\end{omfigure}
+
+Real closes add what the simulation leaves out: participants who choose their own timing, imbalance-only orders, and large index flows known in advance.
+Bogousslavsky and Muravyev (2023) study who trades at the close and what it means for \omterm{def:mx:fragmentation-and-routing:discovery}{price discovery} and liquidity.
+
+\section{Frequent batch auctions}
+
+\begin{definition}[Frequent batch auction]\label{def:mx:auction-mechanics-and-theory:fba}
+A \emph{frequent batch auction}\index{frequent batch auction} replaces continuous matching with uniform-price call auctions held at short fixed intervals:
+orders arriving within an interval are treated as simultaneous and cleared together at its end.
+\end{definition}
+
+Budish, Cramton and Shim (2015) argued that the high-frequency trading arms race is a symptom of continuous matching: when public information moves the
+price, a fast trader can take a quote before its owner cancels it, and whoever is fastest wins; they proposed batch auctions, for example every tenth of a
+second, so that time becomes discrete and a small speed advantage stops deciding who trades. The simulator runs them with
+\texttt{batch\_interval\_ns} (\texttt{firm.auctionsim.batch\_venue}).
+
+The race is easy to stage. A quoter shows one lot a tick either side of a public reference; the reference jumps two ticks 400 times; on each jump the
+quoter cancels and requotes after its latency, and a sniper sends an order to take the stale quote after its own. With the quoter 150 microseconds slower
+than the sniper, the sniper takes the stale quote on 99.75\% of the jumps in the continuous market, 11.75\% with batches every millisecond, 1.25\% every
+10 milliseconds and 0.25\% every 100. With a gap of a millisecond, 99.75\%, 99.75\%, 11.0\% and 0.75\%. The share is close to the latency gap divided by the
+batch interval, capped at one: the sniper wins only when a batch closes between its order and the quoter's cancel. A batch interval longer than the
+latency gaps that matter turns the race into an auction.
+
+\section{Tutorial: the last ten seconds}\label{tut:mx:auction-mechanics-and-theory:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run closing calls, watch the indicative converge, price the last second under two end rules, and replay the sniping race.
+\textbf{End state:} \cref{fig:mx:auction-mechanics-and-theory:path,fig:mx:auction-mechanics-and-theory:late} and the numbers of sections 2, 4 and 5.
+\begin{tutsteps}
+\item \textbf{Design.} \texttt{firm\_auctionsim.ClosingAuction(call\_s, indicative\_s, cutoff\_s, collar, random\_end\_s)}, then
+\texttt{.phases(\dots)} and \texttt{.controls(\dots)} into \texttt{ExchangeConfig} and \texttt{Simulator.add\_events}.
+\item \textbf{Sessions.} \texttt{mx\_auction.close\_session(seed, random\_end\_s, extra)}; \texttt{indicatives(res)} and \texttt{final\_cross(res)}.
+\item \textbf{Study.} \texttt{auction\_study()}: the gap and arrival paths, and the move of the close by a late order, over 24 seeds.
+\item \textbf{Race.} \texttt{snipe\_race(interval\_ms, quoter\_us=\dots, sniper\_us=\dots)} and \texttt{race\_study()}; draw with \texttt{fig\_auction.py}.
+\end{tutsteps}
+\textbf{What to change next.} Add a cut-off ten seconds before the end for market-on-close orders only, and let responders keep offering; give the
+responders a lag of five seconds and watch the \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end}'s protection shrink.
+\end{tutorial}
+
+\section{Build: auction policies}\label{bld:mx:auction-mechanics-and-theory:auctionsim}
+
+\begin{build}
+\bfield{Purpose} Auction designs for the simulator: the closes of chapters 16 and 28's benchmark algorithms, the halt reopenings of chapter~25, and
+Book~11's auction strategies.
+\bfield{Interface} \texttt{ClosingAuction(call\_s, indicative\_s, cutoff\_s, collar, random\_end\_s)} with \texttt{.phases}, \texttt{.controls};
+\texttt{batch\_venue(interval\_ms)}; \texttt{indicatives(res, venue, locate)}, \texttt{final\_cross(res, venue, locate)}, \texttt{gap\_path(ind, final,
+grid\_s)}.
+\bfield{Rules} The engine keeps the auction's orders and uncrosses through Book~1's \texttt{firm.auction}; indicatives are published only when some
+volume pairs; the collar is a price band from the start of the call; the \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} is uniform on its window.
+\bfield{Acceptance tests} \texttt{code/firm/auctionsim/tests/}: a scripted call whose indicatives and cross are checked by hand; a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} inside its
+window; an order outside the collar rejected; a batch venue's interval.
+\bfield{Stretch} Price-monitoring extensions when the uncross would leave the collar; imbalance-only orders; a closing call on several venues with one
+reference price.
+\end{build}
+
+\begin{omsources}
+\item A.~Madhavan, ``Trading mechanisms in securities markets'', \emph{Journal of Finance} 47(2), 1992.
+\item E.~Budish, P.~Cramton and J.~Shim, ``The high-frequency trading arms race: frequent batch auctions as a market design response'', \emph{Quarterly
+Journal of Economics} 130(4), 2015.
+\item V.~Bogousslavsky and D.~Muravyev, ``Who trades at the close? Implications for price discovery and liquidity'', \emph{Journal of Financial Markets}
+66, 2023.
+\item Nasdaq, \emph{The Nasdaq Opening and Closing Crosses}, web page, 2026.
+\item London Stock Exchange, \emph{Maintaining orderly markets: circuit breakers explained}, 2020.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:auction-mechanics-and-theory:1}
+Buys: 300 shares at market, 200 at 10.02, 400 at 10.00. Sells: 500 at 10.00, 300 at 10.01, 200 at 10.03. Find the uncrossing price, the volume and the
+surplus with Book~1's rules.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:auction-mechanics-and-theory:2}
+The indicative shows 20\,000 shares paired at 50.10 with 3\,000 more to buy. What does that tell a liquidity provider, and at what price would it offer?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:auction-mechanics-and-theory:3}
+A sniper is 150 microseconds faster than a quoter. Approximately how often does it take a stale quote under batch auctions every 1 and every 10
+milliseconds? And with a gap of a millisecond and batches every 10?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:auction-mechanics-and-theory:4}
+Standing interest is 500 shares a tick on the sell side. How many ticks does a market-on-close buy of 3\,000 shares move the close if nobody responds? What
+did the simulation measure for a last-second order, and why is it less?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:auction-mechanics-and-theory:5}
+Why is paired volume known long before the price in the simulated call (76\% of the paired shares two minutes before the cross, with the indicative still
+4.7 ticks away)?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:auction-mechanics-and-theory:6}
+Explain why a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} reduces the gain from submitting last, and what it costs other participants.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:auction-mechanics-and-theory:7}
+\emph{Coding.} Rerun \texttt{snipe\_race} with batches every 1, 10 and 100 milliseconds and a latency gap of 150 microseconds, and compare the sniping rate
+with the gap divided by the interval. Where does the approximation fail?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:auction-mechanics-and-theory:8}
+\emph{Find the flaw.} ``The closing price is set by the whole market, so no single late order can move it much.''
+\end{exercise}
+
+\section{Problem: The Last Ten Seconds}
+
+\begin{problem}[{Weekend problem --- the last ten seconds}]\label{pb:mx:auction-mechanics-and-theory:1}
+An exchange asks whether to add a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} to its closing auction and whether to replace continuous trading with \omterm{def:mx:auction-mechanics-and-theory:fba}{frequent batch auctions}. Answer with the
+simulator.
+
+\medskip\noindent\textbf{Part I --- The call.}
+\begin{enumerate}
+\item State the uncrossing rules and apply them to exercise~1.
+\item What does the engine publish during a call, and when?
+\item Describe the simulated call's participants.
+\item How do the responders price their offers, and why does that matter?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Convergence.}
+\begin{enumerate}[resume]
+\item Give the gap between the indicative and the final price at 120, 60, 30 and 10 seconds.
+\item Why is it zero in the last five seconds?
+\item What share of the paired volume is known two minutes and one minute before the cross?
+\item What do Nasdaq and the London Stock Exchange publish or randomise?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The last second.}
+\begin{enumerate}[resume]
+\item Define a cut-off, a collar and a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end}.
+\item How far does a 3,000-share buy move the close when sent 60, 10 and 1 seconds before a fixed end?
+\item And before a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end} of up to 30 seconds?
+\item What is the gain from submitting last under each rule?
+\item Who gains from waiting, and who pays?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Batches and the verdict.}
+\begin{enumerate}[resume]
+\item State Budish, Cramton and Shim's argument.
+\item Describe the sniping race and give its results for the two latency gaps.
+\item Derive the approximation gap divided by interval.
+\item What does a batch interval cost traders who are not racing?
+\item State the \emph{named result}: the gap between the indicative and the final price against the time to the uncross, and the gain from late submission
+under a fixed and a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end}.
+\item Should the exchange add a \omterm{def:mx:auction-mechanics-and-theory:randomend}{random end}? Answer in one sentence.
+\item Should it switch to batches, and at what interval?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:auction-mechanics-and-theory:1}
+How is a closing auction's price determined, and what is an imbalance?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:auction-mechanics-and-theory:2}
+You must buy 500,000 shares at the close. When do you send the order, and what do you watch?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:auction-mechanics-and-theory:3}
+Why do some exchanges end auctions at a random time? What would you measure to see whether it works?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:auction-mechanics-and-theory:4}
+Explain \omterm{def:mx:auction-mechanics-and-theory:fba}{frequent batch auctions} and the problem they address.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:auction-mechanics-and-theory:5}
+Implement the indicative price of a call auction efficiently as orders arrive. What data structure do you keep?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{trader, researcher}]\label{iq:mx:auction-mechanics-and-theory:6}
+A competitor always enters large closing orders in the last second. How would you tell a legitimate strategy from an attempt to move the close?
+\end{interviewq}

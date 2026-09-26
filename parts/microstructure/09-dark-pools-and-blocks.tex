@@ -1,0 +1,304 @@
+\chapter{Dark Pools and Blocks}\label{ch:mx:dark-pools-and-blocks}
+
+A pension fund wants to buy two million shares of a stock that trades five million a day. Shown on a lit book, the order would move the price before a
+tenth of it traded; sent to a dark pool, it waits for a seller, and every venue it touches learns a little of what it wants. Dark venues exist to let
+large orders meet without announcing themselves, and they work only as well as they keep the secret. This chapter builds a dark pool and a block
+venue beside a lit book in the exchange simulator, measures who fills in the dark, and works one large order four ways to price what leaks.
+
+\section{Midpoint crossing and minimum quantities}
+
+A dark pool (One Quant Book 1, chapter~9) displays nothing and usually crosses at the midpoint of the lit market's best bid and offer, so both sides
+save half the spread against trading on the lit book: between 20.00 and 20.02, a cent a share each, USD 100 on 10\,000 shares. The price is borrowed:
+the pool needs the lit quotes, and its crosses are only as current as its copy of them. \texttt{firm.exchsim} now gives a dark venue that copy: a
+\emph{reference quote} control message (N) carries the lit venue's best bid and offer to the dark engine after each change, and \omterm{def:mx:order-types-and-their-uses:peg}{midpoint pegs} price off
+it (\texttt{midpoint\_dark\_pool(reference=\dots)}).
+
+\begin{definition}[Minimum execution quantity]\label{def:mx:dark-pools-and-blocks:minqty}
+A \emph{minimum execution quantity}\index{minimum execution quantity} on a resting dark order is the smallest fill it accepts: an incoming order that
+cannot trade at least that much with it passes it by. On an incoming \omterm{def:mx:order-types-and-their-uses:tif}{immediate-or-cancel order} it is the smallest total fill worth taking.
+\end{definition}
+
+A resting midpoint buy of 5\,000 shares with a minimum of 1\,000 ignores a 300-share sell and trades with a 1\,500-share one. The minimum is a filter on
+counterparties: small orders that probe the pool, and the small orders of fast traders generally, cannot reach it. It is also a filter on fills: the
+large order trades less.
+
+\begin{definition}[Crossing network]\label{def:mx:dark-pools-and-blocks:crossing}
+A \emph{crossing network}\index{crossing network} matches buy and sell orders at a price taken from elsewhere (the lit midpoint, a closing price, a
+benchmark), without \omterm{def:mx:fragmentation-and-routing:discovery}{price discovery} of its own, either continuously or at scheduled times.
+\end{definition}
+
+\section{Conditional orders and block venues}
+
+\begin{definition}[Indication of interest]\label{def:mx:dark-pools-and-blocks:ioi}
+An \emph{indication of interest}\index{indication of interest} (IOI) is a non-binding message that a trader may want to trade a security, with a side
+and sometimes a size or a price, sent to a counterparty or a venue to find the other side of a large trade.
+\end{definition}
+
+\begin{definition}[Conditional order]\label{def:mx:dark-pools-and-blocks:conditional}
+A \emph{conditional order}\index{conditional order} is an \omterm{def:mx:dark-pools-and-blocks:ioi}{indication of interest} resting on a block venue: when it meets a contra conditional of at
+least both sides' minimum sizes, the venue invites both traders to \emph{firm up}, to send a binding order, within a short timer. If both do, the block
+crosses; if either does not, nothing trades.
+\end{definition}
+
+\begin{definition}[Firm-up rate]\label{def:mx:dark-pools-and-blocks:firmup}
+A participant's \emph{firm-up rate}\index{firm-up rate} is the share of the invitations it receives to which it responds with a firm order. Block
+venues track it and restrict participants whose rate is low, because a conditional that does not firm up has learnt that the other side exists at no cost.
+\end{definition}
+
+Conditionals let one order rest on several block venues and algorithms at once without risking a double fill, since only a firm-up commits it. Their
+weakness is in the definition: an invitation tells both sides that a large contra exists. A counterparty that never meant to trade gets the information
+for free, which is why the \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rate} is policed (\cref{fig:mx:dark-pools-and-blocks:conditional}). \texttt{firm.darkpool.ConditionalBook} implements
+the matching, invitations, firm-up timers and rates.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners,align=center,minimum height=0.8cm}]
+\node[box,fill=omDef!12] (b) at (0,1.2) {fund\\ buy 20\,000\\ min 1\,000};
+\node[box,fill=omDef!12] (s) at (0,-1.2) {seller\\ sell 8\,000\\ min 2\,000};
+\node[box,fill=omProp!15] (v) at (4,0) {block venue\\ match $\Rightarrow$ invite};
+\node[box,fill=omThm!12] (x) at (8.3,1) {both firm up:\\ 8\,000 cross at the mid};
+\node[box,fill=omExo!12] (l) at (8.3,-1) {one does not:\\ no trade, but it knows};
+\draw[->] (b) -- node[above,sloped] {conditional} (v);
+\draw[->] (s) -- node[below,sloped] {conditional} (v);
+\draw[->] (v) -- (x);
+\draw[->] (v) -- (l);
+\end{tikzpicture}
+
+\omcaption{A conditional block. Two non-binding orders meet, the venue invites both to firm up within a timer, and only two firm orders trade. A
+participant who lets invitations lapse learns about the other side without trading.}\label{fig:mx:dark-pools-and-blocks:conditional}
+\end{omfigure}
+
+\omcode{code/firm/darkpool/firm_darkpool.py}{70}{89}{Matching conditionals in time priority and inviting both sides; an order is in one invitation at a time.}\label{lst:mx:dark-pools-and-blocks:invite}
+
+\section{Who trades in the dark, and the evidence}
+
+Zhu (2014) explained who goes dark. \omterm{def:mx:why-there-is-a-spread:informed}{Informed traders} trade in the same direction as one another, crowd on the heavy side of the market and so face a
+higher risk of not being filled in the dark, where the other side must come to them; the exchange suits them better, the dark pool suits uninformed
+traders, and a dark pool can concentrate information on the exchange. Comerton-Forde and Putnins (2015) found in Australian data that dark trades are
+less informed than lit trades, that low levels of non-block dark trading are benign or even beneficial for informational efficiency and high levels
+harmful, and no evidence that block trades in the dark impede \omterm{def:mx:fragmentation-and-routing:discovery}{price discovery}.
+
+The chapter's market reproduces the selection. Its efficient price $P^\ast$ moves by exogenous jumps and by the permanent impact of uninformed lit
+\omterm{def:mx:the-limit-order-book:orders}{market orders}, $\lambda=0.0005$ ticks a share (informed orders reveal $P^\ast$, they do not move it). Liquidity providers quote on LIT; noise and
+informed takers try the dark pool first half the time and send what is left to LIT; patient uninformed traders rest \omterm{def:mx:order-types-and-their-uses:peg}{midpoint pegs} in the dark. Over four
+seeds of 45 minutes, informed takers who tried the dark were filled for 6.3\% of their shares, uninformed ones for 17.5\%: the informed buy when
+everyone informed buys, and the dark sellers run out. Resting in the dark gives up the spread, but its fills were followed by a move of $+0.11$ cents in the
+resting trader's favour over 30 seconds, against $-0.13$ cents for lit providers, who capture 0.51 cents of spread and pay adverse selection on it.
+
+\section{Information leakage}
+
+\begin{definition}[Information leakage]\label{def:mx:dark-pools-and-blocks:leakage}
+\emph{Information leakage}\index{information leakage} is the part of a large order's cost that comes from other traders learning of it before it is
+complete, from its fills, its quotes, its conditionals or its routing, and trading ahead of it.
+\end{definition}
+
+\begin{definition}[Pinging order]\label{def:mx:dark-pools-and-blocks:ping}
+A \emph{pinging order}\index{pinging order} is a small \omterm{def:mx:order-types-and-their-uses:tif}{immediate-or-cancel order} sent to a dark venue to detect hidden liquidity: a fill reveals a
+resting contra order at that price, and repeated fills reveal a large one.
+\end{definition}
+
+A fund buys 20\,000 shares from ten minutes into the session over 30 minutes, four ways: \emph{lit}, a \omterm{def:mx:the-limit-order-book:orders}{market order} of 200 every 18 seconds;
+\emph{dark}, one resting \omterm{def:mx:order-types-and-their-uses:peg}{midpoint peg} for the whole order; \emph{dark with a minimum}, the same peg with a minimum of 1\,000; \emph{block}, conditionals
+in a block venue where natural sellers post conditionals of 5\,000 to 15\,000 shares every five minutes on average, 30\% of whom never firm up and buy
+2\,000 shares on LIT instead. Whatever is left after 30 minutes is bought on LIT at once. A pinger probes the dark pool every two seconds with 100 shares,
+alternating sides; when two probes in a row on one side fill within five seconds, it buys (or sells) 500 shares on LIT ahead of the order it has found.
+
+\omcode{code/microstructure/09-dark-pools-and-blocks/python/mx_dark.py}{125}{133}{The pinger: a filled probe is noted, and two in a row trigger a trade ahead on the lit venue.}\label{lst:mx:dark-pools-and-blocks:ping}
+
+The shortfalls are noisy, so the simulation also accounts for the two costs it knows. Each lit buy of $q$ moves $P^\ast$ by $\lambda q$ and raises the
+price of every share the fund buys afterwards: summed over the fund's own lit children this is its own-impact cost, $\lambda Q/2\,(1-1/n)=4.95$ basis
+points for 100 children; summed over the pinger's and the leaky sellers' trades ahead of it, when they were triggered by the fund, it is the leakage cost.
+Over sixteen seeds with the same exogenous events for every strategy (\cref{fig:mx:dark-pools-and-blocks:costs}):
+
+\begin{itemize}
+\item \emph{Lit}: shortfall 3.8 basis points (standard error 1.4), drift of the mid over the window 7.3 (2.3), own impact 4.95, no leakage.
+\item \emph{Dark}: the peg completes in about 360 seconds, but the pinger finds it: 88 of its probes fill against the fund, it buys 44\,000 shares ahead,
+and the leakage costs 10.9 basis points (0.3). Shortfall 12.5 (0.5), drift 26.1 (2.2).
+\item \emph{Dark with a minimum of 1\,000}: no probe can fill it and there is no leakage, but only 46\% of the order fills in the dark; the rest is bought
+at the end, at 1.4 basis points of own impact. Shortfall 9.5 (1.6), drift 11.9 (1.6).
+\item \emph{Block}: 79\% crosses in blocks, 0.75 leaky invitations per run cost 0.6 basis points. Shortfall $-2.9$ (1.9), drift $-1.7$ (2.2).
+\end{itemize}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.4cm,ybar,bar width=9pt,xtick={0,1,2,3},xticklabels={lit,dark,{dark, min 1\,000},block},
+  ylabel={\small basis points},tick label style={font=\footnotesize},ymin=-6,ymax=30,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma,enlarge x limits=0.2]
+\addplot[omDef,fill=omDef!40,error bars/.cd,y dir=both,y explicit] table[x=k,y=shortfall,y error=shortfall_se]{figdata/microstructure/09-dark-pools-and-blocks/costs.csv};
+\addplot[omThm,fill=omThm!40] table[x=k,y=leak]{figdata/microstructure/09-dark-pools-and-blocks/costs.csv};
+\addplot[omProp,fill=omProp!40] table[x=k,y=own]{figdata/microstructure/09-dark-pools-and-blocks/costs.csv};
+\legend{shortfall,leakage (accounted),own impact (accounted)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A 20,000-share buy worked four ways in the simulated market: shortfall against the arrival mid (mean and standard error over sixteen seeds),
+and the two costs the simulation can account for exactly. Resting unprotected in the dark leaks more than trading on the lit book costs. Data:
+\texttt{mx\_dark.compare}.}\label{fig:mx:dark-pools-and-blocks:costs}
+\end{omfigure}
+
+The lessons hold beyond the model's numbers. A resting dark order is visible to whoever probes for it, and the probe costs the prober 100 shares at the
+midpoint; the leak can cost more than the impact the dark venue was chosen to avoid. A minimum quantity above the probe size stops the leak and costs
+completion. And a midpoint fill saves the spread but not the impact when the counterparty is flow that would otherwise have sold on the lit book: taking
+it out of the lit market moves the price the same way. Blocks are cheap in the simulation because their sellers bring size that would not otherwise have
+traded: the cost of a trade is the imbalance it creates, wherever it is printed.
+
+\section{Dark pools in enforcement records}
+
+The secret is the product, and enforcement records show what happens when operators do not keep it. On August 12, 2015 ITG and its affiliate AlterNet
+Securities agreed to pay USD 20.3 million, admitting that an undisclosed proprietary desk, Project Omega, had accessed live feeds of its dark pool
+subscribers' orders and executions and traded against them in POSIT. On January 31, 2016 Barclays agreed to pay USD 70 million, half to the SEC and half to
+the New York Attorney General, for misrepresenting how its Liquidity Profiling policed its LX pool, and Credit Suisse USD 84.3 million over its
+Crossfinder pool, where it misrepresented its Alpha Scoring of subscribers' flow, accepted over 117 million sub-penny orders and alerted two
+high-frequency firms to customer orders through its Crosslink service. Each is a case of \omterm{def:mx:dark-pools-and-blocks:leakage}{information leakage} by the venue itself.
+
+\begin{dated}{2026-09}{Dark trading caps in the European Union}\label{dat:mx:dark-pools-and-blocks:svc}
+The MiFIR review entered into force on 28 March 2024. It replaces the double volume cap on dark trading with a single volume cap that applies only to the
+reference price waiver, from 18 months after entry into force; ESMA planned its first suspension file under the new cap for 9 October 2025.
+\end{dated}
+
+\section{Tutorial: the block that leaked}\label{tut:mx:dark-pools-and-blocks:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build a lit and a dark venue with a block layer, measure who fills in the dark, and price the leakage of a large order.
+\textbf{End state:} \cref{fig:mx:dark-pools-and-blocks:costs} and the numbers of sections 3 and 4.
+\begin{tutsteps}
+\item \textbf{Venues.} \texttt{mx\_dark.Market(seed, strategy)}: two engines driven directly, the dark one priced by control N after each change of the
+lit top.
+\item \textbf{Selection.} \texttt{zhu()}: dark fill rates of informed and uninformed takers, capture and 30-second move of resting fills in the dark and on
+the lit book.
+\item \textbf{Leakage.} \texttt{run(seed, strategy)} for \texttt{lit}, \texttt{dark}, \texttt{dark\_min}, \texttt{block}; \texttt{compare()} over
+sixteen seeds; draw with \texttt{fig\_dark.py}.
+\item \textbf{Block layer.} \texttt{firm\_darkpool.ConditionalBook}: add conditionals, collect invitations, firm up, expire, and read the \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rates}.
+\end{tutsteps}
+\textbf{What to change next.} Give the pinger 50-share probes and the fund a minimum of 200; let the block venue exclude participants whose \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rate}
+falls below one half, and watch the leakage.
+\end{tutorial}
+
+\section{Build: the dark venue}\label{bld:mx:dark-pools-and-blocks:darkpool}
+
+\begin{build}
+\bfield{Purpose} Dark and block liquidity for the execution algorithms of chapters 16 to 18 and 28, and the leakage measures the transaction-cost
+analysis of chapter~19 reports.
+\bfield{Interface} \texttt{ConditionalBook(firm\_up\_ns)}: \texttt{add}, \texttt{cancel}, \texttt{invitations}, \texttt{firm\_up}, \texttt{expire},
+\texttt{firm\_up\_rate}; \texttt{shortfall\_bps}, \texttt{pre\_completion\_drift\_bps}, \texttt{counterparty\_markout}. In \texttt{firm.exchsim}: control
+N in the Python, C++20 and Rust engines, \texttt{ExchangeConfig(reference, reference\_ns)}, \texttt{midpoint\_dark\_pool(reference=\dots)}.
+\bfield{Rules} A conditional matches only when the smaller size meets both minimums; an order is in one invitation at a time; the block crosses only
+when both firm up within the timer; a lapsed invitation counts against whoever did not respond.
+\bfield{Acceptance tests} \texttt{code/firm/darkpool/tests/}: an invitation, a two-sided firm-up, a lapse and the resulting rates; shortfall, drift and
+counterparty mark-out by hand. \texttt{code/firm/exchsim/tests/}: a \omterm{def:mx:order-types-and-their-uses:peg}{midpoint peg} with a minimum ignores a small order and crosses a large one at the lit
+mid; the fixtures with three N messages stay byte-identical in C++20 and Rust.
+\bfield{Stretch} Periodic dark auctions; venue-level participant scoring that blocks low \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rates}; the counterparty mark-out curve of chapter~19.
+\end{build}
+
+\begin{omsources}
+\item H.~Zhu, ``Do dark pools harm price discovery?'', \emph{Review of Financial Studies} 27(3), 2014.
+\item C.~Comerton-Forde and T.~Putni\c{n}\v{s}, ``Dark trading and price discovery'', \emph{Journal of Financial Economics} 118(1), 2015.
+\item U.S. Securities and Exchange Commission, press release 2015-164 (ITG, AlterNet Securities), 2015; press release 2016-16 (Barclays, Credit Suisse),
+2016.
+\item European Securities and Markets Authority, \emph{Double Volume Cap Mechanism}, web page, 2025.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:dark-pools-and-blocks:1}
+The lit market is 20.00 bid, 20.02 offered. What does each side of a 10\,000-share midpoint cross save against crossing the spread on the lit book?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:dark-pools-and-blocks:2}
+A resting midpoint buy of 5\,000 with a minimum of 1\,000 meets a 300-share sell, then a 1\,500-share sell. What trades?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:dark-pools-and-blocks:3}
+A participant received 40 invitations and firmed up 28. What is its \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rate}, and why does the venue care?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:dark-pools-and-blocks:4}
+With $\lambda=0.0005$ ticks a share on a 100.00 stock, a pinger buys 500 shares ahead when the fund has bought 5\,000 of 20\,000. How much does that one
+trade cost the fund, in basis points of the whole order?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:dark-pools-and-blocks:5}
+In the simulation informed takers fill 6.3\% of what they try in the dark and uninformed ones 17.5\%. Explain the gap with Zhu's argument.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:dark-pools-and-blocks:6}
+Show that 100 equal lit children of a 20\,000-share order cost $\lambda Q/2\,(1-1/n)$ in own impact, and compute it.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:dark-pools-and-blocks:7}
+\emph{Coding.} Rerun \texttt{dark\_min} with a minimum of 200 instead of 1\,000 on the sixteen seeds. Compare the leakage, the share filled in the dark,
+the completion time and the shortfall with both dark strategies.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:dark-pools-and-blocks:8}
+\emph{Find the flaw.} ``All our dark fills were at the midpoint, so our large order cost us nothing.''
+\end{exercise}
+
+\section{Problem: The Block That Leaked}
+
+\begin{problem}[{Weekend problem --- the block that leaked}]\label{pb:mx:dark-pools-and-blocks:1}
+A fund must buy 20\,000 shares within 30 minutes and asks where to send the order. Answer with the simulated market.
+
+\medskip\noindent\textbf{Part I --- The venues.}
+\begin{enumerate}
+\item What does a midpoint cross save, and where does its price come from?
+\item What does the dark engine need from the lit venue, and how does the simulator give it?
+\item Define a \omterm{def:mx:dark-pools-and-blocks:minqty}{minimum execution quantity} and give its two effects.
+\item Define a \omterm{def:mx:dark-pools-and-blocks:conditional}{conditional order} and a \omterm{def:mx:dark-pools-and-blocks:firmup}{firm-up rate}.
+\item Why does a lapsed invitation leak information?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Selection.}
+\begin{enumerate}[resume]
+\item State Zhu's argument.
+\item Give the dark fill rates of informed and uninformed takers in the simulation.
+\item Compare the capture and 30-second move of resting fills in the dark and on the lit book.
+\item What did Comerton-Forde and Putnins find about block trades?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Four ways to buy.}
+\begin{enumerate}[resume]
+\item Describe the pinger and the leaky sellers.
+\item Derive the own-impact cost of the lit strategy.
+\item How is the leakage cost accounted?
+\item Give the shortfall, drift and accounted costs of the four strategies.
+\item Why does the unprotected dark order cost more than the lit one?
+\item What does the minimum quantity of 1\,000 fix, and what does it cost?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Venues and the verdict.}
+\begin{enumerate}[resume]
+\item Why are blocks cheap in the simulation, and when would they not be?
+\item Summarise the ITG, Barclays and Credit Suisse cases in one sentence each.
+\item What changed in the EU's cap on dark trading?
+\item State the \emph{named result}: the price drift before completion of a parent order worked in the dark against in the lit market, and the leakage
+cost in basis points.
+\item In one sentence: where should the fund send its order?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:dark-pools-and-blocks:1}
+What is a dark pool, and why would an institution use one?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:dark-pools-and-blocks:2}
+How would you protect a large resting dark order from being detected?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:dark-pools-and-blocks:3}
+Do dark pools harm \omterm{def:mx:fragmentation-and-routing:discovery}{price discovery}? Give the theory and the evidence.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader, researcher}]\label{iq:mx:dark-pools-and-blocks:4}
+How would you measure \omterm{def:mx:dark-pools-and-blocks:leakage}{information leakage} in your firm's executions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:dark-pools-and-blocks:5}
+Design the matching logic of a conditional block venue. What state does it keep per order and per participant?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{trader}]\label{iq:mx:dark-pools-and-blocks:6}
+Your midpoint fills look free, yet your shortfall on dark-heavy orders is higher than on lit ones. What is going on?
+\end{interviewq}

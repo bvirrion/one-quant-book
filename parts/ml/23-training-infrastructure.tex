@@ -1,0 +1,309 @@
+\chapter{Training Infrastructure}\label{ch:ml:training-infrastructure}
+
+A team's order-book model trains for a day, and the team prices a second \omterm{def:ml:training-infrastructure:accelerator}{accelerator}. Before it buys one it should know
+where the time goes. On the chapter's small version of the problem, measured on a laptop, a third of every training step is
+spent assembling the batch, not computing on it; changing the storage format barely matters, and gathering the batch in one
+indexed read instead of window by window cuts the data's share to a fifth. This chapter is about the machinery under the
+models of Parts I to IV: \omterm{def:ml:training-infrastructure:accelerator}{accelerators} and where training time goes, \omterm{def:ml:training-infrastructure:loader}{data loaders} for tick data that never let a window cross
+a session, lower-precision arithmetic, training on several devices, and checkpoints that let a killed run resume exactly.
+Everything runs on one CPU thread, with no worker processes; the multi-device parts are simulated in one process, which is
+enough to check their arithmetic, and the timings are the author's laptop's, labelled as such.
+
+\section{Accelerators and where the time goes}
+
+\begin{definition}[Accelerator]\label{def:ml:training-infrastructure:accelerator}
+An \emph{accelerator}\index{accelerator} is a processor built for the dense linear algebra of \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{neural networks} (a graphics
+processor or a dedicated tensor processor): thousands of arithmetic units, high-bandwidth memory beside them, and
+low-precision matrix units that do most of the work.
+\end{definition}
+
+\begin{dated}{2026-09}{A data-centre accelerator}\label{dat:ml:training-infrastructure:h100}
+NVIDIA's specification page for the H100 lists 80~GB of memory with 3.35~TB/s of bandwidth for the SXM version (94~GB and
+3.9~TB/s for the NVL version), and 1\,979 teraflops of \omterm{def:ml:training-infrastructure:mixed}{bfloat16} tensor-core arithmetic for the SXM version, a figure the page
+marks as with sparsity.
+\end{dated}
+
+Figures like these explain the usual bottleneck. An \omterm{def:ml:training-infrastructure:accelerator}{accelerator} can consume data far faster than a storage system, a
+decompressor or a Python loop can feed it, so the first question about a slow training job is what fraction of each step the
+device waits. The step divides into loading (reading the data from storage), batching (cutting windows and stacking them) and
+computing (forward pass, backward pass, optimiser update). The chapter measures the three on its own job: eight ten-minute
+\texttt{firm.tape} sessions of the book's synthetic market, each a table of 1\,140 half-second rows and 41 columns (the mid
+price and the ten-level book of chapter~8), and a two-layer network that reads the last twenty rows and predicts the mid's
+change over the next ten.
+
+\section{Data loaders for tick data}
+
+\begin{definition}[Data loader, memory-mapped dataset]\label{def:ml:training-infrastructure:loader}
+A \emph{data loader}\index{data loader} is the code that turns stored data into training batches: it reads, decodes, samples,
+cuts and stacks examples, ideally while the device computes on the previous batch. A \emph{memory-mapped
+dataset}\index{memory-mapped dataset} stores the data in one binary file that the operating system maps into the process's
+address space: nothing is read until a slice is touched, the operating system caches what is read, and several processes can
+share one copy.
+\end{definition}
+
+Tick data impose one rule on the loader: a training window must not cross a session boundary, or a window will contain the
+close of one day and the open of the next as if they were consecutive (and, with overlapping sessions for several instruments,
+leak across them). The sampler of \cref{lst:ml:train:sampler} draws (session, start) pairs uniformly among the windows that fit,
+and its random state is part of what a checkpoint saves.
+
+The sessions are stored three ways: one CSV file per session (2.21~MB in all), one NumPy file per session (1.50~MB), and one
+memory-mapped float32 file with a small JSON index (1.50~MB). \Cref{fig:ml:train:time} shows the measured cost of a training step
+with each, loading being charged once per \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epoch} of 100 steps. Parsing the CSV files takes 12.5~ms per \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epoch} (176~MB/s),
+reading the NumPy files 0.83~ms (1.8~GB/s), and mapping the single file 0.39~ms whatever its size. Per step these are tiny
+against the half millisecond of cutting 256 windows one by one in Python and the 1.1 to 1.2~ms of computing: the data's share of
+the step is 0.34, 0.31 and 0.39. Gathering the whole batch from the mapped file in one indexed read
+(\cref{lst:ml:train:gather}) takes 0.27~ms and brings the share to 0.20.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ybar stacked,bar width=22pt,ymin=0,ymax=2.6,ylabel={milliseconds per training step},
+  area legend,xtick={0,1,2,3},xticklabels={{CSV},{NumPy},{memory map},{memory map,\\one gather}},xticklabel style={align=center},
+  tick label style={font=\small},label style={font=\small},xmin=-0.6,xmax=3.6,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none},table/col sep=comma]
+\addplot[fill=omThm,draw=none] table[x=i,y expr=\thisrow{load_ms}/100]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\addplot[fill=omProp,draw=none] table[x=i,y=batch_ms]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\addplot[fill=omDef,draw=none] table[x=i,y=compute_ms]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\legend{loading (per step),batching,computing}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Where a training step's time goes, by storage format and batch assembly: medians of five \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epochs} of 100 steps of 256
+windows. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, no isolated cores; other jobs may have run.
+Data: \texttt{bench\_train.py}, \texttt{measured\_loader.csv}.}\label{fig:ml:train:time}
+\end{omfigure}
+
+At this scale the lesson is about code, not storage: the Python loop over windows costs more than any format. At the scale of a
+year of order-book data the formats diverge. A year of the same half-second table for one instrument, 250 sessions of six and a
+half hours, is about 1.9~GB of float32 and 2.8~GB of text: at the measured rates, parsing the text costs about 16~seconds per
+\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epoch}, reading the binary files about one second, and mapping costs nothing until the windows are read, from the page cache
+after the first \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{epoch}. And beyond the memory of the machine only a memory-mapped or streamed format works at all.
+
+\section{Mixed precision}
+
+\begin{definition}[Mixed-precision training, bfloat16]\label{def:ml:training-infrastructure:mixed}
+\emph{Mixed-precision training}\index{mixed-precision training} runs the expensive operations (matrix products, convolutions)
+in a 16-bit format while keeping the weights, the loss and the optimiser's state in 32 bits (Micikevicius and co-authors,
+2018). \emph{bfloat16}\index{bfloat16} is a 16-bit floating-point format with float32's eight exponent bits and seven fraction
+bits: the same range as float32, and a machine epsilon (Book~4, chapter~25) of $2^{-7}\approx0.0078$ instead of $2^{-23}$, so no
+loss scaling is needed against underflow (Kalamkar and co-authors, 2019).
+\end{definition}
+
+Under the CPU's \omterm{def:ml:training-infrastructure:mixed}{bfloat16} autocast the chapter's network trains to the same place (\cref{fig:ml:train:bf16}): over the last 50
+of 300 steps the mean loss is 0.0525 against 0.0527 in float32. Step by step the two runs differ: the largest difference between
+their losses over the run is 0.0132, 22\% of that step's float32 loss, because rounding changes each update slightly and the
+trajectories drift apart. Reproducing a run bit for bit across precisions is not to be expected; equivalence is judged on the
+validation metric, over the run.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={training step},ylabel={loss (10-step average)},tick label style={font=\small},
+  label style={font=\small},xmin=10,xmax=300,grid=major,grid style={gray!25},legend cell align=left,
+  legend style={font=\footnotesize,at={(0.98,0.98)},anchor=north east,fill=white,draw=none},table/col sep=comma]
+\addplot[omDef,very thick] table[x=step,y=fp32]{figdata/ml/23-training-infrastructure/losses.csv};
+\addplot[omThm,thick,dashed] table[x=step,y=bf16]{figdata/ml/23-training-infrastructure/losses.csv};
+\legend{float32,bfloat16 autocast}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Training loss of the same network, same data order and same initialisation, in float32 and under \omterm{def:ml:training-infrastructure:mixed}{bfloat16} autocast.
+Data: \texttt{ml\_train.run} (\texttt{fig\_train.py}).}\label{fig:ml:train:bf16}
+\end{omfigure}
+
+\section{Distributed training}
+
+\begin{definition}[Gradient accumulation, data parallelism, model parallelism, all-reduce]\label{def:ml:training-infrastructure:dist}
+\emph{Gradient accumulation}\index{gradient accumulation} sums the gradients of several micro-batches before one optimiser step,
+which equals one step on their union. \emph{Data parallelism}\index{data parallelism} runs a copy of the model on each device,
+each on its own share of the batch, and averages their gradients before every step (Li and co-authors, 2020); \emph{model
+parallelism}\index{model parallelism} splits one model's layers or matrices across devices when it does not fit on one
+(Shoeybi and co-authors, 2019). An \emph{all-reduce}\index{all-reduce} is the collective operation that leaves every device with
+the sum (or average) of all devices' arrays.
+\end{definition}
+
+Both identities are checked in the chapter's code (\cref{lst:ml:train:loop}). Four accumulated micro-batches of 64 and one batch
+of 256 of the same windows leave parameters that differ by at most $1.4\times10^{-7}$ after 20 steps, rounding in a different
+order of summation. The average of two workers' gradients on the halves of a batch differs from the whole batch's gradient by at
+most $1.5\times10^{-8}$, against gradients of size 0.12: an \omterm{def:ml:training-infrastructure:dist}{all-reduce} computes exactly the large-batch gradient, and \omterm{def:ml:training-infrastructure:dist}{data
+parallelism} is \omterm{def:ml:training-infrastructure:dist}{gradient accumulation} across devices. What changes with a larger effective batch is the optimisation: the \omterm{def:ml:trees-and-boosting:boosting}{learning
+rate} and its warm-up must be rescaled (Goyal and co-authors, 2017), and for the small, noisy models of trading, larger batches
+rarely help.
+
+\section{Checkpoints and deterministic resumption}
+
+\begin{definition}[Training checkpoint]\label{def:ml:training-infrastructure:ckpt}
+A \emph{training checkpoint}\index{training checkpoint} is a saved state from which a run can continue as if it had not stopped:
+the model's parameters, the optimiser's state (moment estimates, step counts), the data sampler's position and random state,
+the random generators' states and the step count.
+\end{definition}
+
+A run of 200 steps and a run killed at step 100, checkpointed (\cref{lst:ml:train:ckpt}), and resumed into newly constructed
+objects with a different initialisation end with bitwise identical parameters, and identical losses step for step; the checkpoint
+takes 693~kB. Saving only the model's weights, the usual shortcut, restarts \omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{Adam}'s moment estimates and replays the sampler's
+first windows; the resumed run ends with parameters up to 0.039 away from the uninterrupted one's. For research that must be
+reproduced (chapter~25) and for jobs on machines that can be pre-empted, the full checkpoint is the difference between resuming
+and restarting with a different run.
+
+\begin{method}[Before buying an accelerator]\label{met:ml:train:method}
+\begin{enumerate}
+\item Measure load, batch and compute time per step; if data take more than a small share, fix the loader first (binary or
+memory-mapped storage, batch gathering in one read, prefetching).
+\item Try \omterm{def:ml:training-infrastructure:mixed}{bfloat16} autocast and judge it on the validation metric over the run.
+\item Grow the batch by accumulation before growing the hardware; rescale the \omterm{def:ml:trees-and-boosting:boosting}{learning rate} and check that the model improves.
+\item Checkpoint everything that makes the run's future, and test resumption bitwise.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: where the time goes}\label{tut:ml:training-infrastructure:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Store tick sessions three ways, measure a step's time budget, train in \omterm{def:ml:training-infrastructure:mixed}{bfloat16}, verify accumulation and \omterm{def:ml:training-infrastructure:dist}{data
+parallelism}, and resume a run bitwise. \textbf{End state:} \cref{fig:ml:train:time,fig:ml:train:bf16}.
+\begin{tutsteps}
+\item \textbf{A session-aware window sampler with a saveable state.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{78}{96}{Windows that never cross a session boundary.}\label{lst:ml:train:sampler}
+\item \textbf{One gather for a whole batch.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{110}{116}{A batch from the memory-mapped store in one indexed read.}\label{lst:ml:train:gather}
+\item \textbf{Accumulation and \omterm{def:ml:training-infrastructure:mixed}{bfloat16} autocast.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{119}{141}{The training loop.}\label{lst:ml:train:loop}
+\item \textbf{Checkpoints.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{156}{167}{Saving and restoring everything a run's future depends on.}\label{lst:ml:train:ckpt}
+\item \textbf{Run} \texttt{ml\_train.precision()}, \texttt{accumulation()}, \texttt{data\_parallel()}, \texttt{resume()},
+\texttt{naive\_resume()}, \texttt{fig\_train.py}; and, once, \texttt{bench\_train.py} under \texttt{nice}.
+\end{tutsteps}
+\textbf{What to change next.} Prefetch the next batch in a background thread and measure the overlap; add a second instrument
+and check that windows never mix instruments.
+\end{tutorial}
+
+\section{Build: the training toolkit}\label{bld:ml:training-infrastructure:mltrain}
+
+\begin{build}
+\bfield{Purpose} Training runs that are fast where it matters, correct at session boundaries, and exactly resumable.
+\bfield{Interface} \texttt{write\_shards(sessions, root, fmt)}, \texttt{Shards(root, fmt)}, \texttt{WindowSampler(lengths, T,
+horizon, batch, seed)} with \texttt{state}/\texttt{set\_state}, \texttt{make\_batch}, \texttt{make\_batch\_vec},
+\texttt{train(model, shards, sampler, steps, lr, accumulate, bf16)}, \texttt{data\_parallel\_grads}, \texttt{save\_checkpoint},
+\texttt{load\_checkpoint}.
+\bfield{Rules} Windows never cross sessions; timings are measured, labelled with the machine, and never asserted; everything that
+determines the rest of a run goes into its checkpoint.
+\bfield{Acceptance tests} \texttt{code/firm/mltrain/tests/}: the three formats return identical windows; no sampled window crosses
+a boundary; the gathered batch equals the looped one; accumulation equals a larger batch; the averaged shard gradients equal the
+full gradient; resumption is bitwise.
+\bfield{Stretch} Real two-process \omterm{def:ml:training-infrastructure:dist}{data parallelism} with the gloo backend when the machine allows; streaming from compressed
+shards; prefetching.
+\end{build}
+
+\begin{omsources}
+\item P.~Micikevicius and co-authors, ``Mixed precision training'', arXiv:1710.03740, 2018.
+\item D.~Kalamkar and co-authors, ``A study of BFLOAT16 for deep learning training'', arXiv:1905.12322, 2019.
+\item S.~Li and co-authors, ``PyTorch distributed: experiences on accelerating data parallel training'', arXiv:2006.15704, 2020.
+\item P.~Goyal and co-authors, ``Accurate, large minibatch SGD: training ImageNet in 1 hour'', arXiv:1706.02677, 2017.
+\item M.~Shoeybi and co-authors, ``Megatron-LM: training multi-billion parameter language models using model parallelism'',
+arXiv:1909.08053, 2019.
+\item NVIDIA, H100 Tensor Core GPU specifications (web page, accessed September 2026).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:1}
+What is the machine epsilon of \omterm{def:ml:training-infrastructure:mixed}{bfloat16}, float16 and float32? Which of them can represent $10^{-30}$?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:2}
+A session has 1\,140 rows; windows are 20 rows with a 10-row target horizon. How many windows does it hold? What goes wrong if a
+sampler draws starts uniformly over the concatenated sessions?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:3}
+From \cref{fig:ml:train:time}, what speed-up would halving the compute time give with the looped loader, and with the gather?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:4}
+Why do float32 and \omterm{def:ml:training-infrastructure:mixed}{bfloat16} losses differ by up to 22\% at some steps while their averages agree?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:5}
+Show that with a mean loss, accumulating $k$ micro-batches each scaled by $1/k$ gives the gradient of the mean over their union.
+What changes with \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{batch normalisation}?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:6}
+\emph{Find the flaw.} ``We resume pre-empted jobs from the last saved weights, so our runs are reproducible.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:training-infrastructure:7}
+Estimate, from the measured throughputs, the \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{per-epoch} loading time of a year of the chapter's table in each format (250
+sessions of six and a half hours of half-second rows, 41 float32 columns, text about 1.5 times larger than binary).
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:training-infrastructure:8}
+In a ring \omterm{def:ml:training-infrastructure:dist}{all-reduce} over $p$ devices each holding $n$ numbers, each device sends and receives about $2n(p-1)/p$ numbers. Explain
+why, and what it implies for how data-parallel training scales with the number of devices.
+\end{exercise}
+
+\section{Problem: Where the Time Goes}
+
+\begin{problem}[{Weekend problem --- measure before you buy}]\label{pb:ml:training-infrastructure:1}
+The chapter's sessions, formats, network and runs.
+
+\medskip\noindent\textbf{Part I --- The budget.}
+\begin{enumerate}
+\item How large is the data in each format?
+\item What are the load, batch and compute times per step?
+\item What share of the step goes to data for each storage format, and with the gather?
+\item What would you change first, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Precision.}
+\begin{enumerate}[resume]
+\item What are \omterm{def:ml:training-infrastructure:mixed}{bfloat16}'s bits, range and epsilon?
+\item How do the float32 and \omterm{def:ml:training-infrastructure:mixed}{bfloat16} runs compare?
+\item Why is no loss scaling needed with \omterm{def:ml:training-infrastructure:mixed}{bfloat16}?
+\item Where would you keep float32 in a trading model's pipeline?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Parallelism and checkpoints.}
+\begin{enumerate}[resume]
+\item What do the accumulation and data-parallel checks show?
+\item What must a checkpoint contain, and what does leaving part of it out cost?
+\item How large is the chapter's checkpoint?
+\item What does a larger effective batch require of the \omterm{def:ml:trees-and-boosting:boosting}{learning rate}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the data-loading share of step time for each storage format, and the largest loss difference
+between float32 and \omterm{def:ml:training-infrastructure:mixed}{bfloat16} training over the run.
+\item Would the team need a second \omterm{def:ml:training-infrastructure:accelerator}{accelerator}?
+\item When does \omterm{def:ml:training-infrastructure:dist}{model parallelism} become necessary for a trading model?
+\item How would you make a training run reproducible across machines?
+\item What is the risk of a sampler that crosses sessions?
+\item How would you measure a loader on shared infrastructure?
+\item What would you log about every training run?
+\item In one sentence: what is the first thing to measure about a slow training job?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle}]\label{iq:ml:training-infrastructure:1}
+What is \omterm{def:ml:training-infrastructure:mixed}{bfloat16} and why is it preferred to float16 for training?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:training-infrastructure:2}
+Your GPU utilisation is 30\%. How do you find out why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:training-infrastructure:3}
+Explain \omterm{def:ml:training-infrastructure:dist}{data parallelism} and what an \omterm{def:ml:training-infrastructure:dist}{all-reduce} does.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, researcher}]\label{iq:ml:training-infrastructure:4}
+How would you store and sample a year of order-book data for training sequence models?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:training-infrastructure:5}
+What does a \omterm{def:ml:training-infrastructure:ckpt}{training checkpoint} need to contain for bitwise resumption?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{mle, dev}]\label{iq:ml:training-infrastructure:6}
+\omterm{def:ml:training-infrastructure:dist}{Gradient accumulation} and \omterm{def:ml:training-infrastructure:dist}{data parallelism} are said to be equivalent. When are they not?
+\end{interviewq}

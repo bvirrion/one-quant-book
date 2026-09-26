@@ -1,0 +1,384 @@
+\chapter{The Limit Order Book}\label{ch:mx:the-limit-order-book}
+
+A trader sends an order to buy 100 shares at the best bid. The screen shows a price and a size; what it does not show is a line. In the
+simulated hour this book uses throughout, 2\,834 orders joined the back of the best bid or ask: they found a median of 1\,400 shares ahead of
+them, and only 13\% of them ever traded. The best price is not a place where an order sits; it is a queue that an order waits in, and the order
+in which the queue formed decides who trades. This chapter describes the book as a state, as a stream of events that change the state, as a data
+structure a venue and every participant must maintain, and as a queueing system whose simplest model already says how long the wait is.
+
+\section{State: price levels and queues}
+
+\begin{definition}[Limit order, market order]\label{def:mx:the-limit-order-book:orders}
+A \emph{limit order}\index{limit order} is an order to buy at a stated price or lower, or to sell at a stated price or higher; the part that cannot
+execute at once rests in the book until it executes, is cancelled or expires. A \emph{market order}\index{market order} is an order to buy or
+sell a quantity at the best prices available; it never rests.
+\end{definition}
+
+\begin{definition}[Tick size, price level]\label{def:mx:the-limit-order-book:tick}
+The \emph{tick size}\index{tick size} $\delta_{\mathrm{tick}}$ is the smallest price increment a venue accepts for an instrument: every limit
+price is an integer multiple of it. A \emph{price level}\index{price level} is the set of resting orders on one side of the book at one price.
+\end{definition}
+
+\begin{definition}[Limit order book]\label{def:mx:the-limit-order-book:lob}
+A \emph{limit order book}\index{limit order book} is the set of resting \omterm{def:mx:the-limit-order-book:orders}{limit orders} of one instrument on one venue, organised by side and by
+\omterm{def:mx:the-limit-order-book:tick}{price level}; within a level, by priority. Its best bid $b_t$ and best ask $a_t$ are the highest resting buy price and the lowest resting sell price;
+$Q^b_t$ and $Q^a_t$ are the displayed quantities at them.
+\end{definition}
+
+A book is \emph{crossed} if $b_t\ge a_t$; a continuously trading book never is, because an order that would cross executes instead. The
+spread $s_t = a_t - b_t$ is at least one tick. Three views of the same state appear in every later chapter (One Quant Book 1, chapter 28): level 1 is
+$(b_t, Q^b_t, a_t, Q^a_t)$; level 2 adds the aggregated size at each deeper price; level 3 is the book itself, every order with its reference, in
+queue order (\cref{fig:mx:the-limit-order-book:book}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,x=1cm,y=0.62cm]
+\draw[->,thick] (0,0) -- (0,7.4) node[above]{price};
+\foreach \p/\lab in {1/99.97,2/99.98,3/99.99,4/100.00,5/100.01,6/100.02,7/100.03} {\draw (-0.08,\p) -- (0.08,\p); \node[left,font=\footnotesize] at (-0.1,\p) {\lab};}
+\foreach \y/\x/\w in {4/0.4/1.2,4/1.65/0.8,4/2.5/1.6,3/0.4/2.0,3/2.45/1.0,2/0.4/1.4,2/1.85/0.6,2/2.5/1.1,1/0.4/2.4} {\draw[fill=omDef!18,draw=omDef] (\x,\y-0.32) rectangle ++(\w,0.64);}
+\foreach \y/\x/\w in {5/0.4/0.9,5/1.35/1.5,6/0.4/1.8,6/2.25/0.7,7/0.4/1.3,7/1.75/1.3} {\draw[fill=omThm!18,draw=omThm] (\x,\y-0.32) rectangle ++(\w,0.64);}
+\draw[fill=omExo!45,draw=omExo,thick] (4.15,3.68) rectangle ++(0.7,0.64); \node[font=\footnotesize] at (4.5,4) {new};
+\node[anchor=west,font=\footnotesize,align=left] at (5.0,4) {joins the back\\of the best bid};
+\draw[->,thick,omThm] (5.8,5.52) -- (0.85,5.36) node[pos=0,right,font=\footnotesize,align=left]{a market buy takes\\the best ask\\from the front};
+\draw[decorate,decoration={brace,amplitude=4pt}] (-1.25,4.05) -- (-1.25,4.95) node[midway,left=5pt,font=\footnotesize]{spread};
+\node[font=\footnotesize,anchor=west,omDef] at (0.4,-0.6) {bids: price priority downwards, then time};
+\node[font=\footnotesize,anchor=west,omThm] at (1.2,7.75) {asks: price priority upwards, then time};
+\end{tikzpicture}
+
+\omcaption{A \omterm{def:mx:the-limit-order-book:lob}{limit order book} at level 3. Each box is a resting order, its width its size; within a \omterm{def:mx:the-limit-order-book:tick}{price level} the oldest order is at the left.
+The best bid is 100.00 and the best ask 100.01, one tick apart. A new bid at 100.00 joins the back of its level; a market buy consumes the best
+ask from the front.}\label{fig:mx:the-limit-order-book:book}
+\end{omfigure}
+
+\section{Events: add, cancel, modify, execute}
+
+\begin{definition}[Order-book event]\label{def:mx:the-limit-order-book:event}
+An \emph{order-book event}\index{order-book event} is one change to the book: an order added at a \omterm{def:mx:the-limit-order-book:tick}{price level}, reduced or removed by its owner
+(a cancellation), replaced by a new order, or reduced or removed by an execution against an incoming order. A venue's market-by-order feed
+(One Quant Book 1, chapter 19) publishes one message per event, with the order's reference.
+\end{definition}
+
+The table maps the events to the messages of Nasdaq's TotalView-ITCH 5.0 feed, whose layouts the exchange simulator
+of chapter~26 keeps. Nasdaq's specification is explicit about the replace: all remaining shares of the original order are removed, and the
+replacement arrives with a new order reference used from then on, which is how a feed says that the order lost its place.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{4.3cm}p{4.3cm}@{}}
+\toprule
+event & ITCH message & level 3 & level 2 and level 1 \\
+\midrule
+add & A (add order) & a new order at the back of its level & the level's size grows; the best may move \\
+partial cancel & X (order cancel) & the order shrinks, keeps its place & the level's size falls \\
+full cancel & D (order delete) & the order leaves & the level may vanish \\
+replace & U (order replace) & old order leaves, new one at the back & two levels may change \\
+execution & E / C (executed) & the front order shrinks or leaves & the best level shrinks; a trade prints \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Executions are few. In the simulated hour (\texttt{firm.tape}, Book~7's synthetic market, 31\,535 messages), 49.7\% of messages are adds,
+47.8\% cancellations and 2.5\% executions: 40 messages for each trade. Only 3.8\% of the orders that left the book did so by trading; the median
+order lived 15.5 seconds (24.9 for those that traded, 15.3 for those cancelled), and the best bid price lasted a median of 4.5 seconds before it
+moved. Real books in liquid stocks run faster and cancel more (chapter~3 sets the simulated facts beside published ones); what matters here is the
+proportion: the book is mostly orders that will never trade.
+
+\section{Priority and what resets it}
+
+A \omterm{def:mx:the-limit-order-book:engine}{matching engine} (\cref{def:mx:the-limit-order-book:engine}) ranks resting orders by price, then by a rule within the level; price-time priority,
+first come first served, is the common rule for equities (One Quant Book 1, chapter 19, gives the pro-rata and top-order alternatives of futures
+venues). Priority is a property of an order's \emph{arrival}, and venues must say which changes count as a new arrival. The rules are close
+across venues:
+\begin{itemize}
+\item \textbf{A reduction keeps the place.} A partial cancellation (ITCH X) leaves the order where it was: it takes away only its own shares.
+\item \textbf{An increase or a price change loses it.} CME Globex lists the modifications that change an order's priority: an increase of quantity,
+the price, the order type, the stop trigger price, the minimum fill quantity and the account. On Nasdaq a cancel-replace arrives on the feed as
+an Order Replace with a new reference.
+\item \textbf{A refreshed iceberg slice goes to the back} (chapter~2): showing more of a hidden reserve is an increase.
+\end{itemize}
+The reason is fairness to the orders behind: if a size increase kept its place, a trader could stand at the front with one lot and grow it
+whenever a large order arrived. The consequence for a trader is that a queue position is an asset (chapter~6 prices it) that a careless
+modification destroys.
+
+\begin{definition}[Matching engine]\label{def:mx:the-limit-order-book:engine}
+A \emph{matching engine}\index{matching engine} is the venue's program that holds the \omterm{def:mx:the-limit-order-book:lob}{limit order books}, applies each incoming message in the
+order it arrives, executes incoming orders against resting ones by the priority rule, and publishes the resulting events and execution reports.
+\end{definition}
+
+\section{The book as a data structure}
+
+A book has three operations on its hot path: find an order by reference (every cancel and execution names one), find the best price (every
+aggressive order starts there), and walk a level in priority order (every execution). \texttt{firm.lob}, the running project's reference book,
+keeps a hash map from reference to order, a map from price to level on each side, and two first-in-first-out queues per level, displayed orders
+first (\cref{fig:mx:the-limit-order-book:ds}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.55cm,inner sep=3pt}]
+\node[box,fill=omDef!12,minimum width=2.5cm,align=center] (h) at (0,2.6) {hash map\\ reference $\to$ order};
+\node[box,fill=omDef!12,minimum width=2.5cm,align=center] (m) at (0,0) {bids: price $\to$ level\\ (sorted)};
+\foreach \i/\p in {0/100.00,1/99.99,2/99.98} {\node[box,minimum width=1.3cm] (p\i) at (3.3,0.9-0.9*\i) {\p};}
+\foreach \k in {0,1,2} {\node[box,fill=omDef!18] (o\k) at (5.2+1.4*\k,0.9) {\#\the\numexpr 11+\k\relax};}
+\draw[->] (p0) -- (o0); \draw[->] (o0) -- (o1); \draw[->] (o1) -- (o2);
+\node[box,fill=gray!15] (hid) at (9.6,0.9) {hidden};
+\draw[->] (o2) -- (hid);
+\draw[->] (m.east) -- (p0.west); \draw[->] (m.east) -- (p1.west); \draw[->] (m.east) -- (p2.west);
+\draw[->,dashed,omDef] (h.east) to[out=0,in=100] (o1.north);
+\node[anchor=west,align=left] at (5.0,-0.6) {level 100.00: displayed queue in time order,\\ then the hidden queue};
+\end{tikzpicture}
+
+\omcaption{The structures of \texttt{firm.lob}. A cancellation finds its order through the hash map (dashed); an aggressive order finds the best
+level through the sorted map and walks its queues from the front.}\label{fig:mx:the-limit-order-book:ds}
+\end{omfigure}
+
+\omcode{code/firm/lob/firm_lob.py}{60}{91}{The core of \texttt{firm.lob}: add, find, remove and reduce.}\label{lst:mx:the-limit-order-book:lob}
+
+\begin{proposition}[Costs of the book operations]\label{prop:mx:the-limit-order-book:cost}
+With $L$ non-empty levels on a side and $m$ orders at a level, the structure of \cref{fig:mx:the-limit-order-book:ds} finds an order in $O(1)$ expected
+time, adds an order in $O(\log L)$ when it creates a level and $O(1)$ otherwise, finds the best price in $O(1)$ (the end of the sorted map), and
+removes an order in $O(\log L+m)$ worst case. A price-indexed array covering $W$ ticks, with a pointer to the best index, adds and removes in $O(1)$
+and moves the best pointer in $O(g)$, where $g$ is the number of empty ticks it crosses.
+\end{proposition}
+
+\begin{proof}
+Hash lookup is expected constant. A sorted map (a balanced tree, or a sorted list with binary search as in the Python reference) inserts a new key
+in $O(\log L)$. Removal locates the order in its queue, linear in $m$ unless each order keeps a link to its neighbours (an intrusive doubly linked list,
+the production choice, makes it $O(1)$). In the array, a level is an index computed from the price; after a removal empties the best level, the
+pointer moves to the next non-empty index, $g$ steps.
+\end{proof}
+
+Production books for liquid instruments use the array: prices cluster within a few hundred ticks of the best, $g$ is small, and every
+operation touches memory at a computed address (One Quant Book 13 builds one). \texttt{firm.lob} carries both: its \texttt{ArrayBook} and its
+tree-keyed \texttt{MessageBook} rebuilt the simulated hour's book message by message and agreed on all 3\,154 level-2 snapshots compared. Its C++20
+and Rust twins rebuild a shared five-minute fixture and reproduce every one of its 147 snapshots.
+
+\section{The book as a queueing system}
+
+Seen from one order, the best level is a queue in which it waits: orders ahead leave by execution (from the front) or by cancellation (from
+anywhere), and the order itself may be cancelled before its turn comes. The simplest model of the whole book treats every flow as random.
+
+\begin{definition}[Zero-intelligence model]\label{def:mx:the-limit-order-book:zi}
+A \emph{zero-intelligence model}\index{zero-intelligence model} of a \omterm{def:mx:the-limit-order-book:lob}{limit order book} lets \omterm{def:mx:the-limit-order-book:orders}{limit orders}, \omterm{def:mx:the-limit-order-book:orders}{market orders} and cancellations arrive as
+independent Poisson processes whose rates may depend on the distance from the best prices, with no trader choosing anything; its spread,
+depth, volatility and fill probabilities follow from the rates alone.
+\end{definition}
+
+Smith, Farmer, Gillemot and Krishnamurthy (2003) built the model with \omterm{def:mx:the-limit-order-book:orders}{limit orders} placed at random over a band of prices, \omterm{def:mx:the-limit-order-book:orders}{market orders} and
+cancellations, and derived by dimensional analysis how the spread, depth, volatility and impact scale with the rates; with all the rates measurable
+from data, it has no free parameters. Cont, Stoikov and Talreja (2010) wrote the book as a set of birth--death queues (One Quant Book 4, chapter~8) with
+cancellations at a rate proportional to the queue's size, fitted it to Tokyo Stock Exchange data and computed, among other conditional
+probabilities, that of executing an order at the bid before the ask moves. The following result is the building block.
+
+\begin{proposition}[Fill probability behind $n$ orders]\label{prop:mx:the-limit-order-book:fill}
+An order joins a \omterm{def:mx:the-limit-order-book:tick}{price level} behind $n$ orders of one unit each. \omterm{def:mx:the-limit-order-book:orders}{Market orders} arrive at rate $\mu$ and each takes one unit from the front; each
+order ahead is cancelled at rate $\theta$; the order itself is cancelled at rate $\nu$. All clocks are independent and exponential. The probability
+that it fills before it is cancelled is
+\[
+P_n=\frac{\mu}{\mu+\nu}\prod_{k=1}^{n}\frac{\mu+k\theta}{\mu+k\theta+\nu},
+\]
+and, when $\nu=0$, the expected time until it fills is $1/\mu+\sum_{k=1}^{n}1/(\mu+k\theta)$.
+\end{proposition}
+
+\begin{proof}
+With $k\ge1$ orders ahead, the next event is a departure from ahead (rate $\mu+k\theta$) or our cancellation (rate $\nu$); by memorylessness the
+departure comes first with probability $(\mu+k\theta)/(\mu+k\theta+\nu)$, and the queue then restarts from $k-1$. At the front ($k=0$) the next
+\omterm{def:mx:the-limit-order-book:orders}{market order} fills us with probability $\mu/(\mu+\nu)$. The stages are independent, so the probabilities multiply. With $\nu=0$ the stage
+durations are exponential with means $1/(\mu+k\theta)$ and $1/\mu$; the expected total is their sum.
+\end{proof}
+
+\omcode{code/microstructure/01-the-limit-order-book/python/mx_lob.py}{115}{121}{The proposition in code.}\label{lst:mx:the-limit-order-book:fill}
+
+The proposition holds in a queue where nobody jumps ahead. In a real book, and in the \omterm{def:mx:the-limit-order-book:zi}{zero-intelligence model}, someone does: a buyer who places
+a bid one tick above ours becomes the best bid, and the market sells go to it. \Cref{fig:mx:the-limit-order-book:fill} measures the gap. The chapter's
+zero-intelligence market (unit orders, \omterm{def:mx:the-limit-order-book:orders}{limit orders} at rate 0.5 per price per side over 20 prices, \omterm{def:mx:the-limit-order-book:orders}{market orders} at rate 2 per side, cancellations at
+0.05 per order) tracks every bid that joins the back of the best bid. With price improvement switched off, its fill rates match the proposition with
+$\mu=2$, $\theta=\nu=0.05$: behind five orders 0.871 measured against 0.870. With improvement on, as in the original model, they fall to 0.672 behind
+five and 0.535 behind eight: between a quarter and a third of the fills the proposition promises are taken by orders that arrive
+later at a better price. Switching
+improvement off has a price of its own: the spread, 2.55 ticks with it, grows without bound without it, because nothing ever narrows it. Price
+improvement is what keeps the spread finite and what makes queue position less than a guarantee.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=fill,width=7.2cm,height=5.4cm,title={\small fill probability},xlabel={\small orders ahead $n$},
+  tick label style={font=\footnotesize},xtick={1,2,3,4,5,6,7,8},ymin=0.4,ymax=1.0,grid=major,grid style={gray!25},
+  legend columns=1,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none},table/col sep=comma]
+\addplot[black,thick] table[x=n,y=formula]{figdata/microstructure/01-the-limit-order-book/fill.csv};
+\addplot[omDef,thick,mark=o,only marks] table[x=n,y=zi_noimprove]{figdata/microstructure/01-the-limit-order-book/fill.csv};
+\addplot[omThm,thick,mark=square*] table[x=n,y=zi]{figdata/microstructure/01-the-limit-order-book/fill.csv};
+\legend{proposition ($\mu=2$; $\theta=\nu=0.05$),zero intelligence without improvement,zero intelligence with improvement}
+\end{axis}
+\begin{axis}[at={(fill.east)},anchor=west,xshift=1.3cm,width=7.2cm,height=5.4cm,title={\small mean displayed depth (shares)},
+  xlabel={\small ticks from the best},tick label style={font=\footnotesize},xtick={0,1,2,3,4,5,6,7,8,9},ymin=0,ymax=1700,grid=major,
+  grid style={gray!25},ybar,bar width=4pt,legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none},
+  table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=k,y=bid]{figdata/microstructure/01-the-limit-order-book/depth.csv};
+\addplot[fill=omThm!60,draw=omThm] table[x=k,y=ask]{figdata/microstructure/01-the-limit-order-book/depth.csv};
+\legend{bids,asks}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Left: the probability that an order at the back of the best bid fills before it is cancelled, against the orders ahead of it: the
+proposition, and the zero-intelligence market with and without price improvement (400\,000 events each; beyond eight orders ahead
+the tracked orders are too few, under a hundred per point). Right: the mean displayed depth at each
+distance from the best price in the simulated hour of \texttt{firm.tape}, sampled every second; it peaks one tick behind the best. Data:
+\texttt{mx\_lob.zi\_market}, \texttt{mx\_lob.depth\_profile}.}\label{fig:mx:the-limit-order-book:fill}
+\end{omfigure}
+
+The right panel of \cref{fig:mx:the-limit-order-book:fill} shows a shape chapter~3 will find in real books: displayed depth is not largest at the best
+price but one tick behind it, because the best level is where executions and the most cancellations happen.
+
+\section{Tutorial: rebuild a book and time its queue}\label{tut:mx:the-limit-order-book:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Rebuild the simulated hour's book in two structures, measure its event mix and its queues, and test the fill-probability
+proposition in a zero-intelligence market. \textbf{End state:} the numbers of section~2, the two structures agreeing, and
+\cref{fig:mx:the-limit-order-book:fill}.
+\begin{tutsteps}
+\item \textbf{Rebuild.} \texttt{mx\_lob.tree\_vs\_array(session())} replays 31\,535 messages into a \texttt{MessageBook} and an \texttt{ArrayBook} and
+compares their ten best levels every tenth message: 3\,154 comparisons, no mismatch.
+\item \textbf{Measure.} \texttt{event\_mix}, \texttt{best\_survival} and \texttt{joiners} give the shares of adds, cancels and executions, the lives of
+orders, how long a best price lasts and what becomes of orders that join the best queue.
+\item \textbf{Queue.} Evaluate \texttt{fill\_probability} and check it against \texttt{queue\_mc}; run \texttt{zi\_market(improve=False)} and
+\texttt{zi\_market(improve=True)}; draw the figure with \texttt{fig\_lob.py}.
+\item \textbf{Twins.} Run \texttt{make\_lob\_fixture.py}; build \texttt{cpp/firm\_lob\_test.cpp} and \texttt{cargo test} in \texttt{rust/}: both reproduce
+the Python book's 147 snapshots.
+\end{tutsteps}
+\textbf{What to change next.} Give the zero-intelligence market's orders sizes drawn from a geometric law and see how far the proposition, counted in
+orders, drifts from the fill rate; halve the cancellation rate and watch the spread and the depth at the best.
+\end{tutorial}
+
+\section{Build: the reference order book}\label{bld:mx:the-limit-order-book:lob}
+
+\begin{build}
+\bfield{Purpose} The book every later component of the firm stores orders in: the exchange simulator's engine (chapter~26), the participants'
+own views of the market, and the tests of Book~13's production books.
+\bfield{Interface} \texttt{Order(ref, side, price, qty, visible, seq, owner)}; \texttt{LimitOrderBook}: \texttt{add}, \texttt{remove}, \texttt{reduce},
+\texttt{get}, \texttt{best}, \texttt{best\_visible}, \texttt{prices}, \texttt{level\_orders}, \texttt{top}, \texttt{depth}, \texttt{check};
+\texttt{MessageBook.apply(kind, ref, side, price, qty, new\_ref)} for A, X, D, E, C and U; \texttt{ArrayBook(lo, hi, tick)}; C++20
+\texttt{firm::lob::MessageBook} and Rust \texttt{firm\_lob::MessageBook} with the same \texttt{l2\_lines}.
+\bfield{Rules} Displayed before hidden, then time, at each price; a reduction keeps the place; a replace arrives under a new reference at the back;
+the book stores and never matches; \texttt{check()} verifies that every order sits in exactly its level.
+\bfield{Acceptance tests} \texttt{code/firm/lob/tests/}: priority by hand; the two Python structures agreeing on a simulated session; the replace;
+the fixture's 147 level-2 snapshots in C++20 and Rust.
+\bfield{Stretch} An intrusive linked list per level for $O(1)$ removal; an array book that recentres when the price leaves its band.
+\end{build}
+
+\begin{omsources}
+\item M.~D.~Gould, M.~A.~Porter, S.~Williams, M.~McDonald, D.~J.~Fenn and S.~D.~Howison, ``Limit order books'', \emph{Quantitative Finance}
+13(11), 2013.
+\item E.~Smith, J.~D.~Farmer, L.~Gillemot and S.~Krishnamurthy, ``Statistical theory of the continuous double auction'', \emph{Quantitative
+Finance} 3(6), 2003.
+\item R.~Cont, S.~Stoikov and R.~Talreja, ``A stochastic model for order book dynamics'', \emph{Operations Research} 58(3), 2010.
+\item Nasdaq, \emph{TotalView-ITCH 5.0} specification; CME Group, client systems documentation, ``Order functionalities''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:the-limit-order-book:1}
+The best bid is 100.00 with 700 shares in three orders of 300, 200 and 200; the best ask is 100.01. A market sell of 450 shares arrives. What trades,
+and what is the new level 1?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:the-limit-order-book:2}
+An order joins behind three unit orders; \omterm{def:mx:the-limit-order-book:orders}{market orders} arrive at rate 1 per second, each order ahead cancels at 0.1 per second, and the order's
+owner cancels it at 0.2 per second. What is its fill probability?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:the-limit-order-book:3}
+A trader first reduces an order from 500 to 300 shares, then raises it back to 500. What happens to its queue position at each step on CME Globex,
+and how does each step appear in an ITCH feed?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:the-limit-order-book:4}
+A price-indexed array covers the prices within 1\% of 100.00 for a stock with a one-cent tick. How many slots does it need, and what happens on a
+day the stock moves 3\%?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:the-limit-order-book:5}
+With no cancellation of its own, an order waits behind ten unit orders; \omterm{def:mx:the-limit-order-book:orders}{market orders} arrive at 0.5 per second and each order ahead cancels at 0.02 per
+second. What is its expected wait?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:the-limit-order-book:6}
+Why is displayed depth in \cref{fig:mx:the-limit-order-book:fill} larger one tick behind the best than at the best?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:the-limit-order-book:7}
+\emph{Coding.} Rerun \texttt{zi\_market} with \omterm{def:mx:the-limit-order-book:orders}{market orders} at rate 1 instead of 2. What happens to the spread, and to the gap between the
+proposition and the measured fill probability behind five orders? Explain both.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:the-limit-order-book:8}
+\emph{Find the flaw.} ``Our order has been at the front of the best bid for ten seconds, so by the proposition it will fill with probability
+$\mu/(\mu+\nu)$ whatever happens next.''
+\end{exercise}
+
+\section{Problem: The Line at the Best Bid}
+
+\begin{problem}[{Weekend problem --- the line at the best bid}]\label{pb:mx:the-limit-order-book:1}
+A desk asks how long its passive orders wait and how many of them trade. You have the simulated hour of \texttt{firm.tape} and the chapter's
+zero-intelligence market.
+
+\medskip\noindent\textbf{Part I --- The stream.}
+\begin{enumerate}
+\item How many messages does the hour hold, and in what proportions of adds, cancels and executions?
+\item How many messages are there per trade, and what share of orders leave the book by trading?
+\item How long does the median order live, and does an order that trades live longer than one that is cancelled?
+\item How long does a best bid price last, in the median?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The queue at the best.}
+\begin{enumerate}[resume]
+\item How many orders join the back of the best bid or ask, and how many shares do they find ahead?
+\item What share of them ever trade, and what share fill in full?
+\item Where does mean displayed depth peak, and why there?
+\item Which of these numbers would change if cancellations were slower?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The model.}
+\begin{enumerate}[resume]
+\item State the fill-probability proposition and its assumptions.
+\item Compute $P_1$, $P_5$ and $P_{12}$ for $\mu=2$, $\theta=\nu=0.05$.
+\item Check $P_5$ by simulation of the stylised queue.
+\item What is the expected wait behind five orders with $\nu=0$?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The market.}
+\begin{enumerate}[resume]
+\item What fill rates does the zero-intelligence market give without price improvement, and why do they match the proposition?
+\item What does it give with improvement, behind one, five and eight orders?
+\item State the \emph{named result}: the fill probability of an order at the back of the best bid against the orders ahead, and the share of it
+that price improvement takes away.
+\item Why does the market without improvement have an unbounded spread?
+\item What is the zero-intelligence market's spread and mean best-level depth with improvement?
+\item Which assumption of the proposition fails most in a real book, and in which direction does it bias the answer?
+\item What would you measure in real data to estimate $\mu$, $\theta$ and $\nu$?
+\item In one sentence: what is a queue position worth, before chapter~6 prices it?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:mx:the-limit-order-book:1}
+Design the data structures of a \omterm{def:mx:the-limit-order-book:lob}{limit order book}. What are the costs of add, cancel, execute and best-price lookup?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{trader, researcher}]\label{iq:mx:the-limit-order-book:2}
+Why does increasing an order's size lose its queue position, while decreasing it does not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:the-limit-order-book:3}
+You are fifth in a queue. \omterm{def:mx:the-limit-order-book:orders}{Market orders} arrive at rate $\mu$, orders ahead cancel at rate $\theta$ each. What is the probability you fill before you
+cancel at rate $\nu$?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:the-limit-order-book:4}
+A price-indexed array book is fast. When does it fail, and what do you do about it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:mx:the-limit-order-book:5}
+Most orders in a modern book are cancelled. Is that a problem for the market?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:mx:the-limit-order-book:6}
+What does a \omterm{def:mx:the-limit-order-book:zi}{zero-intelligence model} of the order book get right, and what does it get wrong?
+\end{interviewq}

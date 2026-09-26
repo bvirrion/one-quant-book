@@ -1,0 +1,413 @@
+\chapter{A Venue Playbook}\label{ch:hf:a-venue-playbook}
+
+The same quoting code behaves differently on a price-time equities exchange, a pro-rata futures book, a venue with a \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{speed bump} and a crypto
+exchange with an order budget. A desk that learns the differences in production learns them from its losses: orders rejected by a budget it did not
+read, a queue it joined with the wrong size, quotes that arrive five seconds after the price it saw. So a desk keeps one page per venue, and checks
+the page before the first order. In this chapter's simulation, one quoter written once and run with its home venue's parameters has 94\% of its
+orders rejected on a crypto venue, trades a quarter of the volume it could on a pro-rata book, and turns half of its volume into takes on a venue that
+delays new orders. Three venues need a parameter changed, four need nothing, and two, one of them among the three, need different code.
+
+\section{What a venue profile holds}
+
+\begin{definition}[Venue profile]\label{def:hf:a-venue-playbook:profile}
+A \emph{venue profile}\index{venue profile} is a structured, versioned record of what a trading strategy must know about a venue before sending
+it an order (its matching rule, tick and lot, fees and their unit, market-data feed, order types, delays, message budget, session and known quirks),
+together with the strategy's own parameters for that venue, validated by rules that tie the two together.
+\end{definition}
+
+A profile has two halves (\cref{fig:hf:a-venue-playbook:flow}). The first describes the venue and changes when the venue changes: a new fee
+schedule, a new order type, a new limit. The second describes how the desk quotes there and changes when the desk learns: the size it shows, how far
+the price must move before it requotes, how often it may requote, whether it flags its orders post-only. The rules tie the halves together. A
+quote size must be a multiple of the lot. A post-only flag needs a venue that offers post-only orders. A delay that spares post-only orders
+should be met with post-only orders. Requotes must fit the message budget. Each rule is one line of \texttt{firm.venueprofile.validate}
+(\cref{lst:hf:a-venue-playbook:validate}), and each was learned by somebody in production.
+
+The fields, one by one, are what the earlier chapters used:
+\begin{itemize}
+\item \textbf{Matching.} Price-time priority (chapters 1 to 10) or pro-rata allocation with a top-order share (\cref{ch:hf:futures-market-making}),
+or a batch interval with one clearing price (\cref{ch:hf:latency-arbitrage-and-its-defence}), or no matching engine at all
+(\cref{ch:hf:on-chain-trading}).
+\item \textbf{Tick, lot and price scale.} A tick of one cent on a \$100 stock is one basis point; a quarter point on a futures contract is a
+different amount of money per contract, and the lot turns a quote size into risk.
+\item \textbf{Fees and their unit.} Per share on US equities, per contract on futures and options, in basis points of notional on crypto venues;
+the sign of the maker fee separates a maker-taker venue from an inverted one (\cref{ch:hf:rebates-inverted-venues-and-tiers}).
+\item \textbf{Feed.} Market-by-order or market-by-price, and whether a quoter can find its own orders in it: a quoter that cannot will chase them
+(\cref{ch:hf:the-business-of-market-making}).
+\item \textbf{Order types.} Post-only, \omterm{def:hf:automated-options-market-making:mass}{mass quotes}, replace with or without loss of priority, pegs.
+\item \textbf{Delays.} A \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{speed bump}, symmetric or asymmetric (\cref{def:hf:latency-arbitrage-and-its-defence:bump}); an in-play delay on
+placing orders; a batch interval.
+\item \textbf{Budgets.} Orders a second, a day, per account and per instrument, whether cancels count, and what happens on a breach: a reject, a
+disconnection, a fee.
+\item \textbf{Session and quirks.} Hours, auctions, maintenance windows, and the paragraph that begins ``note that''.
+\end{itemize}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>=stealth,box/.style={draw,rounded corners,fill=omThm!8,minimum width=2.5cm,minimum height=0.75cm,align=center}]
+\node[box] (v) at (0,1.3) {venue half\\matching, tick, lot, fees,\\feed, orders, delays, budget};
+\node[box] (q) at (0,-0.3) {quoting half\\size, requote threshold,\\pacing, post-only};
+\node[box,fill=omDef!12] (val) at (4.2,0.5) {validate\\(rules tying\\the halves)};
+\node[box] (cfg) at (8.2,1.3) {simulator\\configuration};
+\node[box] (par) at (8.2,-0.3) {quoter\\parameters};
+\node[box,fill=omDef!20] (sim) at (8.2,-1.9) {one quoter,\\home vs own};
+\node[box,fill=gray!10] (rep) at (4.2,-1.9) {report: volume, edge,\\picked off, messages};
+\node[box,fill=gray!10] (reg) at (0,-1.9) {registry row\\and fee schedule};
+\draw[->] (v) -- (val); \draw[->] (q) -- (val);
+\draw[->] (val) -- (cfg); \draw[->] (val) -- (par);
+\draw[->] (cfg.east) -- ++(0.5,0) |- (sim.east); \draw[->] (par) -- (sim);
+\draw[->] (sim) -- (rep); \draw[->] (val.south west) -- (reg.north east);
+\end{tikzpicture}
+
+\omcaption{A \omterm{def:hf:a-venue-playbook:profile}{venue profile} and what it produces. The venue half and the quoting half are validated together; a valid profile yields the
+simulator's configuration (Book 10's exchange simulator), the quoter's parameters, and the rows for Book 1's venue registry and fee-schedule
+engine. The chapter runs one quoter on every simulated profile with the home venue's parameters and with the profile's own. Source:
+\texttt{firm.venueprofile}.}\label{fig:hf:a-venue-playbook:flow}
+\end{omfigure}
+
+The chapter's registry holds eleven profiles, one per venue type; eight have a matching engine the exchange simulator can run. Their fees and
+limits are illustrative of each type, set from the dated box's figures where one exists; a desk's own profile holds the venue's actual schedule, with
+the date it was read. The venue half of the eleven:
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llllll@{}}
+\toprule
+profile & matching & tick; lot & fees, make/take & delay or budget & own quoting\\
+\midrule
+lit equity & price-time & 1 c; 100 & $-0.20$/$+0.30$ c/sh & -- & home\\
+inverted equity & price-time & 1 c; 100 & $+0.10$/$-0.05$ c/sh & -- & home\\
+bumped equity & price-time & 1 c; 100 & $-0.20$/$+0.30$ c/sh & 350 \textmu s, all & home\\
+batch & batch auction & 1 c; 100 & 0/0 & 100 ms interval & home\\
+pro-rata futures & top, pro rata & 0.25; 1 & 0/0 a contract & -- & size 500\\
+FIFO futures & price-time & 0.25; 1 & 0/0 a contract & message ratio & home\\
+crypto & price-time & 1; 1 & $-0.5$/$+2.5$ bp & 0.125/s, burst 5 & 16-s pacing\\
+event & price-time & 1 c; 1 & 0/0 & 5 s, new orders & 3-tick threshold\\
+options & top, pro rata & 1 c; 1 & $-25$/$+50$ c/ct & risk tools & not run\\
+FX ECN & price-time & 1 pip; 1M & 0/0.05 bp & -- & not run\\
+on-chain & pool & -- & 30 bp pool fee & block time & not run\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The crypto budget is a per-instrument share of an account's: 200,000 orders a day, the dated box's figure, shared by about eighteen instruments,
+leaves one order every eight seconds for each, with a burst of five. The event venue's five-second delay on new orders sits inside the one-to-twelve
+seconds the dated box reports for one betting exchange's in-play markets.
+
+\section{Equities and options venues}
+
+On a US equity exchange the profile's first question is the fee sign. A maker-taker venue pays the maker a rebate and charges the taker up to the
+access fee cap; an inverted venue charges the maker and pays the taker, so its queues are shorter and its fills are more often the informed ones
+(\cref{ch:hf:rebates-inverted-venues-and-tiers}). In the chapter's run the two venues are the same book with the fee signs swapped: the quoter trades
+14,567 units on each, the same fills, and its fee line moves from a rebate of \$29 to a charge of \$15 over the twenty minutes. Nothing in the quoter's
+parameters has to change for that; its accounting does, and so does the decision of whether to quote there at all.
+
+The second question is the feed. An order-by-order feed (a market-by-order feed such as Nasdaq's ITCH, where a replaced order takes a new reference)
+lets the quoter find its own orders and quote off everyone else's; a market-by-price feed shows totals per level, and a quoter must subtract its own
+size, which is exact only once its acknowledgements have arrived. The chapter's quoter identifies its orders by the references in their
+acknowledgements, and the simulator delivers acknowledgements before the public feed (15 against 20 microseconds), as private order entry
+usually does. With the acknowledgement arriving second, a first draft of this quoter took its own order for somebody else's and chased it.
+
+The third question is the delay. The bumped equity venue delays every message by 350 microseconds, the delay one US exchange has run since 2016.
+In the run it changes nothing: the arbitrageur's order and the quoter's cancel are delayed alike, the arbitrageur still wins every race, and 42\% of
+the quoter's volume is still taken on a jump. The bump in that design protects the venue's pegged orders, which reprice before the delayed
+arbitrageur arrives (\cref{ch:hf:latency-arbitrage-and-its-defence}); it does not protect a displayed quote whose owner reacts through the same
+delay. An asymmetric delay, one that spares cancels, would; a US proposal of that kind was disapproved in 2020.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=9pt,ymin=0,ymax=72,xmin=-0.6,xmax=7.6,
+  xtick={0,1,2,3,4,5,6,7},xticklabels={lit,inverted,bumped,batch,{pro rata},FIFO fut.,crypto,event},
+  xticklabel style={font=\scriptsize,rotate=25,anchor=north east},ylabel={\small volume picked off (\%)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},table/col sep=comma,
+  legend style={font=\scriptsize,at={(0.03,0.97)},anchor=north west},legend columns=2]
+\addplot[fill=omThm!60,draw=omThm] table[x=i,y=picked_home]{figdata/hft/29-a-venue-playbook/playbook.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=i,y=picked_own]{figdata/hft/29-a-venue-playbook/playbook.csv};
+\legend{home parameters,own parameters}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The share of the quoter's volume taken by the fast arbitrageur within a jump of the efficient price, on each simulated venue, with the
+home venue's parameters and with the venue's own; three seeds of 20 minutes, a jump every 20 seconds on average. The arbitrageur hears of a jump 20
+microseconds before the quoter and sends through a 5-microsecond link against the quoter's 20. Data: \texttt{hf\_venues.playbook}.}\label{fig:hf:a-venue-playbook:picked}
+\end{omfigure}
+
+Options venues add two fields a stock venue does not have: \omterm{def:hf:automated-options-market-making:mass}{mass quotes}, one message that replaces the bid and offer of many series, and
+exchange-side quote risk protection, which stops a maker's executions when those across a class in a short window exceed limits it has set
+(\cref{ch:hf:automated-options-market-making}). The profile records both, with the protection's parameters as the desk has set them; they are the
+last line of defence on a venue where a single sweep touches hundreds of series.
+
+\section{Futures and FX venues}
+
+A pro-rata futures book shares each incoming order among the resting orders in proportion to their sizes, after giving a share to the order that
+set the price. Size is the parameter: the quoter with the home venue's 100 units traded 10,884 units in the runs, and with the profile's 500 it traded
+40,633, 3.7 times as much with fewer messages. The larger size also has more of itself taken on each jump, 58\% of its volume against 47\%, so the
+edge per unit barely moves, $-0.14$ ticks against $-0.17$; whether to show the size depends on the edge, and on how many of the other makers
+over-quote in turn (\cref{ch:hf:futures-market-making}). A FIFO futures book is a price-time book with contract units: in the runs it trades
+exactly as the lit equity venue, fee line aside. What its profile adds is the exchange's message-efficiency benchmark, messages over traded volume
+per product group, which a requote threshold spends (\cref{ch:hf:the-quoting-engine}).
+
+\begin{dated}{2026-09}{One venue per type, as their rules read}\label{dat:hf:a-venue-playbook:venues}
+\small
+\begin{tabular}{@{}p{2.3cm}p{9.9cm}@{}}
+US equities & Nasdaq's ITCH feed is order by order; a replaced order gets a new reference. The access fee cap is \$0.003 a share until the first
+business day of November 2027, when the \$0.001 cap adopted in 2024 applies.\\
+\omterm{def:hf:latency-arbitrage-and-its-defence:bump}{Speed bump} & IEX's approval as an exchange, on 17 June 2016, came with a 350-microsecond delay on its inbound and outbound messages. The SEC
+disapproved an asymmetric four-millisecond delay on Cboe EDGA in February 2020.\\
+Futures & CME's pro-rata algorithms give the order that first improves the market its share, then allocate pro rata, rounding down, with the
+remainder FIFO (a vendor's guide, August 2025). CME's messaging efficiency programme compares messages over volume with product-group
+benchmarks.\\
+Options & Cboe's risk tools stop a maker's executions once its notional, volume, count or percentage-of-quote limit over a period of 100
+milliseconds to a day is reached.\\
+FX & Some primary venues introduced \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{speed bumps} to protect dealers (BIS, 2022); last look must be disclosed under the FX Global Code.\\
+Crypto & A large spot venue's endpoint returned order limits of 100 per 10 seconds and 200,000 a day on 24 September 2026.\\
+Betting & One betting exchange delays placing bets in play by one to twelve seconds so that customers can cancel unmatched bets.
+\end{tabular}
+\end{dated}
+
+FX venues split the profile in two: a central limit order book (an ECN) with a firm-price protocol, and the disclosed or undisclosed last look of
+the streaming channels (\cref{ch:hf:fx-market-making}). The profile for an ECN holds the minimum size (a million of the base currency
+is a common lot, so the home venue's 100 units is not even a valid order: \texttt{validate} says so), the fee in basis points or per million, the
+venue's latency floor or \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{speed bump} if it has one, and the session, which runs five days round the clock with a weekly gap.
+
+\section{Crypto, on-chain and event venues}
+
+A crypto venue meters orders. With the profile's budget, one order every eight seconds and a burst of five, the quoter with the home venue's
+parameters sent 2,735 orders in twenty minutes and had 2,581 of them rejected: every rejected order was sent again at the next book update, and each
+rejection consumed nothing but left the quote missing. Paced to one requote every sixteen seconds, the rule the profile's validation enforces (two
+orders a requote within the budget), it sent 118 orders, none rejected, and traded 8,333 units against 7,267
+(\cref{fig:hf:a-venue-playbook:budget}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xlabel={\small minimum gap between requotes (s)},ylabel={\small orders in 20 minutes},ymode=log,log basis y=10,
+  ymin=10,ymax=5000,xmin=-1,xmax=33,xtick={0,2,4,8,16,32},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  table/col sep=comma,legend style={font=\scriptsize,at={(0.97,0.97)},anchor=north east}]
+\addplot[omThm,thick,mark=*,mark size=1.4pt] table[x=gap,y=orders]{figdata/hft/29-a-venue-playbook/budget.csv};
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.3pt] table[x=gap,y=accepted]{figdata/hft/29-a-venue-playbook/budget.csv};
+\legend{orders sent,orders accepted}
+\end{axis}
+\begin{axis}[width=11cm,height=5.4cm,axis y line*=right,axis x line=none,ymin=0,ymax=12,xmin=-1,xmax=33,
+  ylabel={\small volume (thousand units)},tick label style={font=\footnotesize},table/col sep=comma]
+\addplot[black,thick,dotted,mark=triangle*,mark size=1.6pt] table[x=gap,y=volume]{figdata/hft/29-a-venue-playbook/budget.csv};
+\node[font=\scriptsize,anchor=south] at (axis cs:8,10.1) {volume (right)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The crypto venue's order budget (one order every eight seconds, a burst of five) against the quoter's pacing: orders sent and accepted
+(left, log scale) and volume traded (right), three seeds of 20 minutes. Up to an eight-second gap the venue accepts 151 to 154 orders whatever is
+sent, the whole budget; volume peaks at eight seconds. Data: \texttt{hf\_venues.budget\_curve}.}\label{fig:hf:a-venue-playbook:budget}
+\end{omfigure}
+
+The budget binds in every run up to an eight-second gap: the venue accepts 151 to 154 orders in twenty minutes, 0.125 a second plus the burst,
+whatever the quoter sends. What the pacing decides is which ones. A quoter that fires at every book update spends the budget in bursts and has no
+orders left when the market moves; a paced one spends it evenly. Volume peaks at an eight-second gap, 10,100 units, with 28 orders rejected in
+bursts; the sixteen-second rule gives up a sixth of that volume to have no rejections at all. The cancels are free in this budget, as they are on the
+venue in the dated box; the jump cancel never waits, which is why the profile's validation requires it.
+
+An on-chain venue has no matching engine and no profile field for one: its fields are the block time, the pool's fee, the gas and the builder
+auction that orders the transactions in a block (\cref{ch:hf:on-chain-trading}). The simulator does not run it; the profile records it so that the
+desk's venue list is complete and so that a strategy that assumes an order book is refused there.
+
+An event venue that delays new orders in play, and not cancels, protects resting orders: the arbitrageur's order waits five seconds, the quoter's
+cancel does not, and only 5.6\% of the quoter's volume was picked off, against 42\% on the lit venue. But the delay applies to the quoter's own new
+orders too, and 52\% of its volume there was taken, not made: an order priced for the book it saw lands five seconds later in a book that has
+moved, crosses it, and trades as the aggressor at the old price. The edge was the worst of the eight venues after the batch, $-0.52$ ticks a unit. The profile's
+parameter, a three-tick requote threshold, cut the messages by 70\% (799 to 238) for 6\% less volume, because a requote that lands five seconds
+late is mostly wasted, and cut the taken share to 34\%; the edge did not improve ($-0.57$). Fixing it needs code that prices for where the book will
+be when the order lands, or sends no new order while the price moves.
+
+\section{Onboarding a new venue}
+
+The batch venue is the other one no parameter fixes. It protects the quoter completely, no volume picked off, because the jump cancel lands in the
+same interval as the arbitrageur's order and is processed before the batch clears. But a quoter that joins the touch in a uniform-price auction is
+filled only when the batch clears through its price, which happens when the order flow in that batch runs against it: 2,567 units at $-1.12$ ticks a
+unit, every fill in the auction. The venue needs a quoter that prices against its fair value (\cref{ch:hf:fair-value}),
+not the touch.
+
+That result sets the order of onboarding. A desk writes the venue half of the profile from the rulebook, the fee schedule, the feed and
+order-entry specifications and the technical notices; validates it with the home venue's quoting half, which lists what the home parameters break;
+runs the strategy on the simulator configured from the profile, with the home and the proposed parameters, and reads the difference; then connects
+to the venue's test environment, runs the conformance tests the venue requires, and starts with small size under the risk controls of
+\cref{ch:hf:risk-controls}, as a staged rollout (One Quant Book 7, chapter 21).
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+venue & volume & own & picked off & edge (ticks) & messages & own\\
+\midrule
+lit equity & 14,567 & = & 42\% & $+0.03$ & 591 & =\\
+inverted equity & 14,567 & = & 42\% & $+0.03$ & 591 & =\\
+bumped equity & 14,567 & = & 42\% & $+0.03$ & 591 & =\\
+batch & 2,567 & = & 0\% & $-1.12$ & 330 & =\\
+pro-rata futures & 10,884 & 40,633 & 47\% / 58\% & $-0.17$ / $-0.14$ & 474 & 419\\
+FIFO futures & 14,567 & = & 42\% & $+0.03$ & 591 & =\\
+crypto & 7,267 & 8,333 & 56\% / 48\% & $-0.07$ / $-0.17$ & 2,857 & 191\\
+event & 8,367 & 7,900 & 6\% / 4\% & $-0.52$ / $-0.57$ & 799 & 238\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The table is the chapter's named result: the quoter's volume, the share picked off, its edge (ticks a unit against the efficient price five seconds
+later) and its messages on each venue, with the home venue's parameters and, where they differ, the venue's own (an equals sign: nothing to
+change). In this market joining the touch is roughly break-even on the continuous venues, as chapter 1 found; the venues differ in what takes the
+edge away, and a profile's parameters recover only what parameters can.
+
+The profile is kept alive after onboarding. Venues change fee schedules monthly, add order types, move data centres and change limits; each change is
+a new version of the venue half, validated against the quoting half, and replayed through the simulator before it takes effect. The profile's date
+is the date somebody last read the rulebook.
+
+\section{Tutorial: one code, eight venues}\label{tut:hf:a-venue-playbook:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Encode eleven \omterm{def:hf:a-venue-playbook:profile}{venue profiles}, validate each with the home venue's quoting parameters, and run one quoter on the eight simulated venues
+with the home and the venue's own parameters. \textbf{End state:} the result table and the three figures.
+\begin{tutsteps}
+\item \textbf{The profiles}: \texttt{firm.venueprofile.standard()}, a \texttt{Registry} that validates each profile on entry and round-trips through
+JSON.
+\item \textbf{The rules}: \texttt{validate}; \texttt{hf\_venues.home\_errors} lists what the home parameters break (the crypto budget, the FX lot).
+\omcode{code/firm/venueprofile/firm_venueprofile.py}{133}{153}{The rules that tie the quoting half to the venue half: lot, post-only, asymmetric delays and the order budget.}\label{lst:hf:a-venue-playbook:validate}
+\item \textbf{The quoter}, written once: it joins the others' best prices, requotes past a threshold and no faster than its pacing, and cancels
+its stale side on a jump signal.
+\omcode{code/firm/venueprofile/firm_venueprofile.py}{303}{341}{The jump signal empties the stale side for a cooling period; the requote keeps one order a side at the target unless the target moved by the threshold.}\label{lst:hf:a-venue-playbook:quoter}
+\item \textbf{The runs}: \texttt{hf\_venues.playbook} (three seeds of 20 minutes, home and own) and \texttt{hf\_venues.budget\_curve}.
+\end{tutsteps}
+\textbf{What to change next.} Give the batch venue a quoter that prices against a fair value; add a delay-aware quoter for the event venue that
+sends no new order while the price moves; add the options venue with a mass-quote throttle.
+\end{tutorial}
+
+\section{Build: venue profiles}\label{bld:hf:a-venue-playbook:venueprofile}
+
+\begin{build}
+\bfield{Purpose} Keep one validated, versioned page per venue, and turn it into the simulator's configuration, the quoter's parameters and the
+registry and fee-schedule rows.
+\bfield{Interface} \texttt{Quoting}, \texttt{Profile} (\texttt{to\_dict}, \texttt{from\_dict}), \texttt{validate(p)}, \texttt{Registry} (\texttt{get},
+\texttt{by\_type}, \texttt{simulated}, \texttt{dump}, \texttt{load}), \texttt{standard()}, \texttt{HOME}, \texttt{exchange\_config(p)},
+\texttt{venue\_record(p)} (Book 1's \texttt{firm.venues}), \texttt{fee\_schedule(p)} (Book 1's \texttt{firm.feesched}), \texttt{jumps},
+\texttt{Quoter}, \texttt{Sniper}, \texttt{run(p, quoting, seconds, seed)}.
+\bfield{Rules} Prices in 1/10,000 of the currency, as the simulator's; units as the market's; a profile that fails validation cannot enter a
+registry; the budget applies to the quoter's session only (the background stands for many participants with their own).
+\bfield{Acceptance tests} \texttt{code/firm/venueprofile/tests/}: every standard profile validates and the home parameters break the crypto budget
+and the FX lot; a malformed profile lists all its faults; JSON round trip; the simulator's configuration for pro rata, batch, event and crypto; short
+runs in which the bumped venue changes no race, the inverted venue changes the fee sign only, the event venue's delay protects resting orders, the
+paced quoter has no rejects, and the larger pro-rata size trades more than twice the volume.
+\bfield{Stretch} A profile diff that lists which rules a venue notice breaks; the options venue with \omterm{def:hf:automated-options-market-making:mass}{mass quotes}; versioned profiles with effective
+dates.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, TotalView-ITCH 5.0 specification.
+\item US Securities and Exchange Commission, Release No.\ 34-78101 (IEX, 2016) and the order disapproving Cboe EDGA's liquidity provider protection
+delay (February 2020).
+\item CME Group, Globex Messaging Efficiency Program, rule filing with the CFTC, 8 November 2019.
+\item Betfair Developer Program, ``Why do you have a delay on placing bets on a market that is in-play''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:1}
+The crypto budget is 0.125 orders a second with a burst of five. How many orders can the venue accept in twenty minutes, and how does that compare
+with the runs?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:2}
+A requote sends at most one new order on each side. What minimum gap between requotes does the budget require, and what does the home venue's
+quoting set?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:3}
+On the pro-rata book, an incoming order of 1,000 contracts meets a level of 5,000 resting contracts, of which the order that set the price holds
+200 and the quoter 500. With a 40\% top-order share and the rest pro rata, how many does the quoter get?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:4}
+Why does a symmetric 350-microsecond delay change none of the quoter's fills in the runs, and what would change that?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:5}
+On the event venue only 6\% of the quoter's volume is picked off, yet its edge is $-0.52$ ticks. Explain.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:6}
+On the batch venue the quoter is never picked off. Why does it lose more than a tick a unit, and what would you change?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:a-venue-playbook:7}
+\emph{Coding.} With \texttt{hf\_venues.budget\_curve}, which pacing maximises volume, how many orders does it have rejected, and why does it beat the
+sixteen-second rule?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:a-venue-playbook:8}
+\emph{Find the flaw.} ``The new venue's profile passed validation and the simulator shows our usual edge, so we can go live at full size on Monday.''
+\end{exercise}
+
+\section{Problem: One Code, Eight Venues}
+
+\begin{problem}[{Weekend problem --- one code, eight venues}]\label{pb:hf:a-venue-playbook:1}
+A market-making desk that quotes on a US equity exchange is asked to take its quoter to seven other venue types.
+
+\medskip\noindent\textbf{Part I --- The venues.}
+\begin{enumerate}
+\item Define a \omterm{def:hf:a-venue-playbook:profile}{venue profile} and its two halves.
+\item List the fields of the venue half and, for each, a chapter of this book where it mattered.
+\item What do the dated box's venues say about matching, delays and budgets?
+\item Why are an on-chain pool and an FX last-look stream in the registry although the simulator does not run them?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The rules.}
+\begin{enumerate}[resume]
+\item Give the validation rules that tie the quoting half to the venue half.
+\item Which rules do the home venue's parameters break, and on which venues?
+\item Why must the jump cancel be free under the budget?
+\item How does the quoter find its own orders, and what goes wrong if the feed shows an order before its acknowledgement arrives?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Measurements.}
+\begin{enumerate}[resume]
+\item Describe the market of the runs: the flow, the jumps, the arbitrageur, the quoter's signal.
+\item Give the volume, share picked off, edge and messages on each venue with the home parameters.
+\item Which venues change with the venue's own parameters, and by how much?
+\item Describe the budget curve and explain why the accepted orders are flat up to eight seconds.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the quoter's capture and message count on each venue type with and without the venue-specific parameters.
+\item Which venues need a parameter, which need nothing, and which need different code?
+\item Why does the bumped venue not protect the quoter, and what kind of delay would?
+\item What would you do on the event venue?
+\item What would you do on the batch venue?
+\item How would you onboard a ninth venue, step by step?
+\item How do you keep a profile current, and who signs off a change?
+\item In one sentence: what does a \omterm{def:hf:a-venue-playbook:profile}{venue profile} buy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:hf:a-venue-playbook:1}
+What fields would you put in a \omterm{def:hf:a-venue-playbook:profile}{venue profile}, and which three would you check before the first order?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:hf:a-venue-playbook:2}
+You move a quoting strategy from a price-time equities venue to a pro-rata futures book. What do you change first, and what is the risk of the
+change?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:hf:a-venue-playbook:3}
+Your orders on a crypto venue are being rejected in bursts, and your quotes are missing when the market moves. Diagnose and fix.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:hf:a-venue-playbook:4}
+A venue introduces a delay on incoming orders that spares cancels. How does it change a maker's economics, and whose?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:hf:a-venue-playbook:5}
+With an order budget of $b$ a second and a burst of $B$, and requotes of two orders each, what pacing uses the budget without rejects, and why might
+a faster pacing trade more?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:hf:a-venue-playbook:6}
+In a uniform-price batch auction a maker joins the best bid and offer. Show that its fills are adversely selected, and describe a quoting rule
+that is not.
+\end{interviewq}

@@ -1,0 +1,344 @@
+\chapter{Deep Hedging and Machine Learning in Pricing}\label{ch:ml:deep-hedging-and-machine-learning-in-pricing}
+
+A one-month at-the-money call on a stock whose volatility follows Heston's model is worth 2.25 on a spot of 100, and one point
+of implied volatility is worth 0.115 of it. Hedged every day to its Black--Scholes delta with a transaction cost of 5 basis
+points, the hedge pays 0.123 in costs on average: more than a volatility point, for a trader whose edge is often less. A
+network that learns when not to trade pays 0.099 and carries less risk. This chapter uses machine learning where
+derivatives desks use it: to hedge under frictions that the textbook ignores (\omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:dh}{deep hedging}), to replace a slow pricer by a
+fast approximation (surrogates, and the differential learning that makes them accurate with few samples), and to calibrate
+a model in one pass. Each is measured against the exact answer that Book~5's engines provide, and each has a place where it
+breaks.
+
+\section{Hedging under frictions as a learning problem}
+
+Book~5 (chapter~4) measured the discrete hedging error of the Black--Scholes delta and (chapter~26) the hedging band that
+transaction costs call for. With costs, the best hedge depends on the current holding (trading back to delta is not worth it
+if delta has moved little), on the risk the trader is willing to carry, and on everything the model leaves out; there is no
+closed form beyond asymptotic ones. The problem is a stochastic control problem (Book~4, chapter~9) whose objective is a risk
+measure of the hedged P\&L.
+
+\begin{definition}[Convex risk measure, entropic risk measure, indifference price]\label{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}
+A \emph{convex risk measure}\index{convex risk measure} $\rho$ assigns to a random P\&L $X$ the amount of cash that makes it
+acceptable, and is monotone, cash-invariant ($\rho(X + c) = \rho(X) - c$) and convex (Föllmer and Schied, 2002); expected
+shortfall (Book~6, chapter~21) is one. The \emph{entropic risk measure}\index{entropic risk measure} is $\rho(X) =
+\lambda^{-1}\log\E[e^{-\lambda X}]$, the certainty equivalent of exponential utility with risk aversion $\lambda$. The
+\emph{indifference price}\index{indifference price} of a claim is the premium that leaves the seller exactly as well off, by
+the risk measure, as not selling, each with its best trading strategy: $p = \inf_\delta\rho(-Z + G_\delta) -
+\inf_\delta\rho(G_\delta)$, where $G_\delta$ is the gain of trading strategy $\delta$ after costs. When the underlying's
+price is a martingale, as in the chapter's simulation, not trading is best without the claim and the second term is zero.
+\end{definition}
+
+\section{Deep hedging}
+
+\begin{definition}[Deep hedging]\label{def:ml:deep-hedging-and-machine-learning-in-pricing:dh}
+\emph{Deep hedging}\index{deep hedging} represents the hedging strategy by a \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{neural network} that maps what is observable at
+each date (time, prices, current holdings) to the new holdings, and trains it on simulated paths to minimise a \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{convex risk
+measure} of the hedged P\&L after all frictions (Buehler, Gonon, Teichmann and Wood, 2019).
+\end{definition}
+
+The chapter's network (\cref{lst:ml:dh:band}) is the no-transaction band network of Imaki and co-authors (2021): from the
+time to maturity and the log-moneyness it outputs a band, and the new holding is the old one clipped into it, so that not
+trading is the default and the band's width can be read off. The P\&L of selling the call and hedging daily with the
+underlying is computed on a batch of paths (\cref{lst:ml:dh:pnl}), the entropic risk with $\lambda = 1$ is the loss, and 1\,000
+\omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{Adam} steps on batches of 2\,048 of 20\,000 training paths take about fifteen seconds on one core. Every \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} is then scored
+on 20\,000 other paths.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xlabel={proportional cost (basis points)},ylabel={indifference price (entropic, $\lambda = 1$)},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=20,ymin=2.4,ymax=3.05,grid=major,grid style={gray!25},
+  legend cell align=left,legend style={font=\footnotesize,at={(0.02,0.98)},anchor=north west,fill=white,draw=none},
+  table/col sep=comma]
+\addplot[omDef,very thick,mark=*] table[x=cost,y=deep]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/indifference.csv};
+\addplot[omProp,very thick,mark=square*] table[x=cost,y=ww]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/indifference.csv};
+\addplot[omThm,very thick,mark=triangle*] table[x=cost,y=bs]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/indifference.csv};
+\legend{deep hedge (band network),Whalley--Wilmott band,Black--Scholes delta}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The seller's \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price} of the one-month at-the-money call (its Heston value is 2.25) under each hedging
+\omterm{def:ml:reinforcement-learning-foundations:mdp}{policy}, against the cost of trading the underlying. Data: \texttt{ml\_hedge.hedging}.}\label{fig:ml:dh:indiff}
+\end{omfigure}
+
+\Cref{fig:ml:dh:indiff} is the first half of the chapter's named result. Without costs the deep hedge's \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price} is
+2.454 against 2.475 for the Black--Scholes delta: under Heston, spot and volatility move together ($\rho = -0.7$) and the
+network learns a hedge ratio that uses it. With costs of 5, 10 and 20 basis points it rises to 2.558, 2.658 and 2.840; the
+Black--Scholes delta hedge's to 2.608, 2.743 and 3.018, and the Whalley--Wilmott band's (Whalley and Wilmott, 1997) to 2.606,
+2.712 and 2.910. \Cref{tab:ml:dh:ten} shows the other statistics at 10 basis points. Trained on expected shortfall instead, the
+network lowers the expected shortfall (3.763 against 3.817) and raises the entropic risk (2.671 against 2.658): the risk
+measure is part of the model, and each network is best by its own.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} & entropic risk & expected shortfall 95\% & mean cost & standard deviation\\
+\midrule
+deep hedge, entropic & 2.658 & 3.817 & 2.442 & 0.643\\
+deep hedge, expected shortfall & 2.671 & 3.763 & 2.457 & 0.657\\
+Whalley--Wilmott band & 2.712 & 4.044 & 2.424 & 0.703\\
+Black--Scholes delta & 2.743 & 4.090 & 2.507 & 0.595\\
+no hedge & 8.767 & 9.992 & 2.235 & 2.945\\
+\bottomrule
+\end{tabular}
+\caption{Selling the call and hedging daily at 10 basis points of cost, on 20\,000 test paths: risk measures of the P\&L
+before the premium, its mean loss and standard deviation. Data: \texttt{ml\_hedge.hedging}, \texttt{shortfall\_hedge}.}\label{tab:ml:dh:ten}
+\end{table}
+
+The second half of the named result is the band itself (\cref{fig:ml:dh:bands}). At the money half-way to maturity, the
+learned band is 0.031 wide in delta at 5 basis points and 0.104 at 20; the Whalley--Wilmott band, $\pm(3cS\Gamma^2/2\lambda)^{1/3}$,
+is 0.181 and 0.288. The asymptotic formula assumes a trader who watches continuously and trades at the band's edge; with one
+decision a day, the position drifts between decisions and a wide band compounds the drift, so the network keeps a narrower
+band at the money and above it, and a wider one below the money, where the option is nearly worthless to hedge. The formula gives the right idea and the wrong size
+for this trader; the network finds the size for the trader's actual schedule and risk measure.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xlabel={spot (strike 100, half-way to maturity)},ylabel={holding (shares per option)},
+  tick label style={font=\small},label style={font=\small},xmin=92,xmax=108,ymin=-0.05,ymax=1.0,grid=major,grid style={gray!25},
+  legend cell align=left,legend style={font=\footnotesize,at={(0.02,0.98)},anchor=north west,fill=white,draw=none},
+  table/col sep=comma]
+\addplot[black,thick,dashed] table[x=spot,y=delta]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/bands.csv};
+\addplot[omProp,thick] table[x=spot,y=wwlo]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/bands.csv};
+\addplot[omDef,very thick] table[x=spot,y=deeplo]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/bands.csv};
+\addplot[omProp,thick,forget plot] table[x=spot,y=wwhi]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/bands.csv};
+\addplot[omDef,very thick,forget plot] table[x=spot,y=deephi]{figdata/ml/19-deep-hedging-and-machine-learning-in-pricing/bands.csv};
+\legend{Black--Scholes delta,Whalley--Wilmott band,learned band}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{No-trade bands at 20 basis points of cost, half-way to maturity: the holding is left alone inside a band and moved
+to its nearer edge outside it. Data: \texttt{ml\_hedge} (\texttt{fig\_hedge.py}).}\label{fig:ml:dh:bands}
+\end{omfigure}
+
+\section{Surrogate pricers and differential learning}
+
+\begin{definition}[Surrogate model, differential machine learning]\label{def:ml:deep-hedging-and-machine-learning-in-pricing:surrogate}
+A \emph{surrogate model}\index{surrogate model} is a fast approximation of a slow function, here a pricer, fitted to its
+outputs on sampled inputs. \emph{Differential machine learning}\index{differential machine learning} trains the surrogate on the
+derivatives of the labels with respect to the inputs as well as on the labels, the network's own derivatives being computed by
+automatic differentiation (Book~4, chapter~28); with Monte Carlo labels the derivative labels are pathwise (Huge and Savine,
+2020).
+\end{definition}
+
+A risk system that prices a book under thousands of scenarios cannot afford a Fourier integral or a Monte Carlo run per
+price. The chapter's surrogate learns the Heston price of a three-month call as a function of the spot (70 to 130) and the
+initial variance (0.01 to 0.09) from the cheapest labels there are: one simulated path per sample, whose payoff is an unbiased
+but very noisy price. The differential label is the pathwise derivative of the payoff with respect to the spot,
+$\mathbf1\{S_T > K\}S_T/S_0$, free once the path exists. \Cref{tab:ml:dh:surr} scores both trainings against the Fourier price
+on 400 test points (\cref{lst:ml:dh:surr} is the training loop).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}rcccc@{}}
+\toprule
+& \multicolumn{2}{c}{price RMSE} & \multicolumn{2}{c}{delta RMSE}\\
+\cmidrule(lr){2-3}\cmidrule(l){4-5}
+training samples & standard & differential & standard & differential\\
+\midrule
+256 & 0.927 & 0.679 & 0.066 & 0.057\\
+1\,024 & 0.436 & 0.218 & 0.059 & 0.021\\
+4\,096 & 0.297 & 0.279 & 0.042 & 0.020\\
+\bottomrule
+\end{tabular}
+\caption{A two-layer surrogate of the Heston call price learned from one-path Monte Carlo payoffs, with and without pathwise
+delta labels: errors against the Fourier price and its finite-difference delta on 400 test points. Data:
+\texttt{ml\_hedge.surrogates}.}\label{tab:ml:dh:surr}
+\end{table}
+
+With 1\,024 samples the derivative labels halve the price error and cut the delta error by nearly two-thirds; with 4\,096 the
+prices are as good either way but only the differential network's deltas are. A surrogate's delta is what the hedger uses, and
+a network fitted to prices alone has no reason to get its slope right.
+
+\section{Calibration networks}
+
+\begin{definition}[Deep calibration]\label{def:ml:deep-hedging-and-machine-learning-in-pricing:calib}
+\emph{Deep calibration}\index{deep calibration} replaces the numerical optimisation of a model's parameters against market quotes
+(Book~4, chapter~24) by a network trained on model-generated data: either the inverse map from quotes to parameters (Hernandez,
+2016) or a fast forward map from parameters to quotes inside a standard optimiser (Horvath, Muguruza and Tomas, 2021).
+\end{definition}
+
+The chapter's network learns the inverse map from fifteen normalised call prices (five strikes, three maturities) to the five
+Heston parameters, on 4\,000 parameter sets drawn uniformly in a box. On 200 \omterm{def:ml:why-financial-machine-learning-is-different:sets}{test sets}, its errors as a share of each
+parameter's range are 1.7\% for the initial variance, 18.7\% for the mean-reversion speed, 9.7\% for the long-run variance,
+9.0\% for the volatility of variance and 9.8\% for the correlation; the surfaces re-priced with its answers miss the true ones
+by 13.2 basis points of spot on average. Speed and long-run variance are poorly identified by three maturities, and the network
+is as uncertain about them as the data are. On five test surfaces its answer misses the implied volatilities by 0.46 points on
+average, and Book~5's Levenberg--Marquardt calibrator, started from it or from a fixed guess, fits them exactly. The network is
+a fast first guess and a sanity check, not a replacement, on clean data from the model it was trained on; on market data,
+which no model fits exactly, it has never seen the residuals it will meet.
+
+\section{Where learned pricing breaks}
+
+Three failures recur. \emph{Extrapolation}: a surrogate or a calibration network outside its training box returns confident
+numbers with no warning, exactly where a stressed market takes the book; train on boxes wider than any scenario and check
+inputs against them. \emph{Arbitrage}: a surrogate's prices need not be monotone or convex in the strike, and its Greeks can
+change sign where they should not; constrain the architecture or check the outputs. \emph{Model risk}: a deep hedge is optimal
+for the simulator it was trained on, like chapter~17's agent; train it on several models or randomised parameters, and compare
+it with the asymptotic band on paths it was not trained on.
+
+\begin{method}[Machine learning on a derivatives desk]\label{met:ml:dh:method}
+\begin{enumerate}
+\item Keep the exact pricer as the reference; every surrogate is validated against it on a grid wider than the book's
+scenarios, prices and Greeks both.
+\item Train surrogates with differential labels when derivatives are cheap (pathwise or by automatic differentiation).
+\item Use calibration networks as starting points and checks; the optimiser has the last word.
+\item Train deep hedges on the desk's own frictions and risk measure, and compare with the closed-form band out of sample and
+across models.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: hedging with frictions}\label{tut:ml:deep-hedging-and-machine-learning-in-pricing:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Deep-hedge the call at four cost levels and read off the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference prices} and bands; train the surrogate with
+and without differential labels; fit the calibration network. \textbf{End state:}
+\cref{fig:ml:dh:indiff,fig:ml:dh:bands}, \cref{tab:ml:dh:ten,tab:ml:dh:surr}.
+\begin{tutsteps}
+\item \textbf{The no-transaction band network.}
+\omcode{code/firm/deephedge/firm_deephedge.py}{54}{69}{A network that outputs a band; the holding is clipped into it.}\label{lst:ml:dh:band}
+\item \textbf{The hedged P\&L after costs.}
+\omcode{code/firm/deephedge/firm_deephedge.py}{72}{86}{Selling a call and hedging it on a batch of paths.}\label{lst:ml:dh:pnl}
+\item \textbf{Differential training.}
+\omcode{code/firm/deephedge/firm_deephedge.py}{165}{186}{A surrogate trained on prices and pathwise derivatives.}\label{lst:ml:dh:surr}
+\item \textbf{Run} \texttt{ml\_hedge.hedging()} (about a minute and a half on one core), \texttt{surrogates()},
+\texttt{calibration()}, \texttt{lm\_check()} and \texttt{fig\_hedge.py}.
+\end{tutsteps}
+\textbf{What to change next.} Give the network the current variance as an input and add a variance swap as a second hedge;
+train on randomised Heston parameters and test on another model.
+\end{tutorial}
+
+\section{Build: deep hedging and learned pricers}\label{bld:ml:deep-hedging-and-machine-learning-in-pricing:deephedge}
+
+\begin{build}
+\bfield{Purpose} Hedges and prices learned where they save time or cost, checked against Book~5's exact engines.
+\bfield{Interface} \texttt{heston\_paths}; \texttt{BandNet}, \texttt{hedge\_pnl(policy, S, K, T, cost)}, \texttt{entropic},
+\texttt{expected\_shortfall}, \texttt{train\_hedge(S, K, T, cost, risk, seed, steps, batch, lr)}; \texttt{bs\_policy},
+\texttt{ww\_policy}, \texttt{no\_hedge}, \texttt{band}; \texttt{SurrogateNet}, \texttt{fit\_surrogate(X, y, dy,
+differential, seed)}, \texttt{surrogate\_values}; \texttt{fit\_calibrator(vols, params, seed)}.
+\bfield{Rules} Every learned price, Greek and hedge is scored against an exact reference on data it was not trained on;
+training boxes and cost levels are recorded with the model.
+\bfield{Acceptance tests} \texttt{code/firm/deephedge/tests/}: the P\&L of the delta hedge without costs matches the discrete
+hedging error's scale; the entropic risk of a constant is minus the constant; the band network holds its position inside the
+band; Whalley--Wilmott's band widens with cost; a differential surrogate of a known function recovers its slope; the
+calibrator inverts a simple map.
+\bfield{Stretch} A second hedging instrument; recurrent policies with the variance as a hidden state; arbitrage-free surrogate
+architectures.
+\end{build}
+
+\begin{omsources}
+\item H.~Buehler, L.~Gonon, J.~Teichmann and B.~Wood, ``Deep hedging'', \emph{Quantitative Finance} 19(8), 2019.
+\item S.~Imaki, K.~Imajo, K.~Ito, K.~Minami and K.~Nakagawa, ``No-transaction band network'', arXiv:2103.01775, 2021.
+\item A.~E.~Whalley and P.~Wilmott, ``An asymptotic analysis of an optimal hedging model for option pricing with transaction
+costs'', \emph{Mathematical Finance} 7(3), 1997.
+\item H.~Föllmer and A.~Schied, ``Convex measures of risk and trading constraints'', \emph{Finance and Stochastics} 6(4), 2002.
+\item B.~Huge and A.~Savine, ``Differential machine learning'', arXiv:2005.02347, 2020.
+\item B.~Horvath, A.~Muguruza and M.~Tomas, ``Deep learning volatility'', \emph{Quantitative Finance} 21(1), 2021.
+\item A.~Hernandez, ``Model calibration with neural networks'', SSRN 2812140, 2016.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:1}
+Show that the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{entropic risk measure} is cash-invariant: $\rho(X + c) = \rho(X) - c$. What is $\rho$ of a constant?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:2}
+Compute the Whalley--Wilmott half-width at the money half-way to maturity for $c = 0.001$, $S = 100$, $\lambda = 1$ and a
+Black--Scholes gamma of 0.0998.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:3}
+Why is the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price} above the Heston value (2.25) even without costs?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:4}
+Why does the deep hedge beat the Black--Scholes delta when there are no costs at all?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:5}
+Why are the mean-reversion speed and the long-run variance hard for the calibration network, and what data would help?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:6}
+\emph{Find the flaw.} ``Our surrogate matches the pricer to 0.1\% on the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{test set}, so we use it for the stress scenarios.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:7}
+\emph{Coding.} Derive the pathwise delta label for a digital call ($\mathbf1\{S_T > K\}$). What goes wrong, and what does
+Huge and Savine's approach do instead?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:deep-hedging-and-machine-learning-in-pricing:8}
+Show that without costs and in a complete market (Black--Scholes, continuous trading) the entropic \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price} equals
+the Black--Scholes price for any $\lambda$.
+\end{exercise}
+
+\section{Problem: Hedging with Frictions}
+
+\begin{problem}[{Weekend problem --- when not to trade}]\label{pb:ml:deep-hedging-and-machine-learning-in-pricing:1}
+The chapter's call, hedges, surrogate and calibrator.
+
+\medskip\noindent\textbf{Part I --- The problem.}
+\begin{enumerate}
+\item What is sold, how is it hedged, and what does the network see?
+\item What does daily delta hedging cost at 5 basis points, and how does that compare with the vega?
+\item Why a band network rather than a network that outputs the holding directly?
+\item What is the loss, and what does $\lambda = 1$ mean here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Results.}
+\begin{enumerate}[resume]
+\item Give the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference prices} of the three hedges at each cost level.
+\item Compare the learned band with the Whalley--Wilmott band.
+\item What does training on expected shortfall change?
+\item Why does the Whalley--Wilmott hedge have the lowest mean cost at 10 basis points but not the lowest risk?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Surrogates and calibration.}
+\begin{enumerate}[resume]
+\item What do differential labels buy, and when?
+\item What errors does the calibration network make?
+\item How should the network and the optimiser be combined?
+\item Where would each learned pricer fail on a real desk?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price} as a function of the cost level, and the learned no-trade band's
+width against the Whalley--Wilmott band.
+\item Would you quote the option at the \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price}? Why or why not?
+\item How would you validate a deep hedge before using it on a book?
+\item What would change with a second hedging instrument?
+\item How do you keep a surrogate honest when the model is recalibrated daily?
+\item What is the risk of training the hedge on one Heston parameter set?
+\item Where does automatic differentiation fit in this chapter?
+\item In one sentence: what does a hedging network learn that a delta does not?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, trader}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:1}
+Why does delta hedging with transaction costs call for a no-trade band?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:2}
+What is \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:dh}{deep hedging}, and what are its inputs, outputs and loss?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, researcher}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:3}
+Explain \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:surrogate}{differential machine learning} and why it helps with noisy Monte Carlo labels.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:4}
+What is an \omterm{def:ml:deep-hedging-and-machine-learning-in-pricing:risk}{indifference price}, and how does it relate to a risk measure?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:5}
+A calibration network is fast. Why not use it alone?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:deep-hedging-and-machine-learning-in-pricing:6}
+Your surrogate's gamma turns negative for deep out-of-the-money strikes. What happened and how do you fix it?
+\end{interviewq}

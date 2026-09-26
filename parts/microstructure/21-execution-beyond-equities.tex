@@ -1,0 +1,269 @@
+\chapter{Execution Beyond Equities}\label{ch:mx:execution-beyond-equities}
+
+Buying the same amount of risk takes an order in an index future, a request for quote in bonds, a stream of last-look prices in currencies and a venue
+that never closes in crypto. The objective is the same shortfall; the market's rules change what the algorithm can do. This chapter takes one risk
+transfer, USD~50 million, through four simulated markets with execution adapters built on the market components of One Quant Books 1 to 3, and
+measures the all-in cost in each and the part of it that the market's own rule explains.
+
+The four markets are stylised: their spreads, volatilities and volumes (\cref{tab:mx:execution-beyond-equities:markets}) are assumptions of a
+realistic order of magnitude, chosen to show the mechanisms, not measurements of particular instruments. Each order's impact follows the square-root
+law of chapter~11, $Y\sigma\sqrt{Q/V}$ with $Y=0.7$, the daily volatility $\sigma$ and daily volume $V$.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+market & half-spread (bp) & daily volatility (bp) & daily volume (USD) \\
+\midrule
+index future & 0.25 & 100 & 200 billion \\
+EUR/USD & 0.08 & 50 & 300 billion \\
+corporate bond & 5 & 40 & 20 million \\
+bitcoin (one exchange) & 0.5 & 300 & 5 billion \\
+\bottomrule
+\end{tabular}
+\caption{The simulated markets' parameters (assumptions). Data: \texttt{mx\_xexec.MARKETS}.}\label{tab:mx:execution-beyond-equities:markets}
+\end{table}
+
+\section{Futures: one book, implied liquidity, rolls}
+
+An index future trades in one central book, with a tick that is often most of the spread and depth that dwarfs any single stock's. USD~50 million is
+200 contracts at 5,000 points and USD~50 a point. Its impact is small (1.11 basis points) and its spread smaller (0.25). What the future adds is the roll
+(One Quant Book 1, chapter~21): a position held past expiry must be sold in the front month and bought in the next, and the calendar spread between
+them has its own book (Book~1, chapter~19). Exchanges link the books with implied prices: a spread order can trade against the two outright books at
+once (implied in), and spread orders make prices in the outrights (implied out); CME describes implied orders as removing the legging risk, and implied
+quantity never matches implied quantity.
+
+Rolling 200 contracts through this chapter's books (front 4,999.75 bid for 150, back 5,010.25 offered for 100, the spread book $-10.25$ bid for 60,
+each level backed by the same size a tick worse): selling the front and buying the back as two orders costs 0.44 points a contract against the
+spread's mid of $-10.25$, 0.88 basis points. Selling the spread in its own book for the first 60 contracts and legging the rest costs 0.23 points, 0.45
+basis points: half. With implied prices the last 140 contracts trade at the same price as legging, but as one atomic order, with no risk that the
+market moves between the legs (\texttt{firm\_xexec.roll}, on Book~1's \texttt{firm.match}).
+
+\omcode{code/firm/xexec/firm_xexec.py}{76}{88}{Rolling a long futures position: legging through the two outright books, selling the spread in its own book, or using the book that implied prices show, then legging whatever is left.}\label{lst:mx:execution-beyond-equities:roll}
+
+\section{FX: streams, last look and aggregation}
+
+\begin{definition}[Liquidity aggregator, request for stream, firm liquidity]\label{def:mx:execution-beyond-equities:aggregator}
+A \emph{liquidity aggregator}\index{liquidity aggregator} collects the streaming quotes of several liquidity providers into one book and routes each
+request to the best price. A \emph{request for stream}\index{request for stream} asks providers to start streaming executable prices for a stated size
+to one client. \emph{Firm liquidity}\index{firm liquidity} is liquidity whose quotes fill when hit, with no last-look window in which the provider may
+reject.
+\end{definition}
+
+Most FX is traded bilaterally, off exchange, on providers' streams (One Quant Book 2, chapter~15). The FX Global Code's principle~17 asks providers
+that use last look to be transparent about it and to use it as a risk control, not to gather information. The adapter sends USD~50 million as 20
+requests of USD~2.5 million (\texttt{firm.acexec}'s straight-line schedule) to an aggregator of four last-look streams (half-spreads of 0.08 to 0.11
+basis points, holds of 20 to 80 milliseconds, asymmetric thresholds of 0.05 to 0.08 basis points) and one firm stream at 0.15. A rejected request loses
+the move that caused the rejection and goes on to the next stream at the new price (Book~2's \texttt{firm.lastlook}).
+
+\omcode{code/firm/xexec/firm_xexec.py}{101}{113}{One request through the aggregator: the cheapest stream first; each rejection after its hold costs the client the move the provider declined to honour, and the request moves on.}\label{lst:mx:execution-beyond-equities:fx}
+
+Over 2,000 simulated orders, rejections numbered 7.7\% of the requests, and the aggregator's average cost was 0.087 basis points against the best
+quote's 0.080: last look costs 0.007 basis points here, and the aggregator still beats the firm stream (0.15). Last look's cost is not in the spread
+the client sees but in the moves it gives back on the requests it loses; Oomen (2017) analysed the practice in detail. With an impact of 0.45 basis
+points, the all-in cost in FX is 0.54 basis points, the cheapest of the four.
+
+\begin{dated}{2026-09}{How FX is traded}\label{dat:mx:execution-beyond-equities:bis}
+The BIS Triennial Survey of April 2025 found electronic trading at 59\% of FX turnover, about the same share as in the previous survey, and noted that
+customers using disclosed multi-dealer electronic trading could in theory choose among more than 15 platforms (BIS Quarterly Review, December 2025).
+\end{dated}
+
+\section{Bonds: requests for quote and portfolio lists}
+
+\begin{definition}[Risk transfer price]\label{def:mx:execution-beyond-equities:rtp}
+A \emph{risk transfer price}\index{risk transfer price} is a price at which a dealer takes a whole block at once as principal, charging for the cost and
+risk of unwinding it, instead of working it as agent.
+\end{definition}
+
+A corporate bond trades a few times a day: USD~50 million is two and a half days of this bond's volume, and an order worked over a day would move the
+price by the square-root law's 44.3 basis points on top of a 5-basis-point half-spread. The client instead asks dealers for a \omterm{def:mx:execution-beyond-equities:rtp}{risk transfer price} by
+request for quote (Book~2, chapter~22). The adapter prices it with Book~2's \texttt{firm.rfq}: each dealer bids the value less a markup (here the
+49.3 basis points the dealer expects to pay to unwind), plus a private term with a dispersion of 8 basis points (its inventory and axes); each dealer who
+sees the request and loses costs the client 1.5 basis points of leakage. Asking one dealer costs 49.3; asking three, 45.5 (6.8 of competition less 3.0
+of leakage); asking more adds leakage faster than competition, so three is best. Hendershott and Madhavan (2015) showed that such electronic
+one-sided auctions are a viable source of liquidity even in inactively traded bonds.
+
+\section{Crypto: round the clock, rate limits and on-chain legs}
+
+Bitcoin trades on many exchanges and in automated market makers, every hour of every day. On one exchange with this chapter's parameters, USD~50
+million costs 0.5 basis points of spread and 21.0 of impact. A constant-product pool (One Quant Book 3, chapter~20) with USD~1 billion on each side and
+a 5-basis-point fee offers another leg: its price moves along $xy=k$ as the order takes coins out. The adapter sends $x$ to the pool and the rest to
+the exchange and chooses $x$ to minimise the sum, the pool's price starting at the exchange's mid (\texttt{cex\_amm\_split}, on Book~3's integer
+\texttt{firm.amm}): the best is USD~1.375 million to the pool, saving 0.36 basis points. The pool is cheap for the first dollars and expensive for
+the rest: its marginal cost rises twice as fast as its average.
+
+A venue's rate limits (Book~3, chapter~15) bound what the algorithm can send: a large spot exchange's published limits allow 100 orders in ten
+seconds. Twelve \omterm{def:mx:the-almgren-chriss-framework:parent}{child orders} in an hour are nowhere near it; 120 in one second are refused (\texttt{orders\_allowed} on Book~3's
+\texttt{firm.ratelimit}). Rate limits bind on strategies that quote and cancel, not on schedules like this one; the round-the-clock market does not
+remove the day's volume pattern, it moves the thin hours to the night.
+
+\section{One order, four markets}
+
+\Cref{tab:mx:execution-beyond-equities:allin} puts the four executions side by side.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+market & spread & impact & market's rule & all-in & the rule \\
+\midrule
+index future & 0.25 & 1.11 & 0.45 & 1.81 & roll through the spread book (legging: 0.88) \\
+EUR/USD & 0.08 & 0.45 & 0.007 & 0.54 & last-look rejections \\
+corporate bond & --- & 49.27 & $-3.77$ & 45.50 & RFQ to three dealers \\
+bitcoin & 0.50 & 21.00 & $-0.36$ & 21.14 & a pool leg \\
+\bottomrule
+\end{tabular}
+\caption{The all-in cost (basis points) of buying USD~50 million of risk in the four simulated markets, and the part of it that each market's rule
+explains. For the bond, the dealer's markup takes the place of spread and impact. Data: \texttt{mx\_xexec.table}.}\label{tab:mx:execution-beyond-equities:allin}
+\end{table}
+
+The rule explains a quarter of the future's cost (the roll, 25\%), 1.3\% of the currency's, and it saves 8.3\% of the bond's (competition net of
+leakage) and 1.7\% of bitcoin's. The costs themselves span two orders of magnitude, and the reason is the market's depth relative to the order, not its
+rules: the same USD~50 million is a rounding error in the index future and two days' volume in the bond. An \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm}
+(chapter~16) written against \texttt{firm.acexec}'s scheduler can drive all four through adapters; what changes is what a ``\omterm{def:mx:the-almgren-chriss-framework:parent}{child order}'' is: a
+\omterm{def:mx:the-limit-order-book:orders}{limit order}, a request to a stream, an auction among dealers, a swap against a pool.
+
+\section{Tutorial: one order, four markets}\label{tut:mx:execution-beyond-equities:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Execute the same risk transfer through four execution adapters and split each all-in cost into spread, impact and the market's rule.
+\textbf{End state:} \cref{tab:mx:execution-beyond-equities:allin} and the numbers of sections 1 to 4.
+\begin{tutsteps}
+\item \textbf{Futures.} \texttt{firm\_xexec.roll(front, back, spread, lots, tick)} on \texttt{firm.match}'s \texttt{Quote}; \texttt{mx\_xexec.futures()}.
+\item \textbf{FX.} \texttt{LP}, \texttt{fx\_child}, \texttt{children(notional, scheduler, n)}; \texttt{fx()}.
+\item \textbf{Bonds.} \texttt{rfq(n, markup, sigma, leak)}; \texttt{bonds()}.
+\item \textbf{Crypto.} \texttt{amm\_cost\_bp}, \texttt{cex\_amm\_split}, \texttt{orders\_allowed}; \texttt{crypto()}; \texttt{table()}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the bond's markup by a model of the dealer's own unwinding; give the FX streams symmetric last look; route the
+bitcoin order across two exchanges and the pool.
+\end{tutorial}
+
+\section{Build: execution adapters}\label{bld:mx:execution-beyond-equities:xexec}
+
+\begin{build}
+\bfield{Purpose} The market-specific layer under chapter~28's \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm}: one scheduler, several ways to trade a slice.
+\bfield{Interface} \texttt{Market(name, half\_spread\_bp, sigma\_day\_bp, adv, y)}, \texttt{sqrt\_impact\_bp}, \texttt{children(notional,
+scheduler, n)}, \texttt{roll(front, back, spread, lots, tick)}, \texttt{LP(name, half\_bp, hold\_ms, threshold\_bp, policy)},
+\texttt{fx\_child(lps, sigma, rng)}, \texttt{rfq(n, markup, sigma, leak)}, \texttt{amm\_cost\_bp}, \texttt{cex\_amm\_split}, \texttt{orders\_allowed(governor,
+horizon\_ms, n)}.
+\bfield{Rules} Costs in basis points of notional against the starting mid; the adapters compose Books 1 to 3's components rather than copy them.
+\bfield{Acceptance tests} \texttt{code/firm/xexec/tests/}: the roll on the chapter's books and implied-in at the legging price; a firm stream's cost is
+its half-spread and an always-rejecting stream passes the request on; the last-look cost against Book~2's formula; the RFQ split adds up; a small
+pool trade pays the fee; the split saves; the rate limit's boundary.
+\bfield{Stretch} Futures in \texttt{firm.exchsim} with implied matching; symmetric last look; several pools and exchanges.
+\end{build}
+
+\begin{omsources}
+\item Global Foreign Exchange Committee, \emph{FX Global Code}, principle~17 (last look).
+\item R.~Oomen, ``Last look'', \emph{Quantitative Finance} 17(7), 2017.
+\item T.~Hendershott and A.~Madhavan, ``Click or call? Auction versus search in the over-the-counter market'', \emph{Journal of Finance} 70(1),
+2015.
+\item CME Group, Globex matching algorithms and implied orders (client systems wiki).
+\item BIS, ``The FX trade execution landscape through the prism of the 2025 BIS Triennial Survey'', \emph{BIS Quarterly Review}, December 2025.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:1}
+Compute the impact of USD~50 million in the index future and in the bond by the square-root law with the table's parameters.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:2}
+Verify the roll's legging cost of 0.44 points a contract from the books.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:3}
+What is the bond's cost by request for quote to one, two and four dealers?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:4}
+Why does implied liquidity not improve the roll's price here, and what does it improve?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:5}
+Why can an aggregator of last-look streams be cheaper than a firm stream, and when would it not be?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:6}
+Why does the pool take only USD~1.4 million of the bitcoin order?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:execution-beyond-equities:7}
+\emph{Coding.} With leakage of 3 basis points per losing dealer instead of 1.5, how many dealers should the client ask, and what does the bond cost?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:execution-beyond-equities:8}
+\emph{Find the flaw.} ``Our FX algorithm paid 0.08 basis points on average: exactly the best quote in the aggregator, so last look cost us nothing.''
+\end{exercise}
+
+\section{Problem: One Order, Four Markets}
+
+\begin{problem}[{Weekend problem --- one order, four markets}]\label{pb:mx:execution-beyond-equities:1}
+A multi-asset fund must add USD~50 million of risk and can do it in an index future, a currency, a corporate bond or bitcoin. The desk asks what each
+costs and why.
+
+\medskip\noindent\textbf{Part I --- Futures.}
+\begin{enumerate}
+\item Why is a future's impact so small for this order?
+\item Describe implied-in and implied-out prices.
+\item Give the roll's cost by legging and through the spread book.
+\item What does the implied book add?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- FX.}
+\begin{enumerate}[resume]
+\item Define an aggregator, a \omterm{def:mx:execution-beyond-equities:aggregator}{request for stream} and \omterm{def:mx:execution-beyond-equities:aggregator}{firm liquidity}.
+\item What does principle 17 of the FX Global Code ask of last look?
+\item How does the adapter model a rejection, and what does it cost?
+\item Give the rejection rate and the last-look cost.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Bonds and crypto.}
+\begin{enumerate}[resume]
+\item Define a \omterm{def:mx:execution-beyond-equities:rtp}{risk transfer price}.
+\item Split the three-dealer RFQ cost into markup, competition and leakage.
+\item Why is three dealers the best number here?
+\item How is the bitcoin order split between the exchange and the pool, and what does it save?
+\item When do an exchange's rate limits bind?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The comparison.}
+\begin{enumerate}[resume]
+\item \emph{State the named result}: the all-in cost of the same risk transfer in futures, FX, bonds and crypto in the simulator, and the part of it
+each market's rule explains.
+\item Why do the costs span two orders of magnitude?
+\item What is a \omterm{def:mx:the-almgren-chriss-framework:parent}{child order} in each market?
+\item How would you build one algorithm that trades all four?
+\item Which of the chapter's assumptions would you check first against real data?
+\item What does the dated box say about how FX is traded?
+\item In one sentence: what changes when an \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm} leaves the equity book?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:execution-beyond-equities:1}
+You must roll a large futures position. How do you do it, and what can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:execution-beyond-equities:2}
+A liquidity provider rejects 10\% of your FX requests. How do you work out what that costs you?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:execution-beyond-equities:3}
+How many dealers should a client ask for a price on a corporate bond, and what does the answer depend on?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:execution-beyond-equities:4}
+Design an execution adapter interface that lets one scheduler trade equities, FX streams and RFQs.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:execution-beyond-equities:5}
+How would you split a large crypto order between a centralised exchange and an AMM pool?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{bank}]\label{iq:mx:execution-beyond-equities:6}
+A client asks your bank for a \omterm{def:mx:execution-beyond-equities:rtp}{risk transfer price} on USD~50 million of a bond that trades USD~20 million a day. How do you price it?
+\end{interviewq}

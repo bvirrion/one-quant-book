@@ -1,0 +1,336 @@
+\chapter{Build: an Execution Algorithm}\label{ch:mx:build-an-execution-algorithm}
+
+A trader hands the algorithm an order to buy 200,000 shares by three o'clock with a limit price. Everything this book has built, the schedule, the
+placement, the routing, the measurement, has to run at once, and keep running when the market does something the design did not expect: a halt, a
+spike, a kill from the desk. This chapter assembles \texttt{firm.execalgo}, an \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm}, from chapters 14, 17, 18 and 25, runs
+200 \omterm{def:mx:the-almgren-chriss-framework:parent}{parent orders} through chapter~27's agent market against a TWAP baseline on the same order flow, and measures both with chapter~19's toolkit. The
+answer to the question every desk asks, ``how much does it beat TWAP by?'', turns out to depend on the order.
+
+\section{The algorithm as a state machine}
+
+An \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm} (chapter~16) is a program that holds a \omterm{def:mx:the-almgren-chriss-framework:parent}{parent order} and decides, again and again, what \omterm{def:mx:the-almgren-chriss-framework:parent}{child orders} to have in the market.
+Written as a state machine it has few states and many events (\cref{fig:mx:build-an-execution-algorithm:states}): a new order starts \emph{working} at
+its start time and records the arrival mid; it is \emph{paused} while its stock is halted or paused and resumes when trading does; it ends \emph{done}
+when filled, \emph{expired} when its deadline passes with shares left, or \emph{killed} when the desk or a risk control stops it. Every transition and
+every refusal is written to an audit log with its time, the state and the reason: the log is how the desk, compliance and the developer reconstruct what
+the algorithm did and why.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,st/.style={draw,rounded corners=3pt,minimum width=1.7cm,minimum height=0.65cm,fill=omDef!12},
+  end/.style={st,fill=gray!15},>=stealth]
+\node[st] (n) at (-0.6,0) {new};
+\node[st] (w) at (3.2,0) {working};
+\node[st] (p) at (3.2,-2.2) {paused};
+\node[end] (d) at (8.4,1.3) {done};
+\node[end] (e) at (8.4,0) {expired};
+\node[end] (k) at (8.4,-1.3) {killed};
+\draw[->,thick] (n) -- node[above] {start time} (w);
+\draw[->,thick] ([xshift=-4mm]w.south) -- node[left] {halt, pause} ([xshift=-4mm]p.north);
+\draw[->,thick] ([xshift=4mm]p.north) -- node[right] {trading} ([xshift=4mm]w.south);
+\draw[->,thick] (w) -- node[above,sloped] {filled} (d);
+\draw[->,thick] (w) -- node[above] {deadline} (e);
+\draw[->,thick] (w) -- node[above,sloped,pos=0.6] {kill} (k);
+\draw[->,thick] (p) -- node[below,sloped] {kill} (k);
+\path[->,thick] (w) edge[loop above,looseness=6] node[above,align=center] {every second: schedule,\\ band, cross, rest} (w);
+\end{tikzpicture}
+
+\omcaption{The algorithm's states. A working order checks its schedule every second; a halt or pause cancels its orders and stops the clock; the three
+end states are final, and every transition is logged.}\label{fig:mx:build-an-execution-algorithm:states}
+\end{omfigure}
+
+\section{Schedule, placement and routing together}
+
+The schedule is chapter~14's: the Almgren--Chriss trajectory of holdings $x(t) = X \sinh(\kappa(T - t))/\sinh(\kappa T)$, with the \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} given as
+$\kappa T$ (zero for a straight line) through \texttt{firm.acexec}'s scheduler interface (Almgren and Chriss 2001; Kissell's textbook describes the same
+family of \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithms}). Every second the algorithm computes what the schedule says should be done by now and what it says should
+be done a little later (20 seconds), and bounds both by the \omterm{def:mx:build-an-execution-algorithm:band}{participation band}.
+
+\begin{definition}[Participation band]\label{def:mx:build-an-execution-algorithm:band}
+A \emph{participation band}\index{participation band} is a lower and an upper limit on an \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm}'s share of the market's volume since the
+order started: whatever its schedule says, the algorithm trades at least enough to stay above the lower limit and never so much as to go above the upper
+one.
+\end{definition}
+
+\begin{definition}[I-would price]\label{def:mx:build-an-execution-algorithm:iwould}
+An \emph{I-would price}\index{I-would price} is a price, set by the trader, at or better than which an algorithm should trade more than its schedule
+says, up to its upper participation limit, because the trader would be glad to complete the order there.
+\end{definition}
+
+Placement is chapter~17's lesson made operational: rest passively at the near touch for the schedule a little ahead, and cross the spread only for what
+the order is behind by more than a tolerance (20 seconds of schedule), so that the passive order has time to fill before it is overtaken. Crossing goes
+through chapter~18's sweep when the stock trades on several venues: the displayed quotes at the far touch, best price first, each leg an
+immediate-or-cancel child. A limit price caps every child; an \omterm{def:mx:build-an-execution-algorithm:iwould}{I-would price} switches the algorithm to its band's upper edge while the far touch is at or
+better than it.
+
+\omcode{code/firm/execalgo/firm_execalgo.py}{170}{209}{The algorithm's decision every second: done or not, the deadline (cross what is left, or expire), the schedule bounded by the participation band, the I-would price, a cross for what is behind by more than the tolerance, and one passive order for the schedule ahead.}\label{lst:mx:build-an-execution-algorithm:check}
+
+\section{Limits, pauses and exceptions}
+
+Every child passes pre-trade controls before it is sent: no child above a maximum size, no price further than a collar from the mid, never more working
+and filled than the order. They are the algorithm's own share of the controls a broker must have in front of the market.
+
+\begin{dated}{2026-09}{Market access controls}\label{dat:mx:build-an-execution-algorithm:access}
+The SEC adopted Rule 15c3-5 on 3 November 2010, ending unfiltered market access. A broker-dealer with market access must have controls reasonably
+designed to prevent the entry of orders that exceed pre-set credit or capital thresholds in the aggregate for each customer and for itself, and of
+erroneous orders, by rejecting orders that exceed price or size parameters order by order or over a short period, or that indicate duplicative
+orders (17 CFR 240.15c3-5).
+\end{dated}
+
+\omcode{code/firm/execalgo/firm_execalgo.py}{94}{108}{The pre-trade controls every child passes: its size, its price against a collar around the consolidated mid, and the order's total; a refusal is logged with its reason.}\label{lst:mx:build-an-execution-algorithm:controls}
+
+The exceptions are driven by the feed and the desk. A trading-action message that leaves the \emph{trading} state (chapter~25's halts and pauses)
+cancels every working child and stops the schedule's clock; when trading resumes, the schedule is shifted by the pause, so the order neither rushes to
+catch up nor loses its deadline. A kill, sent by the desk or by a risk monitor through the simulator's scheduled calls, cancels everything and ends the
+order. Three runs of the same buy of 16,000 shares show them (\cref{fig:mx:build-an-execution-algorithm:stress}, \cref{tab:mx:build-an-execution-algorithm:log}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.8cm,xlabel={\small seconds from the order's start},ylabel={\small filled (thousand shares)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=720,ymin=0,ymax=17,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.28)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,very thick] table[x=t,y=base]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omDef,very thick] table[x=t,y=halt]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omProp,very thick,dashed] table[x=t,y=spike]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omThm,very thick] table[x=t,y=kill]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\legend{normal day,60-second halt,spike with a limit,killed at 300 s}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One buy of 16,000 shares over ten minutes at low \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}, on the same order flow: a normal day, a halt from 200 to 260 seconds, a price spike
+from another buyer with a limit ten ticks above the arrival mid, and a kill at 300 seconds. Data: \texttt{mx\_execalgo.stress}.}\label{fig:mx:build-an-execution-algorithm:stress}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrll@{}}
+\toprule
+run & time (s) & event & detail \\
+\midrule
+halt & 200.0 & pause & trading state H \\
+ & 260.0 & resume & schedule shifted by 60 s \\
+ & 661.0 & finish & crossing the last 600 \\
+ & 662.0 & done & 16,000 filled \\
+spike & 252.0 & limit & far touch 100.18 beyond the limit 100.105 \\
+ & 465.0 & limit off & far touch 100.07 \\
+ & 587.0 & done & 16,000 filled \\
+kill & 299.6 & kill & 8,500 of 16,000 filled \\
+\bottomrule
+\end{tabular}
+\caption{Extracts of the audit log of the three stressed runs (times from the order's start). After the kill, 200 more shares filled: a child
+already in flight when the kill was sent. Data: \texttt{mx\_execalgo.stress}.}\label{tab:mx:build-an-execution-algorithm:log}
+\end{table}
+
+The halted order finished a minute late, as designed, and paid 2.62 basis points against 2.31 on the normal day. In the spike, another buyer's 60,000
+shares took the far touch past the limit within twelve seconds; the algorithm stopped crossing for 213 seconds and kept its passive order at the limit,
+and paid 3.79 basis points, against 4.31 for the same order without a limit. The killed order stopped at 8,500 shares and ended at 8,700: a kill
+cancels what is resting, not what has already been sent, which is why the desk's position after a kill is read from the fills, never from the order.
+
+\section{Measuring it}
+
+The measure is chapter~19's: the implementation shortfall (Perold 1988) against the arrival mid, all-in (fees and rebates included), attributed by
+\texttt{firm.tca} into spread, impact (the order's own push, from a copy of the session without it), timing (the market's own move) and fees. The
+experiment is an A/B test with common random numbers: 200 \omterm{def:mx:the-almgren-chriss-framework:parent}{parent orders}, four sizes (4,000 to 32,000 shares over ten minutes, 2.4\% to 15.9\% of the
+market's volume) by two urgencies ($\kappa T$ of 0.5 and 3) by 25 seeds, each run with the full algorithm and with a TWAP baseline of the same size on the
+same seed (a straight line, a \omterm{def:mx:the-limit-order-book:orders}{market order} every ten seconds for what is due).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.6cm,xlabel={\small order size (shares)},ylabel={\small saving against TWAP (bp)},
+  xtick={0,1,2,3},xticklabels={4\,000,8\,000,16\,000,32\,000},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  xmin=-0.4,xmax=3.4,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,error bars/.cd,y dir=both,y explicit] table[x=k,y=u0,y error=se0]{figdata/microstructure/28-build-an-execution-algorithm/saved.csv};
+\addplot[omThm,very thick,mark=square*,error bars/.cd,y dir=both,y explicit] table[x expr=\thisrow{k}+0.08,y=u1,y error=se1]{figdata/microstructure/28-build-an-execution-algorithm/saved.csv};
+\addplot[gray,dashed,domain=-0.4:3.4] {0};
+\legend{low urgency ($\kappa T = 0.5$),high urgency ($\kappa T = 3$)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The all-in saving of the \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm} against TWAP on the same order flow, by order size and \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}: the mean of 25
+paired orders with its standard error. Data: \texttt{mx\_execalgo.ab\_study}.}\label{fig:mx:build-an-execution-algorithm:saved}
+\end{omfigure}
+
+Over the 200 orders the algorithm saves $-0.15$ basis points against TWAP, with a 95\% interval of $[-0.44, 0.14]$ clustered by seed: no saving on
+average. The average hides a slope (\cref{fig:mx:build-an-execution-algorithm:saved}). A regression of the saving on the size's doubling and a
+\omterm{def:mx:the-almgren-chriss-framework:urgency}{high-urgency} dummy gives $1.25 - 0.70\,\log_2(Q/4000) - 0.69\,h$, where $h$ is 1 at high \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} (standard errors 0.08, 0.04 and 0.22): the algorithm saves
+1.06 basis points on the smallest orders at low \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} and loses 1.96 on the largest at high \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}, and breaks even near 13,700 shares, about 8\% of
+the volume, at low \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.4cm,ybar,bar width=12pt,ylabel={\small ticks per share},
+  xtick={0,1,2,3},xticklabels={spread,impact,timing,fees},tick label style={font=\footnotesize},
+  grid=major,grid style={gray!25},enlarge x limits=0.15,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=is]{figdata/microstructure/28-build-an-execution-algorithm/attribution.csv};
+\addplot[fill=gray!45,draw=gray] table[x=k,y=twap]{figdata/microstructure/28-build-an-execution-algorithm/attribution.csv};
+\legend{implementation shortfall,TWAP}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\texttt{firm.tca}'s attribution of the two arms' costs, averaged over the 200 pairs (a tick is about a basis point at USD~100). Data:
+\texttt{mx\_execalgo.ab\_study}.}\label{fig:mx:build-an-execution-algorithm:attr}
+\end{omfigure}
+
+The attribution says why (\cref{fig:mx:build-an-execution-algorithm:attr}). Resting passively earns the algorithm what TWAP pays: $-0.15$ ticks of
+spread against $+0.51$, and rebates against fees, $-0.02$ against $+0.30$. It pays it back in impact, 1.73 ticks against 0.93: a resting buy absorbs the
+sell orders that would have pushed the price down, the catch-up crosses come in bursts, and \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} front-loads the order into the market's memory.
+The spread and the fees scale with the shares, the impact with the order's size too, so the passive design wins on small orders and loses on large
+ones. This is not a failure of the build: it is the measurement that tells the desk which orders to give it, and which parameters to change for the
+others (a lower \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}, a smaller tolerance, a wider band).
+
+\section{Rolling it out}
+
+A new algorithm reaches clients the way any model does (Book~7, chapter~21): first in simulation (this chapter), then on a canary, a small share of
+the desk's own flow, with a kill criterion written in advance, then in a randomised A/B test against the incumbent, and only then as the default. The
+test's size follows from the paired dispersion: the difference between the arms has a standard deviation of 1.33 basis points per order even with
+common random numbers, so detecting an average saving of 0.15 with 80\% power at the 5\% level needs $(1.96 + 0.84)^2 \times 1.33^2 / 0.15^2
+\approx 620$ orders, and live orders, which do not share their market with a counterfactual, need many more. A per-order effect that depends on size
+is easier: stratify by size and test within the stratum where the algorithm is meant to win.
+
+\section{Tutorial: beat TWAP}\label{tut:mx:build-an-execution-algorithm:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Assemble an \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm}, run it through chapter~27's market against TWAP, measure both with \texttt{firm.tca},
+and stress it. \textbf{End state:} \cref{tab:mx:build-an-execution-algorithm:log},
+\cref{fig:mx:build-an-execution-algorithm:stress,fig:mx:build-an-execution-algorithm:saved,fig:mx:build-an-execution-algorithm:attr}.
+\begin{tutsteps}
+\item \textbf{Build.} \texttt{firm\_execalgo.Params(side, qty, start\_s, horizon\_s, urgency, limit, i\_would, band, look\_s, tol\_s)};
+\texttt{ISAlgo(params, venues)}; its \texttt{.log}, \texttt{.fills}, \texttt{.state}.
+\item \textbf{Run.} \texttt{mx\_execalgo.simulate(seed, agents, controls, calls)}, \texttt{run(params, seed)}, the arms \texttt{IS(qty, urgency)} and
+\texttt{TWAP(qty)}.
+\item \textbf{Measure.} \texttt{ab\_study()}: the paired savings, \texttt{firm\_tca.cluster\_ols}, the attribution; \texttt{stress()}; draw with
+\texttt{fig\_execalgo.py}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the tolerance rule with chapter~17's dynamic-programming placement; let the \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} depend on size; route
+passive orders across venues with chapter~18's allocation; run the A/B test on chapter~16's volume curves.
+\end{tutorial}
+
+\section{Build: execalgo}\label{bld:mx:build-an-execution-algorithm:execalgo}
+
+\begin{build}
+\bfield{Purpose} The firm's \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm} on \texttt{firm.exchsim}, for this chapter and for the execution work of Books 11 and 13.
+\bfield{Interface} \texttt{Params} (the fields of the tutorial), \texttt{ISAlgo(params, name, venues)} (a \texttt{firm.exchsim} Agent; \texttt{.kill(t\_ns)} for
+\texttt{Simulator.schedule\_call}), \texttt{shortfall\_bp(side, fills, arrival, qty, last\_mid)}.
+\bfield{Rules} One decision a second; every child through the pre-trade controls; halts cancel and stop the clock; the end states are final; every
+transition and refusal in the audit log.
+\bfield{Acceptance tests} \texttt{code/firm/execalgo/tests/}: the order completes and \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} front-loads it; TWAP only takes; a halt pauses and shifts
+the schedule and nothing trades while halted; no fill beyond the limit; the collar refuses and logs; a kill ends the order; the \omterm{def:mx:build-an-execution-algorithm:iwould}{I-would price} trades
+ahead of schedule; a cross sweeps two venues' displayed quotes.
+\bfield{Stretch} Chapter~17's dynamic-programming placement; dark venues first; a volume-curve schedule; a real-time risk monitor that sends the kill.
+\end{build}
+
+\begin{omsources}
+\item R.~Almgren and N.~Chriss, ``Optimal execution of portfolio transactions'', \emph{Journal of Risk} 3(2), 2001.
+\item A.~F.~Perold, ``The implementation shortfall: paper versus reality'', \emph{Journal of Portfolio Management} 14(3), 1988.
+\item R.~Kissell, \emph{The Science of Algorithmic Trading and Portfolio Management}, Academic Press, 2014.
+\item SEC Rule 15c3-5, Risk management controls for brokers or dealers with market access, 17 CFR 240.15c3-5 (adopted in Release 34-63241, 2010).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:1}
+An order to buy 10,000 shares over 600 seconds with $\kappa T = 0$: how many shares should be done after 300 seconds, and with a tolerance of 20
+seconds, from how far behind does the algorithm cross?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:2}
+The market has traded 40,000 shares since the order started, of which the algorithm 8,000. With a band of 0 to 30\%, how many more shares may it
+trade before trading more?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:3}
+From the regression, what is the expected saving of a 16,000-share order at high \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}, and at what size does a \omterm{def:mx:the-almgren-chriss-framework:urgency}{low-urgency} order break even?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:4}
+Why does a passive buy order have impact, when it never crosses the spread?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:5}
+Why does the algorithm shift its schedule by the length of a halt instead of catching up?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:6}
+After a kill the order had 200 more shares than when the kill was logged. What should the desk's systems do about it?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-execution-algorithm:7}
+\emph{Coding.} From the study's pairs, compute the all-in saving before fees are counted, and explain the difference from the all-in figure.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-execution-algorithm:8}
+\emph{Find the flaw.} ``Our new algorithm beat TWAP by 1 basis point on the 200 orders we gave it last month, so it saves our clients 1 basis point.''
+\end{exercise}
+
+\section{Problem: Beat TWAP by How Much?}
+
+\begin{problem}[{Weekend problem --- beat TWAP by how much?}]\label{pb:mx:build-an-execution-algorithm:1}
+The head of the execution desk wants to know whether the new \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm} should replace TWAP as the default.
+
+\medskip\noindent\textbf{Part I --- The machine.}
+\begin{enumerate}
+\item Draw the algorithm's states and transitions.
+\item What does the audit log record, and for whom?
+\item Define a \omterm{def:mx:build-an-execution-algorithm:band}{participation band} and an \omterm{def:mx:build-an-execution-algorithm:iwould}{I-would price}.
+\item How are the schedule, the placement and the sweep combined each second?
+\item What does the tolerance do, and what happens at the deadline?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Controls and exceptions.}
+\begin{enumerate}[resume]
+\item What pre-trade controls does every child pass?
+\item What does Rule 15c3-5 require of a broker with market access?
+\item What does the algorithm do on a halt, and why shift the schedule?
+\item What did the limit do in the spike, and what did it save?
+\item Why did the killed order end with more shares than it had at the kill?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The experiment.}
+\begin{enumerate}[resume]
+\item Describe the 200 \omterm{def:mx:the-almgren-chriss-framework:parent}{parent orders} and the TWAP baseline.
+\item Why run both arms on the same seeds?
+\item What does \texttt{firm.tca} attribute the costs to?
+\item \emph{State the named result}: the shortfall saved against TWAP with its confidence interval, and its dependence on \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency} and order size.
+\item Why does the passive design win on small orders and lose on large ones?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item How many orders would a live A/B test need, and why more than in simulation?
+\item How would you roll the algorithm out?
+\item Which orders would you give it, and what would you change for the others?
+\item What would you tell the head of the desk?
+\item In one sentence: how much does it beat TWAP by?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:build-an-execution-algorithm:1}
+Your algorithm is 30\% behind schedule with an hour to go and the stock is moving away. What do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:build-an-execution-algorithm:2}
+How would you structure an \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm}'s code so that it is testable, and what would you log?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:build-an-execution-algorithm:3}
+How would you measure whether a new algorithm beats the old one, and how many orders do you need?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:mx:build-an-execution-algorithm:4}
+Which pre-trade controls belong in the algorithm, and which in a layer the algorithm cannot bypass?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{bank}]\label{iq:mx:build-an-execution-algorithm:5}
+A client asks why your \omterm{def:mx:benchmark-algorithms:is}{implementation-shortfall algorithm} cost more than TWAP on its large orders. What do you answer?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{mle}]\label{iq:mx:build-an-execution-algorithm:6}
+You want to learn the algorithm's parameters from its own history of orders. What biases the data, and how do you fix it?
+\end{interviewq}

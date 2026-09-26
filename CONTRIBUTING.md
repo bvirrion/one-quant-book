@@ -177,6 +177,28 @@ chapter that declares it.
 | $P^{\mathrm{idx}}_t$, $P^{\mathrm{mark}}_t$, $\pi_t$, $\phi$ | perpetual index and mark price, premium index, funding rate per interval (*local*) |
 | $x,y,L,p=y/x$ | AMM reserves, liquidity, pool price (*local* to the DeFi chapters) |
 
+## Books 10–13 additions (sync, 2026-09-25)
+
+Series symbols above keep their meaning. *Local* symbols are declared at first use in the chapter
+that uses them and never leave it.
+
+| symbol | meaning |
+|---|---|
+| $P^\ast_t$ | efficient (fundamental) price, Books 10–13 (not $v_t$, the variance, nor $V_t$, a value); $\hat P_t$ a fair-price estimate (B11) |
+| $Q^b_t, Q^a_t$ | size at the best bid and ask queues; $n$ orders ahead of one's own (local) |
+| $\delta_{\mathrm{tick}}$ | tick size (always decorated; bare $\delta$ stays the accrual fraction; $\delta^b_t,\delta^a_t$ are quote depths in B11's inventory chapters, local) |
+| $\epsilon_n\in\{\pm1\}$ | trade sign (as Book 1 ch. 10), distinct from innovations $\varepsilon_t$; propagator kernel $G(\ell)$, response function $\mathcal R(\ell)$ |
+| $\Delta t^{\mathrm{md}}, \Delta t^{\mathrm{oe}}, \Delta t^{\mathrm{rt}}$ | market-data, order-entry and round-trip latency (Books 10–13); stage latencies $X_i$ and percentiles $q_p(X)$ local to Book 13, p50/p99/p99.9 in prose |
+| $f^{\mathrm{make}}, f^{\mathrm{take}}$ | maker and taker fee per unit traded, negative for a rebate |
+| $q_t$, $\bar q$ | inventory and its bound (B11); parent size $X$, holdings $x_t$, trading rate $v_t=-\dot x_t$, participation $\pi_t$ local to B10's execution chapters |
+| $\eta$ | stays the vol-of-vol, **except** as a declared local symbol for the Almgren–Chriss temporary-impact coefficient (B10 ch. 14–16, 28, as in the literature) and the learning rate (B12); neither chapter uses a vol-of-vol. The square-root law's prefactor is $Y$: $I(Q)=Y\sigma_d\sqrt{Q/V_d}$ |
+| $\gamma$ | risk aversion in execution and market-making models (local; $\gamma(h)$ with an argument stays the autocovariance) |
+| $\lambda$ | stays an intensity; Kyle's $\lambda$ inside the Kyle sections only, $\lambda_{\mathrm K}$ elsewhere |
+| $\rho=\lambda/\mu$ | utilisation of a queue, local to Book 13 (as Book 4 ch. 8); $\rho$ is otherwise a correlation |
+| $\ell(y,\hat y)$, $\mathcal L_n(\theta)$ | per-observation loss (always two arguments) and empirical loss (always subscripted), B12 |
+| $x_t, u_t, g_{t+1}, G_t, \pi(u\mid x), V^\pi, Q^\pi$ | RL state, action, reward, return, policy, value functions (B12 ch. 17–18; avoids $s_t$ spread and $a_t$ ask) |
+| units | prices in code as integers of 1/10,000 currency unit; time as integer ns since midnight; `\qty{}{\nano\second}`, `\micro\second`, `\giga\hertz`, `\byte` |
+
 ## Gates
 
 `tools/gates.sh chapter <slug>/<NN-chapter>`, `make test-code CH=<slug>/<NN-chapter>`,

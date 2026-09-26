@@ -1,0 +1,328 @@
+\chapter{Memory Hierarchy and Caches}\label{ch:ll:memory-hierarchy-and-caches}
+
+On this book's laptop, reading one price level of an order book costs about a nanosecond when the level is in the
+core's first-level cache, three or four nanoseconds when it is in the second level, and about 150 nanoseconds when it
+has to come from memory: a factor of more than a hundred for the same instruction. Chapter~1's toy book, built on balanced trees
+whose nodes are scattered across the heap, spent most of its time waiting for such loads. Most of the difference
+between a fast order book and a slow one is not the algorithm but where its bytes live, and this chapter is about that:
+the levels of the hierarchy and their costs, what happens when two cores share a line, how virtual addresses are
+translated, and what the hardware does to hide all of it.
+
+\section{Cache levels, lines and associativity}
+
+\begin{definition}[Cache line, set-associative cache]\label{def:ll:memory-hierarchy-and-caches:line}
+Memory moves between the levels of the hierarchy in fixed blocks called \emph{cache lines}\index{cache line}, 64 bytes
+on current x86 processors. In a \emph{set-associative cache}\index{set-associative cache} with $S$ sets of $W$ ways, a
+line can be stored only in the set given by bits of its address, in any of that set's $W$ slots; the cache holds
+$S \cdot W$ lines.
+\end{definition}
+
+\begin{definition}[Cache miss, working set]\label{def:ll:memory-hierarchy-and-caches:miss}
+A \emph{cache miss}\index{cache miss} is an access to a line that is not in a given level, which must then be fetched
+from the next level down. The \emph{working set}\index{working set} of a piece of code over an interval is the set of
+lines it touches in that interval; the level whose capacity it fits in sets its speed.
+\end{definition}
+
+An address splits into three fields (\cref{fig:ll:memory-hierarchy-and-caches:split}): the low 6 bits are the offset
+within the 64-byte line; the next $\log_2 S$ bits choose the set; the rest, the tag, identify the line among those that
+map to the set. Two consequences for data layout. A structure that straddles two lines costs two misses where one would
+do. And addresses that differ by a multiple of $S \times 64$ bytes compete for the same $W$ slots: a program that walks
+several arrays whose strides are that multiple (a power of two, typically 4\,KiB) can miss in a cache that is mostly
+empty.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\draw[fill=gray!10] (0,0) rectangle (6.4,0.6); \node at (3.2,0.3) {tag};
+\draw[fill=omDef!15] (6.4,0) rectangle (8.8,0.6); \node at (7.6,0.3) {set index};
+\draw[fill=omThm!12] (8.8,0) rectangle (10.8,0.6); \node at (9.8,0.3) {offset};
+\node[anchor=south,align=center] at (3.2,0.65) {remaining bits of the address};
+\node[anchor=south,align=center] at (7.6,0.65) {bits 6--11\\ (64 sets)};
+\node[anchor=south,align=center] at (9.8,0.65) {bits 0--5\\ (64 bytes)};
+\draw[-Stealth,thick,omDef] (7.6,0) -- (7.6,-0.75);
+\foreach \w in {0,...,11} \draw[draw=omDef,fill=omDef!6] (4.6+0.5*\w,-0.8) rectangle (5.05+0.5*\w,-1.3);
+\node[anchor=north,align=center] at (7.35,-1.4) {the selected set: 12 ways, any of which may hold a line with this index};
+\end{tikzpicture}
+
+\omcaption{How an address selects its place in a \omterm{def:ll:memory-hierarchy-and-caches:line}{set-associative cache}. A 48~KiB, 12-way cache of 64-byte lines has 64
+sets; bits 6 to 11 of the address choose the set, so addresses 4\,KiB apart share a set.}\label{fig:ll:memory-hierarchy-and-caches:split}
+\end{omfigure}
+
+\begin{example}[Geometry of a first-level cache]\label{ex:ll:memory-hierarchy-and-caches:geometry}
+A 48~KiB, 12-way cache with 64-byte lines has $48 \times 1024 / (64 \times 12) = 64$ sets. The set index is bits 6 to
+11; addresses that are equal modulo $64 \times 64 = 4\,096$ bytes fall into the same set. Thirteen hot structures placed
+at the same offset of thirteen 4~KiB pages cannot all stay in this cache, although together they occupy 832 bytes.
+\end{example}
+
+\Cref{fig:ll:memory-hierarchy-and-caches:stairs} measures the hierarchy with a pointer chase: a buffer of $n$ slots, one
+per \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line}, laid out as a single random cycle, each slot holding the address of the next. Each load's address is
+the previous load's result, so no two loads overlap and the time per step is the latency of the level the buffer fits
+in. The staircase shows the first level up to 48~KiB at about \qty{1.1}{\nano\second} (five cycles), the second
+level up to about a megabyte and a half at about \qty{3.5}{\nano\second}, the third level from about three to eight
+megabytes at 15 to \qty{23}{\nano\second}, close to its published latency of 75 cycles or more (about
+\qty{20}{\nano\second}), and memory from about twelve megabytes on, at 100 to \qty{175}{\nano\second}: the
+low-power memory of a laptop, which a published measurement puts at 150 to 175 nanoseconds for this processor. The
+third level is 24~MiB, shared by all the cores; a random chase through a virtual machine's pages starts to miss in it
+well before its nominal size.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xmode=log,ymode=log,log basis x=2,xmin=4096,xmax=268435456,ymin=0.8,ymax=500,
+  xtick={4096,32768,262144,2097152,16777216,134217728},xticklabels={4 KiB,32 KiB,256 KiB,2 MiB,16 MiB,128 MiB},
+  ytick={1,2,5,10,20,50,100,200},yticklabels={1,2,5,10,20,50,100,200},
+  xlabel={working set (log scale)},ylabel={ns per load (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.2pt] table[x=bytes,y=random_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\addplot[omThm,thick,mark=square*,mark size=1.2pt] table[x=bytes,y=random_huge_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\addplot[omMeth,thick,dashed,mark=triangle*,mark size=1.2pt] table[x=bytes,y=sequential_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\legend{random order,{random order, huge pages},address order}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The memory staircase: time per dependent load through a buffer of one slot per \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line}, against the
+buffer's size. In address order the prefetcher hides almost all of it. Measured on a laptop (Intel Core Ultra 7 155H)
+under WSL2, no isolated cores, pinned to one CPU, the machine otherwise idle. Data: \texttt{bench\_mem.py}.}\label{fig:ll:memory-hierarchy-and-caches:stairs}
+\end{omfigure}
+
+\section{Coherence and false sharing}
+
+\begin{definition}[Cache coherence]\label{def:ll:memory-hierarchy-and-caches:coherence}
+\emph{Cache coherence}\index{cache coherence} is the protocol by which the private caches of several cores keep one
+view of each line: before a core writes a line it must obtain the line in an exclusive state, invalidating every other
+core's copy; a later read by another core must fetch the modified line from the writer. In the MESI family each line
+in each cache is Modified, Exclusive, Shared or Invalid.
+\end{definition}
+
+\begin{definition}[False sharing]\label{def:ll:memory-hierarchy-and-caches:false}
+\emph{False sharing}\index{false sharing} occurs when two cores repeatedly write different variables that lie in the
+same \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line}: neither shares data with the other, yet every write invalidates the other core's copy and the line
+travels between them.
+\end{definition}
+
+A market-data thread that updates a sequence counter and a strategy thread that updates its own statistics, placed next
+to each other in one structure, pay the price of the line moving between cores on every update, without any data
+being shared. \Cref{fig:ll:memory-hierarchy-and-caches:false} measures it: one thread incrementing a counter pays about
+\qty{4}{\nano\second} per atomic increment; two threads each incrementing their own counter on separate lines pay about
+the same; two threads whose counters share a line pay about five times as much. The cure is layout: give each
+independently written variable its own line (\texttt{CachePadded}, below), and keep variables written by one thread
+together and away from those written by another.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5cm,xbar,bar width=12pt,xmin=0,enlarge x limits={upper,value=0.15},
+  symbolic y coords={same line,padded,one thread},ytick=data,enlarge y limits=0.3,
+  xlabel={ns per atomic increment},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[y=layout,x=ns_per_increment]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_false.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:memory-hierarchy-and-caches:false}{False sharing}: two threads, pinned to two CPUs, each incrementing its own atomic counter 20 million times,
+with the counters on one \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} or on two. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated
+cores. Data: \texttt{bench\_mem.py}.}\label{fig:ll:memory-hierarchy-and-caches:false}
+\end{omfigure}
+
+\section{Translation buffers and huge pages}
+
+\begin{definition}[Translation lookaside buffer, huge page]\label{def:ll:memory-hierarchy-and-caches:tlb}
+Programs use virtual addresses, translated to physical addresses through page tables. The \emph{translation lookaside
+buffer}\index{translation lookaside buffer} (TLB) caches recent translations; a TLB miss makes the processor walk the
+page tables, several dependent memory accesses. A \emph{huge page}\index{huge page} is a page larger than the base
+4~KiB (2~MiB or 1~GiB on x86-64), which one TLB entry covers.
+\end{definition}
+
+The TLB's reach is its number of entries times the page size. A second-level TLB of 2\,048 entries covers 8~MiB of
+4~KiB pages and 4~GiB of 2~MiB pages; an order book, a symbol table and a few rings of a trading process can easily
+exceed the first and never the second. Linux offers \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} two ways: reserved pages from a pool, and transparent
+\omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages}, which the kernel assembles on its own; in the default \texttt{madvise} mode it does so only for regions the
+program has marked with \texttt{madvise(MADV\_HUGEPAGE)}. The kernel's documentation notes that the gain is larger
+under virtualisation, where each walk goes through two levels of page tables, the guest's and the hypervisor's. On
+this laptop, which is virtualised, a random chase over 256~MiB costs about \qty{180}{\nano\second} a step with 4~KiB
+pages and about \qty{150}{\nano\second} with \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} (\texttt{measured\_huge.csv}): the difference is
+the page walk.
+
+
+\section{Prefetching and access patterns}
+
+\begin{definition}[Hardware prefetching]\label{def:ll:memory-hierarchy-and-caches:prefetch}
+\emph{Hardware prefetching}\index{hardware prefetching} is the processor's fetching of lines before they are requested,
+by recognising patterns in recent misses: consecutive lines, constant strides.
+\end{definition}
+
+The dashed curve of \cref{fig:ll:memory-hierarchy-and-caches:stairs} is the same chase with the slots visited in address
+order: the prefetcher recognises the stream and the loads cost under \qty{2}{\nano\second} until the buffer leaves the
+second level, and four or five nanoseconds from memory, some thirty times less than the random chase. Nothing changed but
+the order. The practical rules follow: store what the hot path reads together in contiguous arrays, not in nodes linked
+by pointers; iterate in address order; keep the hot data of a message (price, quantity, side) in the first line of its
+structure; and when the access is truly random, as an order-id lookup is, make the table small enough to stay in cache
+(chapter~19).
+
+\section{Tutorial: measuring the staircase}\label{tut:ll:memory-hierarchy-and-caches:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Measure the latency of each level of the hierarchy, the cost of \omterm{def:ll:memory-hierarchy-and-caches:false}{false sharing} and the effect of \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge
+pages}. \textbf{End state:} \cref{fig:ll:memory-hierarchy-and-caches:stairs,fig:ll:memory-hierarchy-and-caches:false} and
+the huge-page table.
+\begin{tutsteps}
+\item \textbf{A ring of pointers.} Shuffle the slot order with Fisher--Yates, then store in each slot the address of the
+next: a single cycle through every line, which no prefetcher can predict.
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{52}{72}{Building and following a pointer-chase ring.}\label{lst:ll:memory-hierarchy-and-caches:chase}
+\item \textbf{\omterm{def:ll:memory-hierarchy-and-caches:tlb}{Huge pages} on request.} \texttt{Buffer} maps anonymous memory, asks for transparent \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} with
+\texttt{madvise}, and writes every page once so that no page fault happens later on the hot path (chapter~6).
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{27}{36}{A buffer with huge pages and pre-faulting.}\label{lst:ll:memory-hierarchy-and-caches:buffer}
+\item \textbf{A counter per line.} \texttt{CachePadded} aligns its value on a line of its own; two threads increment
+their counters with relaxed atomic additions, once padded and once packed in one structure.
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{22}{26}{A value alone on its cache line.}\label{lst:ll:memory-hierarchy-and-caches:padded}
+\item \textbf{Run} \texttt{python bench\_mem.py} (about a minute): the staircase with 4~KiB and \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} and in address
+order, the huge-page comparison over 256~MiB, and the false-sharing test on CPUs 2 and 4.
+\end{tutsteps}
+\textbf{What to change next.} Use a stride of 4\,096 bytes instead of 64 in the chase and find the \omterm{def:ll:memory-hierarchy-and-caches:miss}{working set} at which
+the first level fails, far earlier than 48~KiB; pin the two false-sharing threads to the same CPU and explain the result.
+\end{tutorial}
+
+\section{Build: memory placement tools}\label{bld:ll:memory-hierarchy-and-caches:memkit}
+
+\begin{build}
+\bfield{Purpose} The layout primitives every later component uses: counters and sequence numbers written by different
+threads (rings, chapter~12; the feed handler's statistics, chapter~18) and buffers that must not fault or miss the TLB
+on the hot path (books, journals).
+\bfield{Interface} C++20 \texttt{firm::memkit}: \texttt{kLine}, \texttt{CachePadded<T>}, \texttt{Buffer(bytes,
+huge)} with \texttt{data()}, \texttt{size()}, \texttt{huge\_requested()}, \texttt{chase\_ring(base, n, stride, random,
+seed)}, \texttt{chase(start, steps)}. Rust \texttt{firm\_memkit}: \texttt{CachePadded<T>}, \texttt{chase\_ring},
+\texttt{chase} on a byte buffer.
+\bfield{Rules} Padded values occupy whole lines; buffers are page-aligned, rounded up to the page size requested, and
+pre-faulted at construction; a failed huge-page request falls back to base pages and says so.
+\bfield{Acceptance tests} \texttt{code/firm/memkit/}: sizes and alignments of padded values, neighbouring padded
+values one line apart, a 2~MiB-rounded huge buffer, and the ring as a single cycle in both orders, in C++ and Rust.
+\bfield{Stretch} Report the \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} actually obtained, from \texttt{/proc/self/smaps}; allocate from reserved 1~GiB
+pages when the host has them.
+\end{build}
+
+\begin{omsources}
+\item U.~Drepper, ``What every programmer should know about memory'', LWN.net, 2007.
+\item M.~Papamarcos and J.~Patel, ``A low-overhead coherence solution for multiprocessors with private cache memories'',
+ISCA 1984.
+\item Linux kernel documentation, ``Transparent hugepage support''.
+\item Chips and Cheese, ``Intel's Redwood Cove: baby steps are still steps'' (2024) and ``Update on Meteor Lake DRAM
+latency measurements'' (2024).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:1}
+In a cache with 64-byte lines and 64 sets, which set does address \texttt{0x7f3a12345e48} map to, and what is its offset
+within the line?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:2}
+A 2~MiB, 16-way cache has 64-byte lines. How many sets does it have, and at what stride do addresses alias to the same
+set?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:3}
+A process uses 600~MiB of hot data. How many TLB entries does it need with 4~KiB pages, and with 2~MiB pages?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:4}
+A message structure holds an 8-byte sequence number written by the feed thread and a 4-byte counter written by the
+strategy thread, next to each other. What happens, and how do you fix it at a cost of how many bytes?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:5}
+From \cref{fig:ll:memory-hierarchy-and-caches:stairs}, how long does a book update that makes four dependent random
+loads take when its data fit in the second level, and when they come from memory?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:6}
+Why does the address-order chase stay fast far beyond the second level, while the random chase does not? What does that
+say about linked lists and balanced trees on a hot path?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:memory-hierarchy-and-caches:7}
+\emph{Coding.} Rewrite the Rust \texttt{chase} of \texttt{firm\_memkit} with raw pointers and \texttt{unsafe}, as the C++
+does, and compare both with the index version on a 64~MiB ring. Is the bounds check visible in the time per step? Why or
+why not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:memory-hierarchy-and-caches:8}
+\emph{Find the flaw.} ``We benchmarked our order-book update at \qty{20}{\nano\second} by applying the same add and
+delete messages to one instrument ten million times in a loop.''
+\end{exercise}
+
+\section{Problem: The Staircase}
+
+\begin{problem}[{Weekend problem --- how many books fit}]\label{pb:ll:memory-hierarchy-and-caches:1}
+A market-making process quotes a set of instruments. For each it keeps a dense price ladder of 256 levels per side,
+each level 32 bytes (price, quantity, order count, flags), plus 4~KiB of per-instrument state. The team wants every
+instrument's hot data in the second-level cache of the core that runs the strategy.
+
+\medskip\noindent\textbf{Part I --- The measurement.}
+\begin{enumerate}
+\item Read the latency of the first level, the second level and memory from
+\cref{fig:ll:memory-hierarchy-and-caches:stairs}.
+\item Where are the steps, and what capacities do they suggest?
+\item Why does the third-level step end at about eight megabytes, not at 24~MiB?
+\item What sets the height of the step between the second level and memory?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The layout.}
+\begin{enumerate}[resume]
+\item How many bytes does one instrument's hot data occupy?
+\item How many \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines}?
+\item If three quarters of a 2~MiB second level is available to the books, how many instruments fit?
+\item How many fit in a 48~KiB first level, at most?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- When they do not fit.}
+\begin{enumerate}[resume]
+\item The desk wants 300 instruments. What fraction of updates will miss the second level if instruments are updated
+uniformly at random, and the second level holds the most recent ones?
+\item If an update makes three dependent loads, what is its average memory time with that miss rate, taking the
+second-level and memory latencies of Part~I?
+\item What would \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} change, and why especially here?
+\item Name two layout changes that shrink the hot data.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the latency of each level on this laptop and the number of instruments whose book
+fits in the second level.
+\item Why is 32 bytes a good size for a level, and 48 a bad one?
+\item Should the ladder store levels as structures of four fields or four arrays of one field? When does each win?
+\item What does the chase measure that a sequential benchmark hides?
+\item Why must the benchmark visit every line once per lap?
+\item What is the cost of one false-shared counter in the book, per update?
+\item How would you confirm on the production host that the books stay in the second level?
+\item In one sentence: what decides the speed of an order book?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:1}
+Why is iterating over a \texttt{std::vector} faster than over a \texttt{std::list} of the same elements?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:2}
+What is \omterm{def:ll:memory-hierarchy-and-caches:false}{false sharing}? How would you detect it and fix it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:3}
+What is a TLB, and why do trading systems use \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:4}
+How would you measure the latency of each level of a machine's cache hierarchy?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:5}
+Two arrays of 4\,096 doubles are processed element by element together and the loop is unexpectedly slow. What might be
+happening?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:memory-hierarchy-and-caches:6}
+Design the memory layout of an order-id to order lookup for a feed with a million live orders, for the lowest p99.
+\end{interviewq}

@@ -1,0 +1,361 @@
+\chapter{Trees and Boosting}\label{ch:ml:trees-and-boosting}
+
+The firm's default gradient-boosted trees (300 trees of fifteen leaves) are fitted to ten years of a 300-stock panel
+and score $-0.19\%$ out of sample. A random search of twenty configurations finds one that scores 0.39\% on the
+validation months and 0.32\% on the test: four leaves, 200 slow trees. The search worked, for once. But rerun with four
+different random seeds, the defaults' validation score ranges from 0.00\% to 0.17\%, and a search that compared the
+candidates against one draw of the defaults could have called anything between the two a success. \omterm{def:ml:trees-and-boosting:boosting}{Gradient boosting} is
+the workhorse of the field on tabular data; this chapter builds it from trees, measures how it overfits on market data,
+and tunes it with the noise in view.
+
+\section{Trees}
+
+\begin{definition}[Decision tree]\label{def:ml:trees-and-boosting:tree}
+A \emph{decision tree}\index{decision tree} partitions the feature space by a sequence of binary splits $x_j\le c$,
+chosen greedily to reduce the loss most (for regression, the sum of squared errors), and predicts in each final cell,
+or leaf, the mean target of its training rows. Its capacity is set by its depth and by the minimum number of rows per
+leaf.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,level distance=1.25cm,level 1/.style={sibling distance=5.2cm},level 2/.style={sibling distance=2.6cm},
+  every node/.style={align=center},split/.style={draw=omDef,fill=omDef!10,rounded corners=2pt,inner sep=3pt},
+  leaf/.style={draw=omThm,fill=omThm!10,rounded corners=2pt,inner sep=3pt}]
+\node[split] {$c_0 \le 0.1$?}
+  child {node[split] {$c_2 \le -0.4$?}
+    child {node[leaf] {$+0.21\%$\\ \footnotesize 9\,300 rows}}
+    child {node[leaf] {$-0.18\%$\\ \footnotesize 17\,100 rows}}}
+  child {node[split] {$c_3 \le 0.5$?}
+    child {node[leaf] {$+0.12\%$\\ \footnotesize 14\,800 rows}}
+    child {node[leaf] {$+0.47\%$\\ \footnotesize 6\,800 rows}}};
+\node[font=\footnotesize,anchor=west] at (4.4,-0.1) {yes: left, no: right};
+\end{tikzpicture}
+
+\omcaption{A tree of depth two on ranked characteristics, as a schematic: each split sends a stock-month left or right,
+each leaf predicts the mean demeaned return of its training rows. The leaf values and counts are illustrative, not
+fitted.}\label{fig:ml:trees:tree}
+\end{omfigure}
+
+A tree captures interactions without being told (the right branch of \cref{fig:ml:trees:tree} lets characteristic~3
+matter only when characteristic~0 is high) and does not care about monotone transformations of the features. Its
+weakness is variance: the split points and the leaf means are fitted to noise. On the chapter's panel (300 stocks, 40
+ranked characteristics with factor risk, 160 training months, a ceiling of 0.77\% on the 80 test months) a tree of
+depth two scores 0.24\% out of sample, depth five $-0.20\%$, depth ten $-3.42\%$.
+
+\section{Bagging and random forests}
+
+\begin{definition}[Bagging, random forest, out-of-bag error]\label{def:ml:trees-and-boosting:bagging}
+\emph{Bagging}\index{bagging} (bootstrap aggregation) averages models fitted to bootstrap samples of the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set}.
+A \emph{random forest}\index{random forest} bags deep trees and, at each split, considers only a random subset of the
+features, to decorrelate the trees. The \emph{out-of-bag error}\index{out-of-bag error} scores each training row with
+the trees whose bootstrap sample did not contain it.
+\end{definition}
+
+\begin{proposition}[What averaging buys]\label{prop:ml:trees:bagging}
+If $B$ predictions have the same variance $\sigma^2$ and pairwise correlation $\rho$, their average has variance
+$\rho\sigma^2 + (1 - \rho)\sigma^2/B$.
+\end{proposition}
+
+\begin{proof}
+$\Var(\frac1B\sum_bf_b) = \frac1{B^2}(B\sigma^2 + B(B-1)\rho\sigma^2) = \rho\sigma^2 + (1-\rho)\sigma^2/B$.
+\end{proof}
+
+More trees remove only the second term; the first is removed by making the trees less correlated, which is what the
+random feature subsets are for. A forest of 40 trees (30\% of the features per split, 300 rows per leaf) scores 0.20\%
+on the test months. Its out-of-bag R-squared is 0.42\%, twice as good, and its in-sample one 2.76\%. The out-of-bag
+rows are not out of sample on a panel: each shares its month, and so its factor returns, with hundreds of in-bag rows
+that have similar characteristics. It is chapter~2's warning about out-of-bag scores, in another guise.
+
+\section{Gradient boosting}
+
+\begin{definition}[Gradient boosting, learning rate]\label{def:ml:trees-and-boosting:boosting}
+\emph{Gradient boosting}\index{gradient boosting} builds an additive model $F_M(x) = F_0 + \eta\sum_{m=1}^Mh_m(x)$ one
+tree at a time: tree $h_m$ is fitted to the negative gradient of the loss with respect to the current predictions,
+$-\partial\ell(y_i, F_{m-1}(x_i))/\partial F$, and added with a factor $\eta\in(0,1]$. The \emph{learning
+rate}\index{learning rate} $\eta$ is the step multiplier of an iterative fit: here the shrinkage of each tree, in
+gradient descent the size of each step (Book~4, chapter~24). Following the ML convention, $\eta$ denotes it in this
+book as a local symbol.
+\end{definition}
+
+\begin{proposition}[Boosting as gradient descent in function space]\label{prop:ml:trees:gradient}
+For the squared loss $\ell(y, F) = \frac12(y - F)^2$ the negative gradient is the residual $y_i - F_{m-1}(x_i)$, so each
+tree fits the current residuals. For any differentiable loss, one step $F_m = F_{m-1} + \eta h_m$ with $h_m$ equal to the
+negative gradient at the training points decreases the empirical loss for small enough $\eta$.
+\end{proposition}
+
+\begin{proof}
+$\partial\frac12(y - F)^2/\partial F = -(y - F)$. For the second claim, $\mathcal L_n(F_{m-1} + \eta h) =
+\mathcal L_n(F_{m-1}) - \eta\frac1n\sum_ig_i^2 + O(\eta^2)$ with $g_i$ the gradient at row $i$, when $h = -g$ at the
+training points; a tree approximates $-g$ and the same expansion holds with $\sum_ig_ih(x_i) < 0$.
+\end{proof}
+
+The Huber loss of Book~4 (chapter~15) is the usual choice when returns have fat tails; LightGBM's histogram-based trees,
+grown leaf by leaf, make the method fast enough to fit hundreds of models a day (Ke et al.).
+
+\section{Regularisation, early stopping and monotonic constraints}
+
+\begin{definition}[Early stopping]\label{def:ml:trees-and-boosting:early}
+\emph{Early stopping}\index{early stopping} stops an iterative fit (more trees, more epochs) at the iteration where the
+loss on a validation block, purged from the training rows, is lowest.
+\end{definition}
+
+The number of trees and the \omterm{def:ml:trees-and-boosting:boosting}{learning rate} trade against each other (\cref{fig:ml:trees:early}). At $\eta = 0.1$ the
+validation R-squared peaks after 34 trees and collapses afterwards; the stopped model scores 0.05\% on the test months,
+the model run to 600 trees $-3.38\%$. At $\eta = 0.01$ the peak comes after 233 trees and is higher and flatter; the
+stopped model scores 0.26\% on the test months, and running to 600 trees costs little ($0.03\%$). A small \omterm{def:ml:trees-and-boosting:boosting}{learning rate}
+is a regulariser in its own right: each tree moves the fit so little that noise must be fitted slowly.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={number of trees},ylabel={validation $R^2$ (\%)},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=600,ymin=-1.2,ymax=0.6,grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma,restrict y to domain=-1.2:1]
+\addplot[omThm,very thick] table[x=trees,y=lr01]{figdata/ml/05-trees-and-boosting/early.csv};
+\addplot[omDef,very thick] table[x=trees,y=lr001]{figdata/ml/05-trees-and-boosting/early.csv};
+\draw[omThm,dashed] (axis cs:34,-1.2) -- (axis cs:34,0.6);
+\draw[omDef,dashed] (axis cs:233,-1.2) -- (axis cs:233,0.6);
+\legend{learning rate 0.1,learning rate 0.01}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Validation R-squared (40 purged months) of boosted trees as trees are added, at two \omterm{def:ml:trees-and-boosting:boosting}{learning rates}; dashed,
+the early-stopping points (34 and 233 trees). The curve at $\eta = 0.1$ leaves the frame after about 340 trees and reaches
+$-2.9\%$ at 600. Data: \texttt{ml\_trees.early}.}\label{fig:ml:trees:early}
+\end{omfigure}
+
+\begin{definition}[Monotonic constraint]\label{def:ml:trees-and-boosting:monotone}
+A \emph{monotonic constraint}\index{monotonic constraint} restricts a model to be non-decreasing (or non-increasing) in a
+feature, all others fixed. In a tree ensemble it is enforced by allowing a split on that feature only when the left
+child's value does not exceed the right child's (or the reverse), propagated down the tree.
+\end{definition}
+
+Microstructure often knows a sign the data are too noisy to show. On firm.tape sessions a larger order-flow imbalance
+should never forecast a lower mid price (Book~7, chapter~8). Boosted trees fitted to five-second mid changes on eight
+ten-minute sessions (912 non-overlapping labels, ten order-book features) and tested on eight more score an R-squared of
+0.333 unconstrained, 0.364 with the seven imbalance and flow features constrained to act positively. Unconstrained, a
+push of half a standard deviation in the five-second imbalance lowers the forecast for 7.0\% of the test rows; with the
+constraints, for none (\cref{fig:ml:trees:pdp}). The constraint is prior knowledge used as regularisation, and it is also
+a guarantee a risk committee can read. (The R-squared are high because the simulated mid trends over a few seconds, a
+property of \texttt{firm.tape} Book~7 documents; the comparison is the point, not the level.)
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.4cm,xlabel={five-second order-flow imbalance (standardised units)},
+  ylabel={average forecast (ticks)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=x,y=free]{figdata/ml/05-trees-and-boosting/pdp.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.2pt] table[x=x,y=mono]{figdata/ml/05-trees-and-boosting/pdp.csv};
+\legend{unconstrained,monotone}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Partial dependence of the five-second forecast on the order-flow imbalance (the feature swept over its 2nd to
+98th percentile, the others at their observed values), for boosted trees without and with \omterm{def:ml:trees-and-boosting:monotone}{monotonic constraints}. Data:
+\texttt{ml\_trees.partial\_dependence} on \texttt{firm.tape}.}\label{fig:ml:trees:pdp}
+\end{omfigure}
+
+\section{Tuning under noise}
+
+A random search draws twenty configurations (leaves, \omterm{def:ml:trees-and-boosting:boosting}{learning rate}, trees, rows per leaf, row and column sampling, an
+$\ell_2$ penalty) and scores each on the validation block (\cref{fig:ml:trees:tuning}). Their validation R-squared
+ranges from $-0.54\%$ to 0.39\%. The winner has four leaves, a \omterm{def:ml:trees-and-boosting:boosting}{learning rate} of 0.02 and 200 trees; retrained with four
+seeds it scores 0.36--0.39\% (a standard deviation of 0.014 points), and 0.32\% on the test months, 0.07 points below its
+validation score, as chapter~3 predicts for a winner. The defaults, retrained with the same four seeds, score between
+0.00\% and 0.17\% (a standard deviation of 0.07 points) and $-0.19\%$ on the test months.
+
+Two lessons come out of it. Complex configurations are noisy as well as bad: the seed-to-seed spread of the defaults is
+five times that of the winner, so a single validation run of a complex model is a poor estimate of it, and a search that
+rescores its top candidates with several seeds is cheap insurance. And the good region is a plateau: six of the
+twenty configurations sit within 0.04 points of the best. Choosing the least complex configuration within one seed
+standard deviation of the best (four leaves, 1\,000 rows per leaf, no subsampling) gives 0.35\% on validation and 0.31\%
+on test, as good, with a model a seventh as flexible by the measure of \cref{fig:ml:trees:tuning}.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.8cm,xlabel={complexity, $\log_{10}(\text{leaves}\times\text{trees}\times\eta/\sqrt{\text{rows per leaf}})$},
+  ylabel={validation $R^2$ (\%)},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  ymin=-0.65,ymax=0.5,xmin=-0.5,xmax=1.8,xtick={-0.4,0,0.4,0.8,1.2,1.6},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=1.8pt,gray] table[x=complexity,y=score]{figdata/ml/05-trees-and-boosting/tuning.csv};
+\addplot[only marks,mark=square*,mark size=2.6pt,omThm] table[x=complexity,y=score]{figdata/ml/05-trees-and-boosting/tuning_best.csv};
+\addplot[only marks,mark=diamond*,mark size=3pt,omDef] table[x=complexity,y=score]{figdata/ml/05-trees-and-boosting/tuning_plateau.csv};
+\addplot[only marks,mark=triangle*,mark size=2.4pt,omProp] table[x=complexity,y=score]{figdata/ml/05-trees-and-boosting/tuning_default.csv};
+\legend{other configurations,best,plateau choice,defaults (4 seeds)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Twenty random configurations of boosted trees on the validation months, against a crude measure of their
+flexibility; the defaults retrained with four seeds. Data: \texttt{ml\_trees.tuning}.}\label{fig:ml:trees:tuning}
+\end{omfigure}
+
+\begin{method}[Tuning boosted trees on market data]\label{met:ml:trees:tuning}
+\begin{enumerate}
+\item Fix a purged validation block (or purged folds) and never tune on the test.
+\item Start from a small \omterm{def:ml:trees-and-boosting:boosting}{learning rate} (0.01--0.03) with \omterm{def:ml:trees-and-boosting:early}{early stopping}, few leaves and many rows per leaf.
+\item Search randomly over the regularisers; rescore the top few candidates with several seeds.
+\item Choose from the plateau (the least flexible within one seed standard deviation of the best), not the peak.
+\item Declare \omterm{def:ml:trees-and-boosting:monotone}{monotonic constraints} wherever the economics fixes a sign.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: tuning in the fog}\label{tut:ml:trees-and-boosting:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Fit trees, a forest and boosted trees to the panel; stop boosting early at two \omterm{def:ml:trees-and-boosting:boosting}{learning rates}; run a
+random search and choose from its plateau; constrain order-book features on \texttt{firm.tape}. \textbf{End state:}
+the chapter's numbers and \cref{fig:ml:trees:early,fig:ml:trees:pdp,fig:ml:trees:tuning}.
+\begin{tutsteps}
+\item \textbf{\omterm{def:ml:trees-and-boosting:early}{Early stopping}} through LightGBM's callbacks, keeping the validation curve.
+\omcode{code/firm/gbdt/firm_gbdt.py}{38}{48}{Early stopping on a purged validation block.}\label{lst:ml:trees:early}
+\item \textbf{The plateau rule and the model dump}: the fitted trees become a dictionary that a NumPy function
+evaluates exactly (chapter~26 compiles the same dictionary).
+\omcode{code/firm/gbdt/firm_gbdt.py}{63}{98}{Choosing from the plateau; evaluating dumped trees.}\label{lst:ml:trees:dump}
+\item \textbf{Run} \texttt{ml\_trees.family()}, \texttt{early()}, \texttt{tuning()}, \texttt{monotone()} and
+\texttt{fig\_trees.py}.
+\end{tutsteps}
+\textbf{What to change next.} Constrain the order-flow imbalance with the wrong sign and measure the cost; rescore every
+configuration of the search with four seeds and see whether the winner changes.
+\end{tutorial}
+
+\section{Build: the firm's boosted trees}\label{bld:ml:trees-and-boosting:gbdt}
+
+\begin{build}
+\bfield{Purpose} One way to fit, stop, constrain, ensemble, choose and export gradient-boosted trees.
+\bfield{Interface} \texttt{make(params, monotone, names, seed)}, \texttt{DEFAULTS}, \texttt{fit\_early\_stop(params,
+X, y, Xv, yv, max\_trees, patience, monotone, names, seed)}, \texttt{SeedEnsemble(params, seeds, monotone, names)},
+\texttt{plateau\_select(scores, se, complexity)}, \texttt{to\_dict(model)}, \texttt{predict\_dict(d, X)}.
+\bfield{Rules} Deterministic, single-threaded fits; the validation block is purged by the caller; constraints are
+declared by feature name, never by column position; exported dictionaries reproduce predictions exactly, missing values
+included.
+\bfield{Acceptance tests} \texttt{code/firm/gbdt/tests/}: two fits give identical predictions; the dictionary evaluator
+matches LightGBM with missing values; \omterm{def:ml:trees-and-boosting:early}{early stopping} keeps the best iteration and the dump holds only it; a monotone
+feature never lowers the prediction; seed ensembles average; the plateau rule picks the simplest near-best candidate.
+\bfield{Stretch} Quantile and Huber losses through the same interface; a warm-started refit that adds trees for new
+months (chapter~12).
+\end{build}
+
+\begin{omsources}
+\item L.~Breiman, ``Random forests'', \emph{Machine Learning} 45, 2001.
+\item J.~H.~Friedman, ``Greedy function approximation: a gradient boosting machine'', \emph{Annals of Statistics} 29(5),
+2001.
+\item G.~Ke et al., ``LightGBM: a highly efficient gradient boosting decision tree'', \emph{Advances in Neural Information
+Processing Systems} 30, 2017.
+\item T.~Chen and C.~Guestrin, ``XGBoost: a scalable tree boosting system'', \emph{KDD}, 2016.
+\item L.~Grinsztajn, E.~Oyallon and G.~Varoquaux, ``Why do tree-based models still outperform deep learning on typical
+tabular data?'', \emph{NeurIPS Datasets and Benchmarks}, 2022.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:trees-and-boosting:1}
+Fifty trees each have prediction variance $\sigma^2$ and pairwise correlation 0.3. What is the variance of their
+average? And with infinitely many trees?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:trees-and-boosting:2}
+A tree splits 1\,000 rows into two leaves of 400 and 600 rows whose mean targets are $-0.1$ and $+0.2$. The overall
+mean is $0.08$. By how much does the split reduce the sum of squared errors?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:trees-and-boosting:3}
+Boosting with squared loss starts from $F_0 = 0$; a row has target 1.0 and the first tree predicts 0.8 for it. With
+$\eta = 0.1$, what is the row's residual after the first step? What would it be after ten steps if every tree, the first
+included, predicted its current residual exactly?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:trees-and-boosting:4}
+Why is the forest's out-of-bag R-squared (0.42\%) twice its test R-squared (0.20\%) on the panel?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:trees-and-boosting:5}
+The defaults' validation score over four seeds is 0.17, 0.11, 0.09 and 0.00\%. A candidate scores 0.14\% on one seed.
+Is it better than the defaults? What would you do before deciding?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:trees-and-boosting:6}
+\emph{Find the flaw.} ``We used \omterm{def:ml:trees-and-boosting:early}{early stopping} on the test months to pick the number of trees, and report the test
+R-squared at that point.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:trees-and-boosting:7}
+\emph{Coding.} In \texttt{ml\_trees.monotone}, constrain the five-second order-flow imbalance to act \emph{negatively}
+(all other constraints as in the chapter). Report the test R-squared and explain the result.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:trees-and-boosting:8}
+Show that with squared loss and a \omterm{def:ml:trees-and-boosting:boosting}{learning rate} $\eta$, if every tree fitted the residuals exactly, a row's residual after
+$M$ trees would be $(1 - \eta)^M$ times its target; explain why this makes \omterm{def:ml:trees-and-boosting:early}{early stopping} and a small \omterm{def:ml:trees-and-boosting:boosting}{learning rate}
+substitutes.
+\end{exercise}
+
+\section{Problem: Tuning in the Fog}
+
+\begin{problem}[{Weekend problem --- twenty configurations and a plateau}]\label{pb:ml:trees-and-boosting:1}
+The chapter's panel: 300 stocks, forty characteristics with factor risk, 160 training months (the last 40 of them as a
+purged validation block when tuning), 80 test months.
+
+\medskip\noindent\textbf{Part I --- Single trees and forests.}
+\begin{enumerate}
+\item What do trees of depth 2, 5 and 10 score out of sample, and why the ordering?
+\item What does the forest score out of sample, out of bag and in sample?
+\item Why is the out-of-bag score optimistic on a panel?
+\item What does \cref{prop:ml:trees:bagging} say more trees can and cannot do?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Boosting and \omterm{def:ml:trees-and-boosting:early}{early stopping}.}
+\begin{enumerate}[resume]
+\item What do the defaults score on the test months?
+\item Where does \omterm{def:ml:trees-and-boosting:early}{early stopping} stop at $\eta = 0.1$ and $0.01$, and what do the stopped models score?
+\item What would running to 600 trees have cost at each \omterm{def:ml:trees-and-boosting:boosting}{learning rate}?
+\item Why is a small \omterm{def:ml:trees-and-boosting:boosting}{learning rate} a regulariser?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The search.}
+\begin{enumerate}[resume]
+\item What range of validation scores do the twenty configurations cover?
+\item What is the winner, and what does it score with four seeds and on the test months?
+\item How noisy are the defaults across seeds compared with the winner?
+\item Which configuration does the plateau rule choose, and what does it score?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Constraints and the verdict.}
+\begin{enumerate}[resume]
+\item What do \omterm{def:ml:trees-and-boosting:monotone}{monotonic constraints} do to the order-book model's R-squared and to its violations?
+\item Why can a constraint improve an out-of-sample score?
+\item State the \emph{named result}: the seed standard deviation of the defaults' and of the winner's validation
+score against the gain from tuning, and the winner's validation-to-test gap.
+\item Which configuration would you put in production, and why?
+\item How many seeds would you use to rescore the top candidates of a search?
+\item What should the research log record about the search?
+\item What would change with ten times more stocks?
+\item In one sentence: how should boosted trees be tuned on market data?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle}]\label{iq:ml:trees-and-boosting:1}
+Explain the difference between \omterm{def:ml:trees-and-boosting:bagging}{bagging} and boosting.
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{mle}]\label{iq:ml:trees-and-boosting:2}
+Which \omterm{def:ml:why-financial-machine-learning-is-different:sets}{hyperparameters} of a gradient-boosted model would you tune first on noisy data, and in which direction?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:trees-and-boosting:3}
+Why might a \omterm{def:ml:trees-and-boosting:bagging}{random forest}'s \omterm{def:ml:trees-and-boosting:bagging}{out-of-bag error} be misleading on financial panel data?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:trees-and-boosting:4}
+What is a \omterm{def:ml:trees-and-boosting:monotone}{monotonic constraint}, and give two features of a trading model you would constrain.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:trees-and-boosting:5}
+Two boosting configurations differ by 0.03 points of validation R-squared. How do you decide between them?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, mle}]\label{iq:ml:trees-and-boosting:6}
+Derive why boosting with squared loss fits residuals, and what changes with a Huber loss.
+\end{interviewq}

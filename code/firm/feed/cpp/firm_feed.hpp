@@ -1,6 +1,6 @@
 // Feed normaliser (build of Book 1, Chapter 28), C++20. Same wire format as firm_feed.py.
 // Header only. No allocation per message on the decode path; the book uses standard containers,
-// which a production book would replace (One Quant Book 12).
+// which a production book would replace (One Quant Book 13).
 #pragma once
 #include <cstddef>
 #include <cstdint>

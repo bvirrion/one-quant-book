@@ -1,0 +1,494 @@
+\chapter{Linux Tuning}\label{ch:ll:linux-tuning}
+
+Run a thread that does nothing but read the \omterm{def:ll:cpu-microarchitecture:tsc}{time-stamp counter} in a loop, and record every gap between two consecutive
+readings longer than \qty{200}{\nano\second}, when one pass of the loop takes about fifteen. Each such gap is a moment when
+the thread was not running: something else had the CPU. On the laptop of this book, pinned to a CPU that no other program
+of ours uses, the thread loses about 1.3\% of its time: some 750 times a second for five microseconds or more, a few
+times a second for more than a hundred, and every few seconds for a millisecond or more. A market-data
+message that arrives during a gap waits for the rest of it. None of this is the program's fault, and none of it can be
+fixed in the program: it is the operating system doing its own work on the CPU the program thought it had. This chapter is
+about taking the CPU back. It moves the kernel's work, the interrupts and the timer tick off the cores that run the hot
+path, replaces sleeping with polling, keeps the program's memory in RAM, and ends with a build that audits a host against
+the placement plan of chapter~4 before a trading process is allowed to start on it.
+
+\section{Core isolation and CPU affinity}
+
+\begin{definition}[CPU affinity, core isolation, housekeeping core]\label{def:ll:linux-tuning:isolation}
+The \emph{CPU affinity}\index{CPU affinity} of a thread is the set of CPUs the scheduler may run it on; it is set with
+\texttt{sched\_setaffinity} (or \texttt{taskset} from a shell) and inherited by the threads a thread creates. \emph{Core
+isolation}\index{core isolation} removes CPUs from the scheduler's load balancing, so that no thread runs on them unless its
+affinity names them explicitly, and moves the kernel's own unbound work away from them. A \emph{housekeeping
+core}\index{housekeeping core} is a CPU left out of the isolated set, which runs everything else: the kernel's work, the
+interrupts of devices the hot path does not use, and the process's cold threads.
+\end{definition}
+
+Affinity alone fixes where a thread runs, not what else runs there: a pinned thread still shares its CPU with any other
+runnable task the scheduler places on it, with kernel threads, and with interrupts. The kernel documentation calls all of
+these ``noise'', asynchronous (interrupts, timers, work queues, kernel threads) or synchronous (system calls and \omterm{def:ll:cpp-for-latency-i-memory:fault}{page
+faults}), and notes that it usually goes unnoticed: the timer interrupt can run 1\,024 times a second ``without a significant
+and measurable impact most of the time''. The exceptions it names are workloads such as very low latency network processing.
+Isolation is how the noise is moved: the boot parameter \texttt{isolcpus} (with its default \texttt{domain} flag) takes CPUs
+out of ``the general SMP balancing and scheduling algorithms'', irreversibly until the next boot, and control-group cpusets
+do the same at run time. A thread reaches an isolated CPU only through its affinity, which is exactly what chapter~9's
+\texttt{firm.affinity} sets from chapter~4's plan.
+
+\Cref{fig:ll:linux-tuning:hiccups} shows what the hook's thread sees in three situations on this untuned laptop. Pinned
+alone or left free to move, it loses about one percent of its time in gaps of microseconds, and a few gaps a second reach
+a hundred microseconds or more. Sharing its CPU with a second spinning thread, it loses about half of it, about 120 times a
+second for about four milliseconds each: the scheduler hands the CPU to the rival for a slice, and a slice of that length
+matches the period of this kernel's tick, which runs 250 times a second (its configuration, \texttt{CONFIG\_HZ}). The shared case is the one that
+isolation removes outright; the small gaps of the other two need the rest of this chapter, and some of them, on a virtual
+machine, belong to the hypervisor, which the guest cannot see or tune.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,xmode=log,ymode=log,log origin y=infty,xmin=150,xmax=1.3e7,ymin=0.1,ymax=20000,
+  xlabel={gap length $x$ (ns, log scale)},ylabel={gaps per second $\ge x$ (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  unbounded coords=discard,filter discard warning=false,
+  xtick={1e3,1e4,1e5,1e6,1e7},xticklabels={\qty{1}{\micro\second},\qty{10}{\micro\second},\qty{100}{\micro\second},
+  \qty{1}{\milli\second},\qty{10}{\milli\second}},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.2pt] table[x=threshold_ns,y=alone]{figdata/low-latency/13-linux-tuning/measured_hiccups.csv};
+\addplot[omMeth,thick,dashed,mark=square*,mark size=1.2pt] table[x=threshold_ns,y=unpinned]{figdata/low-latency/13-linux-tuning/measured_hiccups.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.6pt] table[x=threshold_ns,y=shared]{figdata/low-latency/13-linux-tuning/measured_hiccups.csv};
+\legend{pinned alone,unpinned,{pinned, sharing its CPU}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The hiccup meter: how often a thread spinning on the \omterm{def:ll:cpu-microarchitecture:tsc}{time-stamp counter} is kept from running for at least $x$,
+over five seconds, pinned to a CPU no other program of ours uses, free to move, and pinned to a CPU shared with a second
+spinning thread. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores, benchmark at normal
+priority on an otherwise idle machine. Data: \texttt{bench\_tuning.py}.}\label{fig:ll:linux-tuning:hiccups}
+\end{omfigure}
+
+On a tuned host the plan of chapter~4 becomes a boot configuration. \Cref{fig:ll:linux-tuning:host} draws it for the
+two-socket fixture of that chapter: the three hot threads on three cores of the network card's socket, their hyper-threading
+siblings taken offline (the kernel's own checklist says to avoid SMT, ``to prevent your hardware thread from being
+`preempted' by another one''), the card's interrupts on housekeeping CPUs of the same socket, and everything else on the
+rest. The documentation asks for at least one housekeeping CPU, preferably one per \omterm{def:ll:multi-socket-machines-and-interconnects:numa}{NUMA node}; a trading host keeps several,
+since the logger, the monitoring agents and the kernel all live there, and a housekeeping CPU that is itself overloaded delays
+the work (log draining, timers) that the hot path hands to it.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,cpu/.style={draw=gray!70,minimum width=0.62cm,minimum height=0.5cm,inner sep=0pt}]
+\foreach \s/\y in {0/0,1/-1.9} {
+  \node[anchor=east,font=\footnotesize] at (-0.2,\y-0.3) {socket \s};
+  \foreach \k in {0,...,7} {
+    \pgfmathtruncatemacro{\a}{16*\s+\k}\pgfmathtruncatemacro{\b}{16*\s+\k+8}
+    \node[cpu,fill=gray!12] (c\a) at (0.7*\k+0.3,\y) {\a};
+    \node[cpu,fill=gray!12] (c\b) at (0.7*\k+0.3,\y-0.6) {\b};
+  }
+}
+\foreach \c in {16,17,18,19,20} {\node[cpu,fill=omDef!30] at (c\c) {\c};}
+\foreach \c in {21,22,23} {\node[cpu,fill=omThm!55,text=white,font=\scriptsize\bfseries] at (c\c) {\c};}
+\foreach \c in {29,30,31} {\node[cpu,fill=white,draw=gray!70,dashed,text=gray] at (c\c) {\c};}
+\node[draw=omDef,thick,fill=omDef!8,align=center] (nic) at (1.7,-3.55) {network card, node 1};
+\draw[omDef,thick,-Stealth] (nic.north) -- node[right,font=\scriptsize]{interrupts to CPUs 16--20} (1.7,-2.75);
+\foreach \i/\f/\d/\t in {0/omThm!55/solid/{isolated, tickless: feed, strategy, gateway},1/white/dashed/{their siblings, offline},
+  2/omDef!30/solid/{the card's interrupts (node 1)},3/gray!12/solid/{housekeeping: kernel, logger, the rest}} {
+  \draw[draw=gray!70,fill=\f,\d] (6.1,-0.5*\i-0.1) rectangle ++(0.35,0.3);
+  \node[anchor=west,font=\footnotesize] at (6.5,-0.5*\i+0.05) {\t};
+}
+\end{tikzpicture}
+
+\omcaption{A tuned host for chapter~4's two-socket fixture: each column is a physical core with its two hardware threads.
+The boot line \texttt{isolcpus=21-23,29-31 nohz\_full=21-23 rcu\_nocbs=21-23 irqaffinity=0-15} with the siblings taken
+offline, the card's interrupt queues bound to CPUs 16--20; the build's audit accepts this host (the \texttt{tuned}
+fixture).}\label{fig:ll:linux-tuning:host}
+\end{omfigure}
+
+\section{Interrupts and their affinity}
+
+\begin{definition}[Interrupt affinity]\label{def:ll:linux-tuning:irq}
+The \emph{interrupt affinity}\index{interrupt affinity} of an interrupt line is the set of CPUs allowed to handle it, read and
+written in \path{/proc/irq/N/smp_affinity_list}; the boot parameter \texttt{irqaffinity} sets the default for lines that no one
+configures.
+\end{definition}
+
+An interrupt runs its handler on whichever CPU receives it, in the middle of whatever that CPU was doing: the network card
+announcing a packet, a disk finishing a write, another CPU asking this one to flush its translation buffer. On an untuned
+machine every line may go to every CPU: the audit of this laptop in the build below finds the default mask and all of its
+active lines allowed on the CPUs that chapter~4 would give the hot path. The kernel documentation's instruction is short:
+``isolate the IRQs whenever possible, so that they don't fire on the target CPUs''. Two details make it harder than writing a
+mask. Many distributions run \texttt{irqbalance}, a daemon that periodically spreads interrupts across CPUs and would undo a
+hand-made placement; the Red Hat real-time tuning guide says it is not needed where applications are bound to CPUs, and
+disables it. And some interrupts belong on a hot core's socket but not on the core: the network card's receive queues should
+interrupt a housekeeping CPU of the card's node (\cref{fig:ll:linux-tuning:host}), so that the kernel's packet processing
+leaves the data in the socket's shared cache, where the hot threads read it, rather than across the interconnect
+(chapter~4).
+
+\begin{dated}{2026-09}{Distribution tuning profiles}\label{dat:ll:linux-tuning:rhel}
+Red Hat's guide to optimising RHEL~9 for Real Time for low-latency operation (consulted September 2026) walks through the
+same steps as this chapter: isolating CPUs with the TuneD real-time profile's \texttt{isolated\_cores} variable, disabling
+\texttt{irqbalance} and binding interrupts by hand, locking memory with \texttt{mlock} and \texttt{mlockall}, and the
+real-time throttling parameters of \cref{sec:ll:linux-tuning:rt}. Profiles and their variable names change between releases;
+the kernel parameters they set are the stable part.
+\end{dated}
+
+\section{Tickless kernels and housekeeping}
+
+\begin{definition}[Tickless kernel]\label{def:ll:linux-tuning:nohz}
+A \emph{tickless kernel}\index{tickless kernel} (adaptive ticks, \texttt{nohz\_full}) stops the periodic scheduling-clock
+interrupt on listed CPUs while each runs a single task, and moves the work that interrupt did for them (timekeeping, a residual
+once-a-second tick, the callbacks of the read-copy-update mechanism) to housekeeping CPUs.
+\end{definition}
+
+The scheduling-clock interrupt, the tick, lets the kernel account time, run timers and decide whether to switch tasks,
+100 to 1\,000 times a second depending on the build. A CPU with a single runnable task has nothing to switch to, and the
+kernel's documentation on adaptive ticks puts the gain precisely: real-time applications ``improve their worst-case response
+times by the maximum duration of a scheduling-clock interrupt''. The same document lists the conditions: the kernel must be
+built with \texttt{CONFIG\_NO\_HZ\_FULL} (this laptop's is not), the CPU must run one task only, the thread must stay out of
+the kernel (system calls and \omterm{def:ll:cpp-for-latency-i-memory:fault}{page faults} bring the noise back), and at least one CPU must keep ticking for timekeeping.
+Read-copy-update callbacks, deferred work the kernel queues on each CPU, go with the tick: \texttt{nohz\_full} offloads them
+from the listed CPUs, and \texttt{rcu\_nocbs} does so explicitly. The price is paid elsewhere: entering and leaving the kernel
+costs more on a tickless CPU, and the housekeeping CPUs take the offloaded work.
+
+What does a gap cost a message? The hook's thread spends its time either running or stopped, and a message arriving at a
+random moment waits only if it arrives during a stop.
+
+\begin{proposition}[The wait added by gaps]\label{prop:ll:linux-tuning:wait}
+A thread that must handle each message immediately is stopped during gaps of lengths $g_1,\dots,g_n$ in an observation of
+length $T$. A message arriving at a uniformly random moment of $[0,T]$ waits, beyond its own processing,
+\[
+\E[W] = \frac{1}{2T}\sum_{i=1}^{n} g_i^2, \qquad \P(W > x) = \frac{1}{T}\sum_{i=1}^{n} (g_i - x)^+ ,
+\]
+and the fraction of time during which it would wait at all is $\sum_i g_i/T$.
+\end{proposition}
+
+\begin{proof}
+The message falls inside gap $i$ with probability $g_i/T$, and then its position in the gap is uniform, so it waits a
+remaining time $U_i$ uniform on $[0, g_i]$, with mean $g_i/2$ and $\P(U_i > x) = (1 - x/g_i)^+$. Outside the gaps it does
+not wait. Summing over the gaps gives $\E[W] = \sum_i (g_i/T)(g_i/2)$ and $\P(W > x) = \sum_i (g_i/T)(1 - x/g_i)^+$.
+\end{proof}
+
+The squares matter: the wait is dominated by the long gaps, not the frequent ones. A tick of \qty{2}{\micro\second} at
+250~Hz steals 0.05\% of the time and adds half a nanosecond on average; a single gap of \qty{1}{\milli\second} a second steals
+0.1\% but adds \qty{500}{\nano\second} on average and makes one message in two thousand wait more than half a millisecond.
+On the laptop, pinned alone, the meter's gaps give an average added wait of about three microseconds (it moves by a factor
+of two or more from run to run, with the run's longest gap: the squares at work), a wait beyond \qty{10}{\micro\second}
+for about 0.45\% of messages and beyond \qty{100}{\micro\second} for 0.1 to 0.2\%: the host adds a 99.9th percentile of
+over a hundred microseconds to a path whose own work takes a few microseconds or less (chapter~1). The proposition assumes messages arrive
+independently of the gaps; bursts that coincide with the kernel's work (an interrupt from the same card that brings the
+data) make it worse.
+
+\section{Busy polling and kernel bypass}
+
+\begin{definition}[Context switch, busy polling, kernel bypass]\label{def:ll:linux-tuning:polling}
+A \emph{context switch}\index{context switch} is the kernel saving the state of the thread running on a CPU and restoring
+another's; a thread that blocks waiting for data gives its CPU away and is switched back in when the data arrives. \emph{Busy
+polling}\index{busy polling} checks for new data in a loop that never blocks, keeping the CPU. \emph{Kernel
+bypass}\index{kernel bypass} moves the network card's receive and transmit queues into the application's address space, so
+that packets reach the program without a system call, an interrupt or the kernel's network stack.
+\end{definition}
+
+A blocking receive is the default and the right choice for almost every program: the thread sleeps, the CPU does other work
+or saves power, and the kernel wakes the thread when the packet has gone through the interrupt handler, the protocol stack and
+the socket's buffer (\cref{fig:ll:linux-tuning:paths}, left). Each step costs microseconds, and the wake-up is the worst of
+them: the sleeping thread's CPU may be idle in a low-power state, and the thread must be scheduled back in. \omterm{def:ll:linux-tuning:polling}{Busy polling}
+removes the sleep: the thread asks for data in a loop, with a non-blocking call, and finds it as soon as the kernel has put it
+in the socket (middle). The socket option \texttt{SO\_BUSY\_POLL} makes the kernel itself spin for up to a set number of
+microseconds inside a blocking receive (socket(7)); the tutorial polls from user space instead, which works on any socket.
+\omterm{def:ll:linux-tuning:polling}{Kernel bypass} removes the kernel: in the open-source DPDK, a poll-mode driver ``accesses the RX and TX descriptors directly
+without any interrupts'', in a run-to-completion loop on a dedicated core (right). One Quant Book~14 covers the stacks and the
+cards; what matters here is that each step to the right trades a CPU spinning at 100\% for microseconds.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum width=2.9cm,minimum height=0.55cm,
+  align=center,inner sep=2pt},arr/.style={-Stealth,thick}]
+\foreach \x/\t in {0/{interrupts, blocking},4.4/{busy polling},8.8/{kernel bypass}} {\node[font=\footnotesize\bfseries] at (\x,0.7) {\t};}
+\node[box,fill=gray!10] (n1) at (0,-4.4) {network card};
+\node[box,fill=omThm!15] (i1) at (0,-3.3) {interrupt handler};
+\node[box,fill=omThm!15] (s1) at (0,-2.2) {kernel network stack};
+\node[box,fill=omThm!15] (b1) at (0,-1.1) {socket buffer, wake-up};
+\node[box,fill=omDef!20] (a1) at (0,0) {thread asleep in \texttt{recv}};
+\draw[arr] (n1) -- (i1); \draw[arr] (i1) -- (s1); \draw[arr] (s1) -- (b1);
+\draw[arr,omThm] (b1) -- node[right,font=\scriptsize]{context switch} (a1);
+\node[box,fill=gray!10] (n2) at (4.4,-4.4) {network card};
+\node[box,fill=omThm!15] (s2) at (4.4,-3.0) {kernel network stack};
+\node[box,fill=omThm!15] (b2) at (4.4,-1.6) {socket buffer};
+\node[box,fill=omDef!20] (a2) at (4.4,0) {thread spinning};
+\draw[arr] (n2) -- (s2); \draw[arr] (s2) -- (b2);
+\draw[arr,omDef,dashed] (b2) -- node[right,font=\scriptsize,align=left]{non-blocking\\ call in a loop} (a2);
+\node[box,fill=gray!10] (n3) at (8.8,-4.4) {network card};
+\node[box,fill=gray!10] (r3) at (8.8,-2.2) {descriptor ring\\ in user memory};
+\node[box,fill=omDef!20] (a3) at (8.8,0) {thread spinning};
+\draw[arr] (n3) -- node[right,font=\scriptsize]{DMA} (r3);
+\draw[arr,omDef,dashed] (r3) -- node[right,font=\scriptsize]{poll} (a3);
+\end{tikzpicture}
+
+\omcaption{Three ways for a packet to reach a thread. Left: the card interrupts a CPU, the kernel processes the packet, and
+the sleeping thread is switched back in. Middle: the thread never sleeps and polls the socket. Right: the card writes into
+queues mapped into the program, which polls them; the kernel is not on the path (DMA: \omterm{def:ll:multi-socket-machines-and-interconnects:pcie}{direct memory access}, chapter~4).
+Shaded red: the kernel's work on the path.}\label{fig:ll:linux-tuning:paths}
+\end{omfigure}
+
+\Cref{fig:ll:linux-tuning:receive} measures the first two on the laptop's loopback interface, where no card is involved and the
+difference is the sleep alone. A round trip of 64 bytes between two pinned threads takes about \qty{30}{\micro\second} at the
+median with blocking receives and about \qty{2.3}{\micro\second} busy-polled, over ten times less. Two threads bouncing a byte
+through a pair of pipes on the \emph{same} CPU complete a round trip in about \qty{1.5}{\micro\second}: two \omterm{def:ll:linux-tuning:polling}{context switches}
+with their system calls, each well under a microsecond when the CPU is awake. The same ping-pong between two CPUs takes about
+\qty{30}{\micro\second}: the cost is not the switch but waking a CPU that went idle while waiting, which is also why the
+blocking receive is slow. \omterm{def:ll:linux-tuning:polling}{Kernel bypass}, which removes the system calls as well, needs a card that supports it, which this
+laptop does not have.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=7pt,ymode=log,log origin y=infty,ymin=500,ymax=1e7,
+  symbolic x coords={udp-block,udp-spin,pipe-same,pipe-two},
+  xtick=data,xticklabels={{UDP loopback,\\ blocking},{UDP loopback,\\ busy-polled},{pipe ping-pong,\\ one CPU},{pipe ping-pong,\\ two CPUs}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.15,
+  ylabel={ns per round trip (log scale)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=p50]{figdata/low-latency/13-linux-tuning/measured_receive.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=key,y=p99]{figdata/low-latency/13-linux-tuning/measured_receive.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=p999]{figdata/low-latency/13-linux-tuning/measured_receive.csv};
+\addplot[fill=gray!40,draw=gray] table[x=key,y=max]{figdata/low-latency/13-linux-tuning/measured_receive.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Round trips of 64 bytes between two pinned threads over loopback UDP, receiving with a blocking call or with
+non-blocking calls in a loop, and of one byte through two pipes with both threads on one CPU or on two; 100\,000 round trips
+each. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores. Data:
+\texttt{bench\_tuning.py}.}\label{fig:ll:linux-tuning:receive}
+\end{omfigure}
+
+The tails tell the rest: \omterm{def:ll:linux-tuning:polling}{busy polling} cuts the median, not the p99.9, which on this laptop is still tens of microseconds,
+because the spinning thread meets the gaps of \cref{fig:ll:linux-tuning:hiccups} like any other. Polling and isolation go
+together: a thread that polls on a CPU where the kernel still interrupts it is fast on average and slow in the tail, and an
+isolated CPU whose thread sleeps in a blocking call wakes up slowly. The \omterm{def:ll:cpu-microarchitecture:dvfs}{idle states} are the third part: a CPU that is never
+idle never enters a deep one, but the housekeeping CPUs that wake the hot path's helpers can, and the kernel documentation
+lists \texttt{intel\_idle.max\_cstate=} as the way to limit their depth, and \texttt{idle=poll} as a stronger one that ``can
+cause your CPU to overheat'' and disables turbo frequencies.
+
+\section{Real-time priorities and memory locking}\label{sec:ll:linux-tuning:rt}
+
+\begin{definition}[Real-time scheduling policy, memory locking]\label{def:ll:linux-tuning:rt}
+A \emph{real-time scheduling policy}\index{real-time scheduling policy} (\texttt{SCHED\_FIFO} or \texttt{SCHED\_RR} in
+Linux) gives a thread a static priority above every ordinary thread: a runnable real-time thread preempts any ordinary one and,
+under \texttt{SCHED\_FIFO}, runs without time slicing until it blocks, yields or is preempted by a higher priority.
+\emph{Memory locking}\index{memory locking} (\texttt{mlock}, \texttt{mlockall}) keeps a process's pages in physical memory:
+they are never paged out, and with \texttt{MCL\_FUTURE} every page of every later mapping is made present when the mapping is
+created.
+\end{definition}
+
+A real-time policy answers the shared-CPU curve of \cref{fig:ll:linux-tuning:hiccups}: the rival no longer gets a slice.
+On an isolated core with a single thread there is no rival to preempt, and the policy brings a risk instead. A real-time
+thread that spins forever would starve the CPU's kernel threads, so Linux throttles real-time threads by default: they may run
+\qty{950}{\milli\second} of every second, and the remaining \qty{50}{\milli\second} go to ordinary tasks (the kernel's
+documentation of real-time group scheduling). A spinning \texttt{SCHED\_FIFO} thread on a CPU that also has an ordinary task
+runnable is therefore stopped for up to \qty{50}{\milli\second} once a second, a hiccup a thousand times longer than any on the
+untuned laptop. Throttling can be disabled (\texttt{sched\_rt\_runtime\_us} set to $-1$), which the Red Hat guide calls
+adequate only when the real-time tasks are well engineered. An ordinary process may not ask for the policy at all: on this
+laptop the request fails with \texttt{EPERM}. The firm's design therefore spins ordinary threads on isolated cores, where
+there is nothing to preempt, and keeps real-time priorities for threads that must preempt others on shared CPUs.
+
+\omterm{def:ll:cpp-for-latency-i-memory:fault}{Page faults} are the synchronous noise of the kernel documentation, and chapter~6 measured them: the first write to a page
+costs a microsecond or more. The mlockall manual page names the reason to lock: ``paging is one major cause of unexpected
+program execution delays'' for real-time algorithms. On the laptop, writing one byte to each page of a fresh 32~MiB mapping
+takes 8\,192 \omterm{def:ll:cpp-for-latency-i-memory:fault}{page faults} and about one to two microseconds a page. After \texttt{mlockall(MCL\_CURRENT | MCL\_FUTURE)}, the
+same writes take no fault and about \qty{35}{\nano\second} a page: the cost has moved to the \texttt{mmap} call, which now
+populates every page up front, at start-up, where it belongs. Locking is limited by \texttt{RLIMIT\_MEMLOCK}, 64~MiB for an
+ordinary user on this machine: a process whose book and rings need a gigabyte must be given the limit (the build checks it),
+or \texttt{mlockall} fails with \texttt{ENOMEM}.
+
+\section{Tutorial: measure an untuned machine}\label{tut:ll:linux-tuning:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Measure what this machine does to a thread that wants its CPU, and audit it against a placement plan.
+\textbf{End state:} \cref{fig:ll:linux-tuning:hiccups,fig:ll:linux-tuning:receive}, the page-fault counts with and without
+locking, and the audit's report for this machine next to the two fixtures'.
+\begin{tutsteps}
+\item \textbf{The hiccup meter.} A loop reads the \omterm{def:ll:cpu-microarchitecture:tsc}{time-stamp counter} and records every gap above a threshold in a buffer
+reserved before the loop; it allocates nothing and makes no system call, so every gap it sees was imposed on it.
+\omcode{code/low-latency/13-linux-tuning/cpp/ll_tuning.hpp}{25}{44}{The hiccup meter's loop, generic over its clock so that
+the test can script one.}\label{lst:ll:linux-tuning:meter}
+\item \textbf{Run it} with \texttt{python bench\_tuning.py}: five seconds pinned alone with \texttt{taskset}, five seconds
+unpinned, and five seconds pinned beside a second spinning thread; the script converts the gaps into
+\cref{fig:ll:linux-tuning:hiccups} and applies \cref{prop:ll:linux-tuning:wait} to them.
+\item \textbf{Poll instead of sleeping.} The same receive, blocking or in a non-blocking loop:
+\omcode{code/low-latency/13-linux-tuning/cpp/ll_tuning_bench.cpp}{109}{117}{A receive that sleeps and one that
+spins.}\label{lst:ll:linux-tuning:receive}
+\item \textbf{Lock the memory} and count the faults. The C++ test maps 8~MiB, touches it (2\,048 faults), then calls
+\texttt{mlockall} and maps and touches another 8~MiB (none); if the process may not lock, it says so and skips that half.
+\omcode{code/low-latency/13-linux-tuning/cpp/ll_tuning.hpp}{62}{71}{Counting page faults, and locking every present and future
+page.}\label{lst:ll:linux-tuning:lock}
+\item \textbf{Ask for a real-time policy} (\texttt{ll\_tuning\_bench privileges}): an ordinary process gets \texttt{EPERM}.
+\item \textbf{Audit the machine}: \texttt{python firm\_tuneaudit.py /} plans the hot threads with \texttt{firm.coreplan} and
+checks the host against the plan (next section).
+\end{tutsteps}
+\textbf{What to change next.} Run the meter on a CPU while another program (a compile, a test suite) runs on its hyper-threading
+sibling: the gaps do not change, but count the loop's passes a second. On a Linux host you administer, boot with
+\texttt{isolcpus} and \texttt{nohz\_full} on two CPUs, move their interrupts away, and run the meter there.
+\end{tutorial}
+
+\section{Build: the host audit}\label{bld:ll:linux-tuning:tuneaudit}
+
+\texttt{firm.tuneaudit} reads the same files an engineer would, from \texttt{/proc} and \texttt{/sys} or from a fixture tree
+with their layout, and checks each rule of this chapter against the plan of \texttt{firm.coreplan}: the hot CPUs isolated,
+their siblings offline or isolated, the hot CPUs tickless and their read-copy-update callbacks offloaded, no interrupt line
+(nor the default mask) allowed on a hot CPU, \texttt{irqbalance} not running, the \texttt{performance} frequency governor on
+the hot CPUs, the \omterm{def:ll:cpu-microarchitecture:dvfs}{idle states} capped on the boot line, transparent \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} only where asked for (\texttt{madvise}, with
+no stalling \texttt{always} defragmentation, which the kernel documentation says makes an allocation ``stall on allocation
+failure and directly reclaim pages and compact memory''), a locked-memory limit large enough, and real-time throttling off
+if the hot threads are real-time.
+
+\omcode{code/firm/tuneaudit/firm_tuneaudit.py}{72}{100}{The isolation, tick and interrupt rules of the
+audit.}\label{lst:ll:linux-tuning:audit}
+
+A setting the host does not expose is reported \texttt{unknown}, not passed: this laptop has no frequency governor to read, as
+virtual machines often do not. Its report fails seven of the eleven rules (the hot CPUs neither isolated nor tickless, their
+siblings busy, every interrupt allowed on them, no idle-state cap, a 64~MiB locked-memory limit), passes three and cannot judge
+one. The \texttt{tuned} fixture, which describes \cref{fig:ll:linux-tuning:host}, passes all eleven; the \texttt{mistuned}
+fixture fails nine, one per usual mistake.
+
+\begin{build}
+\bfield{Purpose} The check that a host is fit to run the hot path before a process starts on it: the deployment of chapter~25
+runs it and refuses a host that fails, and its report goes with every latency measurement, so that a change of host tuning is
+visible when the numbers move.
+\bfield{Interface} Python \texttt{firm.tuneaudit}: \texttt{audit(root, plan, hot, memlock\_bytes, fifo)} returns a list of
+\texttt{Finding(rule, status, detail)} with status \texttt{ok}, \texttt{fail} or \texttt{unknown}, one per rule of
+\texttt{RULES} in order; \texttt{failures(findings)}; \texttt{report(findings)}; the command line audits a root and an interface
+with \texttt{firm.coreplan}'s plan and exits non-zero on any failure.
+\bfield{Rules} Read-only: the audit changes nothing on the host. Every rule is derived from the plan, not from a fixed CPU list;
+an unreadable setting is \texttt{unknown}, never \texttt{ok}; details name the offending CPUs or interrupt lines.
+\bfield{Acceptance tests} \texttt{code/firm/tuneaudit/}: the \texttt{tuned} fixture passes every rule and the
+\texttt{mistuned} fixture fails exactly the nine expected ones, with the offending siblings, interrupt lines and governor named;
+real-time threads with default throttling fail; a larger locking requirement fails only the mistuned limit; an empty tree reports
+\texttt{unknown} where nothing can be read. The fixtures are written by \texttt{make\_tuneaudit\_fixture.py} for
+\texttt{firm.coreplan}'s two-socket fixture.
+\bfield{Stretch} Check that the card's interrupt queues are on housekeeping CPUs of the card's node; check the kernel's own
+configuration (\texttt{CONFIG\_NO\_HZ\_FULL}) when it is exposed; emit the boot line and interrupt masks that would fix a
+failing host.
+\end{build}
+
+\begin{omsources}
+\item Linux kernel documentation: ``The kernel's command-line parameters'' (isolcpus, nohz\_full, rcu\_nocbs,
+irqaffinity); ``CPU Isolation''; ``NO\_HZ: Reducing Scheduling-Clock Ticks''; ``Real-Time group scheduling'';
+``Transparent Hugepage Support''.
+\item Linux man pages \texttt{sched(7)}, \texttt{socket(7)} (\texttt{SO\_BUSY\_POLL}), \texttt{mlockall(2)}.
+\item Red Hat, \emph{Optimizing RHEL 9 for Real Time for low latency operation}.
+\item DPDK Programmer's Guide, ``Poll Mode Driver'' (release 24.07).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:linux-tuning:1}
+A kernel ticks 1\,000 times a second and each tick takes \qty{2}{\micro\second} on the CPU it interrupts. What fraction of a
+spinning thread's time does it take, what average wait does it add to a message arriving at random
+(\cref{prop:ll:linux-tuning:wait}), and what does \texttt{nohz\_full} remove from the worst case?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:linux-tuning:2}
+A process whose rings and books occupy 3~GiB calls \texttt{mlockall(MCL\_CURRENT | MCL\_FUTURE)} as an ordinary user on this
+laptop. What happens, and what must change?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:linux-tuning:3}
+A host has 32 cores with two hardware threads each; the sibling of CPU $c < 32$ is $c + 32$. The plan puts four hot threads on
+CPUs 12--15. Write the \texttt{isolcpus} and \texttt{nohz\_full} lists, and say what to do with the siblings.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:linux-tuning:4}
+A thread loses 1\,000 gaps a second of \qty{10}{\micro\second} each. What fraction of its time is stolen, what is the mean
+added wait, and what fraction of messages wait more than \qty{5}{\micro\second}? Compare with one gap a second of
+\qty{10}{\milli\second}, which steals the same time.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:linux-tuning:5}
+\omterm{def:ll:linux-tuning:polling}{Busy polling} keeps a core at 100\% whether or not data arrives. When is that a price worth paying, and what does it cost
+besides the core?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:linux-tuning:6}
+A team gives its spinning feed thread \texttt{SCHED\_FIFO} priority on a CPU where a monitoring agent also runs, with the
+default throttling. What gap does the feed thread suffer, how often, and what share of its time? What are the two fixes?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:linux-tuning:7}
+\emph{Coding.} Add a rule \texttt{nic\_irqs} to \texttt{firm.tuneaudit}: the interrupt lines of the plan's network card (read
+their names from a fixture \path{/proc/interrupts}) must be allowed only on housekeeping CPUs of the card's node. Extend both
+fixtures and the tests.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:linux-tuning:8}
+\emph{Find the flaw.} ``We isolated CPUs 2--5 with \texttt{isolcpus} and started the feed handler with \texttt{taskset -c 2-5}
+so that its four threads would share them. Its latency got worse.''
+\end{exercise}
+
+\section{Problem: The Hiccup}
+
+\begin{problem}[{Weekend problem --- what the host takes from a spinning thread}]\label{pb:ll:linux-tuning:1}
+The hiccup meter ran for five seconds on this laptop in three situations
+(\texttt{measured\_hiccup\_summary.csv}). A tuned host is modelled with stated assumptions, not measurements: with the tick
+running, 250 interruptions a second of \qty{2}{\micro\second}; with the hot CPU isolated and tickless, one interruption of
+\qty{2}{\micro\second} a second.
+
+\medskip\noindent\textbf{Part I --- The meter.}
+\begin{enumerate}
+\item Why must the meter's loop never allocate memory or call the kernel?
+\item From the summary, how long does one pass of the loop take, and why is the \qty{200}{\nano\second} threshold safe?
+\item What fraction of its time does the thread lose pinned alone, and what is its worst gap?
+\item What fraction does it lose sharing its CPU with a second spinner, and why about that?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- What a message sees.}
+\begin{enumerate}[resume]
+\item Using \cref{prop:ll:linux-tuning:wait}, what does the summary give for the mean added wait pinned alone?
+\item What fraction of messages wait more than \qty{10}{\micro\second}, and more than \qty{100}{\micro\second}?
+\item In the shared case, what is the median added wait of a message?
+\item Why do long gaps matter more than frequent ones?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The tuned host.}
+\begin{enumerate}[resume]
+\item With the 250~Hz tick of \qty{2}{\micro\second}: stolen fraction and mean added wait.
+\item With the tick: what fraction of messages waits more than \qty{1}{\micro\second}?
+\item Isolated and tickless: stolen fraction and mean added wait.
+\item Where does the residual once-a-second tick of a tickless CPU run?
+\item If the feed thread were \texttt{SCHED\_FIFO} with default throttling and a runnable ordinary task on its CPU, what
+would the worst gap and stolen fraction be?
+\item Why can the laptop not be tuned to the model?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the fraction of wall time a spinning thread is not running, and its worst gap, on this
+laptop against the tuned host.
+\item Which of the audit's rules does this laptop fail (\texttt{measured\_audit.csv})?
+\item How would you run the meter on a production host without disturbing trading?
+\item What does the meter not tell you about a gap, and how would you find it?
+\item What should be recorded with every latency measurement, following this chapter?
+\item In one sentence: what does tuning buy, and what does it cost?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:linux-tuning:1}
+What do \texttt{isolcpus}, \texttt{nohz\_full} and \texttt{rcu\_nocbs} do, and why are they used together?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:linux-tuning:2}
+Your pinned, spinning thread shows a latency spike every few milliseconds. How do you find the cause?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:linux-tuning:3}
+Blocking receive, \omterm{def:ll:linux-tuning:polling}{busy polling}, or \omterm{def:ll:linux-tuning:polling}{kernel bypass}: what does each cost, and when would you choose each?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:linux-tuning:4}
+Should the hot threads of a trading process run under \texttt{SCHED\_FIFO}? What can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:linux-tuning:5}
+Where should the network card's interrupts go on a tuned host, and why not simply away from every CPU of its socket?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:linux-tuning:6}
+A colleague reports that tuning halved the median tick-to-trade but did nothing to the p99.9. What would you look at?
+\end{interviewq}

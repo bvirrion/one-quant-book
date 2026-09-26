@@ -1,0 +1,332 @@
+\chapter{Lock-Free Programming}\label{ch:ll:lock-free-programming}
+
+In July 1997 a spacecraft on the surface of Mars began resetting itself, losing data each time. A low-priority task that
+gathered weather data held a lock that a high-priority task managing the information bus needed; a medium-priority task
+ran in between, the high-priority task missed its deadline, and a watchdog reset the machine. The fix, uploaded from
+Earth, switched on priority inheritance for that lock (Jones, 1997). A trading thread that shares a lock with a logger,
+a risk reporter or a configuration reloader has the same problem, only the deadline is a few microseconds, and the lower
+thread need not be preempted by anything more sinister than the operating system's scheduler. This chapter is about
+sharing data between threads without locks: what the hardware guarantees about memory, what C++ and Rust let a program
+say about ordering, the \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} loop and its classic trap, the reclamation of memory that other threads may
+still be reading, and what ``\omterm{def:ll:lock-free-programming:progress}{lock-free}'' actually promises.
+
+\section{Atomics and the memory model}
+
+\begin{definition}[Atomic operation]\label{def:ll:lock-free-programming:atomic}
+An \emph{atomic operation}\index{atomic operation} on a memory location is indivisible with respect to other threads: no
+thread observes it half done. C++ provides \texttt{std::atomic<T>} and Rust \texttt{AtomicU64} and its siblings, with
+loads, stores, exchanges, fetch-and-add and \omterm{def:ll:lock-free-programming:cas}{compare-and-swap}; on x86 each maps to one instruction for sizes up to eight
+bytes.
+\end{definition}
+
+A \omterm{def:ll:rust-for-low-latency:race}{data race} (chapter~9) is \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour} in C++; atomics are how a program shares a location without one. The
+question they leave open is order. A processor executes out of order (chapter~2), keeps stores in a buffer before they
+reach the cache, and a compiler reorders memory accesses that it can prove independent in one thread; another thread can
+therefore see a thread's writes in a different order from the program's.
+
+\begin{definition}[Memory ordering, acquire--release ordering, sequential consistency]\label{def:ll:lock-free-programming:ordering}
+The \emph{memory ordering}\index{memory ordering} of an \omterm{def:ll:lock-free-programming:atomic}{atomic operation} states what other memory accesses it orders.
+In \emph{acquire--release ordering}\index{acquire--release ordering}, a load with acquire that reads the value written by a
+store with release sees every write the storing thread made before that store: the pair publishes data. \emph{Sequential
+consistency}\index{sequential consistency}, the default of C++ atomics, adds a single total order of all such operations
+that every thread agrees on, as if they were interleaved on one processor. A relaxed operation is atomic but orders
+nothing else.
+\end{definition}
+
+The publication pattern (write the data, then store a flag with release; load the flag with acquire, then read the data) is
+the backbone of every ring buffer in chapter~12. \omterm{def:ll:lock-free-programming:ordering}{Sequential consistency} is needed less often and costs more; the classic
+case where acquire--release is not enough is the store-buffer pattern of \cref{fig:ll:lock-free-programming:litmus}: each
+thread writes its own flag and reads the other's. On x86 a store may still sit in the processor's store buffer when the
+following load of another location completes, so both threads can read zero. Only a sequentially consistent store (compiled
+to an instruction that drains the buffer) forbids it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5cm,ybar,bar width=16pt,ymin=0,enlarge y limits={upper,value=0.2},
+  symbolic x coords={relaxed,release-acquire,seq_cst},xtick=data,xticklabels={relaxed,{release--acquire},seq\_cst},
+  enlarge x limits=0.3,ylabel={$r_1 = r_2 = 0$ per million},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=ordering,y=both_zero]{figdata/low-latency/11-lock-free-programming/measured_litmus.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The store-buffer litmus test: thread A runs \texttt{x = 1; r1 = y}, thread B runs \texttt{y = 1; r2 = x},
+a million times each. Under \omterm{def:ll:lock-free-programming:ordering}{sequential consistency} at least one read sees 1; with weaker orderings, the stores still in each
+core's store buffer let both read 0, rarely but really. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no
+isolated cores. Data: \texttt{bench\_lockfree.py}.}\label{fig:ll:lock-free-programming:litmus}
+\end{omfigure}
+
+\section{Compare-and-swap loops and the ABA problem}
+
+\begin{definition}[Compare-and-swap]\label{def:ll:lock-free-programming:cas}
+\emph{Compare-and-swap}\index{compare-and-swap} (CAS) atomically replaces the value of a location with a new value if and
+only if it still equals an expected value, and reports whether it did. A CAS loop reads the current value, computes a new
+one, and retries the CAS until no other thread has changed the location in between.
+\end{definition}
+
+Every \omterm{def:ll:lock-free-programming:progress}{lock-free} structure is built from CAS loops. A stack pops by reading the head node and its successor and swinging
+the head from the node to its successor with a CAS; the CAS fails, and the loop retries, if another thread moved the head
+in the meantime. The failure it cannot see is the change that was undone.
+
+\begin{definition}[ABA problem]\label{def:ll:lock-free-programming:aba}
+The \emph{ABA problem}\index{ABA problem} is the failure of a \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} to detect that a location changed from
+$A$ to $B$ and back to $A$ between the read and the CAS: the comparison succeeds although the state it was computed from
+(here, $A$'s successor) is stale.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  nd/.style={draw=omDef,fill=omDef!10,circle,minimum size=0.6cm,inner sep=0pt},
+  fr/.style={draw=gray,fill=gray!15,circle,minimum size=0.6cm,inner sep=0pt}]
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (0.9,1.9) {1. thread 1 reads\\ head and next};
+\node[nd] (a1) at (0,1.4) {A}; \node[nd] (b1) at (0.9,1.4) {B}; \node[nd] (c1) at (1.8,1.4) {C};
+\draw[-Stealth] (a1) -- (b1); \draw[-Stealth] (b1) -- (c1);
+\node[anchor=north,align=center] at (0.9,0.9) {head = A,\\ next = B};
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (5.3,1.9) {2. thread 2: pop A,\\ pop B, push A};
+\node[nd] (a2) at (4.5,1.4) {A}; \node[nd] (c2) at (5.4,1.4) {C}; \node[fr] (b2) at (6.6,1.4) {B};
+\draw[-Stealth] (a2) -- (c2);
+\node[anchor=north,align=center] at (5.5,0.9) {head = A again;\\ B back in the pool};
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (10.0,1.9) {3. thread 1:\\ CAS(head, A $\to$ B)};
+\node[fr,draw=omThm,fill=omThm!15] (b3) at (9.5,1.4) {B}; \node[nd] (c3) at (10.6,1.4) {C};
+\draw[-Stealth,omThm] (b3) -- (c3);
+\node[anchor=north,align=center,omThm] at (10.05,0.9) {succeeds: the head is\\ a node in the free pool};
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:ll:lock-free-programming:aba}{ABA problem} on a \omterm{def:ll:lock-free-programming:progress}{lock-free} stack. The head is A both times thread 1 looks, so its \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} succeeds
+and installs B, which thread 2 has already removed. A tag incremented at every update makes the second A compare unequal.
+Data: \texttt{ll\_aba.aba}, a deterministic replay.}\label{fig:ll:lock-free-programming:aba}
+\end{omfigure}
+
+The standard cures change what is compared. A tag (a version counter) stored next to the pointer and incremented on every
+update makes the three states $A$, $B$, $A$ compare as $(A,1)$, $(B,2)$, $(A,3)$. On x86-64 a pointer and a counter fit a
+16-byte \omterm{def:ll:lock-free-programming:cas}{compare-and-swap}; the tutorial's stack avoids the wide instruction by storing nodes in a fixed array and packing a
+32-bit index with a 32-bit tag into one 64-bit word. Its nodes are never freed, which removes the other half of the
+problem.
+
+\section{Safe memory reclamation}
+
+\begin{definition}[Hazard pointer, epoch-based reclamation]\label{def:ll:lock-free-programming:reclaim}
+In a \omterm{def:ll:lock-free-programming:progress}{lock-free} structure whose nodes are freed, a node removed by one thread may still be read by another that loaded its
+address before the removal. A \emph{hazard pointer}\index{hazard pointer} is a per-thread published pointer to a node the
+thread is about to read; a node is freed only when no hazard pointer points to it (Michael, 2004). In
+\emph{epoch-based reclamation}\index{epoch-based reclamation} threads announce entering and leaving a global epoch; a node
+removed in epoch $e$ is freed once every thread has left $e$ (Fraser, 2004).
+\end{definition}
+
+Both defer freeing until no reader can hold the node, and both put a cost on the read path: \omterm{def:ll:lock-free-programming:reclaim}{hazard pointers} a store and a
+fence per node read, epochs a store on entering and leaving each operation. On a hot path the simplest reclamation is none:
+fixed pools whose slots are recycled but never returned to the system (chapter~6), bounded rings whose cells are reused by
+position (chapter~12), and the tagged indices of the tutorial. Reclamation matters for unbounded structures shared between
+many threads, which a hot path should not have.
+
+\section{Progress guarantees}
+
+\begin{definition}[Lock-free, wait-free]\label{def:ll:lock-free-programming:progress}
+An algorithm is \emph{lock-free}\index{lock-free} if, whatever the scheduling of the threads, some thread completes its
+operation in a finite number of its own steps: a thread that stalls cannot stop the others. It is \emph{wait-free}\index{wait-free}
+if every thread completes its operation in a bounded number of its own steps, whatever the others do (Herlihy, 1991).
+\end{definition}
+
+\begin{definition}[Priority inversion]\label{def:ll:lock-free-programming:inversion}
+\emph{Priority inversion}\index{priority inversion} occurs when a high-priority thread waits for a resource held by a
+low-priority thread that cannot run because medium-priority threads take its processor; the high-priority thread is
+effectively demoted below the medium ones.
+\end{definition}
+
+The guarantees are about stalls, not speed. A \omterm{def:ll:lock-free-programming:progress}{lock-free} algorithm's threads can still collide and retry, and under
+contention a CAS loop can be slower than a lock (\cref{fig:ll:lock-free-programming:counters}); what it removes is the
+possibility that a preempted thread holding a lock stops everyone, and with it \omterm{def:ll:lock-free-programming:inversion}{priority inversion}. Many useful structures
+sit between the categories: the bounded multi-producer queue of the build uses one \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} per operation and no
+locks, yet its author notes that it is not \omterm{def:ll:lock-free-programming:progress}{lock-free} in the official sense, because a producer stopped between claiming a
+cell and filling it holds up the consumers of that cell. \omterm{def:ll:lock-free-programming:progress}{Wait-free} structures are rarer and usually slower on average; a
+single-producer single-consumer ring (chapter~12) is \omterm{def:ll:lock-free-programming:progress}{wait-free} for free, and is the structure trading hot paths use most.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,ymode=log,xmin=0.8,xmax=4.2,ymin=2,ymax=400,xtick={1,2,3,4},
+  ytick={2,5,10,20,50,100,200},yticklabels={2,5,10,20,50,100,200},
+  xlabel={threads incrementing},ylabel={ns per increment, per thread (log)},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*] table[x=threads,y=mutex]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omProp,thick,mark=square*] table[x=threads,y=CAS_loop]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omDef,thick,mark=triangle*] table[x=threads,y=fetch_add]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omMeth,very thick,mark=diamond*] table[x=threads,y=per_thread]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\legend{mutex,CAS loop,fetch\_add,per-thread counters}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One to four threads counting a million events each into a shared counter protected by a mutex, updated by a CAS
+loop or by \texttt{fetch\_add}, or into padded per-thread counters summed at the end. Only the design that shares nothing
+scales. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores, threads unpinned. Data:
+\texttt{bench\_lockfree.py}.}\label{fig:ll:lock-free-programming:counters}
+\end{omfigure}
+
+The counters make the chapter's second lesson concrete. With one thread every design costs a few nanoseconds. With two or
+more, every design that writes one shared line pays for the line bouncing between cores (chapter~3) at each update, a CAS
+loop also for its retries, a mutex also for the lock's own line; the per-thread counters, each on its own \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line},
+cost what they cost alone. The fastest synchronisation is the one that is not needed: give each thread its own data and
+combine at the end, or hand data over in one direction only.
+
+\section{Tutorial: a stack, a queue and a litmus test}\label{tut:ll:lock-free-programming:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build a \omterm{def:ll:lock-free-programming:progress}{lock-free} stack that is immune to ABA, measure the cost of sharing a counter, observe memory
+reordering, and build a bounded multi-producer multi-consumer queue. \textbf{End state:}
+\cref{fig:ll:lock-free-programming:litmus,fig:ll:lock-free-programming:counters} and a stress-tested queue in two languages.
+\begin{tutsteps}
+\item \textbf{A tagged stack.} The head packs a tag with a node index; push and pop are CAS loops that increment the tag.
+\omcode{code/low-latency/11-lock-free-programming/cpp/ll_lockfree.hpp}{13}{43}{A Treiber stack over a fixed pool, with a tagged head.}\label{lst:ll:lock-free-programming:stack}
+\item \textbf{Replay ABA.} \texttt{ll\_aba.aba(tagged=False)} replays the interleaving of \cref{fig:ll:lock-free-programming:aba}
+and returns a stack whose head is a freed node; with \texttt{tagged=True} the \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} fails.
+\item \textbf{The queue.} A producer claims a position with one \omterm{def:ll:lock-free-programming:cas}{compare-and-swap}, writes its cell, and publishes it with a
+release store of the cell's sequence number; the consumer of that position acquires it.
+\omcode{code/firm/mpmcq/cpp/firm_mpmcq.hpp}{30}{48}{The producer side of the bounded MPMC queue.}\label{lst:ll:lock-free-programming:push}
+\item \textbf{Stress and sanitise.} The tests run two producers and two consumers through 300\,000 items and check that each
+arrives exactly once, in C++ and in Rust; the C++ test also runs under the thread sanitiser.
+\item \textbf{Measure} with \texttt{python bench\_lockfree.py}.
+\end{tutsteps}
+\textbf{What to change next.} Remove the tag from the stack's head and run the two-thread churn test until it fails; change the
+queue's release store to relaxed and run the stress test under the thread sanitiser.
+\end{tutorial}
+
+\section{Build: the bounded multi-producer multi-consumer queue}\label{bld:ll:lock-free-programming:mpmcq}
+
+\begin{build}
+\bfield{Purpose} The queue for the few places where several threads produce into, or consume from, one stream: order
+requests from several strategies to one gateway, work for a pool of risk calculators. Single-producer paths use chapter~12's
+rings instead.
+\bfield{Interface} C++20 \texttt{firm::mpmcq::Queue<T>(capacity)} with \texttt{try\_push(v)} and \texttt{try\_pop()} returning
+\texttt{std::optional<T>}; Rust \texttt{firm\_mpmcq::Queue<T: Copy>} with \texttt{try\_push} and \texttt{try\_pop}.
+\bfield{Rules} Capacity a power of two; one \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} per operation; no allocation after construction; full and empty
+reported, never waited for inside the queue; producer and consumer positions on separate \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines}.
+\bfield{Acceptance tests} \texttt{code/firm/mpmcq/}: first in, first out through a full and empty cycle; two producers and two
+consumers deliver 300\,000 items exactly once, in C++20 and Rust, within a few seconds.
+\bfield{Stretch} Batch operations that claim several positions with one \omterm{def:ll:lock-free-programming:cas}{compare-and-swap}; a blocking wrapper for threads that
+may sleep.
+\end{build}
+
+\begin{omsources}
+\item M.~Jones, ``What really happened on Mars Rover Pathfinder'', 1997.
+\item H.-J.~Boehm and S.~Adve, ``Foundations of the C++ concurrency memory model'', PLDI 2008.
+\item M.~Herlihy, ``Wait-free synchronization'', \emph{ACM TOPLAS} 13(1), 1991.
+\item M.~Michael, ``Hazard pointers: safe memory reclamation for lock-free objects'', \emph{IEEE TPDS} 15(6), 2004;
+K.~Fraser, \emph{Practical lock-freedom}, Cambridge technical report 579, 2004.
+\item D.~Vyukov, ``Bounded MPMC queue'', 1024cores.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:1}
+From \cref{fig:ll:lock-free-programming:counters}, how much does a shared \texttt{fetch\_add} cost per increment with one
+thread and with four? How many increments a second do four threads achieve together, shared and per-thread?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:2}
+A writer stores a price, then sets a flag with release; a reader loads the flag with acquire and, if set, reads the price.
+Can the reader see the flag set and an old price? And if the flag store is relaxed?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:3}
+A tag of 32 bits is incremented at every update of the stack's head at 100 million updates a second. How long before it wraps,
+and why is wrapping (almost) harmless?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:4}
+In the store-buffer test, which outcomes $(r_1, r_2)$ are possible under \omterm{def:ll:lock-free-programming:ordering}{sequential consistency}, and which extra one does x86
+allow with release--acquire? Why does the figure show it so rarely?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:5}
+Why is the bounded MPMC queue not \omterm{def:ll:lock-free-programming:progress}{lock-free} in the strict sense? Describe the stall.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:6}
+A logger thread holds a mutex for \qty{2}{\micro\second} per message, 100\,000 times a second, and the trading thread takes the
+same mutex once per order. What fraction of orders find it held, and how long can one wait if the logger is preempted for a
+scheduler quantum of \qty{4}{\milli\second}?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:lock-free-programming:7}
+\emph{Coding.} Run the untagged stack of \texttt{ll\_lockfree.hpp} (mode \texttt{aba} of the benchmark) with two threads
+popping and pushing back a million times each, twenty times. Is a node ever lost or duplicated? What does the result say about
+testing \omterm{def:ll:lock-free-programming:progress}{lock-free} code by running it?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:lock-free-programming:8}
+\emph{Find the flaw.} ``Our order-book snapshot is published with a relaxed flag; we tested it for a week on x86 and never saw a
+torn snapshot, so it is correct.''
+\end{exercise}
+
+\section{Problem: The Descheduled Lock Holder}
+
+\begin{problem}[{Weekend problem --- a lock shared with the logger}]\label{pb:ll:lock-free-programming:1}
+A strategy thread sends about 20\,000 orders a second and, for each, takes a mutex to append the order to a log buffer that a
+logger thread drains. The logger holds the same mutex for \qty{3}{\micro\second} each time it drains, 50\,000 times a second.
+Once in a while the operating system preempts the logger while it holds the mutex, for a quantum of about
+\qty{3}{\milli\second}; suppose this happens on 0.01\% of its drains.
+
+\medskip\noindent\textbf{Part I --- Contention.}
+\begin{enumerate}
+\item What fraction of the time does the logger hold the mutex?
+\item What fraction of orders find it held, and how long do they wait on average?
+\item What is the expected blocking time per second for the strategy, ignoring preemption?
+\item What does \cref{fig:ll:lock-free-programming:counters} say about the mutex's own cost when two threads take it often?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Preemption.}
+\begin{enumerate}[resume]
+\item How many preemptions of the lock holder happen per second?
+\item What fraction of time is the mutex held by a preempted logger?
+\item How many orders a second meet such a preempted holder, and how long does each wait at most?
+\item Add Parts I and II: the expected blocking per second.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The redesign.}
+\begin{enumerate}[resume]
+\item Replace the mutex by a single-producer single-consumer ring: what does the strategy do per order now?
+\item What happens when the ring is full?
+\item Which progress guarantee does the ring give the strategy?
+\item Why does priority inheritance not solve the problem for a trading thread?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the strategy's expected blocking time per second with the mutex, and with the ring.
+\item What did the Mars Pathfinder engineers do, and why was it enough there?
+\item Where else in a trading process can a lock hide?
+\item What does the \omterm{def:ll:lock-free-programming:aba}{ABA problem} require of a \omterm{def:ll:lock-free-programming:progress}{lock-free} structure that frees memory?
+\item How do the build's tests check the queue, and what can they not prove?
+\item When is a mutex the right choice in a trading system?
+\item What \omterm{def:ll:lock-free-programming:ordering}{memory ordering} does the ring's publication need?
+\item In one sentence: what does \omterm{def:ll:lock-free-programming:progress}{lock-free} buy a hot path?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:1}
+What is the difference between \texttt{memory\_order\_relaxed}, acquire--release and sequentially consistent atomics?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:2}
+Explain the \omterm{def:ll:lock-free-programming:aba}{ABA problem} and two ways to prevent it.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:3}
+Is a \omterm{def:ll:lock-free-programming:progress}{lock-free} algorithm always faster than one with locks? Give a counterexample.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:4}
+What is \omterm{def:ll:lock-free-programming:inversion}{priority inversion}, and why does it matter in a trading system?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:5}
+How do you test \omterm{def:ll:lock-free-programming:progress}{lock-free} code? What can a stress test not tell you?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:lock-free-programming:6}
+Design a counter that many threads increment and one thread reads once a second, with the lowest cost to the incrementing
+threads.
+\end{interviewq}

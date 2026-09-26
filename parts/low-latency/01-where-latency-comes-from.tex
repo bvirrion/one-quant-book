@@ -1,0 +1,451 @@
+\chapter{Where Latency Comes From}\label{ch:ll:where-latency-comes-from}
+
+A study of a large equity exchange's message data found that races to trade on a stale quote, or to cancel it
+before someone else trades on it, happen about once a minute in each of the largest stocks, account for about a
+fifth of the day's volume, and are usually decided in five to ten millionths of a second (Aquilina, Budish and
+O'Neill, 2022). In those races a microsecond is a unit of competition. This book is about the software on either
+side of it: where each microsecond of a trading system goes, how to measure it, and how to take it back. This first
+chapter fixes the vocabulary: the path a market event takes through a trading system, why its duration is a
+distribution rather than a number, how to write a budget for it, and which strategies pay for which part of it.
+
+\section{The tick-to-trade path}
+
+\begin{definition}[Latency]\label{def:ll:where-latency-comes-from:latency}
+The \emph{latency}\index{latency} of a system between two events is the time from the first event (a packet
+arriving, a function being called) to the second (an order leaving, the function returning), measured for one
+occurrence. It is a random variable: each message has its own.
+\end{definition}
+
+One Quant Book~7, chapter~18, used two latencies of a whole trading firm, the market-data \omterm{def:ll:where-latency-comes-from:latency}{latency} and the
+order-entry \omterm{def:ll:where-latency-comes-from:latency}{latency}, to model what a strategy sees and when its orders act. This book opens them up.
+
+\begin{definition}[Tick-to-trade and wire-to-wire latency]\label{def:ll:where-latency-comes-from:t2t}
+The \emph{tick-to-trade latency}\index{tick-to-trade latency} of a trading system is the time from the arrival of
+the market-data message that triggers a decision to the departure of the order that the decision sends. It is a
+\emph{wire-to-wire latency}\index{wire-to-wire latency} when both instants are taken on the network cable (the last
+bit of the inbound packet, the first bit of the outbound one), by a device outside the server; it is a software
+tick-to-trade \omterm{def:ll:where-latency-comes-from:latency}{latency} when they are taken inside the program (the packet handed to the application, the order handed
+to the network stack).
+\end{definition}
+
+The difference matters. The wire-to-wire figure includes the network card, the operating system's receive path and
+the card's transmit path; the software figure, which a program can measure on itself with the processor's clock
+(chapter~5), leaves them out. A vendor who quotes a \omterm{def:ll:where-latency-comes-from:latency}{latency} without saying between which two instants has not
+quoted a \omterm{def:ll:where-latency-comes-from:latency}{latency}.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum height=0.9cm,text width=1.3cm,align=center},
+  hw/.style={draw=gray,fill=gray!10,rounded corners=2pt,minimum height=0.9cm,text width=1.1cm,align=center}]
+\node[hw] (nic1) at (0,0) {network card};
+\node[hw] (os) at (1.5,0) {kernel or bypass};
+\node[st] (dec) at (3.2,0) {decode, arbitrate};
+\node[st] (book) at (4.9,0) {book};
+\node[st] (strat) at (6.6,0) {strategy};
+\node[st] (risk) at (8.3,0) {risk checks};
+\node[st] (gw) at (10.0,0) {encode, send};
+\node[hw] (nic2) at (11.6,0) {network card};
+\foreach \a/\b in {nic1/os,os/dec,dec/book,book/strat,strat/risk,risk/gw,gw/nic2} \draw[-Stealth,thick] (\a) -- (\b);
+\draw[-Stealth,thick] (-1.1,0) node[left,align=right,font=\footnotesize]{packet\\ in} -- (nic1);
+\draw[-Stealth,thick] (nic2) -- (12.7,0) node[right,align=left,font=\footnotesize]{order\\ out};
+\draw[decorate,decoration={brace,amplitude=5pt}] (2.5,0.6) -- (10.7,0.6) node[midway,above=6pt]{software tick-to-trade (the hot path)};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (-0.6,-0.6) -- (12.2,-0.6) node[midway,below=6pt]{wire-to-wire, timestamped by a capture device on the cable};
+\end{tikzpicture}
+
+\omcaption{The tick-to-trade path of a trading server. The software stages (blue) are this book's subject; the
+network card and the kernel's receive and transmit paths (grey) are treated from the program's side in chapters~4
+and~13, and in hardware in One Quant Book~14.}\label{fig:ll:where-latency-comes-from:path}
+\end{omfigure}
+
+\begin{definition}[Hot path]\label{def:ll:where-latency-comes-from:hot}
+The \emph{hot path}\index{hot path} of a trading system is the sequence of code executed between a triggering market
+event and the resulting order: the code whose duration is the \omterm{def:ll:where-latency-comes-from:t2t}{tick-to-trade latency}. Everything else (logging to
+disk, reporting, risk aggregation, configuration) runs off the hot path, on other threads or at other times.
+\end{definition}
+
+\Cref{fig:ll:where-latency-comes-from:path} is the map of Part~IV of this book, where each stage is built:
+the feed handler that decodes and arbitrates the exchange's packets (chapter~18), the order-book builder
+(chapter~19), the strategy engine (chapter~20), the pre-trade risk gate (chapter~22) and the order gateway
+(chapter~21). Parts~I to~III supply what each stage is made of: the processor and its memory (chapters~2 to~5), the
+languages (chapters~6 to~14) and the protocols (chapters~15 to~17).
+
+Two physical quantities bound the path from below and are worth computing once.
+
+\begin{example}[Light in fibre, bits on the wire]\label{ex:ll:where-latency-comes-from:physics}
+A standard single-mode fibre has an effective group index of about 1.462 at a wavelength of 1\,550 nm (a
+manufacturer's specification sheet): light in it covers a metre in $1.462/c = \qty{4.88}{\nano\second}$, so
+the 30 metres of cable between a server and an exchange's switch inside one data centre cost about
+\qty{146}{\nano\second} each way. Putting a frame on the wire takes its length in bits divided by the line rate,
+plus 20 bytes of preamble, start delimiter and inter-frame gap: a minimal 64-byte frame occupies a 10~Gb/s link for
+$84 \times 8 / 10 = \qty{67.2}{\nano\second}$ and a 25~Gb/s link for \qty{26.9}{\nano\second}. A software path of a
+few microseconds is therefore dominated by computation and by the operating system, not by physics, until it is
+very good.
+\end{example}
+
+\section{Latency is a distribution}
+
+The \omterm{def:ll:where-latency-comes-from:t2t}{tick-to-trade latency} of one message is a draw. Its median describes the ordinary message; the messages that
+cost money are often the others.
+
+\begin{definition}[Tail latency, jitter]\label{def:ll:where-latency-comes-from:tail}
+The \emph{tail latency}\index{tail latency} of a system is the upper part of its \omterm{def:ll:where-latency-comes-from:latency}{latency} distribution, reported as
+high percentiles: the 99th (p99), the 99.9th (p99.9), the maximum over a period. \emph{Jitter}\index{jitter} is
+the variability of \omterm{def:ll:where-latency-comes-from:latency}{latency} from one occurrence to the next, reported as a spread (p99 minus p50, or a standard
+deviation); a system with low jitter is one whose tail is close to its median.
+\end{definition}
+
+We write $X$ for a \omterm{def:ll:where-latency-comes-from:latency}{latency}, $X_i$ for the \omterm{def:ll:where-latency-comes-from:latency}{latency} of stage $i$ of a path, and $q_p(X)$ for its $p$-quantile, so that
+p99 is $q_{0.99}(X)$. The end-to-end \omterm{def:ll:where-latency-comes-from:latency}{latency} of a path is $X = \sum_i X_i$. Means add: $\E[X] = \sum_i \E[X_i]$.
+Quantiles do not, and the direction of the error is not fixed.
+
+\begin{proposition}[Tails of a sum]\label{prop:ll:where-latency-comes-from:union}
+For any random variables $X_1,\dots,X_n$, whatever their dependence, and levels $\alpha_i > 0$ with $\sum_i \alpha_i < 1$,
+\[
+q_{1-\sum_i \alpha_i}\Big(\sum_i X_i\Big) \le \sum_i q_{1-\alpha_i}(X_i).
+\]
+In particular, stage targets $b_i$ met at the level $1-(1-p)/n$ guarantee an end-to-end target $\sum_i b_i$ at
+level $p$.
+\end{proposition}
+
+\begin{proof}
+Let $b_i = q_{1-\alpha_i}(X_i)$, so $\P(X_i > b_i) \le \alpha_i$. If $\sum_i X_i > \sum_i b_i$, then $X_i > b_i$ for
+at least one $i$; hence $\P(\sum_i X_i > \sum_i b_i) \le \sum_i \P(X_i > b_i) \le \sum_i \alpha_i$, and the
+$(1-\sum_i\alpha_i)$-quantile of the sum is at most $\sum_i b_i$. With $\alpha_i = (1-p)/n$ the level is $p$.
+\end{proof}
+
+The proposition says nothing about $q_{0.99}(\sum X_i)$ against $\sum q_{0.99}(X_i)$, and that comparison can go
+either way. It fails in the direction that matters when each stage has rare stalls that none of the stage
+percentiles sees.
+
+\begin{example}[Two clean stages, one stalled path]\label{ex:ll:where-latency-comes-from:nonsub}
+Two independent stages each take \qty{1}{\micro\second}, except that each stalls for \qty{100}{\micro\second} with
+probability 0.9\%. Each stage's p99 is \qty{1}{\micro\second}: its stalls are rarer than 1\%. The path stalls when
+either stage does, with probability $1-0.991^2 = 1.79\%$, so its p99 is \qty{101}{\micro\second}, fifty times the
+sum of the stage p99s. (The same failure of additivity for value at risk is why One Quant Book~6 prefers expected
+shortfall for aggregating risk.)
+\end{example}
+
+\Cref{fig:ll:where-latency-comes-from:ccdf} shows the same effect on a synthetic six-stage path, each stage with a
+lognormal body and a 0.3\% chance of a stall of \qty{8}{\micro\second} on average. The stages' medians add up
+almost exactly to the path's median (\qty{2.13}{\micro\second} against \qty{2.17}{\micro\second}) and the means add
+exactly (\qty{2.32}{\micro\second}). The path is stalled with probability $1-0.997^6 \approx 1.8\%$, so its p99
+(\qty{6.56}{\micro\second}) sits in the stalls, while the sum of the stage p99s (\qty{3.59}{\micro\second}) does
+not see them. The union bound at level $1-0.01/6 \approx 99.83\%$ per stage gives \qty{28.7}{\micro\second}: safe,
+and four times too pessimistic. Only the end-to-end distribution, measured message by message, gives the answer.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log origin y=infty,xmin=1.5,xmax=60,ymin=1e-4,ymax=1.2,
+  xlabel={end-to-end latency $x$ (\si{\micro\second}, log scale)},ylabel={$\P(X > x)$ (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  xtick={2,5,10,20,50},xticklabels={2,5,10,20,50},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick] table[x=x_us,y=ccdf]{figdata/low-latency/01-where-latency-comes-from/ccdf.csv};
+\addplot[black!45,dashed,thin,domain=1.5:60,samples=2] {0.01};
+\addplot[omThm,very thick,ycomb] table[x=sum_p99,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\addplot[omMeth,very thick,ycomb] table[x=p99,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\addplot[omProp,very thick,dashed,ycomb] table[x=sum_union,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\legend{end-to-end tail,1\% level,sum of the stage p99s,end-to-end p99,{union bound (stages at 99.83\%)}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The tail of a synthetic six-stage path whose stages each stall 0.3\% of the time. The sum of the stage
+p99s misses the stalls and understates the path's p99; the union bound of
+\cref{prop:ll:where-latency-comes-from:union} overstates it. Data: \texttt{ll\_budget.composition}, 400\,000 simulated
+messages.}\label{fig:ll:where-latency-comes-from:ccdf}
+\end{omfigure}
+
+The same arithmetic applies to a real path, measured. \Cref{fig:ll:where-latency-comes-from:measured} times the four
+stages of a toy path, Book~1's decoder and book with a trivial decision and an order encoder, message by message on
+this book's laptop. The book, built on balanced trees and a hash map, is the largest stage at the median; the p99.9
+of the decoder, the book and the decision is several times their p99, and the maximum is hundreds of times the
+median: an interruption of the thread by the operating system, which this laptop, with no isolated cores, does not
+prevent (chapter~13).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,ybar,bar width=7pt,ymode=log,log origin y=infty,ymin=10,ymax=100000,
+  symbolic x coords={decode,book,decide,encode,total},xtick=data,enlarge x limits=0.14,
+  ylabel={nanoseconds (log scale)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},
+  legend columns=5,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=stage,y=p50]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=stage,y=p99]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=stage,y=p999]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=gray!40,draw=gray] table[x=stage,y=max]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Per-message \omterm{def:ll:where-latency-comes-from:latency}{latency} of the stages of a toy tick-to-trade path (decode one message, apply it to Book~1's
+book, decide, encode an order), over 200 replays of Book~1's 2\,020-message sample, pinned to one CPU. Measured on a
+laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores; each figure includes the timer's own cost of about
+\qty{15}{\nano\second}. Data: \texttt{bench\_path.py}.}\label{fig:ll:where-latency-comes-from:measured}
+\end{omfigure}
+
+\section{Budgets from wire to wire}
+
+\begin{definition}[Latency budget]\label{def:ll:where-latency-comes-from:budget}
+A \emph{latency budget}\index{latency budget} is a target for the end-to-end \omterm{def:ll:where-latency-comes-from:latency}{latency} of a path at stated
+percentiles, split into targets for each stage, against which every change to the system is measured.
+\end{definition}
+
+A budget turns ``make it faster'' into a list of numbers that a stage either meets or does not. It is written from
+the outside in: what the strategy needs, what the physics and the hardware cost, and what is left for software.
+
+\begin{method}[Writing a latency budget]\label{met:ll:where-latency-comes-from:budget}
+\begin{enumerate}
+\item State the requirement from the strategy's side: the \omterm{def:ll:where-latency-comes-from:latency}{latency} at which its edge disappears, and the
+percentiles that matter (the median for races; the tail for exposure to stale quotes).
+\item Subtract the fixed costs: cable and fibre lengths, serialisation, switches, the exchange's own gateway.
+\item Split the remainder among the software stages in proportion to what they must do, at a stage level stricter
+than the end-to-end level (\cref{prop:ll:where-latency-comes-from:union}).
+\item Instrument every stage boundary (chapter~26) and check each release against the budget, stage by stage and end
+to end, on the joint per-message samples (chapter~25).
+\end{enumerate}
+\end{method}
+
+\begin{dated}{2026-09}{Published tick-to-trade figures}\label{dat:ll:where-latency-comes-from:published}
+At CppCon 2017 an engineer of a large electronic market maker gave ``around \qty{2.5}{\micro\second}'' as a very
+good minimum wire-to-wire time for a software-based trading system. The STAC-T0 benchmark measures the time from the
+last bit of the inbound data needed for a decision to the first bit of the outbound order, with UDP in, TCP out and
+essentially no trading logic; a report of June 2024 on a programmable-hardware card gave a minimum of
+\qty{13.9}{\nano\second} for 507-byte frames. The two figures bracket the industry: software at microseconds,
+hardware at tens of nanoseconds (One Quant Book~14, chapters~6 and~7).
+\end{dated}
+
+\begin{example}[A three-microsecond budget]\label{ex:ll:where-latency-comes-from:budget}
+A software system must answer within \qty{3}{\micro\second} wire to wire at the median. The card and kernel-bypass
+receive path take about \qty{0.9}{\micro\second} and the transmit path \qty{0.8}{\micro\second} (the synthetic
+figures of \cref{fig:ll:where-latency-comes-from:ccdf}); \qty{1.3}{\micro\second} is left for decode, book, strategy,
+risk and encode. Split \qty{60}{\nano\second}, \qty{120}{\nano\second}, \qty{200}{\nano\second},
+\qty{50}{\nano\second} and the rest in reserve, it fits; the toy book of \cref{fig:ll:where-latency-comes-from:measured}
+alone, at about \qty{80}{\nano\second} at the median but near a microsecond at p99.9, does not fit a tail
+target. Chapter~19 builds one that does.
+\end{example}
+
+\section{Which strategies pay for which microseconds}
+
+A race between two firms reacting to the same event is won by the one whose \omterm{def:ll:where-latency-comes-from:latency}{latency} on that message is lower. With
+our \omterm{def:ll:where-latency-comes-from:latency}{latency} $X_A$ and the competitor's $X_B$, independent,
+\[
+\P(\text{win}) = \P(X_A < X_B),
+\]
+which depends on both distributions entirely, not on a single number. The median decides most races; the tail
+decides the others.
+
+\begin{example}[Median against tail in a race]\label{ex:ll:where-latency-comes-from:race}
+Our \omterm{def:ll:where-latency-comes-from:latency}{latency} has a lognormal body with median \qty{2.0}{\micro\second} and a 2\% chance of a stall of
+\qty{30}{\micro\second} on average; the competitor's median is \qty{2.2}{\micro\second} with stalls of the same
+length 0.5\% of the time. Simulated over a million races, we win 66.1\%. Halving our median wins 98.0\%. Halving our
+stall rate, which cuts our p99 from \qty{23.6}{\micro\second} to \qty{3.5}{\micro\second}, wins 66.7\%: a large
+improvement of a percentile that races barely see (\cref{fig:ll:where-latency-comes-from:race}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=1.6,xmax=2.8,ymin=0,ymax=1,ytick={0.2,0.4,0.6,0.8,1},
+  xlabel={our median latency (\si{\micro\second}); the competitor's is 2.2},ylabel={$\P(\text{win})$},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick] table[x=median_us,y=with_stalls]{figdata/low-latency/01-where-latency-comes-from/race.csv};
+\addplot[omThm,thick,dashed] table[x=median_us,y=no_stalls]{figdata/low-latency/01-where-latency-comes-from/race.csv};
+\legend{with our 2\% stalls,without stalls}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Probability of winning a race against a competitor with median \qty{2.2}{\micro\second} and 0.5\% stalls,
+as our median varies. Removing all our stalls moves the curve by about a point; moving our median by a tenth of a
+microsecond moves it by about eight. Data: \texttt{ll\_budget.race\_curve}, 400\,000 simulated races per
+point.}\label{fig:ll:where-latency-comes-from:race}
+\end{omfigure}
+
+The tail matters where the question is not who arrives first but how long a firm is exposed. A market maker's
+quotes rest in the book while its view of the market is stale; for the duration of a stall they can be traded
+against by anyone who has seen the new price. The expected cost of a stall is the rate of informed arrivals times
+the stall's length times the loss per fill: adverse selection (One Quant Book~1, chapter~1), scaled by the tail. A
+latency-arbitrage strategy (One Quant Book~11, chapter~9) pays for its median; a market maker pays for both, and
+for its tail on the worst days, when stalls and news arrive together. A firm executing large orders over hours pays
+for neither at the microsecond scale: its \omterm{def:ll:where-latency-comes-from:budget}{latency budget} is written in milliseconds, and its engineers' time is
+better spent elsewhere.
+
+\section{Tutorial: timing a path and composing its budget}\label{tut:ll:where-latency-comes-from:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Time the stages of a toy tick-to-trade path message by message, then compose and check a budget with
+\texttt{firm.latbudget}. \textbf{End state:} \cref{fig:ll:where-latency-comes-from:measured,fig:ll:where-latency-comes-from:ccdf}
+and a budget report.
+\begin{tutsteps}
+\item \textbf{Time each stage.} The benchmark replays Book~1's sample and reads the processor's time-stamp counter
+between stages (chapter~2 explains the counter and chapter~5 its calibration); the first pass warms the caches and is
+discarded.
+\omcode{code/low-latency/01-where-latency-comes-from/cpp/ll_path_bench.cpp}{28}{48}{Timing four stages per message with the time-stamp counter.}\label{lst:ll:where-latency-comes-from:bench}
+\item \textbf{Run it pinned:} \texttt{python bench\_path.py} compiles the benchmark, runs it on one CPU with
+\texttt{taskset}, and writes \texttt{measured\_path.csv} with a \texttt{.meta} file that records the machine, the
+compiler, the flags and the load.
+\item \textbf{Check a budget.} Stage targets and end-to-end targets are data; the check composes the stages jointly,
+message by message.
+\omcode{code/firm/latbudget/firm_latbudget.py}{44}{54}{A budget checked against aligned per-stage samples.}\label{lst:ll:where-latency-comes-from:check}
+\item \textbf{Compose synthetic stages} with \texttt{ll\_budget.composition()} and compare the sum of stage percentiles
+with the end-to-end percentile.
+\end{tutsteps}
+\textbf{What to change next.} Run the benchmark without \texttt{taskset} and next to a compilation of this book, and
+compare the p99.9; replace the independent stalls of \texttt{ll\_budget} by stalls that hit every stage of a message at
+once, and see which percentiles move.
+\end{tutorial}
+
+\section{Build: the latency budget}\label{bld:ll:where-latency-comes-from:latbudget}
+
+\begin{build}
+\bfield{Purpose} The contract every stage of the firm's \omterm{def:ll:where-latency-comes-from:hot}{hot path} is measured against, from this chapter to the
+assembled path of chapter~26.
+\bfield{Interface} \texttt{Stage(name, targets)}, \texttt{Budget(stages, end\_to\_end)},
+\texttt{Budget.check(samples)} returning one row per stage and level (target, measured, ok),
+\texttt{compose\_joint}, \texttt{compose\_independent(samples, n, seed)}, \texttt{stage\_level(p, n)},
+\texttt{allocate(total, weights)}, \texttt{quantile(x, p)} (nearest rank).
+\bfield{Rules} Samples are nanoseconds, one array per stage, aligned message by message when they come from one run;
+end-to-end figures are composed jointly from aligned samples, never by adding percentiles; a stage target at level
+$p$ for an end-to-end level $p$ is flagged as unsound.
+\bfield{Acceptance tests} \texttt{code/firm/latbudget/tests/}: the union bound on independent, comonotone and
+countermonotone pairs; the non-subadditive p99 of \cref{ex:ll:where-latency-comes-from:nonsub}; a budget with one
+failing stage.
+\bfield{Stretch} Confidence intervals on each measured percentile (bootstrap, One Quant Book~4, chapter~13); a
+budget in cycles as well as nanoseconds.
+\end{build}
+
+\begin{omsources}
+\item M.~Aquilina, E.~Budish and P.~O'Neill, ``Quantifying the high-frequency trading `arms race''', \emph{Quarterly
+Journal of Economics} 137(1), 2022, 493--564.
+\item C.~Cook, ``When a microsecond is an eternity: high performance trading systems in C++'', CppCon 2017.
+\item STAC, STAC-T0 benchmark reports (tick-to-trade network I/O), 2020--2024.
+\item Corning, SMF-28 ULL optical fibre, product information PI1470 (2020).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:1}
+A server sits 45 metres of fibre from the exchange's switch. What does the fibre cost each way, at a group index of
+1.462?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:2}
+How long does a 128-byte frame occupy a 10~Gb/s link, counting 20 bytes of preamble, delimiter and gap? And a 25~Gb/s
+link?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:3}
+Four stages have mean latencies of 300, 80, 150 and \qty{500}{\nano\second}. What is the mean end-to-end \omterm{def:ll:where-latency-comes-from:latency}{latency}, and
+what can be said about its median?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:4}
+A path has five independent stages, each stalling with probability 0.4\% per message. What is the probability that a
+message meets at least one stall? Is the path's p99 in the stalls?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:5}
+An end-to-end p99.9 target of \qty{10}{\micro\second} is to be guaranteed by targets on four stages. At what
+percentile must each stage meet its target, and how must the targets relate?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:6}
+Read \cref{fig:ll:where-latency-comes-from:race}. By how much must our median fall to gain as much as removing all
+our stalls gains at a median of \qty{2.0}{\micro\second}?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:where-latency-comes-from:7}
+\emph{Coding.} In \texttt{ll\_budget}, make the stalls common: when the path stalls (probability 1.8\% per message),
+put the stall on one stage chosen at random, and none on the others. Which of the figures of
+\cref{fig:ll:where-latency-comes-from:ccdf} change: the stage p99s, the end-to-end p99?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:where-latency-comes-from:8}
+\emph{Find the flaw.} ``Our feed handler's p99 is \qty{400}{\nano\second}, our strategy's is \qty{600}{\nano\second}
+and our gateway's is \qty{300}{\nano\second}, measured separately in three benchmarks: our tick-to-trade p99 is
+\qty{1.3}{\micro\second}.''
+\end{exercise}
+
+\section{Problem: The Microsecond That Lost the Race}
+
+\begin{problem}[{Weekend problem --- two firms, one stale quote}]\label{pb:ll:where-latency-comes-from:1}
+Our firm and one competitor race for the same stale quotes. Our \omterm{def:ll:where-latency-comes-from:latency}{latency} has a lognormal body (median
+\qty{2.0}{\micro\second}, dispersion 0.15) and a 2\% chance per message of a stall of exponential length with mean
+\qty{30}{\micro\second}; the competitor's median is \qty{2.2}{\micro\second} and it stalls 0.5\% of the time.
+
+\medskip\noindent\textbf{Part I --- The race.}
+\begin{enumerate}
+\item Write the probability that we win a race in terms of the two \omterm{def:ll:where-latency-comes-from:latency}{latency} distributions. What does it assume about
+their dependence?
+\item Without stalls, both bodies lognormal with the same dispersion, what is $\P(\text{win})$ in closed form?
+Evaluate it.
+\item What share of races do we win with the stalls (the simulation)?
+\item Why is the answer below the no-stall answer by less than our stall rate?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Median or tail.}
+\begin{enumerate}[resume]
+\item What are our p50 and p99 with the stalls?
+\item What does halving our median win? What does halving our stall rate win, and what does it do to our p99?
+\item Removing all stalls wins how much?
+\item Which should the firm pay for, if it only races?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Exposure.}
+\begin{enumerate}[resume]
+\item Our quotes are exposed while we are stalled. With stalls on 2\% of messages and a mean of
+\qty{30}{\micro\second}, what fraction of time is our view of the market stale if a message arrives every
+\qty{10}{\micro\second} on average and stalls do not overlap?
+\item If informed takers arrive at 20 a second and each fill on a stale quote costs half a tick of \$0.01 on 100
+shares, what does the staleness cost a day of 6.5 hours?
+\item How does halving the stall rate change that cost?
+\item Which part of the distribution does the exposure depend on, and which the race?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The budget.}
+\begin{enumerate}[resume]
+\item The firm wants $\P(\text{win}) \ge 0.9$ against this competitor. Read the median it needs from
+\cref{fig:ll:where-latency-comes-from:race}.
+\item Write that as a budget over five software stages with equal shares of what remains after
+\qty{1.0}{\micro\second} of network and kernel. What does each stage get?
+\item At what level must each stage meet its target to guarantee an end-to-end p99?
+\item State the \emph{named result}: our win probability, and its gain from halving the median against halving the
+stall rate.
+\item Why does a single number (``our \omterm{def:ll:where-latency-comes-from:latency}{latency} is \qty{2}{\micro\second}'') describe neither race nor exposure?
+\item What measurement would tell the firm the competitor's distribution?
+\item Name one strategy for which neither the median nor the tail at microseconds matters.
+\item In one sentence: what does a \omterm{def:ll:where-latency-comes-from:budget}{latency budget} buy an engineering team?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:where-latency-comes-from:1}
+What is the difference between tick-to-trade and \omterm{def:ll:where-latency-comes-from:t2t}{wire-to-wire latency}, and how would you measure each?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer, trader}]\label{iq:ll:where-latency-comes-from:2}
+Why do trading firms report p99 and p99.9 rather than the mean \omterm{def:ll:where-latency-comes-from:latency}{latency}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:ll:where-latency-comes-from:3}
+Three components have p99 latencies of 1, 2 and \qty{3}{\micro\second}. What can you say about the p99 of the
+pipeline?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:where-latency-comes-from:4}
+Light travels at about \qty{5}{\nano\second} a metre in fibre. Where else does time go between a packet reaching a
+server and an order leaving it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader, researcher}]\label{iq:ll:where-latency-comes-from:5}
+Your firm wins 60\% of races against its main competitor. Should it spend its next quarter on the median or on the
+tail of its \omterm{def:ll:where-latency-comes-from:latency}{latency}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:where-latency-comes-from:6}
+Design the measurement that would let you write a \omterm{def:ll:where-latency-comes-from:budget}{latency budget} for an existing trading system you did not build.
+\end{interviewq}

@@ -398,3 +398,135 @@ surveil (ch29). Each module's docstring holds its stable API; the reusable ones 
   seed, spot)` (monthly paths), `book_exposures`, `spot_profile`, `recycling_impact`.
   `firm_surveil` (ch. 29): `spoofing_days`, `close_days`, `wash_days`, their `*_scores`, `tpr_at_fpr(score, label,
   fpr)`, `flagged_by_type`. Account-day features only; no manipulation's profit is modelled.
+
+## 7. The exchange simulator `firm_exchsim` (frozen at the Books 10–13 sync, 2026-09-25)
+
+Implemented by **Book 10 ch. 26** (`code/firm/exchsim/`), consumed by Books 11 (every market-making
+tutorial), 12 (ch. 16, 18, 29) and 13 (ch. 16–26). Book 10 implements it **first** in Phase B, before its
+chapter 1 prose, in this order: `lob`, `ordertypes`, `auctionsim`, `halts`, then `exchsim` (Python
+reference), then `PROTOCOL.md` + `schema.json` + golden fixtures, then the C++20 engine and localhost
+server, then the Rust engine and codecs. Book 10 records what has landed, with the date, in
+`code/firm/exchsim/STATUS.md` (Book 10 writes it; consumers read it before each chapter that needs the
+simulator). Until a piece lands, consumers use Book 7's `firm_tape` agent API or `firm_lobreplay`, through
+an adapter, never a private simulator. Book 10 may **add** to this contract; renaming or removing
+anything needs the main session.
+
+**Reuse, not duplication.** Allocation calls Book 1's `firm_match` (FIFO, pro-rata, top-order, LMM);
+the uncross uses Book 1's `firm_auction`; the consolidated feed uses `firm_nbbo`; tiers use
+`firm_feesched`; LULD monitors come from `firm_replay`. Book 7's `firm_tape` supplies background flow
+(`TapeBackground`) and `res.tape()` exports its `msgs/trades/top` arrays so `firm_lobreplay`,
+`firm_lobfeat`, `firm_tradeflow` and `firm_markout` run unchanged; `ReplayStrategyAdapter` runs one
+Strategy on replay and on the simulator with a parity test; `TapeAgentAdapter` runs Book 7 agents.
+
+**(a) In-process Python API** (names binding; defaults are Book 10's):
+`ExchangeConfig(venue, instruments=(InstrumentSpec(symbol, locate, tick, lot, start_price,
+matching='fifo'|'pro_rata'|'configurable', alloc, band),), fees=FeeSchedule(make, take, tiers),
+phases=Phases(...), halts, throttle=Throttle(rate, burst), engine_ns, speed_bump_ns=0,
+asymmetric_delay=False, batch_interval_ns=0 (frequent batch auction when > 0), feed=FeedConfig(lines=('A','B'),
+loss, burst_loss (Gilbert–Elliott), dup, reorder_window, jitter, outages, snapshot_every_ns), faults=(), seed)`;
+`Simulator(venues, inter_venue_ns, sip, seed)`; `add_background(...)`; `add_agent(agent,
+SessionSpec(firm, venue, latency=LatencyModel(entry_ns, ack_ns, data_ns, jitter, spikes), cod, stp_group,
+drop_copy=False))`; `add_events(...)` for scheduled exogenous jumps of the efficient price and for
+scripted orders; `schedule_call(t_ns, fn, *args)` (added ch. 25: a venue-side process called among the controls;
+`firm.halts` policies `LULD(pct, window_s, limit_state_s, pause_s, check_s, locate, shadow, update_pct)`,
+`MarketWide(levels, halt_s, check_s, reference)`, `Velocity(ticks, window_s, pause_s, check_s)`, `Combined(...)` are
+passed as `ExchangeConfig(halts=...)` and act only through controls R and P; client order ids are numbered per
+session, so a multi-venue agent sets `Order.cl_ord_id` itself); `res = sim.run(until_ns)` with `res.feed_bytes(venue, line)`, `res.tape(venue, locate)`,
+`res.reports(firm)`, `res.journal` (every inbound message with its engine-arrival ns), `res.truth`
+(efficient price path, aggressor class and informed flag per trade: evaluation only, never in the feed).
+Agent protocol: `on_start`, `on_feed(ctx, msg)`, `on_book(ctx, locate, top)`, `on_report(ctx, rep)`,
+`on_timer(ctx, tag)`; `ctx`: `now_ns`, `send(Order) -> cl_ord_id`, `replace`, `cancel`, `mass_cancel`,
+`quote` (two-sided mass quote), `set_timer`, `book(locate)` (built from the agent's own feed), `position`,
+`cash`, `working()` (with orders ahead in queue), `compute(ns)` (declared decision time that delays the
+next sends: Book 12 ch. 29 charges inference latency with it).
+Presets (Book 10 ch. 26–29, added as they land): US-equity lit venue, pro-rata futures (with top order and,
+as a stretch, implied-in calendar spreads), midpoint dark pool, speed-bumped venue, periodic batch
+auction, opening/closing auctions with indicative-price and imbalance messages and MOC/LOC and cut-offs,
+and a crypto profile (24-hour session, fees in bp, request-weight rate limit) before Book 11 ch. 24 needs it.
+Performance targets: a 6.5-hour single-instrument day with one agent and default background in tens of
+seconds of Python; one simulated minute with light background in well under a second (Book 12's RL).
+
+**(b) Market-data feed** (big-endian throughout, prices in 1/10,000 currency unit, timestamps 48-bit ns
+since midnight). Payload messages keep Book 1 `firm_feed`'s A 36 / E 31 / X 23 / D 19 / P 44 byte for
+byte (a test decodes an A/E/X/D/P-only stream with `firm_feed`), plus ITCH-5.0-length U replace 35
+(new order ref, loses priority), C executed-with-price 36, Q cross 40, I imbalance 50, S system event 12,
+H trading action 25, and own layouts R instrument directory (locate, symbol, tick, lot), G/W snapshot
+begin/end (W carries the last applied incremental seq and a CRC32). Each message is framed by a u16
+length. **Packets are MoldUDP64**: session (10 bytes ASCII) | sequence number of the first message (u64) |
+count (u16); count 0 is a heartbeat, 0xFFFF end of session. The feed's order ref is the exchange order
+id returned in the Accepted report. Lines A and B carry identical packets with independent seeded
+impairments. A snapshot channel publishes each instrument's full MBO book in priority order, tagged with
+the incremental seq it reflects; a retransmission service answers (session, seq, count) from a bounded
+window with a maximum count and a rate limit; beyond the window a client recovers from the snapshot.
+**Recorded files**: per line and for the snapshot channel, records of (u64 send_ns, u32 len, packet bytes);
+golden decoded CSVs per message type; a deterministic recorded day of at least one million messages is
+*regenerated by a script*, not committed. **`schema.json`** describes every message of both protocols
+(fields, types, offsets, enums) and is the single source from which Book 13 ch. 16 generates its client
+codecs; a test checks it against the Python codec.
+
+**(c) Order-entry protocol.** Session layer **SoupBinTCP 4.0**-style (`u16 len | u8 type`; login with
+username, password, requested session and requested sequence; login accepted / rejected; server and
+client heartbeats; logout; end of session; sequenced server messages, unsequenced client messages;
+re-login from a sequence number replays missed reports). Application messages OUCH-style, big-endian.
+Inbound: O Enter (`cl_ord_id u64`, locate, side, qty, price with 0 = market, tif D/I/F/G/open/close,
+display visible/hidden/midpoint peg/primary peg, post_only, display_qty for icebergs, min_qty, stp_group,
+stp_mode none/cancel-oldest/cancel-newest/both/decrement, stop_price), U Replace (a size decrease at the
+same price keeps priority and is published as a partial X; any other change loses it and is published as
+U), X Cancel (with leave-qty), M Mass cancel (all or per instrument), Q Mass quote (two-sided, atomically
+replaces the previous). Outbound: A Accepted (with order ref), U Replaced (priority kept or not), C
+Canceled (user, IOC remainder, self-trade prevention, disconnect, halt, mass, expired), E Executed (qty,
+price, match id, liquidity flag added/removed/cross, fee, leaves), J Rejected (throttle, bad tick, bad
+qty, halted, unknown symbol, duplicate id, post-only would cross, price band, too late to cancel), S
+system events. Order states on the venue: Live → PartiallyFilled → Filled | Canceled | Expired; Replace
+yields a new id; Rejected is terminal; PendingNew/PendingCancel exist only in the client (Book 13's
+gateway). The cancel–fill race is real: a cancel arriving after the final fill gets J(too late). Per
+session: token-bucket throttle, self-trade prevention per group, cancel on disconnect, and an optional
+read-only **drop-copy** session carrying all the firm's executions and cancels.
+**Scheduled faults** (for Book 13 ch. 24–25): session drops, login refusals over a window, an engine
+pause-and-resume standing in for a failover, halts; plus scripted orders at set times.
+
+**(d) Clock and determinism.** Integer-ns simulated clock; events ordered by `(t_ns, class, seq)`; the
+engine charges `engine_ns` per message, so bursts queue. Latency per session and direction: base +
+lognormal jitter + optional spikes; TCP stays FIFO, UDP lines may reorder. Randomness is counter-based
+(SplitMix64 keyed on seed, session, direction, counter), identical in Python, C++ and Rust, so adding a
+participant never changes anyone else's draws (common random numbers with and without an agent, disjoint
+seed streams for train/validation/test). Same config, seed and inputs give byte-identical feeds and
+reports (tested by SHA-256).
+
+**(e) Transport.** A framed byte-stream abstraction: in-memory pipe (default, simulated time) or real
+sockets. Live mode: feed over **UDP multicast on loopback** (tested to work under WSL2) with UDP unicast
+on two ports as the fallback; order entry and retransmission over TCP. `python -m firm_exchsim serve`
+(slow, reference) and `cpp/bin/exchsim_server --config cfg.json` (C++20, real time; journals its inputs
+so any run replays exactly). Book 13 ch. 26 measures only the client's internal path.
+
+**(f) Twins.** C++20: `exchsim_codec.hpp` (allocation-free decode), `exchsim_engine.hpp`,
+`exchsim_server.cpp`; Rust crate with `codec` and `engine`. The three engines produce byte-identical feeds
+and reports on the shared fixtures. Client-side handler, book builder and gateway belong to Book 13;
+Book 10 ships only a minimal test client. `PROTOCOL.md` documents every byte, state and reason code.
+
+**(g) Populations and the firm's algorithm on the simulator** (added Book 10 ch. 27–28). `firm.agentmkt`:
+`session(cfg, seconds, seed, agents=(), venue=None) -> (Result, Population)` runs a reacting population as one
+Agent with zero latency (`PopulationConfig`: providers, noise takers with Pareto sign runs, fundamentalists on a
+hidden value, chartists `chart`/`chart_window` off by default, activity `curve`); other agents join with 20 µs
+latency; `MarketMaker(lots, skew, max_lots, refresh_s)`; `facts(tape, sample_s)` (stylised facts of any
+firm.tape-format tape), `distance`, `msm`. Chapter 27's calibrated population is `PopulationConfig(lo_rate=3,
+near=0.5, cancel=0.02, depth=10, mo_lots=2, fund=0.2, v_rate=0.1, noise=1.2, run_tail=2.5, chart=0.05)` with
+`MarketMaker(skew=0.1)`. `firm.execalgo`: `ISAlgo(Params(...), name, venues)` is an ordinary Agent (states new,
+working, paused, done, expired, killed; `.log`, `.fills`; `.kill(t_ns)` for `schedule_call`); it pauses on any
+trading-action message other than T and resumes on T.
+
+## 8. Books 10–13 components (reserved 2026-09-25 at the sync, all new and unique; all **landed** 2026-09-26)
+
+- **Book 10** (`microstructure`): lob ordertypes lobstats spreadmodels spreaddecomp queuevalue venuefees consolidated darkpool auctionsim impactfit propagator crossimpact acexec execcontrol algos placement sor tca algowheel xexec riskbid otcsearch mktquality halts exchsim agentmkt execalgo
+- **Book 11** (`hft`): mmharness mmecon fairprice invmm multimm qreactive toxicity hfalpha xvenue latrace quoteengine mmhedge etfmm basketarb drarb futmm auctionmm rebatemm newsrace optquoter optarb fxlp rfqmm wholesale cryptohft searcher sportsmm riskctl mmattrib venueprofile
+- **Book 12** (`ml`): mlsynth labeling cvsplit mlbase gbdt featimp nettab lobseq xsnet represent uncert onlinelearn textml llmeval altdata genmkt rlcore rltrade deephedge regimes modelcard e2eport mltrain featstore exptrack mlinfer mlmonitor modelpkg lobmodel
+- **Book 13** (`low-latency`): latbudget ubench memkit coreplan lathist arena pipeline flagbench affinity gcwatch mpmcq ring tuneaudit simdscan fixengine wirecodec wsclient feedhandler bookbuilder stratengine ordergw riskgate binlog sequencer perfgate ticktotrade (`coreplan` = Book 13 ch. 4's core-placement plan; `placement` is Book 10 ch. 17's child-order placement)
+
+Cross-book contracts inside the batch (each implementer documents its API in the module docstring and
+here when it lands): Book 11 `mmharness` (`Quoter` protocol over `firm_tape` now, `firm_exchsim` later);
+Book 11 `riskctl` limits schema + fixtures, which Book 13 `riskgate` replays in nanoseconds (policy in
+Book 11, implementation in Book 13); Book 10 `acexec`/`execalgo` schedules as Book 12 `rltrade`
+baselines; Book 10 `agentmkt` stylised-fact checks callable on any message stream (Book 12 `genmkt`);
+Book 13 `wirecodec` generated from `exchsim/schema.json`. When two batch books are written at the same
+time, a consumer that reaches its chapter first writes against this contract and a thin adapter, and the
+main session wires them together at the reconciliation.

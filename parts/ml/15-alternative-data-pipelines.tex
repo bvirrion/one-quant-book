@@ -1,0 +1,316 @@
+\chapter{Alternative-Data Pipelines}\label{ch:ml:alternative-data-pipelines}
+
+A card-spending panel nowcasts a hundred retailers' year-on-year sales growth within 3.3 percentage points on average for
+three years; in the fourth it misses by 22.5. Nothing changed at the retailers. The vendor had changed its bank partner,
+and the new partner's cardholders were older and lived elsewhere. Book~7 (chapter~12) taught how to decide whether to buy
+a dataset; Book~8 (chapter~16) traded one. This chapter is the plumbing in between, where most of the work and most of the
+losses are: ingesting deliveries that are sometimes wrong, turning merchant strings into securities, correcting a panel
+that is not the population, and telling a history the vendor lived through from one it reconstructed. Every number comes
+from a synthetic panel whose truth is known, built so that each stage has something to catch.
+
+\section{Ingestion and validation}
+
+\begin{definition}[Ingestion pipeline, schema validation]\label{def:ml:alternative-data-pipelines:ingest}
+An \emph{ingestion pipeline}\index{ingestion pipeline} is the code that receives a vendor's deliveries, checks them, maps
+them to the firm's identifiers and stores them with the time each value became known. \emph{Schema
+validation}\index{schema validation} checks each record against a declared schema: every field present, of its type and in
+its range, and no record duplicated; records that fail are rejected with a reason, never silently repaired.
+\end{definition}
+
+The chapter's world has 100 retailers over 24 quarters. Their true sales are spent by a population divided into six cells,
+three age bands by two regions, with known shares; each retailer draws its customers from the cells in its own proportions,
+and spending in each cell grows at its own rate. The vendor's panel holds 50\,000 cardholders from one bank, tilted young
+(45\% in the youngest band against 30\% of the population) and drifting younger by a point a quarter; at quarter 16 the
+vendor changes partner and the panel becomes 30\,000 cardholders, half in the oldest band and three-quarters in one region.
+The vendor launches at quarter 12, delivering quarters 0 to 11 at once, then one quarter's data a quarter after it ends.
+
+Each delivery is rows of quarter, merchant string, age band, region, spend and panel count, one retailer's spend in a cell
+split across two or three store-level strings: 36\,766 rows in all, with planted defects. \omterm{def:ml:alternative-data-pipelines:ingest}{Schema validation}
+(\cref{lst:ml:alt:validate}) rejects 121 rows with a missing field, 69 with a negative spend, 64 with the panel count
+delivered as text, and 111 duplicates, every planted defect and nothing else. A row can be valid and the delivery wrong: the
+delivery for quarter 19 arrives in cents. A second check compares each delivery's total with the previous one and holds it
+for review when the ratio leaves $[0.5, 2]$; it holds that delivery and no other, and review rescales it. Checks on the
+delivery, not only on the rows, are what catch a vendor's change of units, a lost file or a file sent twice.
+
+\section{Mapping to securities}
+
+\begin{definition}[Entity resolution, record linkage]\label{def:ml:alternative-data-pipelines:er}
+\emph{Record linkage}\index{record linkage} decides which records in two files describe the same entity when no common
+identifier exists, by comparing their attributes (Fellegi and Sunter, 1969). \emph{Entity resolution}\index{entity
+resolution} is the task applied to a dataset's entity strings (merchants, issuers, apps, vessels) against a reference list,
+here the security master (Book~7, chapter~4): normalise, compare, and decide to match, to send to review, or to leave
+unmatched.
+\end{definition}
+
+A card network prints ``SQ *BOREALIS RET'', ``BOREALIS RETAIL \#4417'', ``BOREALI RETA STR 313'' or ``BOREALIS 5120'', and
+the model needs the permanent identifier of Borealis Retail, not a string. The resolver of \cref{lst:ml:alt:resolve}
+strips processor prefixes, store numbers and filler words, then scores each alias by its tokens, counting a token found as a
+prefix of three letters or more (card networks truncate) as a full match. Of the 600 strings of the retailers, exact matching
+on the normalised name finds 300; the resolver matches 500 automatically, all correctly, and sends the other 100 to review:
+the strings that give only the name's first word, which up to three retailers share (Borealis Retail, Borealis Stores,
+Borealis Outfitters). Of ten strings from unrelated merchants (``DELTA AIR LINES'', ``SUMMIT DENTAL CARE''), none is matched,
+six go to review and four are rejected outright. The review queue is where a person earns their place in the pipeline:
+matching a store to the wrong retailer contaminates its sales silently, while a string left for review only delays it.
+
+\section{Panel bias and reweighting}
+
+\begin{definition}[Panel bias, panel reweighting]\label{def:ml:alternative-data-pipelines:panel}
+\emph{Panel bias}\index{panel bias} is the difference between a statistic computed on a data vendor's panel (cardholders,
+devices, users) and the same statistic on the population it stands for, caused by who is in the panel. \emph{Panel
+reweighting}\index{panel reweighting} gives each panel member a weight so that the weighted panel matches known population
+totals; \emph{raking} (iterative proportional fitting) does it with only the margins, adjusting the weights to each margin
+in turn until all match (Deming and Stephan, 1940).
+\end{definition}
+
+The raw nowcast divides each retailer's panel spend by the number of panelists and reads year-on-year growth from it. While
+the panel drifts slowly, the error is modest (3.3 points on average over quarters 4 to 15): a retailer whose young customers
+spend more each year looks, in a panel getting younger, as if it grows faster than it does. In the four quarters after the
+partner change, each year-on-year comparison sets the new panel against the old, and the error jumps to 22.5 points
+(\cref{fig:ml:alt:errors}); it returns to 2.7 once both sides of the comparison come from the new panel. Raking the six cells
+to the population's age and region margins (\cref{lst:ml:alt:rake}) removes the composition effect: 1.7 points before the
+change, 2.7 in the change year, 2.6 after. The change year's residual comes from the new panel's small cells (1\,125
+cardholders in the thinnest), whose sampling noise no reweighting removes.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={quarter},ylabel={mean absolute error (points)},
+  tick label style={font=\small},label style={font=\small},xmin=3.5,xmax=23.5,ymin=0,ymax=26,grid=major,
+  grid style={gray!25},legend cell align=left,legend style={font=\footnotesize,at={(0.02,0.97)},anchor=north west,fill=white,draw=none},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=quarter,y=raw]{figdata/ml/15-alternative-data-pipelines/errors.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=quarter,y=raked]{figdata/ml/15-alternative-data-pipelines/errors.csv};
+\addplot[black!60,dashed,ycomb,forget plot,mark=none] table[x=quarter,y expr=26]{figdata/ml/15-alternative-data-pipelines/events.csv};
+\legend{spend per panelist,raked to the population margins}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Mean absolute error, across 100 retailers, of the year-on-year sales growth read from the panel. Dashed: the
+vendor's launch (quarter 12) and its change of bank partner (quarter 16). Data: \texttt{ml\_altdata.errors}.}\label{fig:ml:alt:errors}
+\end{omfigure}
+
+Raking needs the population margins to be known and the panel to cover every cell: a cell the panel does not reach cannot
+be reweighted into existence. It also assumes that within a cell the panel spends like the population, which is the
+assumption a new partner is most likely to break (its cardholders may be richer as well as older). The vendor's own
+reweighting, when there is one, deserves the same scrutiny as the raw panel: ask for the margins it rakes to and for the
+panel's composition by quarter.
+
+\section{Detecting backfill}
+
+\begin{definition}[First-seen timestamp]\label{def:ml:alternative-data-pipelines:firstseen}
+The \emph{first-seen timestamp}\index{first-seen timestamp} of a value is the time the firm first received it, recorded by
+the firm at ingestion, as opposed to the valid time the vendor attaches to it. A value whose first-seen time is much later
+than its valid time was backfilled (Book~7, chapter~3), and its history cannot be trusted to be what a live user would have
+seen.
+\end{definition}
+
+The pipeline stores every value in the bitemporal store of Book~7 (chapter~3), with the delivery quarter as knowledge time,
+and the backfill test is one query: quarters 0 to 10 were first seen at quarter 12, more than a quarter after they ended.
+They matter because the vendor built them at launch with hindsight, moving its panel estimates three quarters of the way
+towards the sales the retailers had already reported. (Quarter 11, delivered at launch one quarter after it ended, looks
+like a live quarter and was not adjusted: its sales had not yet been reported.)
+
+To score the nowcast as a predictor, each retailer's announcement return is its sales surprise, true growth minus a
+consensus that misses by 3 points on average, plus noise. The rank information coefficient between the raked nowcast's
+surprise and the return is 0.480 on the backfilled quarters and 0.419 on the live quarters before the partner change, 0.412
+after it (\cref{fig:ml:alt:ic}). The raw nowcast's IC falls from 0.391 live before the change to 0.264 after it. A trial
+that scores the backfilled history, which is most of what a new vendor can offer, sees a signal about 15\% stronger than
+the one it will trade.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,ybar,bar width=12pt,ymin=0,ymax=0.55,ylabel={mean rank IC},area legend,
+  xtick={0,1,2},xticklabels={backfilled,live before\\the change,live after\\the change},tick label style={font=\small},
+  xticklabel style={align=center},
+  label style={font=\small},enlarge x limits=0.25,grid=major,grid style={gray!25},legend columns=2,
+  legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none},table/col sep=comma]
+\addplot[fill=omThm,draw=none] table[x=i,y=raw]{figdata/ml/15-alternative-data-pipelines/ic.csv};
+\addplot[fill=omDef,draw=none] table[x=i,y=raked]{figdata/ml/15-alternative-data-pipelines/ic.csv};
+\legend{spend per panelist,raked}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Mean rank information coefficient of the nowcast's surprise with the announcement return, by period. Data:
+\texttt{ml\_altdata.ic\_summary}.}\label{fig:ml:alt:ic}
+\end{omfigure}
+
+\section{From pipeline to predictor}
+
+The nowcast becomes a predictor through the vendor-trial harness of Book~7 (chapter~12): coverage by quarter, the backfill
+share, a panel-drift test on the residuals against reported sales, the IC by year and the incremental IC over what the desk
+already owns. The pipeline's job is to hand it data that mean what they say. Froot, Kang, Ozik and Sadka (2017) built
+real-time sales proxies for retailers from about 50 million mobile devices and related them to earnings surprises and
+announcement returns; Katona, Painter, Patatoukas and Zeng (2024) used the introduction of satellite coverage of retailers'
+car parks to show that investors with such data traded profitably ahead of retailers' reports, especially bad ones. Both
+depend on the plumbing this chapter builds: which stores belong to which company, who is in the panel, and when each number
+was known.
+
+\begin{method}[An alternative-data pipeline]\label{met:ml:alt:method}
+\begin{enumerate}
+\item Validate every row against a schema and every delivery against the last; reject with reasons, hold what looks wrong,
+never repair silently.
+\item Resolve entities to permanent identifiers with a match threshold, a review band and a person on the queue; measure
+precision on a labelled sample.
+\item Store every value with its first-seen time; label backfill; score trials on live data only.
+\item Obtain the panel's composition by period and rake it to known margins; monitor composition for breaks.
+\item Hand the result to the trial harness and, once live, to monitoring (chapter~27).
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: the panel that grew}\label{tut:ml:alternative-data-pipelines:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Ingest a vendor's deliveries, resolve its merchant strings, rake its panel and compare nowcast errors and ICs
+by period. \textbf{End state:} \cref{fig:ml:alt:errors,fig:ml:alt:ic}.
+\begin{tutsteps}
+\item \textbf{\omterm{def:ml:alternative-data-pipelines:ingest}{Schema validation}.}
+\omcode{code/firm/altdata/firm_altdata.py}{37}{60}{Row validation against a schema.}\label{lst:ml:alt:validate}
+\item \textbf{Merchant strings to identifiers.}
+\omcode{code/firm/altdata/firm_altdata.py}{77}{112}{Token similarity and resolution with a review band.}\label{lst:ml:alt:resolve}
+\item \textbf{Raking.}
+\omcode{code/firm/altdata/firm_altdata.py}{115}{126}{Iterative proportional fitting to two margins.}\label{lst:ml:alt:rake}
+\item \textbf{Run} \texttt{ml\_altdata.ingest()}, \texttt{resolution\_quality()}, \texttt{error\_summary()},
+\texttt{ic\_summary()} and \texttt{fig\_altdata.py}.
+\end{tutsteps}
+\textbf{What to change next.} Give the new partner's cardholders a different spending level within each cell, and watch
+raking fail; lower the review threshold and count the wrong matches.
+\end{tutorial}
+
+\section{Build: the alternative-data pipeline}\label{bld:ml:alternative-data-pipelines:altdata}
+
+\begin{build}
+\bfield{Purpose} Vendor deliveries turned into point-in-time, identifier-keyed, reweighted data a predictor can use.
+\bfield{Interface} \texttt{SCHEMA}, \texttt{validate(rows, schema)}, \texttt{delivery\_check(prev, new, lo, hi)};
+\texttt{normalise}, \texttt{similarity}, \texttt{resolve(strings, aliases, accept, review)}; \texttt{rake(counts, row\_margin,
+col\_margin, iters)}; \texttt{first\_seen(store, entity, field, valid)} on \texttt{firm.pit}; \texttt{card\_panel(n\_firms,
+quarters, launch, partner\_change, seed)}.
+\bfield{Rules} Rejections carry reasons; nothing is repaired without a record; every stored value has a knowledge time;
+matches below the threshold wait for a person.
+\bfield{Acceptance tests} \texttt{code/firm/altdata/tests/}: each defect type is rejected with its reason and clean rows pass;
+a doubled delivery is held; truncated and prefixed strings resolve, shared stems go to review, unrelated merchants do not
+match; raking matches both margins and leaves a panel already at the margins unweighted; first-seen times separate a
+backfilled history.
+\bfield{Stretch} Fellegi--Sunter match weights learned from the review decisions; raking to three margins with a cap on
+weights; the panel's composition monitored for breaks.
+\end{build}
+
+\begin{omsources}
+\item I.~P.~Fellegi and A.~B.~Sunter, ``A theory for record linkage'', \emph{Journal of the American Statistical Association}
+64(328), 1969.
+\item W.~E.~Deming and F.~F.~Stephan, ``On a least squares adjustment of a sampled frequency table when the expected marginal
+totals are known'', \emph{Annals of Mathematical Statistics} 11(4), 1940.
+\item K.~A.~Froot, N.~Kang, G.~Ozik and R.~Sadka, ``What do measures of real-time corporate sales say about earnings
+surprises and post-announcement returns?'', \emph{Journal of Financial Economics} 125(1), 2017.
+\item Z.~Katona, M.~Painter, P.~N.~Patatoukas and J.~Zeng, ``On the capital market consequences of big data: evidence from
+outer space'', \emph{Journal of Financial and Quantitative Analysis}, 2024.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:1}
+A delivery totals 2.4 billion; the previous one totalled 23.9 million. What does the delivery check do, and what are the
+likely causes?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:2}
+Rake the $2\times2$ panel counts $\begin{pmatrix}30 & 20\\ 10 & 40\end{pmatrix}$ to even row and column margins. Give the
+weighted counts.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:3}
+Why does ``BOREALIS 5120'' go to review while ``BOREALI RETA STR 313'' is matched?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:4}
+Explain, with the chapter's world, why the raw nowcast's error rises for exactly four quarters after the partner change.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:5}
+Why could the first-seen test not flag quarter 11, and why did that not matter here? When would it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:6}
+\emph{Find the flaw.} ``We fixed the vendor's negative spends by taking absolute values and cast the text panel counts to
+integers, so no data were lost.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:alternative-data-pipelines:7}
+\emph{Coding.} Run the pipeline with the review queue left unresolved (strings in review dropped). What happens to the raked
+nowcast's error, and why is the error larger for some retailers than others?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:alternative-data-pipelines:8}
+Show that with a panel whose cell counts are the product of an age margin and a region margin, raking to the population's
+margins gives the post-stratification weights (population share over panel share of each cell) when the population's cell
+shares are also a product. What happens when they are not?
+\end{exercise}
+
+\section{Problem: The Panel That Grew}
+
+\begin{problem}[{Weekend problem --- a panel is not a population}]\label{pb:ml:alternative-data-pipelines:1}
+The chapter's world: 100 retailers, 24 quarters, a panel that drifts, changes partner at quarter 16 and launches at quarter
+12 with a backfilled history.
+
+\medskip\noindent\textbf{Part I --- Ingestion.}
+\begin{enumerate}
+\item What defects were planted, and how many rows does validation reject?
+\item Which defect does row validation miss, and what catches it?
+\item Why reject rather than repair?
+\item What does the pipeline store for each value, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Resolution.}
+\begin{enumerate}[resume]
+\item How many strings does exact matching resolve, and how many the resolver?
+\item What goes to review, and why is that the right place for it?
+\item What happens to the unrelated merchants?
+\item What does a wrong match cost, compared with a string left in review?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Panel and backfill.}
+\begin{enumerate}[resume]
+\item What are the raw and raked nowcast errors before, during and after the change year?
+\item What does raking assume, and what residual error remains?
+\item Which quarters are backfilled, and how does the pipeline know?
+\item What are the ICs on backfilled and live history?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the nowcast error with and without reweighting after the partner change, and the IC of
+the backfilled history against the live one.
+\item What would you ask a card-panel vendor for before a trial?
+\item How would you detect a partner change the vendor did not announce?
+\item What would you monitor once the data are live?
+\item How much of the backfilled IC would you believe?
+\item Where would a person sit in this pipeline, and why there?
+\item What changes for a satellite or app-download panel?
+\item In one sentence: what is the most expensive assumption in alternative data?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle}]\label{iq:ml:alternative-data-pipelines:1}
+What is backfill in a vendor dataset, and how do you detect it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:alternative-data-pipelines:2}
+Design the ingestion step for a daily vendor file. What do you check, and what do you do when a check fails?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:alternative-data-pipelines:3}
+How would you map merchant descriptors to listed companies at scale, and how would you measure the mapping's quality?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:alternative-data-pipelines:4}
+A card panel over-represents young customers. How do you correct a sales nowcast for it, and what can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:alternative-data-pipelines:5}
+A nowcast that tracked sales for three years misses badly for a year. What do you check first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:alternative-data-pipelines:6}
+A vendor's trial shows an IC of 0.5 over eight years; the dataset launched two years ago. How would you estimate the IC you
+should expect live?
+\end{interviewq}

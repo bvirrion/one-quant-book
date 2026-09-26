@@ -1,0 +1,299 @@
+\chapter{Cross-Sectional Deep Models}\label{ch:ml:cross-sectional-deep-models}
+
+A statistical factor model extracts three factors from a panel of stock returns and gives each stock a fixed loading on
+each. A stock listed yesterday has no loading; a stock whose characteristics have changed keeps the loading of the stock
+it was. On a simulated panel whose true betas are functions of ten characteristics, half of their variation nonlinear,
+the loadings of principal-component analysis explain 22.5\% of the test months' returns, and their expected returns
+correlate at 0.03 with the true ones. Betas written as linear functions of the characteristics (instrumented PCA)
+explain 27.6\% and correlate at 0.71; betas written as a small \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{neural network} of them (a \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder})
+explain 30.4\% and correlate at 0.95, against a ceiling of 31.3\%. This chapter builds models that learn from a panel as a
+panel: pooled across assets, with inputs that describe the asset rather than name it.
+
+\section{Panels, pooling and permutation invariance}
+
+\begin{definition}[Pooled panel model, permutation-invariant network]\label{def:ml:cross-sectional-deep-models:pooled}
+A \emph{pooled panel model}\index{pooled panel model} fits one function $f_\theta(x_{it})$ to every asset $i$ and date $t$
+of a panel, so that assets share parameters through their characteristics rather than each having its own. A
+\emph{permutation-invariant network}\index{permutation-invariant network} maps a set of vectors to an output that does
+not depend on their order, typically $\rho(\sum_i\phi(x_i))$ for networks $\phi$ and $\rho$ (Zaheer et al., 2017).
+\end{definition}
+
+Every model of chapters~4 to~7 was pooled: one ridge regression or one network for all 500 stocks. Pooling is what makes a
+panel of 500 stocks and 240 months a large dataset; its price is the assumption that stocks with the same
+characteristics behave alike, which is exactly what a factor model with characteristic-driven betas says. Permutation
+invariance appears as soon as a model needs the whole cross-section as an input: the average of any characteristic over
+the stocks, or a characteristic-weighted portfolio's return, does not depend on how the stocks are ordered, and it is
+how the models below turn a cross-section of any size into a fixed number of factors.
+
+\section{Embeddings for identifiers and categories}
+
+\begin{definition}[Entity embedding]\label{def:ml:cross-sectional-deep-models:embedding}
+An \emph{entity embedding}\index{entity embedding} represents each value $j$ of a categorical variable (an industry, a
+venue, a stock identifier) by a vector $e_j\in\mathbb R^m$ learned with the rest of the network, in place of a one-hot
+column per category (Guo and Berkhahn, 2016).
+\end{definition}
+
+Thirty industries are planted on top of the chapter's panel, each with a monthly premium drawn with a standard deviation
+of 0.4\%. A pooled network on the ten characteristics alone explains 0.004\% of the test months' demeaned returns; with a
+one-dimensional embedding of the industry it explains 0.15\%, its forecasts'
+correlation with the true expected returns rises from 0.52 to 0.75, and the learned embedding correlates at 0.86 with the
+planted premia (the industries' raw average returns over the training months correlate at 0.88). One practical detail
+decided the result: embeddings initialised with PyTorch's default standard deviation of one never moved far enough from
+their random start for the premia to show; initialised near zero (standard deviation 0.01), they learned them.
+
+\section{Learned factor models: instrumented PCA and conditional autoencoders}
+
+The chapter's panel is \texttt{firm.mlsynth.factor\_panel}: 300 stocks, 240 months, ten ranked characteristics, three
+factors with monthly premia of 0.6\%, 0.4\% and 0.3\%, and betas that are functions of the characteristics, half of their
+cross-sectional variance linear and half nonlinear (squares, products, absolute values). The truth's expected return is
+$\mu_{it} = \beta(z_{it})^\top\lambda$.
+
+\begin{definition}[Instrumented principal component analysis]\label{def:ml:cross-sectional-deep-models:ipca}
+\emph{Instrumented principal component analysis}\index{instrumented principal component analysis} (IPCA) models
+$r_{i,t+1} = z_{it}^\top\Gamma f_{t+1} + e_{i,t+1}$ with $K$ latent factors $f$ and betas $z^\top\Gamma$ linear in the
+characteristics (a constant included); $\Gamma$ ($L\times K$) and the factors are estimated by alternating least squares,
+the factors month by month as cross-sectional regressions of returns on $Z_t\Gamma$ (Kelly, Pruitt and Su, 2019).
+\end{definition}
+
+\begin{definition}[Autoencoder, conditional autoencoder]\label{def:ml:cross-sectional-deep-models:ae}
+An \emph{autoencoder}\index{autoencoder} is a network trained to reproduce its input through a lower-dimensional
+bottleneck: an encoder maps $x$ to a code $h$, a decoder maps $h$ back to $\hat x$, and the loss is the reconstruction error.
+A \emph{conditional autoencoder}\index{conditional autoencoder} reconstructs the cross-section of returns $r_{t+1}$ as
+$\beta(z_{it})^\top f_{t+1}$, where the code $f_{t+1}$ ($K$ factors) is a linear map of characteristic-managed
+portfolios $Z_t^\top r_{t+1}/n$ and the betas are a network of the characteristics (Gu, Kelly and Xiu, 2021).
+\end{definition}
+
+The managed portfolios are the permutation-invariant summary of the cross-section: their number is the number of
+characteristics, whatever the number of stocks. The chapter's \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} has a beta network with two hidden layers (32
+and 16 units) and a linear factor map; it is trained on months 0 to 159 with \omterm{def:ml:trees-and-boosting:early}{early stopping} on months 160 to 179; IPCA
+and PCA are fitted on months 0 to 179; all three are scored on months 180 to 239.
+
+\begin{proposition}[Why IPCA is a regression]\label{prop:ml:xsnet:ipca}
+For fixed $\Gamma$, the least-squares factors of month $t$ are $\hat f_{t+1} = (\Gamma^\top Z_t^\top Z_t\Gamma)^{-1}\Gamma^\top
+Z_t^\top r_{t+1}$; for fixed factors, $\operatorname{vec}(\Gamma^\top)$ solves the normal equations
+$\sum_t(Z_t^\top Z_t\otimes f_{t+1}f_{t+1}^\top)\operatorname{vec}(\Gamma^\top) = \sum_t(Z_t^\top r_{t+1})\otimes f_{t+1}$.
+\end{proposition}
+
+\begin{proof}
+The first is ordinary least squares of $r_{t+1}$ on the columns of $Z_t\Gamma$. For the second, $z_{it}^\top\Gamma f =
+(z_{it}\otimes f)^\top\operatorname{vec}(\Gamma^\top)$, a linear model in $\operatorname{vec}(\Gamma^\top)$ whose normal
+equations sum $(z\otimes f)(z\otimes f)^\top = zz^\top\otimes ff^\top$ over assets and months.
+\end{proof}
+
+\section{Evaluating a learned factor model}
+
+Two R-squared measure a factor model (Kelly, Pruitt and Su; Gu, Kelly and Xiu). The \emph{total} R-squared uses the
+month's realised factors: how much of the cross-section's variation the betas can explain once the factors are known.
+The \emph{predictive} R-squared uses the average factor of the training months, $\beta^\top\hat\lambda$: an expected-return
+forecast. Both are measured against zero.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & \multicolumn{3}{c}{total $R^2$} & \multicolumn{2}{c}{3 factors: corr.\ of $\hat\mu$ with}\\
+\cmidrule(lr){2-4}\cmidrule(l){5-6}
+model & 1 factor & 3 factors & 5 factors & the truth $\mu$ & $\mu$'s nonlinear part\\
+\midrule
+PCA (static betas) & 22.0\% & 22.5\% & 23.0\% & 0.03 & 0.00\\
+IPCA (linear betas) & 25.1\% & 27.6\% & 28.1\% & 0.71 & $-0.03$\\
+\omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder} & 26.9\% & 30.4\% & 30.8\% & 0.95 & 0.59\\
+\midrule
+the truth & \multicolumn{3}{c}{31.3\%} & 1 & \\
+\bottomrule
+\end{tabular}
+\caption{Three factor models on the sixty test months of the conditional factor panel. Total R-squared uses realised
+factors; the last two columns correlate each model's expected returns $\beta^\top\hat\lambda$ with the true $\mu$ and with
+the part of $\mu$ that comes from the betas' nonlinear terms. \omterm{def:ml:cross-sectional-deep-models:ae}{Autoencoder}: seed~1; seeds 2 and 3 give 30.5\% and 30.6\%
+total and correlations of 0.95 and 0.96. Data: \texttt{ml\_xsnet}.}\label{tab:ml:xsnet:table}
+\end{table}
+
+\Cref{tab:ml:xsnet:table} has three findings. Static betas are the wrong model for a panel whose characteristics move:
+PCA's expected returns carry no cross-sectional information (correlation 0.03), although its total R-squared, driven by
+the market factor, is respectable. Linear betas recover the linear part of the truth and none of the nonlinear part
+($-0.03$). The \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} recovers both, most of the way (0.95 overall, 0.59 of the nonlinear part), and its total
+R-squared is within a point of the truth's with three factors. The predictive R-squared, 1.01\% for PCA, 1.11\% for IPCA and
+1.23\% for the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} against 1.09\% for the truth itself, ranks the models the same way but should not be read
+alone: over sixty months it is dominated by the level of the premia and by how the test window's factor returns happened
+to average, which is why the truth can be beaten on it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.4cm,xlabel={number of factors $K$},ylabel={total $R^2$ out of sample (\%)},
+  tick label style={font=\small},label style={font=\small},xmin=0.5,xmax=5.5,ymin=20,ymax=33,xtick={1,3,5},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,very thick,mark=triangle*] table[x=K,y=pca]{figdata/ml/09-cross-sectional-deep-models/total.csv};
+\addplot[omThm,very thick,mark=square*] table[x=K,y=ipca]{figdata/ml/09-cross-sectional-deep-models/total.csv};
+\addplot[omDef,very thick,mark=*] table[x=K,y=cae]{figdata/ml/09-cross-sectional-deep-models/total.csv};
+\addplot[black!70,thick,dashed] table[x=K,y=truth]{figdata/ml/09-cross-sectional-deep-models/total.csv};
+\legend{PCA,IPCA,conditional autoencoder,truth (3 factors)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Total R-squared of the test months against the number of factors. The truth has three factors; the models with
+more have more room to fit, not more truth to find. Data: \texttt{ml\_xsnet.pca}, \texttt{ipca}, \texttt{cae}.}\label{fig:ml:xsnet:total}
+\end{omfigure}
+
+\begin{method}[Fitting a learned factor model]\label{met:ml:xsnet:method}
+\begin{enumerate}
+\item Rank the characteristics by date and add a constant; keep the return of month $t+1$ with the characteristics of
+month $t$.
+\item Fit IPCA first: it is fast, has no seeds, and tells how much a linear-beta model explains.
+\item Fit the \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder} with \omterm{def:ml:trees-and-boosting:early}{early stopping} on held-out months and several seeds; compare with IPCA on
+total R-squared and on the correlation of expected returns with a benchmark forecast.
+\item Choose the number of factors on held-out months; report both R-squared and never the predictive one alone.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: factors that learn}\label{tut:ml:cross-sectional-deep-models:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Fit PCA, IPCA and a \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder} with one, three and five factors on a panel with
+characteristic-driven betas; measure how much of the planted nonlinearity each recovers; add industries through an
+embedding. \textbf{End state:} \cref{tab:ml:xsnet:table}, \cref{fig:ml:xsnet:total}.
+\begin{tutsteps}
+\item \textbf{IPCA} by alternating least squares (\cref{prop:ml:xsnet:ipca}).
+\omcode{code/firm/xsnet/firm_xsnet.py}{66}{89}{Instrumented PCA: factors by cross-sectional regression, loadings by the Kronecker normal equations.}\label{lst:ml:xsnet:ipca}
+\item \textbf{The \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder}}: betas from characteristics, factors from managed portfolios.
+\omcode{code/firm/xsnet/firm_xsnet.py}{100}{111}{The conditional autoencoder's two networks.}\label{lst:ml:xsnet:ca}
+\item \textbf{Run} \texttt{ml\_xsnet.pca(K)}, \texttt{ipca(K)}, \texttt{cae(K, seed)}, \texttt{embedding()} and
+\texttt{fig\_xsnet.py}.
+\end{tutsteps}
+\textbf{What to change next.} Set the planted nonlinear share to zero and check that IPCA catches up with the
+\omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}; give the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}'s factor map the managed portfolios of squared characteristics too.
+\end{tutorial}
+
+\section{Build: cross-sectional networks and factor models}\label{bld:ml:cross-sectional-deep-models:xsnet}
+
+\begin{build}
+\bfield{Purpose} The firm's learned factor models, comparable on one panel and one pair of R-squared.
+\bfield{Interface} \texttt{managed(Z, r)}, \texttt{with\_constant(Z)}, \texttt{PCAModel(K)}, \texttt{IPCA(K, iters)}
+with \texttt{fit}, \texttt{factors}, \texttt{betas}, \texttt{score}; \texttt{CondAE(L, K, hidden, seed)} with the same
+methods; \texttt{scores(pred\_total, pred\_mu, r)}; \texttt{EmbedMLP}, \texttt{fit\_embed}.
+\bfield{Rules} Characteristics of month $t$ with returns of month $t+1$; managed portfolios computed with the same month's
+characteristics and returns; one CPU thread, \omterm{def:ml:trees-and-boosting:early}{early stopping} on held-out months.
+\bfield{Acceptance tests} \texttt{code/firm/xsnet/tests/}: IPCA recovers a planted linear-beta model's betas (up to rotation)
+and its alternating steps never increase the loss; PCA recovers static loadings; the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}'s managed-portfolio
+input is invariant to reordering the stocks; an embedding recovers planted category effects.
+\bfield{Stretch} IPCA with an intercept (alpha) test; the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} with nonlinear factor maps; the no-arbitrage
+criterion of Chen, Pelger and Zhu.
+\end{build}
+
+\begin{omsources}
+\item B.~Kelly, S.~Pruitt and Y.~Su, ``Characteristics are covariances: a unified model of risk and return'', \emph{Journal
+of Financial Economics} 134(3), 2019.
+\item S.~Gu, B.~Kelly and D.~Xiu, ``Autoencoder asset pricing models'', \emph{Journal of Econometrics} 222(1), 2021.
+\item L.~Chen, M.~Pelger and J.~Zhu, ``Deep learning in asset pricing'', \emph{Management Science} 70(2), 2024.
+\item C.~Guo and F.~Berkhahn, ``Entity embeddings of categorical variables'', arXiv, 2016.
+\item M.~Zaheer et al., ``Deep sets'', \emph{NeurIPS}, 2017.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:cross-sectional-deep-models:1}
+With ten characteristics plus a constant and three factors, how many parameters has IPCA's $\Gamma$? How many has a static
+PCA model of 300 stocks with three factors?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:cross-sectional-deep-models:2}
+Three stocks have characteristic values 0.5, $-0.5$, 1.0 and returns 2\%, $-1\%$, 3\% in a month. What is the
+characteristic's managed-portfolio return, and does it depend on the order of the stocks?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:cross-sectional-deep-models:3}
+Thirty industries, a one-hot encoding into a hidden layer of 32 units against a one-dimensional embedding feeding the same
+layer: how many parameters does each use for the industry?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:cross-sectional-deep-models:4}
+Why does PCA's expected return carry no cross-sectional information on this panel, although its total R-squared is 22.5\%?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:cross-sectional-deep-models:5}
+Why can a model beat the truth on predictive R-squared over sixty months, and what should be reported instead?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:cross-sectional-deep-models:6}
+\emph{Find the flaw.} ``Our \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder} with ten factors explains 40\% of returns in sample against IPCA's 30\%,
+so it captures more of the cross-section.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:cross-sectional-deep-models:7}
+\emph{Coding.} Rerun \texttt{ml\_xsnet.embedding} with embeddings initialised at PyTorch's default (standard deviation one).
+Report the embedding's correlation with the premia and explain.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:cross-sectional-deep-models:8}
+Show that IPCA with $\Gamma$ equal to the identity and $K = L$ reduces to the regression of each month's returns on its
+characteristics (Fama and MacBeth's first step, Book~4, chapter~16).
+\end{exercise}
+
+\section{Problem: Factors That Learn}
+
+\begin{problem}[{Weekend problem --- betas that move with characteristics}]\label{pb:ml:cross-sectional-deep-models:1}
+The chapter's panel: 300 stocks, 240 months, ten characteristics, three factors, betas half nonlinear.
+
+\medskip\noindent\textbf{Part I --- The truth.}
+\begin{enumerate}
+\item What total and predictive R-squared does the truth score on the test months?
+\item Why is the truth's total R-squared far from one?
+\item What are the premia, and what do they do to predictive R-squared?
+\item What does ``half nonlinear'' mean for a model with linear betas?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Three models.}
+\begin{enumerate}[resume]
+\item Give each model's total R-squared with one, three and five factors.
+\item How well do each model's expected returns correlate with the truth and its nonlinear part?
+\item How much do seeds move the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}?
+\item Why does IPCA recover none of the nonlinear part?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Pooling and embeddings.}
+\begin{enumerate}[resume]
+\item Why is pooling the right assumption for this panel?
+\item What does the industry embedding add, and how close does it get to the raw industry averages?
+\item What decided whether the embedding learned at all?
+\item Where does permutation invariance appear in the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: out-of-sample total and predictive R-squared of PCA, IPCA and the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} at three
+factors, and the share of the planted nonlinearity each recovers.
+\item Which model would you use to construct a factor-neutral portfolio, and why?
+\item How would you choose the number of factors?
+\item What changes with real characteristics that are noisy and missing?
+\item What would a stock listed yesterday get from each model?
+\item What does the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder} cost that IPCA does not?
+\item How would you test that the \omterm{def:ml:cross-sectional-deep-models:ae}{autoencoder}'s extra fit is not \omterm{def:ml:why-financial-machine-learning-is-different:generalisation}{overfitting}?
+\item In one sentence: what does a learned factor model learn?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:ml:cross-sectional-deep-models:1}
+What problem does instrumented PCA solve that PCA on returns does not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:ml:cross-sectional-deep-models:2}
+Explain the \omterm{def:ml:cross-sectional-deep-models:ae}{conditional autoencoder}'s two networks and what goes into each.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:cross-sectional-deep-models:3}
+When would you use an \omterm{def:ml:cross-sectional-deep-models:embedding}{entity embedding} for a stock identifier, and what can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:cross-sectional-deep-models:4}
+Total R-squared or predictive R-squared: which do you trust to compare factor models, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:ml:cross-sectional-deep-models:5}
+How would you feed a model information about the whole cross-section at a date, for any number of stocks?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:cross-sectional-deep-models:6}
+Derive IPCA's alternating least-squares steps.
+\end{interviewq}

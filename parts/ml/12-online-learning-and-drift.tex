@@ -1,0 +1,333 @@
+\chapter{Online Learning and Drift}\label{ch:ml:online-learning-and-drift}
+
+A short-horizon model is retrained every weekend. On a Tuesday the relation it learned changes (a venue alters its fee
+schedule, a large participant changes how it trades, a regime ends) and the model keeps trading the old relation until
+the next weekend. A model that updated itself every hour would have noticed on Tuesday afternoon; a model that updated
+itself every trade would have spent the whole year chasing noise. This chapter is about the choice between those two
+failures: how fast a model should forget, how to detect that the world has changed, and when to retrain. On a
+synthetic stream whose coefficients change at random times, a detector calibrated to one false alarm a year finds a
+reversal of the signal about twenty steps after it happens, and the best memory for a recursive estimator grows from 200
+observations to all of them as the regimes lengthen from a hundred steps to ten thousand.
+
+\section{Kinds of drift}
+
+\begin{definition}[Concept drift, covariate shift]\label{def:ml:online-learning-and-drift:drift}
+\emph{Concept drift}\index{concept drift} is a change over time in the conditional distribution of the target given the
+features, $\P_t(y\mid x)$: the relation the model learned stops holding. \emph{Covariate shift}\index{covariate shift}
+is a change in the distribution of the features, $\P_t(x)$, with $\P(y\mid x)$ unchanged.
+\end{definition}
+
+\omterm{def:ml:online-learning-and-drift:drift}{Covariate shift} hurts a model that has learned $\P(y\mid x)$ only where training data were dense and must extrapolate
+elsewhere; a correctly specified model is untouched. \omterm{def:ml:online-learning-and-drift:drift}{Concept drift} hurts every model and is what markets produce:
+crowding weakens a signal (Book~7, chapter~28), a structural break reverses one, a change of market structure rewires the
+relation between order flow and prices. Book~7 measured decay and breaks after the fact (CUSUM tests, the signal
+half-life); this chapter adapts to them as they happen.
+
+The chapter's stream has 20\,000 steps and five features; the target is $y_t = \beta_t^\top x_t + \varepsilon_t$ with a
+signal worth 5\% of the variance, and the coefficients are redrawn at regime ends whose spacing is exponential with
+mean $D$ steps. The truth's own R-squared, the best any model can do, is 4.9 to 5.4\%.
+
+\section{Recursive estimators and forgetting}
+
+\begin{definition}[Online learning, recursive least squares, forgetting factor]\label{def:ml:online-learning-and-drift:rls}
+\emph{Online learning}\index{online learning} updates a model with each new observation, in constant time and memory,
+and is scored prequentially: each observation is predicted before it is learned from. \emph{Recursive least
+squares}\index{recursive least squares} (RLS) updates the weighted least-squares solution
+$\hat\beta_t = \arg\min_b\sum_{s\le t}\lambda^{t-s}(y_s - x_s^\top b)^2$ by
+\[
+k_t = \frac{P_{t-1}x_t}{\lambda + x_t^\top P_{t-1}x_t},\quad \hat\beta_t = \hat\beta_{t-1} + k_t(y_t - x_t^\top\hat\beta_{t-1}),\quad
+P_t = \frac{1}{\lambda}\bigl(P_{t-1} - k_tx_t^\top P_{t-1}\bigr),
+\]
+where the \emph{forgetting factor}\index{forgetting factor} $\lambda\in(0,1]$ discounts old observations; their weights sum
+to about $1/(1-\lambda)$, the estimator's effective memory.
+\end{definition}
+
+\begin{proposition}[Forgetting is a random-walk Kalman filter]\label{prop:ml:online:kalman}
+RLS with \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} $\lambda$ is the Kalman filter (Book~4, chapter~19) for the state-space model $y_t =
+x_t^\top\beta_t + \varepsilon_t$, $\beta_t = \beta_{t-1} + w_t$, in which the prediction step inflates the state covariance
+by $1/\lambda$ instead of adding the covariance of $w_t$: $P_{t\mid t-1} = P_{t-1\mid t-1}/\lambda$, with unit observation
+noise (Sayed and Kailath, 1994).
+\end{proposition}
+
+\begin{proof}
+With $P_{t\mid t-1} = P_{t-1}/\lambda$ and unit noise variance, the Kalman gain is $P_{t\mid t-1}x_t/(1 + x_t^\top P_{t\mid
+t-1}x_t) = P_{t-1}x_t/(\lambda + x_t^\top P_{t-1}x_t) = k_t$; the state update is RLS's; the filtered covariance
+$(I - k_tx_t^\top)P_{t\mid t-1} = (P_{t-1} - k_tx_t^\top P_{t-1})/\lambda$ is RLS's $P_t$.
+\end{proof}
+
+A \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} is therefore an assumption about how fast the truth moves. \Cref{fig:ml:online:forgetting} measures
+the trade-off: short memories track regimes but estimate five coefficients from little data; long ones estimate well
+the coefficients of regimes that have ended. With regimes of 100 or 500 steps on average, the best memory is about 200
+observations ($\lambda = 0.995$), and it recovers 0.75\% and 2.44\% of R-squared out of a possible 4.9\%; with regimes of
+2\,000 steps it is 500 observations (3.71\%), and with regimes of 10\,000 steps nothing should be forgotten ($\lambda = 1$,
+5.21\% of 5.29\%). Online stochastic gradient descent with a fixed \omterm{def:ml:trees-and-boosting:boosting}{learning rate} is a crude forgetting rule of its own
+(0.57\%, 2.05\%, 3.69\% and 4.84\%).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=6cm,xlabel={effective memory $1/(1-\lambda)$ (observations; right: $\lambda = 1$)},
+  ylabel={prequential $R^2$ (\%)},tick label style={font=\small},label style={font=\small},xmin=40,xmax=25000,
+  ymin=-2,ymax=6,xtick={50,100,200,500,1000,2000,20000},xticklabels={50,100,200,500,1\,000,2\,000,all},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*] table[x=memory,y=D100]{figdata/ml/12-online-learning-and-drift/forgetting.csv};
+\addplot[omProp,very thick,mark=square*] table[x=memory,y=D500]{figdata/ml/12-online-learning-and-drift/forgetting.csv};
+\addplot[omDef,very thick,mark=triangle*] table[x=memory,y=D2000]{figdata/ml/12-online-learning-and-drift/forgetting.csv};
+\addplot[black!70,very thick,mark=diamond*] table[x=memory,y=D10000]{figdata/ml/12-online-learning-and-drift/forgetting.csv};
+\legend{$D = 100$,$D = 500$,$D = 2\,000$,$D = 10\,000$}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Prequential R-squared of \omterm{def:ml:online-learning-and-drift:rls}{recursive least squares} (after 1\,000 steps of warm-up) against its effective memory, for
+streams whose coefficients change every $D$ steps on average. Data: \texttt{ml\_online.forgetting}.}\label{fig:ml:online:forgetting}
+\end{omfigure}
+
+\section{Detecting drift}
+
+\begin{definition}[Drift detector, Page--Hinkley test, adaptive windowing]\label{def:ml:online-learning-and-drift:detector}
+A \emph{drift detector}\index{drift detector} watches a statistic of a model in production (its errors, its gains, a
+feature's distribution) and raises an alarm when the statistic's distribution appears to have changed. The
+\emph{Page--Hinkley test}\index{Page--Hinkley test} accumulates the deviations of the monitored value below its running mean,
+less a tolerance $\delta$, and alarms when the sum rises more than $h$ above its running minimum (Page, 1954; Hinkley, 1971).
+\emph{Adaptive windowing}\index{adaptive windowing} (ADWIN) keeps a window of recent values and drops its older part whenever
+some split of the window into two sub-windows has means further apart than a Hoeffding-type bound at confidence $\delta$
+(Bifet and Gavaldà, 2007).
+\end{definition}
+
+Book~7's CUSUM test (chapter~13) is the third detector. All three watch the same statistic: the deployed model's gain
+$g_t = \hat y_t\,y_t$ (its forecast times the outcome), standardised on the warm-up period, whose mean is positive while the
+model is right and falls when it is not. Their thresholds are set, on a long stream with no change, to one false alarm a
+year (one per 252 steps): $h = 9$ for CUSUM and Page--Hinkley (tolerance 0.1), $\delta = 0.0032$ for ADWIN. Then, on twenty
+streams whose coefficients reverse sign at step 2\,000, the detectors raise their first true alarm after 20.8 steps on
+average for CUSUM (median 17), 27.4 for Page--Hinkley (median 18.5) and 42.5 for ADWIN (median 26.5); over the 1\,000 steps
+before the reversal they raised 74, 78 and 91 false alarms across the twenty streams, close to the 79 their calibration
+implies (\cref{fig:ml:online:alarms}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,xlabel={step},ylabel={50-step mean of the gain},tick label style={font=\small},
+  label style={font=\small},xmin=1600,xmax=2400,ymin=-1.5,ymax=1.9,grid=major,grid style={gray!25},
+  xticklabel style={/pgf/number format/1000 sep={}},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},
+  anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,thick] table[x=step,y=running]{figdata/ml/12-online-learning-and-drift/gains.csv};
+\addplot[only marks,mark=triangle*,mark size=3pt,omThm,restrict expr to domain={\thisrow{detector}}{0:0}]
+  table[x=step,y=level]{figdata/ml/12-online-learning-and-drift/alarms.csv};
+\addplot[only marks,mark=square*,mark size=2.6pt,omProp,restrict expr to domain={\thisrow{detector}}{1:1}]
+  table[x=step,y=level]{figdata/ml/12-online-learning-and-drift/alarms.csv};
+\addplot[only marks,mark=*,mark size=2.6pt,omDef,restrict expr to domain={\thisrow{detector}}{2:2}]
+  table[x=step,y=level]{figdata/ml/12-online-learning-and-drift/alarms.csv};
+\draw[black!70,thick,dashed] (axis cs:2000,-1.5) -- (axis cs:2000,1.9);
+\legend{gain,CUSUM alarm,Page--Hinkley alarm,ADWIN alarm}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One stream whose coefficients reverse at step 2\,000 (dashed): the 50-step mean of the deployed model's
+standardised gain, and each detector's alarms from 300 steps before the reversal to its first alarm after it (markers at
+arbitrary heights, one row per detector). Data: \texttt{ml\_online}.}\label{fig:ml:online:alarms}
+\end{omfigure}
+
+\section{Retraining schedules}
+
+\begin{definition}[Retraining schedule]\label{def:ml:online-learning-and-drift:schedule}
+A \emph{retraining schedule}\index{retraining schedule} is the rule that decides when a model is refitted and on which
+data: on a calendar (every week, on a rolling window), on a detector's alarm, continuously (an online estimator), or by a
+combination; it is part of the model and is validated with it.
+\end{definition}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+schedule (least squares on the last 500 observations unless stated) & prequential $R^2$ & refits\\
+\midrule
+never (fitted on the first 1\,000 steps) & $-7.81\%$ & 0\\
+every 250 steps & 2.62\% & 75\\
+on a Page--Hinkley alarm (refit on the data since the alarm) & $-2.67\%$ & 2\\
+\omterm{def:ml:online-learning-and-drift:rls}{recursive least squares}, $\lambda = 0.998$ & 3.24\% & every step\\
+\midrule
+the truth & 4.62\% & \\
+\bottomrule
+\end{tabular}
+\caption{Four \omterm{def:ml:online-learning-and-drift:schedule}{retraining schedules} on a stream whose coefficients are redrawn every 2\,000 steps on average (19\,000 steps
+scored after a warm-up of 1\,000). Data: \texttt{ml\_online.schedules}.}\label{tab:ml:online:schedules}
+\end{table}
+
+\Cref{tab:ml:online:schedules} holds a lesson about detectors. The Page--Hinkley detector that caught a sign reversal
+within a median 18.5 steps refitted the model twice while the coefficients changed ten times: when coefficients are redrawn rather than reversed, the old
+model's gains fall to zero rather than below it, a smaller change than it was tuned to fear, and it waits. The calendar
+schedule, dumb and regular, beats it; \omterm{def:ml:online-learning-and-drift:rls}{recursive least squares} with the memory that suits the regimes beats both. A detector
+must be tuned to the change that matters, and a schedule that relies on one needs a calendar underneath it.
+
+\begin{method}[Choosing how a model adapts]\label{met:ml:online:method}
+\begin{enumerate}
+\item Estimate how fast the relation moves: fit the model on rolling windows of several lengths and compare their
+prequential scores, or equivalently scan the \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor}.
+\item Score every schedule prequentially on history, including the costs of refitting (validation, deployment, turnover).
+\item Calibrate detectors on periods without change to a false-alarm rate the desk can act on, and measure their delay on
+the changes that matter (a reversal, a fade to zero, a volatility shift).
+\item Combine: a calendar refit as the floor, a detector to refit early, and an online estimator where the model is
+simple enough to update safely.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: the half-life of a model}\label{tut:ml:online-learning-and-drift:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Scan the \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} of \omterm{def:ml:online-learning-and-drift:rls}{recursive least squares} against the regime length, calibrate three detectors
+to one false alarm a year and time them on a reversal, and compare \omterm{def:ml:online-learning-and-drift:schedule}{retraining schedules}. \textbf{End state:}
+\cref{fig:ml:online:forgetting,fig:ml:online:alarms}, \cref{tab:ml:online:schedules}.
+\begin{tutsteps}
+\item \textbf{\omterm{def:ml:online-learning-and-drift:rls}{Recursive least squares} with forgetting} (\cref{prop:ml:online:kalman}).
+\omcode{code/firm/onlinelearn/firm_onlinelearn.py}{51}{67}{Recursive least squares with a forgetting factor.}\label{lst:ml:online:rls}
+\item \textbf{The \omterm{def:ml:online-learning-and-drift:detector}{Page--Hinkley test}.}
+\omcode{code/firm/onlinelearn/firm_onlinelearn.py}{104}{123}{The Page--Hinkley test for a fall in the mean.}\label{lst:ml:online:ph}
+\item \textbf{A windowed ADWIN.}
+\omcode{code/firm/onlinelearn/firm_onlinelearn.py}{126}{155}{Adaptive windowing, checked every few steps.}\label{lst:ml:online:adwin}
+\item \textbf{Run} \texttt{ml\_online.forgetting(D)}, \texttt{thresholds()}, \texttt{delays()}, \texttt{schedules()} and
+\texttt{fig\_online.py}.
+\end{tutsteps}
+\textbf{What to change next.} Make the regimes fade their coefficients to zero instead of redrawing them and recalibrate the
+detectors for that change; combine the calendar with the detector.
+\end{tutorial}
+
+\section{Build: online learning and drift detection}\label{bld:ml:online-learning-and-drift:onlinelearn}
+
+\begin{build}
+\bfield{Purpose} Models that adapt at a chosen speed, detectors with a known false-alarm rate, and schedules validated like
+the models they refit.
+\bfield{Interface} \texttt{drift\_stream(n, p, mean\_regime, r2, seed, flip\_at)}; \texttt{RLS(p, lam, delta)},
+\texttt{OnlineSGD(p, lr)}, \texttt{prequential(model, X, y)}; \texttt{CUSUM(mu0, k, h)}, \texttt{PageHinkley(delta, lam)},
+\texttt{ADWIN(delta, max\_window, check, min\_side)}, \texttt{alarm\_times}, \texttt{calibrate(make\_for, thresholds,
+null\_values, rate)}; \texttt{retrain\_schedule(X, y, policy, every, window, warm, make\_detector, min\_fit)}.
+\bfield{Rules} Predict before learning; detectors see only past and present values; thresholds come from calibration on
+no-change data, never from the period being judged.
+\bfield{Acceptance tests} \texttt{code/firm/onlinelearn/tests/}: RLS with $\lambda = 1$ equals batch least squares; its effective
+memory matches $1/(1-\lambda)$ on a planted change; each detector's false-alarm rate on no-change data is within its
+calibration and it finds a planted mean shift; the calendar schedule refits at the right steps.
+\bfield{Stretch} Forgetting that adapts to the detector's statistic (variable $\lambda$); detectors on feature
+distributions (chapter~27).
+\end{build}
+
+\begin{omsources}
+\item E.~S.~Page, ``Continuous inspection schemes'', \emph{Biometrika} 41(1/2), 1954.
+\item A.~Bifet and R.~Gavaldà, ``Learning from time-changing data with adaptive windowing'', \emph{SIAM International
+Conference on Data Mining}, 2007.
+\item J.~Gama, I.~Žliobaitė, A.~Bifet, M.~Pechenizkiy and others, ``A survey on concept drift adaptation'', \emph{ACM
+Computing Surveys} 46(4), 2014.
+\item A.~H.~Sayed and T.~Kailath, ``A state-space approach to adaptive RLS filtering'', \emph{IEEE Signal Processing
+Magazine} 11(3), 1994.
+\item D.~V.~Hinkley, ``Inference about the change-point from cumulative sum tests'', \emph{Biometrika} 58(3), 1971.
+\item G.~Widmer and M.~Kubat, ``Learning in the presence of concept drift and hidden contexts'', \emph{Machine Learning} 23,
+1996.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:online-learning-and-drift:1}
+What are the effective memories of \omterm{def:ml:online-learning-and-drift:rls}{forgetting factors} 0.99, 0.998 and 0.9995? What weight does an observation 500 steps old
+get with each, relative to the newest?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:online-learning-and-drift:2}
+A detector raises one false alarm per 252 steps. How many false alarms should 20 streams of 1\,000 steps raise? Compare with
+the chapter's counts.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:online-learning-and-drift:3}
+A CUSUM with reference 0 and allowance $k = 0.1$ watches standardised gains whose mean falls from 0 to $-0.38$ at the
+reversal (the chapter's streams). At what average rate does its statistic grow after the change, how many steps does it
+need from zero to pass $h = 9$, and why is the measured median delay shorter?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:online-learning-and-drift:4}
+Why does the best memory grow with the regime length, and why is it not proportional to it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:online-learning-and-drift:5}
+Why did the Page--Hinkley schedule refit only twice, and what would you change?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:online-learning-and-drift:6}
+\emph{Find the flaw.} ``We chose the detector's threshold so that it caught last year's two regime changes within a week,
+and it would have.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:online-learning-and-drift:7}
+\emph{Coding.} Run \texttt{ml\_online.schedules} with regimes of 500 steps on average (\texttt{schedules(D=500)}). Report the
+four schedules and explain what changed.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:online-learning-and-drift:8}
+Show that RLS with $\lambda = 1$ and $P_0 = \delta I$ gives the ridge estimator with penalty $1/\delta$, and hence ordinary
+least squares as $\delta\to\infty$.
+\end{exercise}
+
+\section{Problem: The Half-Life of a Model}
+
+\begin{problem}[{Weekend problem --- how fast to forget}]\label{pb:ml:online-learning-and-drift:1}
+The chapter's stream: five features, a signal worth 5\% of the variance, coefficients redrawn every $D$ steps on average.
+
+\medskip\noindent\textbf{Part I --- Forgetting.}
+\begin{enumerate}
+\item What is the truth's R-squared, and why is no model close to it for short regimes?
+\item Which \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} is best for $D = 100$, 500, 2\,000 and 10\,000, and what does it score?
+\item What does online SGD score, and why does it behave like forgetting?
+\item What does \cref{prop:ml:online:kalman} say a \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} assumes?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Detectors.}
+\begin{enumerate}[resume]
+\item What statistic do the detectors watch, and why the gain rather than the squared error?
+\item What thresholds give one false alarm a year?
+\item What are their mean and median delays after a reversal?
+\item How many false alarms did they raise before the reversal, and is that too many?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Schedules.}
+\begin{enumerate}[resume]
+\item What do the four schedules score with regimes of 2\,000 steps?
+\item Why does the never-refitted model score below zero?
+\item Why did the detector-driven schedule fail?
+\item Why does \omterm{def:ml:online-learning-and-drift:rls}{recursive least squares} win?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} that minimises the out-of-sample loss as a function of the regime
+length, and each detector's delay at one false alarm a year.
+\item What schedule would you run for a short-horizon model on a changing venue?
+\item How would you estimate $D$ on real data?
+\item What does a false alarm cost, and what does a missed change cost?
+\item How does this chapter connect to Book~7's signal half-life?
+\item What should a monitoring system log for each alarm?
+\item How would \omterm{def:ml:online-learning-and-drift:drift}{covariate shift} show up in these statistics?
+\item In one sentence: how fast should a model forget?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle, researcher}]\label{iq:ml:online-learning-and-drift:1}
+What is the difference between \omterm{def:ml:online-learning-and-drift:drift}{concept drift} and \omterm{def:ml:online-learning-and-drift:drift}{covariate shift}? Give a market example of each.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:online-learning-and-drift:2}
+Derive \omterm{def:ml:online-learning-and-drift:rls}{recursive least squares} with a \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor}, and say what the \omterm{def:ml:online-learning-and-drift:rls}{forgetting factor} means.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:online-learning-and-drift:3}
+How do you set the threshold of a \omterm{def:ml:online-learning-and-drift:detector}{drift detector}, and how do you know it works?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:online-learning-and-drift:4}
+Your model is retrained monthly. How would you decide whether to retrain weekly, daily, or continuously?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:online-learning-and-drift:5}
+Explain the \omterm{def:ml:online-learning-and-drift:detector}{Page--Hinkley test} and one weakness of it.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:online-learning-and-drift:6}
+Show that exponential forgetting is a Kalman filter for a random-walk coefficient, and what that implies for choosing
+$\lambda$.
+\end{interviewq}

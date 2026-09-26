@@ -1,0 +1,328 @@
+\chapter{Multi-Socket Machines and Interconnects}\label{ch:ll:multi-socket-machines-and-interconnects}
+
+A trading server with two processor sockets, a network card in a slot wired to the second socket, and a strategy
+thread that the operating system happened to start on the first: every packet the card delivered was written near
+socket 1 and read from socket 0, and every order went back the other way. Each crossing costs roughly a hundred
+nanoseconds more than staying on one socket, several times per message, on a path whose whole software budget is a
+few microseconds. Nobody had chosen the placement; nobody had looked at the machine's topology. This chapter describes
+the machine above the core: memory attached to sockets, the links between sockets, the bus that connects the network
+card, and how to read all of it from the operating system and place a trading process on it.
+
+\section{Non-uniform memory access}
+
+\begin{definition}[Non-uniform memory access, NUMA node]\label{def:ll:multi-socket-machines-and-interconnects:numa}
+In a machine with \emph{non-uniform memory access}\index{non-uniform memory access} (NUMA) each processor socket has its
+own memory controllers and memory; a core reaches its own socket's memory faster than another socket's, which it
+reaches over the \omterm{def:ll:multi-socket-machines-and-interconnects:link}{socket interconnect}. A \emph{NUMA node}\index{NUMA node} is a set of CPUs and the memory close to them,
+usually one socket (or part of one).
+\end{definition}
+
+\begin{definition}[First-touch allocation]\label{def:ll:multi-socket-machines-and-interconnects:first}
+Under \emph{first-touch allocation}\index{first-touch allocation}, the default policy of Linux, a page of memory is
+placed on the \omterm{def:ll:multi-socket-machines-and-interconnects:numa}{NUMA node} of the CPU that first writes it (the page fault that creates it), not the one that allocated
+the address range.
+\end{definition}
+
+First touch makes placement a question of who initialises what. A trading process that builds its order books, rings
+and pools in its main thread during start-up, before creating its threads, puts all of them on the main thread's node,
+wherever the hot threads later run. The rule: pin each hot thread first (chapter~9), then let it allocate and touch its
+own data; or bind the memory explicitly (\texttt{numactl --membind}, \texttt{mbind}).
+
+\begin{example}[A book allocated on the wrong node]\label{ex:ll:multi-socket-machines-and-interconnects:touch}
+The main thread, on node 0, allocates and zeroes 64~MiB of order books with \omterm{def:ll:memory-hierarchy-and-caches:tlb}{huge pages} at start-up, then starts the
+feed thread on node 1. Every book update now misses to the other socket's memory. The fix is one line: move the
+initialisation into the feed thread, after it has pinned itself, or pass the node to the allocator.
+\end{example}
+
+\section{The socket interconnect and remote caches}
+
+\begin{definition}[Socket interconnect]\label{def:ll:multi-socket-machines-and-interconnects:link}
+The \emph{socket interconnect}\index{socket interconnect} is the set of point-to-point links between the processor
+sockets of a machine, which carry remote memory accesses and the cache-coherence traffic between sockets.
+\end{definition}
+
+Every coherence transaction of chapter~3 that involves a line held on the other socket crosses the interconnect. A
+published measurement of a two-socket server of a recent Intel generation found that bouncing a \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} between two
+cores took 59 nanoseconds on average within a socket (81 at worst) and 138 nanoseconds across sockets; older
+generations were similar, up to 150 across. A hand-off between two threads, the feed handler publishing a message and
+the strategy reading it, is exactly such a bounce (chapter~12): placed on two sockets, it more than doubles.
+
+The same measurement on this book's laptop, which has one socket and runs under a hypervisor, is
+\cref{fig:ll:multi-socket-machines-and-interconnects:c2c}. It has structure: pairs of neighbouring virtual CPUs hand a
+line over in about 40 nanoseconds, most other pairs in 170 to 200. The laptop's physical cores sit in clusters sharing
+a second-level cache, and the virtual CPUs are mapped onto them by the hypervisor, not visibly to the guest; the
+matrix, not the CPU numbering, is what tells which threads should talk to each other.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.6cm,height=8.6cm,view={0}{90},xmin=-0.5,xmax=21.5,ymin=-0.5,ymax=21.5,y dir=reverse,
+  xtick={0,3,6,9,12,15,18,21},ytick={0,3,6,9,12,15,18,21},xlabel={CPU},ylabel={CPU},
+  tick label style={font=\small},label style={font=\small},
+  colormap={om}{color(0)=(white) color(0.3)=(omDef!30) color(1)=(omDef)},
+  colorbar,colorbar style={ylabel={ns, one way},ylabel style={font=\small},tick label style={font=\footnotesize}},
+  point meta min=0,point meta max=200,table/col sep=comma]
+\addplot[matrix plot*,mesh/cols=22,point meta=explicit] table[x=b,y=a,meta=ns]{figdata/low-latency/04-multi-socket-machines-and-interconnects/measured_c2c.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One-way latency of handing a \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} between two threads pinned to two of the laptop's 22 virtual CPUs
+(20\,000 round trips, best of three). Neighbouring CPUs are fast; the rest are four to five times slower. Measured on a
+laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores. Data: \texttt{bench\_c2c.py}.}\label{fig:ll:multi-socket-machines-and-interconnects:c2c}
+\end{omfigure}
+
+\section{The peripheral bus and direct memory access}
+
+\begin{definition}[PCI Express, direct memory access]\label{def:ll:multi-socket-machines-and-interconnects:pcie}
+\emph{PCI Express}\index{PCI Express} (PCIe) is the serial point-to-point bus that connects devices (network cards,
+storage, accelerators) to a processor socket, in lanes grouped by 1 to 16. In \emph{direct memory access}\index{direct
+memory access} (DMA) a device reads and writes host memory itself, without the processor copying each byte: a network
+card writes each received packet into a buffer the driver gave it and signals its arrival by a descriptor, an interrupt
+or a flag the program polls.
+\end{definition}
+
+\begin{definition}[Direct cache access]\label{def:ll:multi-socket-machines-and-interconnects:dca}
+\emph{Direct cache access}\index{direct cache access} lets a device's DMA writes land in the processor's last-level cache
+instead of memory, so that the core that processes the data finds it in cache; Intel's implementation (Data Direct I/O)
+is transparent to software.
+\end{definition}
+
+Every PCIe slot belongs to one socket: its lanes come from that socket's processor. A card's packets therefore arrive in
+that socket's cache or memory, and the card's registers, which the program writes to send, are across the interconnect
+from any core on the other socket. Each transaction on the bus adds its own latency, which is why low-latency network cards and their user-space drivers
+minimise the number of bus transactions per packet (One Quant Book~14, chapter~3).
+
+\begin{dated}{2026-09}{PCI Express generations}\label{dat:ll:multi-socket-machines-and-interconnects:pcie}
+PCIe 4.0 signals at 16~GT/s per lane and PCIe 5.0, whose specification PCI-SIG released in May 2019, at 32~GT/s; both
+encode 128 bits in 130. A 16-lane PCIe 5.0 link therefore carries $32 \times 16 \times 128/130/8 \approx 63$~GB/s in each
+direction, far more than a 100~Gb/s network port needs (12.5~GB/s): for a trading card the bus matters for its latency,
+not its bandwidth.
+\end{dated}
+
+\section{Where the network card sits}
+
+\begin{definition}[Device locality]\label{def:ll:multi-socket-machines-and-interconnects:locality}
+The \emph{device locality}\index{device locality} of a thread or a buffer is its \omterm{def:ll:multi-socket-machines-and-interconnects:numa}{NUMA node} relative to the device it
+exchanges data with: local when they are on the same node, remote otherwise.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  sock/.style={draw=omDef,fill=omDef!6,rounded corners=3pt,minimum width=4.2cm,minimum height=2.4cm},
+  mem/.style={draw=gray,fill=gray!12,minimum width=4.2cm,minimum height=0.55cm},
+  thr/.style={draw=omThm,fill=omThm!12,rounded corners=2pt,minimum width=1.6cm,minimum height=0.5cm}]
+\node[mem] (m0) at (0,2.1) {memory of node 0};
+\node[mem] (m1) at (7,2.1) {memory of node 1};
+\node[sock] (s0) at (0,0) {};
+\node[sock] (s1) at (7,0) {};
+\node[anchor=north] at (s0.north) {socket 0: cores, caches};
+\node[anchor=north] at (s1.north) {socket 1: cores, caches};
+\node[thr] (bad) at (0,-0.35) {strategy (remote)};
+\node[thr,fill=omMeth!15,draw=omMeth] (good) at (7,-0.35) {strategy (local)};
+\draw[thick] (m0) -- (s0); \draw[thick] (m1) -- (s1);
+\draw[<->,very thick,omProp] (s0.east) -- node[above,align=center]{interconnect\\ 138 ns a line} (s1.west);
+\node[draw=black,fill=gray!20,minimum width=2.4cm,minimum height=0.6cm] (nic) at (7,-2.3) {network card};
+\draw[<->,thick] (nic) -- node[right]{PCIe lanes of socket 1} (s1.south);
+\end{tikzpicture}
+
+\omcaption{A two-socket server whose network card is wired to socket 1. A strategy thread on socket 1 reads packets from
+its own cache; one on socket 0 fetches every packet line, and sends every order, across the interconnect, at about 138
+nanoseconds a line against 59 within a socket (published averages for a recent generation).}\label{fig:ll:multi-socket-machines-and-interconnects:server}
+\end{omfigure}
+
+\begin{proposition}[Cost of remote placement]\label{prop:ll:multi-socket-machines-and-interconnects:remote}
+If a message brings $k_{\mathrm{in}}$ \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} from the card to the hot thread and an order sends $k_{\mathrm{out}}$ back,
+each transferred one after the other, and a line costs $c_{\mathrm L}$ within the socket and $c_{\mathrm R}$ across it, then
+remote placement adds $(k_{\mathrm{in}} + k_{\mathrm{out}})(c_{\mathrm R} - c_{\mathrm L})$ to the \omterm{def:ll:where-latency-comes-from:t2t}{tick-to-trade latency}.
+\end{proposition}
+
+\begin{proof}
+Each of the $k_{\mathrm{in}} + k_{\mathrm{out}}$ dependent transfers costs $c_{\mathrm R}$ instead of $c_{\mathrm L}$; the rest
+of the path is unchanged.
+\end{proof}
+
+With two lines each way and the published 59 and 138 nanoseconds, the proposition gives 316 nanoseconds per message:
+more than a tenth of the \qty{2.5}{\micro\second} a very good software system takes wire to wire (chapter~1). The
+placement rules follow: the card, the hot threads and their memory on one node; each hot thread on its own physical core,
+its hyper-threading sibling idle; the interrupts of other devices and the operating system's work on the other node or
+on housekeeping cores (chapter~13); and every thread that exchanges data with the hot path per message (the risk gate,
+the logger's ring) on the same node.
+
+\section{Reading a machine's topology}
+
+Linux exposes the topology in sysfs. Each CPU's physical package, core and hyper-threading siblings are under
+\path{/sys/devices/system/cpu/cpu*/topology/}; each node's CPUs under \path{/sys/devices/system/node/node*/cpulist};
+each PCI device's node in \path{/sys/bus/pci/devices/*/numa_node}, which holds $-1$ when the firmware did not say; and
+the device behind a network interface is the link \path{/sys/class/net/<name>/device}. Tools such as
+\texttt{lscpu}, \texttt{numactl --hardware} and \texttt{lstopo} print the same facts; a placement plan should read them
+itself, so that a moved card or a new server cannot silently invalidate it.
+
+This laptop shows what can go wrong. Linux sees one node, 22 CPUs described as eleven cores of two threads (the processor
+has 6 two-thread performance cores and 10 single-thread efficient cores), and a network interface that is a synthetic
+adapter of the hypervisor, not a PCI device: there is no card to be local to. The build of this chapter therefore
+treats an unknown node as a fact to report, not to guess.
+
+\section{Tutorial: a placement plan and the core-to-core matrix}\label{tut:ll:multi-socket-machines-and-interconnects:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Read a machine's topology, place the hot threads of a trading process on it, check the plan, and measure
+the cost of a hand-off between every pair of CPUs. \textbf{End state:} a checked plan for a two-socket fixture and for
+this laptop, and \cref{fig:ll:multi-socket-machines-and-interconnects:c2c}.
+\begin{tutsteps}
+\item \textbf{Read the tree.} \texttt{read\_topology(root)} parses the sysfs files above; the tests run it on two
+synthetic trees written by \texttt{make\_coreplan\_fixture.py} (a two-socket, 32-CPU server with its card on node 1, and a
+one-node machine whose card's node is unknown).
+\item \textbf{Place.} The hot roles take the highest-numbered physical cores of the card's node, one each, leaving their
+siblings idle; CPU 0's core and every other CPU go to housekeeping.
+\omcode{code/firm/coreplan/firm_coreplan.py}{115}{131}{A placement plan from the topology.}\label{lst:ll:multi-socket-machines-and-interconnects:plan}
+\item \textbf{Check.} \texttt{check(plan, topo)} lists every violated rule: a hot thread on the wrong node, two hot
+threads on one physical core, a busy sibling, CPU 0 not in housekeeping.
+\item \textbf{Measure hand-offs.} Two pinned threads bounce one padded atomic flag; the time per one-way transfer is the
+core-to-core latency. \texttt{python bench\_c2c.py} runs it for every pair.
+\omcode{code/low-latency/04-multi-socket-machines-and-interconnects/cpp/ll_c2c.hpp}{23}{50}{Bouncing a cache line between two pinned threads.}\label{lst:ll:multi-socket-machines-and-interconnects:pingpong}
+\end{tutsteps}
+\textbf{What to change next.} Add a rule to \texttt{check} that the logger is on the card's node too, and decide whether
+it should be; rerun the ping-pong with the flag and a payload of four lines, and compare the cost per line.
+\end{tutorial}
+
+\section{Build: the core placement plan}\label{bld:ll:multi-socket-machines-and-interconnects:coreplan}
+
+\begin{build}
+\bfield{Purpose} One description of where every thread of the trading process runs, derived from the machine rather than
+typed by hand: chapter~9 pins threads from it, chapter~13 audits a host against it, chapter~26 records it with every
+measurement.
+\bfield{Interface} Python \texttt{firm\_coreplan}: \texttt{read\_topology(root)} returning \texttt{Topology} (CPUs with
+package, core, node and siblings; nodes; PCI cards with node and local CPUs; interfaces), \texttt{Topology.card\_for(ifname)},
+\texttt{plan(topo, ifname, hot, cold)} returning \texttt{Plan(node, roles, idle, housekeeping)}, \texttt{check(plan,
+topo)}, \texttt{remote\_penalty\_ns}.
+\bfield{Rules} Hot roles on the card's node, one physical core each, siblings idle, never CPU 0's core; an unknown node
+($-1$) falls back to the lowest node and is reported; the plan fails loudly when the node has too few cores.
+\bfield{Acceptance tests} \texttt{code/firm/coreplan/tests/}: parsing CPU lists; the two-socket fixture's topology and a
+sound plan on node 1; plans with a thread on the wrong socket and two threads on one core caught; the one-node fixture with
+an unknown card.
+\bfield{Stretch} Read cache topology (\path{/sys/devices/system/cpu/cpu*/cache/}) and place threads that exchange data per
+message on cores sharing a cache level; include the measured core-to-core matrix in the plan.
+\end{build}
+
+\begin{omsources}
+\item Chips and Cheese, ``Core to core latency data on large systems'', 2023.
+\item Linux kernel documentation, ``NUMA memory policy''; ABI documentation, \texttt{sysfs-bus-pci}.
+\item Intel, ``Intel Data Direct I/O technology''.
+\item PCI-SIG, PCI Express 5.0 specification announcement, 2019.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:1}
+What is the usable bandwidth in each direction of an 8-lane PCIe 4.0 link? Is it enough for two 25~Gb/s ports?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:2}
+A packet of 300 bytes lands in the cache of the card's socket. How many \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} must a core on the other socket fetch to
+read it?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:3}
+\path{/sys/bus/pci/devices/0000:81:00.0/numa_node} contains 1 and the strategy runs on CPU 5, whose node is 0. What
+does \cref{prop:ll:multi-socket-machines-and-interconnects:remote} give with three lines in, one out, and the published
+figures?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:4}
+The feed handler, pinned to node 1, publishes each message into a ring that the main thread allocated and zeroed at
+start-up on node 0. Where does each write go, and how do you fix it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:5}
+Read \cref{fig:ll:multi-socket-machines-and-interconnects:c2c}: which pairs of CPUs would you give to a feed thread and a
+strategy thread that hand over every message, and what would a hand-off cost between the pair you chose and a random pair?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:6}
+Why must a hot thread's hyper-threading sibling stay idle, and what does the plan lose by it on the two-socket fixture?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:7}
+\emph{Coding.} Extend \texttt{firm\_coreplan.plan} to place four hot threads on a node with only three usable physical cores
+by sharing one core between the two threads that exchange the least data. Which pair would you choose in a feed, book,
+strategy and gateway pipeline, and what does \texttt{check} need to accept?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:8}
+\emph{Find the flaw.} ``We pinned our strategy with \texttt{taskset -c 5} in the service's start script, so it is on the
+right socket.''
+\end{exercise}
+
+\section{Problem: Wrong Socket}
+
+\begin{problem}[{Weekend problem --- a server nobody had looked at}]\label{pb:ll:multi-socket-machines-and-interconnects:1}
+A firm's new two-socket server has its network card on node 1. The feed handler, strategy and gateway were started by a
+script without any pinning, and the scheduler put them on node 0. Each market-data message brings two \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} to the
+strategy; each order sends two lines to the card. Take the published figures: 59 nanoseconds per line within a socket, 138
+across.
+
+\medskip\noindent\textbf{Part I --- The topology.}
+\begin{enumerate}
+\item Which sysfs files tell the node of the card and of each CPU?
+\item On the fixture \texttt{two\_socket}, which CPUs are on node 1, and what are the siblings of CPU 17?
+\item What does \texttt{plan} return for the three hot roles, and which CPUs does it leave idle?
+\item Why does the plan never use CPU 0's core?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The penalty.}
+\begin{enumerate}[resume]
+\item Apply \cref{prop:ll:multi-socket-machines-and-interconnects:remote}: what does the wrong socket add per message?
+\item What fraction of a \qty{2.5}{\micro\second} wire-to-wire budget is that?
+\item If the strategy also reads its order book, allocated by the main thread on node 0, what happens when the threads are
+moved to node 1 without moving the book?
+\item Which of the two mistakes is worse, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Hand-offs.}
+\begin{enumerate}[resume]
+\item The feed thread hands every message to the strategy through a ring: one line each way. What does the hand-off cost
+within a socket and across?
+\item On this laptop, what does it cost between neighbouring CPUs and between others (\cref{fig:ll:multi-socket-machines-and-interconnects:c2c})?
+\item How would you choose the two CPUs from the matrix alone?
+\item Why can the matrix change from one boot of a virtual machine to the next?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The fix.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the latency added per message by the wrong socket, in nanoseconds and as a share of
+a \qty{2.5}{\micro\second} budget.
+\item Write the steps of the fix, in order.
+\item How do you verify after the fix that each thread runs where the plan says?
+\item What should happen when a hardware change moves the card to node 0?
+\item Which other devices' interrupts should be moved away from the hot cores?
+\item What does \texttt{numa\_node} $= -1$ mean, and what should the plan do?
+\item What would you record with every latency measurement so that a placement change is visible later?
+\item In one sentence: why is placement a latency decision?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:1}
+What is NUMA, and what does it mean for a latency-sensitive process?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:2}
+What is \omterm{def:ll:multi-socket-machines-and-interconnects:first}{first-touch allocation}, and how can it put a thread's memory on the wrong node?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:3}
+How do you find which socket a network card is attached to on Linux?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:4}
+Two threads exchange a message a microsecond. Where would you place them on a two-socket machine, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:5}
+What is DMA, and what does \omterm{def:ll:multi-socket-machines-and-interconnects:dca}{direct cache access} change for a packet's path to the application?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:multi-socket-machines-and-interconnects:6}
+Design a start-up procedure for a trading process that guarantees correct placement of its threads and memory on any
+server in the fleet.
+\end{interviewq}

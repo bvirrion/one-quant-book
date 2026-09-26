@@ -1,0 +1,310 @@
+\chapter{Managed and Functional Languages on the Desk}\label{ch:ll:managed-and-functional-languages-on-the-desk}
+
+In 2011 a retail exchange described in public how its matching logic processed six million orders a second on a single
+thread, written in Java (Fowler, 2011). Its engineers had not escaped the \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{garbage collector}; they had designed around it:
+everything pre-allocated, ring buffers of millions of slots created at start-up, no locks in the business logic. A few
+years earlier a proprietary trading firm had described why it wrote its critical trading systems in OCaml, a functional
+language with a \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{garbage collector} of its own (Minsky and Weeks, 2008). Managed languages are on trading desks, sometimes on
+the hot path. This chapter explains what their runtimes do that C++ and Rust do not, how a latency-sensitive program
+written in them is structured, and what the firms that use them have said in public about why.
+
+\section{Garbage collection and its pauses}
+
+\begin{definition}[Garbage collector, stop-the-world pause]\label{def:ll:managed-and-functional-languages-on-the-desk:gc}
+A \emph{garbage collector}\index{garbage collector} reclaims memory that the program can no longer reach, by tracing
+references from the program's roots (stacks, globals). Most divide the heap into generations: new objects in a small young
+generation, collected often and cheaply; survivors promoted to an old generation, collected rarely and at a cost that grows
+with its size. A \emph{stop-the-world pause}\index{stop-the-world pause} is an interval during which the collector has
+stopped every application thread.
+\end{definition}
+
+The trade is explicit: the program never frees memory and never frees it twice; in exchange, it runs on a schedule set by
+its allocation. Modern collectors shorten pauses by doing most of their work concurrently with the program; a widely used
+Java collector aimed first at pauses under ten milliseconds and later at under one millisecond spent at the points where
+all threads stop (dated box below). Either figure is enormous against a microsecond budget, and the concurrent work itself
+takes cores and memory bandwidth from the program.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\draw[fill=omDef!10,draw=omDef,rounded corners=2pt] (0,0) rectangle (3.2,1.2);
+\node[anchor=north] at (1.6,1.15) {young generation};
+\node at (1.6,0.45) {new objects};
+\draw[fill=omThm!10,draw=omThm,rounded corners=2pt] (5.0,0) rectangle (11.2,1.2);
+\node[anchor=north] at (8.1,1.15) {old generation};
+\node at (8.1,0.45) {long-lived objects: the book, caches, state};
+\draw[-Stealth,thick] (3.3,0.6) -- node[above]{survivors} node[below]{promoted} (4.9,0.6);
+\draw[-Stealth,thick] (-1.4,0.6) node[left]{allocation} -- (-0.1,0.6);
+\draw[omDef,thick,decorate,decoration={brace,amplitude=4pt,mirror}] (0,-0.15) -- (3.2,-0.15) node[midway,below=5pt,align=center]{collected often:\\cost $\propto$ survivors};
+\draw[omThm,thick,decorate,decoration={brace,amplitude=4pt,mirror}] (5.0,-0.15) -- (11.2,-0.15) node[midway,below=5pt,align=center]{collected rarely:\\cost grows with the live heap};
+\end{tikzpicture}
+
+\omcaption{A generational heap. Allocation fills the young generation, whose collections cost in proportion to what
+survives; survivors move to the old generation, whose full collections scan everything alive, and stop or slow the
+program for longer as the heap grows.}\label{fig:ll:managed-and-functional-languages-on-the-desk:heap}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Pause goals of a modern Java collector}\label{dat:ll:managed-and-functional-languages-on-the-desk:jvm}
+OpenJDK's ZGC was proposed (JEP 333) with the goal that garbage-collection pause times should not exceed 10~milliseconds,
+its stop-the-world phases limited to scanning roots. A later proposal (JEP 376) moved the scanning of thread stacks to a
+concurrent phase, with the expectation that less than one millisecond be spent inside the collector's safepoints on typical
+machines.
+\end{dated}
+
+\section{The low-latency managed style: pre-allocation, off-heap memory, warm-up}
+
+\begin{definition}[Off-heap memory]\label{def:ll:managed-and-functional-languages-on-the-desk:offheap}
+\emph{Off-heap memory}\index{off-heap memory} is memory a managed program uses outside its collected heap (direct byte
+buffers, memory-mapped files, native arrays), laid out by the program and invisible to the collector: it is never scanned,
+moved or freed by it.
+\end{definition}
+
+The style that the exchange above described follows from the collector's economics. Allocate nothing per message after
+start-up: pre-allocate every object the hot path needs and reuse it (the pools of chapter~6); keep large, long-lived data
+(order books, rings, journals) off the heap or in flat arrays of primitives, so that full collections have little to scan;
+size the young generation so that the little garbage that remains fills it rarely; and run a quiet collector. What is
+left is a program whose collector has nothing to do during the trading day. The limit of the style is its brittleness:
+one library call that allocates, one boxed integer, puts the collector back on the path, and nothing in the language says
+so; the allocation must be measured, as in chapter~6.
+
+\begin{proposition}[The garbage budget]\label{prop:ll:managed-and-functional-languages-on-the-desk:budget}
+A program that allocates $b$ bytes per message at $r$ messages a second, with a young generation of $Y$ bytes, collects its
+young generation every $Y/(rb)$ seconds. It collects at most $k$ times in a session of length $T$ if and only if
+$b \le kY/(rT)$.
+\end{proposition}
+
+\begin{proof}
+Allocation fills the young generation at $rb$ bytes a second and each collection empties it, so collections occur every
+$Y/(rb)$ seconds and number $rbT/Y$ in the session; $rbT/Y \le k$ is the stated condition.
+\end{proof}
+
+With a young generation of 2~GiB, 200\,000 messages a second and a session of six and a half hours, the budget for one
+collection a session is under half a byte per message: in practice, zero.
+
+\section{Just-in-time compilation and deoptimisation}
+
+\begin{definition}[Just-in-time compilation, warm-up period]\label{def:ll:managed-and-functional-languages-on-the-desk:jit}
+In \emph{just-in-time compilation}\index{just-in-time compilation} a runtime first interprets or lightly compiles a program,
+measures which code is hot and how it behaves, and then compiles the hot code to optimised machine code using that profile.
+The \emph{warm-up period}\index{warm-up period} is the time, or number of executions, before the hot path runs as optimised
+code.
+\end{definition}
+
+\begin{definition}[Deoptimisation]\label{def:ll:managed-and-functional-languages-on-the-desk:deopt}
+\emph{Deoptimisation}\index{deoptimisation} is the runtime's fall-back from optimised code to a slower tier when an
+assumption the optimiser made from the profile is violated (a call site that had seen one type sees another, a branch never
+taken is taken); the code may later be recompiled.
+\end{definition}
+
+A just-in-time compiler is \omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{profile-guided optimisation} (chapter~8) done while the program runs, with the same risk: the
+profile is whatever the program has seen so far. A trading process that starts in the morning is slowest on its first
+messages, exactly when the open is busiest, and a rare path taken for the first time at a volatile moment (an unusual
+message type, a halt) may trigger \omterm{def:ll:managed-and-functional-languages-on-the-desk:deopt}{deoptimisation} just then. The standard remedies are warm-up by replaying synthetic or
+recorded traffic through the real code before trading (with orders sent to a simulator, never the market), and keeping
+the hot path's types and branches stable. Ahead-of-time compilation removes the warm-up at the cost of the profile.
+
+\section{The functional-language shops}
+
+The proprietary firm of the opening described its choice in a journal paper: OCaml as its primary development language,
+over twenty OCaml programmers and hundreds of thousands of lines of code, used for critical trading systems, research,
+systems software and administration, valued because it let the firm ``rapidly produce readable, correct, efficient code''
+(Minsky and Weeks, 2008). The argument was not speed per message but correctness per engineer: an expressive type system
+that encodes invariants (an order's state as a variant whose cases the compiler checks are all handled), immutable data by
+default, and code short enough to be reviewed by people who trade with it. The same firm's later essay argued that the
+next language a programmer learns should be functional (Minsky, 2011). OCaml's collector is generational too, with a small
+minor heap collected often and a major heap collected incrementally; latency-critical OCaml, like latency-critical
+Java, is written to allocate little on the hot path.
+
+\section{Choosing a language for a desk}
+
+The choice is less binary than debates suggest. Several languages usually coexist in one firm: C++ or Rust where
+nanoseconds are traded, a managed or functional language for the large body of logic whose
+\omterm{def:ll:where-latency-comes-from:budget}{latency budget} is microseconds to milliseconds, and Python for research and operations (One Quant Book~15, chapter~8). The
+questions that decide are measurable: the \omterm{def:ll:where-latency-comes-from:budget}{latency budget} at the percentile that matters; the allocation discipline the
+team can sustain and test; the cost of the bugs each language prevents or permits; and the size and experience of the
+team. In Python, this book's research language, the lessons of this chapter apply directly, as the tutorial shows.
+
+\section{Tutorial: the collector in a Python message loop}\label{tut:ll:managed-and-functional-languages-on-the-desk:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Watch CPython's collector interrupt a message loop, and remove it by pre-allocation. \textbf{End state:}
+\cref{fig:ll:managed-and-functional-languages-on-the-desk:gc}.
+\begin{tutsteps}
+\item \textbf{Two books.} One keeps each live order as a Python dictionary, adding two orders for each one removed, as a
+book fills during the morning; the other writes orders into a pre-allocated NumPy record array.
+\omcode{code/low-latency/10-managed-and-functional-languages-on-the-desk/python/ll_gc.py}{19}{38}{A book of dictionaries and a pre-allocated book.}\label{lst:ll:managed-and-functional-languages-on-the-desk:books}
+\item \textbf{Time the collector.} \texttt{GcWatch} registers a callback that CPython calls before and after every
+collection, and records each pause, by generation, in \texttt{firm.lathist}.
+\omcode{code/firm/gcwatch/firm_gcwatch.py}{27}{50}{Timing every collection through the gc module's callbacks.}\label{lst:ll:managed-and-functional-languages-on-the-desk:watch}
+\item \textbf{Measure the loop} over 200\,000 messages with \texttt{python bench\_gc.py}; the loop stores timestamps only,
+so that nothing but the book's own work happens between two of them.
+\end{tutsteps}
+\textbf{What to change next.} Keep the dictionary book but call \texttt{gc.freeze()} after the warm-up and again every
+100\,000 messages, and see what happens to the full collections; bound the dictionary book at 1\,000 live orders and
+explain why the collector then never runs.
+\end{tutorial}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.6cm,ybar,bar width=8pt,ymode=log,log origin y=infty,ymin=100,ymax=100000000,
+  symbolic x coords={dict book,pooled book},xtick=data,enlarge x limits=0.45,
+  ylabel={ns per message (log scale)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=design,y=p50]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=design,y=p99]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=design,y=p999]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=gray!40,draw=gray] table[x=design,y=max]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{A Python message loop over 200\,000 orders: a book of dictionaries, which triggered 259 young, 23 intermediate
+and 2 full collections, and a pre-allocated NumPy book, which triggered none. The dictionary book's maximum is its full
+collection. CPython 3.10. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores. Data:
+\texttt{bench\_gc.py}.}\label{fig:ll:managed-and-functional-languages-on-the-desk:gc}
+\end{omfigure}
+
+The result has two halves, and both matter. The pre-allocated book removed the collector: no collection in 200\,000
+messages, and a tail more than twenty times shorter at its maximum. It is not faster at the median: writing three fields
+of a NumPy array from Python costs more than creating a small dictionary. And the dictionary book's worst message took as
+long as its last full collection, some twenty milliseconds, which scanned every order still alive. CPython adds a
+twist of its own: its collector counts allocations minus deallocations, so a loop whose live set stays bounded never
+triggers a collection at all; a book that grows does.
+
+\section{Build: collector watch and message pool}\label{bld:ll:managed-and-functional-languages-on-the-desk:gcwatch}
+
+\begin{build}
+\bfield{Purpose} The firm's Python services (research servers, reporting, the simulator drivers of One Quant Book~10)
+measure their collector and keep it off their message loops.
+\bfield{Interface} Python \texttt{firm\_gcwatch}: \texttt{GcWatch()} as a context manager with \texttt{pauses[gen]}
+(\texttt{LatHist}, nanoseconds), \texttt{collections[gen]}, \texttt{total\_ns}; \texttt{RecordPool(n, dtype)} with
+\texttt{next()} and \texttt{buf}; \texttt{MESSAGE} (timestamp, price, quantity, side); \texttt{steady\_state(step, n,
+warm)}.
+\bfield{Rules} The callback is removed when the context ends, even on error; \texttt{steady\_state} freezes the heap after
+warm-up and unfreezes it afterwards; the pool never grows.
+\bfield{Acceptance tests} \texttt{code/firm/gcwatch/tests/}: a pooled loop of 50\,000 messages causes no collection; a
+bounded churn causes none either; a growing book causes young collections, each timed.
+\bfield{Stretch} Report the allocation rate (bytes a message) with \texttt{tracemalloc} in a test build; alarm when a
+full collection happens during market hours.
+\end{build}
+
+\begin{omsources}
+\item M.~Fowler, ``The LMAX architecture'', 12 July 2011.
+\item Y.~Minsky and S.~Weeks, ``Caml trading: experiences with functional programming on Wall Street'', \emph{Journal of
+Functional Programming} 18(4), 2008; Y.~Minsky, ``OCaml for the masses'', \emph{ACM Queue}, 2011.
+\item OpenJDK, JEP 333 (ZGC) and JEP 376 (concurrent thread-stack processing).
+\item Python documentation, module \texttt{gc}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:1}
+A Java engine allocates 64 bytes per message at 100\,000 messages a second with a 1~GiB young generation. How often does it
+collect the young generation, and how many times in a 6.5-hour session?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:2}
+A collector's pause is \qty{1}{\milli\second}. How many messages arriving at 200\,000 a second queue behind it, and how long
+does the last of them wait?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:3}
+From \cref{fig:ll:managed-and-functional-languages-on-the-desk:gc}, by how much does the pooled book shorten the maximum and
+the p99.9, and how does its median compare?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:4}
+Why does a Python loop that keeps the last 1\,000 orders in a bounded deque never trigger the collector, while a growing book
+does?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:5}
+A Java strategy is fastest after ten minutes of trading and slowest at the open. Explain, and propose two remedies.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:6}
+The exchange of the opening kept ring buffers of 20 million slots on the input side. At 6 million orders a second, how many
+seconds of input does such a ring hold?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:7}
+\emph{Coding.} Call \texttt{gc.freeze()} in the dictionary book after the warm-up and then every 100\,000 messages. Count the
+full collections and record the worst message. What does freezing trade away?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:8}
+\emph{Find the flaw.} ``Our Java gateway uses the concurrent collector with pauses under a millisecond, so garbage collection
+does not affect our latency.''
+\end{exercise}
+
+\section{Problem: The Garbage Budget}
+
+\begin{problem}[{Weekend problem --- a JVM engine on a busy day}]\label{pb:ll:managed-and-functional-languages-on-the-desk:1}
+A firm runs an order-routing engine on the JVM with a 2~GiB young generation. On a normal day it handles 200\,000 messages a
+second for a 6.5-hour session and allocates 48 bytes per message on average. A code review finds that most of it comes from
+boxed integers and a logging call that formats a string.
+
+\medskip\noindent\textbf{Part I --- The budget.}
+\begin{enumerate}
+\item How many bytes does the engine allocate per second, and per session?
+\item How often does it collect the young generation, and how many times per session?
+\item What is the allocation per message that allows at most one young collection per session?
+\item What does that budget mean in practice?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The pauses.}
+\begin{enumerate}[resume]
+\item If each young collection pauses the engine for \qty{0.5}{\milli\second}, how much time a session does it spend paused?
+\item How many messages queue behind one such pause, and what does the one at the back of the queue wait?
+\item On a day with three times the traffic, how do the answers change?
+\item Why is the busy day the one that matters?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The fixes.}
+\begin{enumerate}[resume]
+\item What replaces boxed integers on the hot path?
+\item What replaces formatted logging (chapter~23)?
+\item Where should the order book and the rings live, and why?
+\item How would you verify, in the test suite, that the allocation per message is zero?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the allocation per message that keeps the engine to one young collection a session,
+and the pause time a session at the current 48 bytes.
+\item What remains of the collector's cost once allocation is zero?
+\item Why must the engine still be warmed up before the open?
+\item What did the Python experiment of the tutorial show that carries over to the JVM?
+\item Why did the functional-language firm value its language, according to its own paper?
+\item When would you choose C++ or Rust over a managed language for this engine?
+\item What must the firm measure before deciding?
+\item In one sentence: what does a \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{garbage collector} cost a hot path?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:managed-and-functional-languages-on-the-desk:1}
+How does a generational \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{garbage collector} work, and why is it generational?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:managed-and-functional-languages-on-the-desk:2}
+How would you write a low-latency service in Java so that the collector does not interfere?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:managed-and-functional-languages-on-the-desk:3}
+What is warm-up in a JIT-compiled runtime, and how do you deal with it before the open?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:managed-and-functional-languages-on-the-desk:4}
+What is \omterm{def:ll:managed-and-functional-languages-on-the-desk:deopt}{deoptimisation}, and why can it happen at the worst moment?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:ll:managed-and-functional-languages-on-the-desk:5}
+Why might a trading firm choose a functional language for its trading systems?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:managed-and-functional-languages-on-the-desk:6}
+A Python service's p99.9 is fine but its maximum is 20 milliseconds once every few minutes. How do you find out whether it is
+the \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{garbage collector}, and what do you do about it?
+\end{interviewq}

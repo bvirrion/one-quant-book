@@ -1,0 +1,412 @@
+\chapter{Build: an Agent-Based Market}\label{ch:mx:build-an-agent-based-market}
+
+An \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:sim}{exchange simulator} with nobody on it is an empty room. Put a few kinds of simple traders in it, some who know nothing, some who know the value, some
+who follow trends and one who makes markets, and it starts to look like a market; which of them it needs in order to look like one is itself a finding.
+This chapter describes the agent library this book has used since chapter~11, \texttt{firm.agentmkt}, adds the two agent types it lacked (chartists and
+an inventory-skewing market maker), calibrates the population to a target market by the \omterm{def:mx:build-an-agent-based-market:msm}{method of simulated moments}, and then takes it apart one agent
+type at a time to see which fact each one carries.
+
+\section{Agents and their information}
+
+\begin{definition}[Agent-based model]\label{def:mx:build-an-agent-based-market:abm}
+An \emph{agent-based model}\index{agent-based model} of a market is a simulation in which prices and volumes are not specified but emerge from the
+orders of many simulated traders (agents), each following its own rule with its own information, through a trading mechanism such as a \omterm{def:mx:the-limit-order-book:lob}{limit order
+book}.
+\end{definition}
+
+\begin{definition}[Fundamentalist agent, chartist agent]\label{def:mx:build-an-agent-based-market:types}
+A \emph{fundamentalist agent}\index{fundamentalist agent} trades toward a value it believes the asset is worth: it buys when the price is below that
+value and sells when it is above, more often the larger the gap. A \emph{chartist agent}\index{chartist agent} trades on the price's own recent
+history, typically in the direction of its recent trend.
+\end{definition}
+
+Agent-based markets come in two traditions. The first gives agents strategies and asks what dynamics follow: Lux and Marchesi (1999) built a market of
+fundamentalists and chartists whose news process had neither fat tails nor any time dependence in volatility, and found that the interactions of the
+agents produced both. The second removes strategy almost entirely: Farmer, Patelli and Zovko (2005) let agents place and cancel orders at random
+(chapter~1's \omterm{def:mx:the-limit-order-book:zi}{zero-intelligence model}) and, on eleven London Stock Exchange stocks, explained 96\% of the cross-sectional variance of the spread and 76\% of
+that of the price diffusion rate with one free parameter. Chiarella and Iori (2002) put heterogeneous rule-based traders into an order-driven market with
+a central matching mechanism and studied how their strategies, the tick and the lifetime of orders shape spreads, volume and volatility. The population
+here takes a little from each: most of its order flow is random, and a few rules give it direction.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.6cm,inner sep=3pt,align=center,text width=3.5cm}]
+\node[box,fill=gray!12,text width=2.6cm,minimum height=1.4cm] (x) at (0,0) {\textbf{exchange simulator}\\ \texttt{firm.exchsim}\\ one book, one feed};
+\node[box,fill=omDef!12] (lp) at (-4.9,1.5) {liquidity providers\\ limit orders, cancels};
+\node[box,fill=omDef!12] (nz) at (-4.9,0) {noise takers\\ market orders, sign runs};
+\node[box,fill=omDef!12] (fd) at (-4.9,-1.5) {fundamentalists\\ see the hidden value $V$};
+\node[box,fill=omProp!14] (ch) at (4.9,1.5) {chartists\\ follow the recent trend};
+\node[box,fill=omProp!14] (mm) at (4.9,0) {market maker\\ skews on inventory};
+\node[box,fill=omThm!14] (ex) at (4.9,-1.5) {execution agents\\ metaorders, algorithms};
+\foreach \n in {lp,nz,fd} {\draw[->,thick] (\n.east) -- (x.west);}
+\foreach \n in {ch,mm,ex} {\draw[->,thick] (\n.west) -- (x.east);}
+\node[anchor=north] at (0,-2.3) {one Population agent: independent Poisson clocks, zero latency};
+\draw[dashed,omDef] (-6.8,-2.25) rectangle (-3.0,2.2);
+\end{tikzpicture}
+
+\omcaption{The population. The three types on the left run as one agent, \texttt{Population}, on independent Poisson clocks; the chartists belong to it
+too, but are new in this chapter; the market maker and the execution agents are separate agents with their own sessions and a 20-microsecond
+latency.}\label{fig:mx:build-an-agent-based-market:pop}
+\end{omfigure}
+
+\texttt{Population} runs its traders as clocks whose rates are recomputed after every event
+(\cref{fig:mx:build-an-agent-based-market:pop}). Liquidity providers add one-lot \omterm{def:mx:the-limit-order-book:orders}{limit orders} on each side, half of them one tick from the opposite
+best quote and the rest up to ten ticks behind it, and every resting order is cancelled at a constant rate. Noise takers send \omterm{def:mx:the-limit-order-book:orders}{market orders} whose signs
+come in runs (next section). Fundamentalists send \omterm{def:mx:the-limit-order-book:orders}{market orders} toward a hidden value $V$, a random walk of one-tick jumps, at a rate proportional to
+the distance between $V$ and the mid: they are also this market's \omterm{def:mx:why-there-is-a-spread:informed}{informed traders} (chapter~4), since nobody else sees $V$. Chartists send \omterm{def:mx:the-limit-order-book:orders}{market
+orders} in the direction of the mid's change over the last 30 seconds, at a rate proportional to its size. The noise orders and the jumps of $V$ are
+drawn in advance from the seed, so two runs that differ by one agent share them (common random numbers).
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{159}{187}{The population's event: an exogenous noise order or jump of the hidden value, or else one of its clocks chosen in proportion to its rate, a provider's limit order, a cancellation, a fundamentalist's or a chartist's market order.}\label{lst:mx:build-an-agent-based-market:pop}
+
+\section{Liquidity providers and their inventory}
+
+\begin{definition}[Market-making agent]\label{def:mx:build-an-agent-based-market:mm}
+A \emph{market-making agent}\index{market-making agent} quotes on both sides continuously and manages the inventory its fills leave it with, usually by
+moving its quotes against that inventory so as to attract the trades that reduce it (inventory skew).
+\end{definition}
+
+The population's providers never hold anything: their orders are independent of what they have filled. The new \texttt{MarketMaker} does: every half
+second it quotes two lots at the other traders' best bid and ask (one tick inside when their spread is wider than two ticks), both moved against its
+inventory by a skew in ticks per lot held, and it stops adding to a position beyond 20 lots. Its reference excludes its own quotes; an early version
+that did not walked its own bid down, refresh after refresh, whenever it was long, since each new quote was set below the previous one.
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{251}{272}{The market maker's refresh: the others' best quotes, a shift of the skew times the inventory in lots, a quote kept if it is already at the right price and replaced otherwise.}\label{lst:mx:build-an-agent-based-market:mm}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+skew (ticks per lot) & inventory (lots, root mean square) & profit per hour (USD) & spread (ticks) \\
+\midrule
+0 & 14.5 & $-116$ (203) & 1.031 \\
+0.1 & 4.2 & 448 (98) & 1.023 \\
+0.3 & 1.6 & 545 (67) & 1.024 \\
+\bottomrule
+\end{tabular}
+\caption{The market maker in the calibrated market at three inventory skews, three hours each: the time-weighted root mean square of its inventory,
+its profit (cash after fees plus the inventory at the last mid) with the standard deviation across hours, and the market's mean spread. Data:
+\texttt{mx\_agents.maker\_study}.}\label{tab:mx:build-an-agent-based-market:mm}
+\end{table}
+
+Without skew the maker's inventory wanders (\cref{fig:mx:build-an-agent-based-market:inv}) and it loses money: its fills follow the fundamentalists,
+who know the value, so the inventory it accumulates is the wrong way round when $V$ moves (chapter~4's adverse selection). With a skew of 0.3 ticks per
+lot its inventory stays within a few lots and its hourly profit is positive and steadier (\cref{tab:mx:build-an-agent-based-market:mm}); the skew is
+the practical form of the inventory models of chapter~4 (and of Book~2, chapter~30). The market's spread hardly changes: the providers keep it near one tick
+whatever the maker does.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.4cm,xlabel={\small seconds from the open},ylabel={\small inventory (lots)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=3600,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,thick,const plot] table[x=t,y=lots]{figdata/microstructure/27-build-an-agent-based-market/inventory_skew0.csv};
+\addplot[omDef,thick,const plot] table[x=t,y=lots]{figdata/microstructure/27-build-an-agent-based-market/inventory_skew3.csv};
+\legend{no skew,skew 0.3 ticks per lot}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The market maker's inventory through one hour of the calibrated market, with the same order flow, without skew and with a skew of 0.3 ticks
+per lot. Without skew it swings from one 20-lot limit to the other. Data: \texttt{mx\_agents.maker\_study}.}\label{fig:mx:build-an-agent-based-market:inv}
+\end{omfigure}
+
+\section{Execution agents and metaorders}
+
+A metaorder (Book~7, chapter~9) cut into children sends many \omterm{def:mx:the-limit-order-book:orders}{market orders} of one sign; this is the mechanism Lillo, Mike and Farmer (2005) proposed for
+the long memory of order signs: if the sizes of large orders have a power-law tail, $P(V > v) \propto v^{-\alpha}$, and they are executed in children of
+constant size, the autocorrelation of order signs decays as $\tau^{-(\alpha - 1)}$, which is long memory (not summable) when $\alpha < 2$. The noise
+takers of \texttt{firm.agentmkt} are that mechanism in a line: their signs come in runs whose lengths are Pareto with tail $\alpha$ (the parameter
+\texttt{run\_tail}), each run a metaorder. Execution agents proper, \texttt{Metaorder} for a schedule of market-order children and the algorithms of
+chapters 16 to 22, are added to the same simulator as separate agents; chapter~11 measured their impact against the same session without them.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=9.6cm,height=5.6cm,xlabel={\small lag (orders)},ylabel={\small sign autocorrelation},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0.8,xmax=120,ymin=0.001,ymax=0.5,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma,unbounded coords=discard]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=lag,y=runs]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[gray,very thick,mark=square*,mark size=1.3pt] table[x=lag,y=none]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[omProp,very thick,mark=triangle*,mark size=1.6pt] table[x=lag,y=excess]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[omThm,thick,dashed] table[x=lag,y=law]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\legend{with sign runs,without,excess from the runs,slope $-(\alpha-1)=-1.5$}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Autocorrelation of the signs of aggressive orders in the calibrated market (run tail $\alpha = 2.5$), with and without the noise takers'
+sign runs, three hours each; the excess the runs add, with the power law their tail implies. The excess is drawn out to lag 20, where it is lost in noise. Data:
+\texttt{mx\_agents.sign\_curves}.}\label{fig:mx:build-an-agent-based-market:signs}
+\end{omfigure}
+
+The calibrated market has $\alpha = 2.5$, so its runs predict an excess autocorrelation falling as $\tau^{-1.5}$: short memory. Measured over lags 1 to
+7 the excess falls with a log-log slope of $-1.15$ (\cref{fig:mx:build-an-agent-based-market:signs}), a little flatter than the asymptotic law, and is
+gone by lag 10. What remains without the runs, about 0.07 to 0.09 out to lag 20, is the fundamentalists' doing: while $V$ is away from the mid they
+send order after order in the same direction.
+
+\section{Calibrating to stylised facts}
+
+\begin{definition}[Method of simulated moments]\label{def:mx:build-an-agent-based-market:msm}
+The \emph{method of simulated moments}\index{method of simulated moments} estimates the parameters of a model that can be simulated but whose moments
+have no closed form: it chooses the parameters that minimise a weighted distance between moments computed from the data and the same moments averaged
+over simulations of the model, the simulations using the same random draws at every candidate parameter.
+\end{definition}
+
+Franke and Westerhoff (2012) estimated small fundamentalist-chartist models this way, with moments chosen from the stylised facts (Book~7, chapter~5)
+of daily index returns. Here the target is one hour of Book~7's synthetic market, \texttt{firm.tape} without its news window, measured on eight hours:
+it has Hawkes-clustered noise flow, metaorders, \omterm{def:mx:why-there-is-a-spread:informed}{informed traders} and a random activity level, none of which the agent population has as such. The
+seven facts are the excess kurtosis of 30-second mid returns, their lag-1 autocorrelation, volatility clustering (the mean autocorrelation of absolute
+returns at lags 1 to 5), the autocorrelation of the signs of aggressive orders at lags 1 and 10 (the prints of one order counted once), the
+time-weighted mean spread and the mean depth at the best. The distance is the sum of squared differences between simulated and target means, each
+scaled by the target's standard deviation across its eight hours.
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{307}{322}{The method of simulated moments on a grid: the distance in target standard deviations, and the average of the same seeds' facts at every grid point.}\label{lst:mx:build-an-agent-based-market:msm}
+
+Three parameters are calibrated, on a grid of three values each: the noise takers' rate (0.9, 1.2, 1.5 a second), their run tail (none, 1.5, 2.5) and
+the chartists' rate (0, 0.05, 0.1 a second per tick of trend); the providers, fundamentalists and market maker (skew 0.1) are fixed. Each point is run
+for three hours with the same three seeds.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.2cm,height=5.4cm,xlabel={\small chartists' rate (per second per tick of trend)},ylabel={\small distance},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xtick={0,0.05,0.1},
+  xticklabel style={/pgf/number format/fixed},ymin=0,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,very thick,mark=square*,mark size=1.4pt] table[x=chart,y=tail0]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.6pt] table[x=chart,y=tail15]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=chart,y=tail25]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\legend{no sign runs,tail 1.5,tail 2.5}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The distance between simulated and target facts at a noise rate of 1.2 orders a second, by the chartists' rate and the run tail, three hours
+per point with the same seeds. Data: \texttt{mx\_agents.calibration}.}\label{fig:mx:build-an-agent-based-market:surface}
+\end{omfigure}
+
+The best point is a noise rate of 1.2, a run tail of 2.5 and a chartists' rate of 0.05, at a distance of 10.1 over its three calibration hours; the
+starting point (noise 0.9, no runs, no chartists) was at 27.9 (\cref{fig:mx:build-an-agent-based-market:surface}). On six fresh hours the calibrated
+population is at 5.4, and six fresh hours of the target market itself are at 1.7 from the target's mean: what sampling noise alone gives.
+\Cref{fig:mx:build-an-agent-based-market:facts} shows where the rest comes from: the calibrated market has too little volatility clustering and too
+little depth, and a little too much sign memory at lag 1.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.6cm,ybar,bar width=7pt,ylabel={\small simulated $-$ target (target s.d.)},
+  xtick={0,1,2,3,4,5,6},xticklabels={kurtosis,return acf,clustering,sign acf 1,sign acf 10,spread,depth},
+  x tick label style={font=\footnotesize,rotate=25,anchor=north east},tick label style={font=\footnotesize},
+  grid=major,grid style={gray!25},enlarge x limits=0.08,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.42)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=gray!45,draw=gray] table[x=k,y=start]{figdata/microstructure/27-build-an-agent-based-market/facts.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=calibrated]{figdata/microstructure/27-build-an-agent-based-market/facts.csv};
+\legend{starting point (calibration hours),calibrated (six fresh hours)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Each fact's gap to the target in target standard deviations, for the starting point and for the calibrated population. The squares of the
+calibrated bars sum to the distance on fresh hours. Data: \texttt{mx\_agents.calibration}.}\label{fig:mx:build-an-agent-based-market:facts}
+\end{omfigure}
+
+The ablation takes the calibrated population and removes one agent type at a time on the six fresh hours, with the same seeds: the sign runs (the noise
+takers keep their rate but their signs become independent), the chartists, the fundamentalists, the market maker. \Cref{tab:mx:build-an-agent-based-market:abl}
+gives each fact's move in target standard deviations.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+removed & kurtosis & return & clustering & sign & sign & spread & depth \\
+ & & acf & & acf 1 & acf 10 & & \\
+\midrule
+sign runs & $+1.32$ & $+0.02$ & $-0.63$ & $\mathbf{-2.77}$ & $-0.35$ & $-0.38$ & $+0.10$ \\
+ & (0.79) & (0.29) & (1.12) & (0.15) & (0.25) & (0.19) & (0.06) \\[2pt]
+chartists & $\mathbf{+1.11}$ & $-0.10$ & $-0.72$ & $+0.02$ & $-0.18$ & $-0.29$ & $+0.09$ \\
+ & (0.55) & (0.20) & (0.67) & (0.10) & (0.27) & (0.11) & (0.02) \\[2pt]
+fundamentalists & $\mathbf{+8.55}$ & $-0.47$ & $-0.73$ & $+0.87$ & $-2.42$ & $-1.29$ & $+0.96$ \\
+ & (2.65) & (0.25) & (0.88) & (0.14) & (0.40) & (0.15) & (0.05) \\[2pt]
+market maker & $-0.79$ & $-1.77$ & $+0.31$ & $-0.69$ & $-1.00$ & $\mathbf{+9.44}$ & $-0.75$ \\
+ & (0.29) & (0.25) & (0.57) & (0.10) & (0.19) & (0.37) & (0.04) \\[2pt]
+\bottomrule
+\end{tabular}
+\caption{Ablation: the change in each fact when one agent type is removed from the calibrated population, in target standard deviations, the mean of
+six hours with the same seeds (paired standard errors in brackets below; the largest move of each type in bold). Data:
+\texttt{mx\_agents.ablation}.}\label{tab:mx:build-an-agent-based-market:abl}
+\end{table}
+
+Each type carries something (\cref{tab:mx:build-an-agent-based-market:abl}). The sign runs carry the lag-1 sign memory ($-2.77$, standard error 0.15 standard deviations).
+The fundamentalists carry the price's movement: without them the mid is pinned between rare jumps, so the kurtosis of returns explodes ($+8.6$) and the
+long-lag sign memory falls ($-2.42$). The market maker carries the spread ($+9.4$): without it, the spread widens by 0.15 ticks. The chartists
+carry nothing this test can see: their largest move, on kurtosis, is $+1.11$ with a standard error of 0.55, two standard errors. Removing the noise takers altogether leaves a market in
+which only fundamentalists trade, with a sign autocorrelation near one; it is not in the table because every fact moves.
+
+\section{What agent-based markets can and cannot tell you}
+
+An agent-based market is a tool for questions about mechanisms: what happens to spreads if the tick halves (chapter~6), whether a band attracts the
+price (chapter~25), how an algorithm's shortfall depends on the other traders' reaction (chapter~28). Replaying a historical tape cannot answer them,
+because a replayed market does not react; Vyetrenko and coauthors (2020) compared market replay with interactive agent-based configurations on a list
+of realism metrics taken from the stylised facts, and found the interactive ones more realistic, and more so when the agents' fundamental value came from
+historical data rather than a mean-reverting random walk. ABIDES (Byrd, Hybinette and Balch 2020), an open-source simulator of tens of thousands of
+agents with an exchange agent whose messages follow Nasdaq's ITCH and OUCH, is built for exactly this.
+
+What it cannot tell you is why real traders do what they do. Matching seven facts to within 5.4 does not identify the agents: other populations,
+with other rules, would match them as well (here the chartists could be removed at little cost), and the facts left unmatched, volatility clustering
+first, say that something in the target (its random activity level) is missing from the population. The calibration answers ``is this population good
+enough for the question?'', not ``is this how the market works?''; and the answer depends on the facts chosen and their weights. The fair use is
+comparative: the same population, with and without an algorithm, a rule or a trader, and the same seeds.
+
+\section{Tutorial: a market that looks like a market}\label{tut:mx:build-an-agent-based-market:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Populate \texttt{firm.exchsim} with agents, calibrate them to a target market's stylised facts, and find which fact each agent type
+carries. \textbf{End state:} \cref{tab:mx:build-an-agent-based-market:mm,tab:mx:build-an-agent-based-market:abl},
+\cref{fig:mx:build-an-agent-based-market:inv,fig:mx:build-an-agent-based-market:signs,fig:mx:build-an-agent-based-market:surface,fig:mx:build-an-agent-based-market:facts}.
+\begin{tutsteps}
+\item \textbf{Populate.} \texttt{PopulationConfig(lo\_rate, near, cancel, depth, noise, run\_tail, fund, v\_rate, chart, chart\_window)};
+\texttt{session(cfg, seconds, seed, agents=[MarketMaker(skew=0.1)])}; the \texttt{Result}'s \texttt{tape()} is in \texttt{firm.tape}'s format.
+\item \textbf{Measure.} \texttt{facts(tape, 30.0)}; chapter~3's \texttt{firm\_lobstats.report(tape)} for the book's own facts (depth profile,
+lifetimes, \omterm{def:mx:empirical-facts-of-order-books:life}{fleeting orders}, resilience).
+\item \textbf{Calibrate.} \texttt{mx\_agents.target()}, \texttt{calibration()} (\texttt{msm} over the grid with common seeds).
+\item \textbf{Take apart.} \texttt{ablation()}, \texttt{sign\_curves()}, \texttt{maker\_study()}; draw with \texttt{fig\_agents.py}.
+\end{tutsteps}
+\textbf{What to change next.} Add a switching rule between fundamentalists and chartists (Lux and Marchesi's mechanism) and see whether the clustering
+gap closes; target a real tape's facts; weight the moments by their simulated covariance instead of the target's variances.
+\end{tutorial}
+
+\section{Build: agentmkt}\label{bld:mx:build-an-agent-based-market:agentmkt}
+
+\begin{build}
+\bfield{Purpose} The agent library and population runner on \texttt{firm.exchsim}, used since chapter~11 and by the tutorials of Books 11 and 12: a
+reacting market with known ingredients.
+\bfield{Interface} \texttt{PopulationConfig}, \texttt{Population(cfg, seed, seconds)} (\texttt{.exo}, \texttt{.v\_path}), \texttt{Metaorder(plan)},
+\texttt{MarketMaker(lots, skew, max\_lots, refresh\_s)}, \texttt{session(cfg, seconds, seed, agents, venue)}; \texttt{facts(tape, sample\_s)},
+\texttt{FACTS}, \texttt{distance(sim, target, scale)}, \texttt{msm(run, grid, target, scale, seeds)}.
+\bfield{Rules} Deterministic and seeded per agent; exogenous flow drawn in advance so that runs share it; output in \texttt{firm.tape}'s format; the
+default population unchanged by later additions (the chartists and the activity curve are off by default).
+\bfield{Acceptance tests} \texttt{code/firm/agentmkt/tests/}: the same seed gives the same tape and the exogenous flow is shared; a metaorder trades its
+plan; the activity curve shapes the flow; the market maker only rests and bounds its inventory; one sign per aggressive order; \texttt{msm} finds the
+minimum of a known function.
+\bfield{Stretch} Strategy switching; agents with learning rules; several instruments and venues in one population.
+\end{build}
+
+\begin{omsources}
+\item T.~Lux and M.~Marchesi, ``Scaling and criticality in a stochastic multi-agent model of a financial market'', \emph{Nature} 397, 1999.
+\item J.~D.~Farmer, P.~Patelli and I.~I.~Zovko, ``The predictive power of zero intelligence in financial markets'', \emph{Proceedings of the National
+Academy of Sciences} 102(6), 2005.
+\item C.~Chiarella and G.~Iori, ``A simulation analysis of the microstructure of double auction markets'', \emph{Quantitative Finance} 2(5), 2002.
+\item F.~Lillo, S.~Mike and J.~D.~Farmer, ``Theory for long memory in supply and demand'', \emph{Physical Review E} 71, 066122, 2005.
+\item R.~Franke and F.~Westerhoff, ``Structural stochastic volatility in asset pricing dynamics: estimation and model contest'', \emph{Journal of
+Economic Dynamics and Control} 36(8), 2012.
+\item D.~Byrd, M.~Hybinette and T.~H.~Balch, ``ABIDES: towards high-fidelity multi-agent market simulation'', Proceedings of the 2020 ACM SIGSIM
+Conference on Principles of Advanced Discrete Simulation.
+\item S.~Vyetrenko, D.~Byrd, N.~Petosa, M.~Mahfouz, D.~Dervovic, M.~Veloso and T.~H.~Balch, ``Get real: realism metrics for robust limit order book
+market simulations'', Proceedings of the First ACM International Conference on AI in Finance, 2020.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:1}
+The target's lag-1 sign autocorrelation is 0.158 with a standard deviation of 0.046 across its hours; the calibrated population gives 0.212 on fresh
+hours. How many target standard deviations is the gap, and what does it add to the distance?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:2}
+By Lillo, Mike and Farmer's result, at what rate does the sign autocorrelation decay for run tails of 1.5 and 2.5? Which is long memory?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:3}
+If the population were exactly right and the facts' simulated variances equal to the target's, what distance would you expect from the mean of six
+simulated hours against the mean of eight target hours, with seven facts? Compare with the fresh distance and the floor.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:4}
+Why is the calibrated point's distance on its three calibration hours larger than on six fresh hours?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:5}
+Why does removing the fundamentalists make the kurtosis of returns explode?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:6}
+Why does the market maker lose money without inventory skew and make money with it, when its quotes are otherwise the same?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-agent-based-market:7}
+\emph{Coding.} Recalibrate on the five return and order-flow facts only (drop spread and depth), from the grid's stored facts. Does the best point
+change, and what is its distance?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-agent-based-market:8}
+\emph{Find the flaw.} ``Our calibrated agent-based market reproduces the stylised facts, so real traders are fundamentalists, chartists and \omterm{def:mx:why-there-is-a-spread:informed}{noise
+traders} in these proportions.''
+\end{exercise}
+
+\section{Problem: A Market That Looks Like a Market}
+
+\begin{problem}[{Weekend problem --- a market that looks like a market}]\label{pb:mx:build-an-agent-based-market:1}
+A research lead wants a simulated market to test \omterm{def:mx:benchmark-algorithms:algo}{execution algorithms} in, and asks how realistic it is and what makes it so.
+
+\medskip\noindent\textbf{Part I --- Agents.}
+\begin{enumerate}
+\item Define an \omterm{def:mx:build-an-agent-based-market:abm}{agent-based model}, a \omterm{def:mx:build-an-agent-based-market:types}{fundamentalist agent} and a \omterm{def:mx:build-an-agent-based-market:types}{chartist agent}.
+\item What did Lux and Marchesi find, and what did Farmer, Patelli and Zovko find?
+\item Describe the population's liquidity providers, noise takers, fundamentalists and chartists.
+\item Why are the fundamentalists also the \omterm{def:mx:why-there-is-a-spread:informed}{informed traders} here?
+\item Why are the noise orders drawn in advance from the seed?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Inventory and metaorders.}
+\begin{enumerate}[resume]
+\item Define a \omterm{def:mx:build-an-agent-based-market:mm}{market-making agent} and describe \texttt{MarketMaker}'s quotes.
+\item What went wrong when the maker's reference included its own quotes?
+\item Give the maker's inventory and profit at the three skews.
+\item State Lillo, Mike and Farmer's result, and how the noise takers implement it.
+\item What does the sign-autocorrelation figure show about the calibrated tail?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Calibration.}
+\begin{enumerate}[resume]
+\item Define the \omterm{def:mx:build-an-agent-based-market:msm}{method of simulated moments}, and say why the same seeds are used at every grid point.
+\item What is the target, and what are the seven facts?
+\item Give the grid and the best point.
+\item \emph{State the named result}: the distance between simulated and target facts after calibration, in and out of sample, against the starting
+point and the floor, and the fact each agent type carries.
+\item Which facts does the calibrated population miss, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Judgement.}
+\begin{enumerate}[resume]
+\item What did Vyetrenko and coauthors find about replay and agent-based markets?
+\item Why can a replayed tape not answer an execution question that an agent market can?
+\item Why does matching the facts not identify the agents?
+\item What would you tell the research lead about using this market to compare algorithms?
+\item In one sentence: what is an agent-based market for?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:mx:build-an-agent-based-market:1}
+What is a zero-intelligence market, and what can it explain?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:build-an-agent-based-market:2}
+How would you calibrate an agent-based market to a stock, and how would you know you had overfitted?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:build-an-agent-based-market:3}
+How do you make an agent-based simulation deterministic, and why does it matter for comparing two algorithms?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:build-an-agent-based-market:4}
+Why should a market maker skew its quotes on inventory, and by how much?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:mx:build-an-agent-based-market:5}
+You train an execution policy by reinforcement learning in an agent-based market. What can go wrong when it meets the real one?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{risk}]\label{iq:mx:build-an-agent-based-market:6}
+A desk validates a new algorithm only in an agent-based simulator. What would you ask before approving it?
+\end{interviewq}

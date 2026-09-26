@@ -1,0 +1,355 @@
+\chapter{Resilience}\label{ch:ll:resilience}
+
+On 1 October 2020, a memory module failed in one of the two devices of a shared disk system inside the Tokyo Stock
+Exchange's trading system. Operations ``were supposed to switch automatically'' to the second device, but the automatic
+switch did not work for that kind of failure unless a setting had been changed, and it had not. Engineers switched over by
+hand at 9:26, less than half an hour after the market should have opened, and every function returned to normal. Trading
+nevertheless stayed halted for the whole day. Orders received before the exchange cut its network had been matched, and
+their executions had accumulated inside the system without being sent to the participants; only a limited number of
+participants could have resent their orders, and there were no agreed, tested rules for restarting. The hardware recovered in
+minutes; the state did not. This chapter is about the second problem: how a trading system keeps one agreed history of what
+it received and what it sent, so that when a machine fails another can take over in milliseconds without losing an order
+or sending one twice.
+
+\section{Failure modes of a trading system}
+
+Components fail in a few ways, and each needs a different answer. A process crashes, or its machine does: it stops, and the
+question is who takes over and from what state. A process hangs or slows down: it has not stopped, so it may come back and
+act after someone else has taken over, which is worse than a crash. A network link fails: each side may believe the other
+is dead while both are alive. A venue session drops: the orders at the venue carry on, may fill or may be cancelled by the
+venue (chapter~21), and the firm does not know which until it reconnects. And the \omterm{def:ll:resilience:failover}{failover} machinery itself fails, as in
+Tokyo, because it runs only when something else has already gone wrong and is therefore the least exercised code in the
+system. The operational risk of One Quant Book~6 (chapter~28) is, for a trading system, mostly this list.
+
+The design goal follows: every input the system acts on, and every order it sends, must be recorded before it matters, in
+one order that everyone agrees on, so that any machine can rebuild the state by replaying the record, and any order can be
+recognised if it is sent again.
+
+\section{Sequencer architectures}
+
+\begin{definition}[Sequencer architecture]\label{def:ll:resilience:sequencer}
+A \emph{sequencer architecture}\index{sequencer architecture} is a design in which every input of a system (market events,
+order reports, commands) passes through a single component, the sequencer, that assigns it the next number of a global
+sequence and appends it to a durable journal before any other component acts on it; every component then processes the
+journal in sequence order.
+\end{definition}
+
+The sequencer turns many unordered sources into one ordered history. It is the \omterm{def:ll:logging-capture-and-replay:journal}{input journal} of chapter~23 lifted from one
+process to the system: the market data from the \omterm{def:ll:the-feed-handler:handler}{feed handler}, the reports from the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}, the parameter changes from
+the control plane all become numbered entries of one journal. The strategy engine's replay of chapter~23 becomes the normal
+way of running: a component is a function of the journal, and two components that read the same journal compute the same
+thing. The cost is one more hop on the path of every input (a microsecond in the build's simulation, more when the journal
+is replicated before it is acknowledged), and a component whose own failure must be handled; the retail exchange whose architecture Fowler described
+(chapter~20) kept its business logic on one thread fed by exactly such a journal, from which its state could be rebuilt.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (md) at (0,1.0) {market data\\ (feed handler)};
+\node[box] (rp) at (0,-1.0) {order reports\\ (gateway)};
+\node[box,fill=omThm!18] (sq) at (3.0,0) {sequencer\\ numbers inputs};
+\node[box,fill=gray!10,minimum width=2.2cm] (jr) at (6.0,0) {journal\\ epoch $|$ seq $|$ entry};
+\node[box] (pr) at (9.2,1.0) {primary replica\\ \textbf{sends}};
+\node[box] (bk) at (9.2,-1.0) {backup replica\\ computes, silent};
+\node[box,fill=gray!10] (vn) at (12.0,1.0) {venue};
+\draw[->] (md) -- (sq);
+\draw[->] (rp) -- (sq);
+\draw[->,thick] (sq) -- (jr);
+\draw[->] (jr) -- (pr);
+\draw[->] (jr) -- (bk);
+\draw[->,thick] (pr) -- node[above]{orders} (vn);
+\draw[->,dashed] (pr) -- node[right]{heartbeats} (bk);
+\draw[->,dashed,omThm] (bk.east) -- ++(0.5,0) |- node[pos=0.25,right,align=left]{on failover: new epoch,\\ reconnect, reconcile,\\ resend} (vn.south);
+\end{tikzpicture}
+
+\omcaption{A \omterm{def:ll:resilience:sequencer}{sequencer architecture} with a hot backup. Every input is numbered and journaled before anyone acts on it; both
+replicas apply the journal and compute the same state and the same orders, but only the primary sends. When the \omterm{def:ll:protocols-i-fix:session}{heartbeats}
+stop, the backup raises the journal's epoch, reconnects the order-entry session, reconciles and resends what no report
+acknowledges.}\label{fig:ll:resilience:arch}
+\end{omfigure}
+
+\section{Replicated state machines and failover}
+
+\begin{definition}[Replicated state machine, primary--backup replication]\label{def:ll:resilience:rsm}
+A \emph{replicated state machine}\index{replicated state machine} is a deterministic program run as several copies (replicas)
+that apply the same sequence of inputs and therefore pass through the same states and produce the same outputs.
+\emph{Primary--backup replication}\index{primary--backup replication} runs one replica as the primary, whose outputs are sent,
+and others as backups, whose outputs are computed and discarded, ready to replace the primary.
+\end{definition}
+
+\begin{definition}[Failover, split brain]\label{def:ll:resilience:failover}
+A \emph{failover}\index{failover} is the replacement of a failed primary by a backup, which takes over its role and its
+connections. \emph{Split brain}\index{split brain} is the state in which two replicas both act as primary, typically because a
+backup has taken over from a primary that was slow or cut off rather than dead; each sends outputs the other does not know
+about.
+\end{definition}
+
+The state machine approach is old and general (Schneider's tutorial of 1990), and the hard part of it, agreeing on the next
+entry of the log when machines fail, is what consensus algorithms such as Raft (Ongaro and Ousterhout, 2014) solve. A trading
+system usually needs less: one sequencer writing the journal, replicated synchronously to a second machine, and a rule for
+deciding who is primary. The build's replicas are the strategy state of the book in miniature: \texttt{firm.sequencer}'s
+replica trades a hundred shares against every price move with an immediate-or-cancel order, within a position limit, and keeps
+its orders by an identifier derived from the journal entry that created them. The Python, C++ and Rust replicas replay the
+fixture's journal (a \omterm{def:ll:resilience:failover}{failover}, with a second epoch, resends and a duplicate in it) to the same states, hash included.
+
+\omterm{def:ll:resilience:failover}{Split brain} is prevented by \emph{fencing}. The journal carries an epoch, a number that only grows; each primary writes under
+the epoch in which it became primary, and a backup that takes over first raises the journal's epoch. From then on, the journal
+refuses any append under an older epoch (\cref{lst:ll:resilience:fence}): a primary that was only slow, and wakes up still
+believing itself in charge, can compute what it likes but can no longer record anything, and nothing it has not recorded is
+sent. The gateway enforces the same rule on outputs, since the venue does not know about epochs.
+
+\omcode{code/firm/sequencer/cpp/firm_sequencer.hpp}{32}{42}{The journal's fence: after a new epoch, a writer from an older
+one cannot append.}\label{lst:ll:resilience:fence}
+
+Failure is detected by \omterm{def:ll:protocols-i-fix:session}{heartbeats}: the primary sends one every millisecond, and the backup declares it dead after three
+missed. Detection is therefore the largest part of the build's recovery time: 2.8 to \qty{3.1}{\milli\second} from the failure
+to a backup that is primary, reconnected and reconciled, of which the reconnection and the replay of the missed reports take
+tens of microseconds. A shorter timeout recovers faster and declares more slow primaries dead, which is exactly when fencing
+matters. The backup in the build is hot: it applies every journal entry as it is written, so there is nothing to catch up. A
+cold backup must replay the journal first; the C++ replica applies it at about \qty{37}{\nano\second} an entry, so a day's
+journal of 37 million entries (chapter~23) takes about a second and a half, acceptable for a restart and not for a \omterm{def:ll:resilience:failover}{failover}.
+
+\section{Exchange disconnects and recovery}
+
+\begin{definition}[Idempotent processing]\label{def:ll:resilience:idempotent}
+An operation is processed \emph{idempotently}\index{idempotent processing} if doing it twice has the same effect as doing it
+once. For orders, it means that every order carries an identifier fixed when it is created, so that the venue, or the firm's
+own gateway, recognises a second copy and discards it.
+\end{definition}
+
+The dangerous moment of a \omterm{def:ll:resilience:failover}{failover} is the orders in the gap: those the old primary sent whose reports were never journaled.
+The new primary knows they exist, since it computed them from the journal, but not whether they left: the old primary may
+have died before sending, while the order was on the wire, or after the venue executed it and before the report came back. It
+has three ways to proceed (\cref{lst:ll:resilience:resend}). It can resend them at once under fresh identifiers, the habit of
+gateways that never reuse an identifier. It can first log in again, ask the venue for the reports it missed (the sequenced
+replay of chapter~21), reconcile, and resend only what is still unaccounted for. Or it can resend at once under the orders'
+original identifiers, derived from the journal, and let the venue reject any copy of an order it already has.
+
+\omcode{code/firm/sequencer/firm_sequencer_sim.py}{116}{137}{The takeover: fence the journal, then resend what no report
+acknowledges, under the original identifiers or under fresh ones (a resend is journaled, so that the replicas
+agree).}\label{lst:ll:resilience:resend}
+
+\Cref{tab:ll:resilience:cuts} kills the primary at every stage of every one of the scenario's 46 orders, against Book 10's
+matching engine. With fresh identifiers and no reconciliation, a failure while an order is on the wire or at the venue but not
+yet reported sends it twice: 54 of the 184 cut points end with a duplicate, one for each of the 27 orders that filled, in each
+of the two stages, and the worst push the position past its limit, to 1\,100 shares against 1\,000. Reconciling first
+removes them all in this model, because every order is reported within \qty{40}{\micro\second} and the venue replays its
+reports. Idempotent identifiers remove them regardless of the order of operations, which matters when the venue is slow to
+report or the session cannot be replayed: the participants of the Tokyo exchange in 2020 were in exactly that position. In
+every case the new primary's state equals a fresh replay of the journal and the position the venue holds.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+procedure & \multicolumn{4}{c}{duplicates, by stage of the order at the failure} & largest position \\
+ & journaled & in flight & at the venue & reported & \\
+\midrule
+fresh identifiers & 0 & 27 & 27 & 0 & 1\,100 \\
+fresh identifiers, reconciled first & 0 & 0 & 0 & 0 & 1\,000 \\
+idempotency keys & 0 & 0 & 0 & 0 & 1\,000 \\
+\bottomrule
+\end{tabular}
+\caption{The primary killed at each of four stages of each of the scenario's 46 orders (184 \omterm{def:ll:resilience:failover}{failovers} per procedure) against
+the matching engine; recovery took 2.8 to \qty{3.1}{\milli\second} in every case, and the state always equalled a replay of the
+journal. Data: \texttt{fig\_failover.py} (deterministic).}\label{tab:ll:resilience:cuts}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (12.6,0) node[right]{time};
+\foreach \x/\l in {0/{input journaled},2.6/{order sent},6.2/{at the venue},9.8/{report journaled}} {
+  \draw (\x,-0.12) -- (\x,0.12);
+  \node[below,align=center] at (\x,-0.15) {\l};
+}
+\fill[omDef!15] (0,0.2) rectangle (2.6,1.0);
+\node[align=center] at (1.3,0.6) {not sent:\\ a resend is safe};
+\fill[omThm!25] (2.6,0.2) rectangle (9.8,1.0);
+\node[align=center] at (6.2,0.6) {a failure here: a resend under a fresh identifier\\ duplicates the order if it executed};
+\fill[omMeth!15] (9.8,0.2) rectangle (12.4,1.0);
+\node[align=center] at (11.1,0.6) {known:\\ nothing to resend};
+\draw[<->] (2.6,1.25) -- node[above]{\qty{20}{\micro\second} on the wire, \qty{20}{\micro\second} back} (9.8,1.25);
+\end{tikzpicture}
+
+\omcaption{The life of one order and the window in which a \omterm{def:ll:resilience:failover}{failover} can duplicate it: from the moment it leaves to the moment
+its report is journaled, two network crossings. With fresh identifiers and no reconciliation, a failure anywhere in the red
+window sends the order twice if it had been executed.}\label{fig:ll:resilience:window}
+\end{omfigure}
+
+The same reasoning applies to a simple disconnect, without any \omterm{def:ll:resilience:failover}{failover}: the gateway loses its session, logs in again asking
+for the reports it has not seen, applies them (the venue's cancel on disconnect may have cancelled resting orders meanwhile),
+reconciles against the \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy}, and only then lets the strategy trade. Book 10's simulator provides each piece: sequenced
+replay on login, cancel on disconnect, and the rejection of a duplicate client order identifier.
+
+\section{Testing failover}
+
+\omterm{def:ll:resilience:failover}{Failover} code runs when something else has already failed, so it is the least tested code in a system unless it is tested on
+purpose, and the Tokyo incident is the standard example of a switch that worked for the failures it was tested against and not
+for the one that happened. The build's test is the table: the primary is killed at every stage of every order of a scenario,
+and each run is checked against properties that must hold whatever the failure point (the new primary's state equals a replay
+of the journal; its position equals the venue's; no order is executed twice when idempotency keys are used). The properties
+matter more than the scenario; exhaustive cut points turn a rare event into a routine test. In production, the same idea is
+practised by failing over deliberately, on a schedule, so that the procedure is exercised when nothing else is wrong.
+
+\section{Tutorial: kill the primary everywhere}\label{tut:ll:resilience:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run the sequencer, two replicas and a gateway against the matching engine, kill the primary at every stage of
+every order, and compare three recovery procedures. \textbf{End state:} \cref{tab:ll:resilience:cuts}, and green replays of
+the \omterm{def:ll:resilience:failover}{failover} journal in three languages.
+\begin{tutsteps}
+\item \textbf{The scenario.} \texttt{firm\_sequencer\_sim.run(None)} runs 60 prices, a millisecond apart, without failure: 46
+orders, a position of $-700$, the state equal to a replay.
+\item \textbf{Cut points.} \texttt{cut\_points()} lists the middle of each of the four stages of each order; \texttt{python
+fig\_failover.py} runs the three procedures at each.
+\item \textbf{Replicas in three languages.} The C++ and Rust replicas replay \texttt{data/journal.txt}, a \omterm{def:ll:resilience:failover}{failover} with fresh
+identifiers, and reach the states of \texttt{data/expected.txt}; a writer from the old epoch is refused.
+\item \textbf{Catch-up.} \texttt{python bench\_sequencer.py} times a replica applying two million entries.
+\end{tutsteps}
+\textbf{What to change next.} Delay the venue's reports by a millisecond and watch duplicates appear with reconciliation too;
+shorten the \omterm{def:ll:protocols-i-fix:session}{heartbeat} timeout and count the \omterm{def:ll:resilience:failover}{failovers} a slow primary would cause.
+\end{tutorial}
+
+\section{Build: the sequencer}\label{bld:ll:resilience:sequencer}
+
+\begin{build}
+\bfield{Purpose} The backbone that makes the trading path of the book (chapters~18 to 22) restartable and replicable: one
+journal of numbered inputs, replicas that compute from it, and a \omterm{def:ll:resilience:failover}{failover} that neither loses nor duplicates an order.
+\bfield{Interface} Python reference \texttt{firm\_sequencer}: \texttt{Journal} with \texttt{append} and \texttt{fence};
+\texttt{Replica} with \texttt{apply} and \texttt{unacknowledged}; \texttt{cl\_for}; \texttt{to\_line}, \texttt{from\_line};
+\texttt{firm\_sequencer\_sim.run} and \texttt{cut\_points} against Book 10's engine. C++20 \texttt{firm::seq}:
+\texttt{Journal}, \texttt{Replica}, \texttt{parse}. Rust \texttt{firm\_sequencer}: \texttt{Journal}, \texttt{Replica},
+\texttt{parse}.
+\bfield{Rules} Nothing acts on an input before it is journaled; replicas are deterministic functions of the journal; epochs
+only grow and fence older writers; order identifiers derive from the journal; resends are journaled.
+\bfield{Acceptance tests} \texttt{code/firm/sequencer/}: the \omterm{def:ll:resilience:failover}{failover} journal replayed to the same states in three languages;
+fencing refuses an old epoch; gaps refused; at every cut point of the scenario and for each procedure, the state equals a replay
+and the venue's position; duplicates only with fresh identifiers and without reconciliation.
+\bfield{Stretch} A replicated journal with synchronous acknowledgement by the backup; several gateways behind the replicas;
+Raft for electing the primary; the gateway of chapter~21 and the \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{risk gate} of chapter~22 as replicas.
+\end{build}
+
+\begin{omsources}
+\item Tokyo Stock Exchange, \emph{The Cause of the Recent Failure in arrowhead and Measures Implemented}, 5 October 2020, and
+\emph{The Failure of Equity Trading System on October 1, 2020}, report, 19 October 2020.
+\item F.~B.~Schneider, ``Implementing fault-tolerant services using the state machine approach: a tutorial'', \emph{ACM
+Computing Surveys} 22(4), 1990.
+\item D.~Ongaro and J.~Ousterhout, ``In search of an understandable consensus algorithm'', \emph{USENIX Annual Technical
+Conference}, 2014.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:1}
+The journal's epoch is 3. The old primary, which became primary in epoch 2, tries to append. What happens, and what happens to
+the orders it computed from that entry?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:2}
+\omterm{def:ll:protocols-i-fix:session}{Heartbeats} every millisecond, three missed declare the primary dead, checked at each \omterm{def:ll:protocols-i-fix:session}{heartbeat} tick. What are the shortest
+and longest times from a failure to its detection?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:3}
+An order created by journal entry 46 is the first output of that entry. What is its client order identifier in the build, and
+why must every replica compute the same one?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:4}
+A strategy sends 500 orders a second; each spends \qty{40}{\micro\second} between leaving and having its report journaled, and
+90\% of them execute. A failure happens at a random moment. What is the probability that a fresh-identifier resend without
+reconciliation duplicates an order?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:5}
+A cold backup applies the journal at \qty{37}{\nano\second} an entry. How long does it take to catch up on a day of 37 million
+entries, and on the last hour of it? Why keep the backup hot anyway?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:6}
+The venue rejects a copy of an order under an identifier it has seen. The backup resends under original identifiers an order
+the venue executed. What does the backup receive, and what must its replica do with it?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:resilience:7}
+\emph{Coding.} Delay the venue's reports by a millisecond in \texttt{firm\_sequencer\_sim} and rerun the three procedures.
+Which one now duplicates orders, at which stages, and why do idempotency keys still produce none?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:resilience:8}
+\emph{Find the flaw.} ``Our \omterm{def:ll:resilience:failover}{failover} is simple: the backup watches the primary's \omterm{def:ll:protocols-i-fix:session}{heartbeat}, and when it stops, the backup
+restarts the strategy from its configuration and sends new quotes.''
+\end{exercise}
+
+\section{Problem: The Failover That Doubled the Orders}
+
+\begin{problem}[{Weekend problem --- counting duplicates over every point of failure}]\label{pb:ll:resilience:1}
+Use \cref{tab:ll:resilience:cuts} (\texttt{failover.csv}, \texttt{failover\_summary.csv}): 46 orders in 60 milliseconds, four
+stages each, three recovery procedures.
+
+\medskip\noindent\textbf{Part I --- The window.}
+\begin{enumerate}
+\item Name the four stages of an order's life used as cut points, and say for which of them the new primary cannot tell
+whether the order left.
+\item How long does an order spend in the two dangerous stages in the simulation?
+\item Why do only 27 of the 46 orders produce a duplicate in each dangerous stage?
+\item Why does a failure while an order is journaled but not yet sent never duplicate it?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Over time.}
+\begin{enumerate}[resume]
+\item What is the scenario's order rate?
+\item If the failure time is uniform over the scenario, what is the probability that a fresh-identifier \omterm{def:ll:resilience:failover}{failover} duplicates
+an order?
+\item What would it be for a strategy sending 5\,000 orders a second with the same latencies?
+\item Why does the largest position reach 1\,100 with fresh identifiers?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The remedies.}
+\begin{enumerate}[resume]
+\item Why does reconciling first remove every duplicate in this model?
+\item Give two real situations in which reconciling first would not be enough.
+\item Why do idempotency keys work whatever the order of operations?
+\item What must hold for idempotency keys to be possible at all?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: duplicates after a \omterm{def:ll:resilience:failover}{failover} without idempotency keys over the failure points, with them,
+and the recovery time.
+\item What dominates the recovery time, and what is the price of shortening it?
+\item What does fencing add that idempotency keys do not?
+\item What went wrong in Tokyo in 2020, in the chapter's terms?
+\item Why must the resends themselves be journaled?
+\item Which properties does the test check at every cut point, and why properties rather than expected outputs?
+\item What would you add to test a cold backup?
+\item In one sentence: what makes a \omterm{def:ll:resilience:failover}{failover} safe?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:resilience:1}
+What is a sequencer, and why would a trading system put one in front of everything?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:resilience:2}
+Your primary stops sending \omterm{def:ll:protocols-i-fix:session}{heartbeats}. How does the backup take over without sending duplicate orders?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:resilience:3}
+What is \omterm{def:ll:resilience:failover}{split brain}, and how do you prevent it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:ll:resilience:4}
+Your session to the exchange drops for five seconds. What do you do, in order, when it comes back?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:resilience:5}
+How would you test that \omterm{def:ll:resilience:failover}{failover} works, given that it is needed rarely?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:resilience:6}
+Design a trading system that survives the loss of any one machine with at most a few milliseconds of interruption and no
+lost or duplicated order. What are the components, the protocol between them, and the tests?
+\end{interviewq}

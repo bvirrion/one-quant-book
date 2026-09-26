@@ -1,0 +1,319 @@
+\chapter{C++ for Latency III: The Compiler}\label{ch:ll:cpp-for-latency-iii-the-compiler}
+
+In July 2009 a Linux kernel driver was found to contain the lines \texttt{struct sock *sk = tun->sk;} and, a little
+further down, \texttt{if (!tun) return POLLERR;}. The check was meant to protect against a null pointer. The compiler had
+deleted it: the pointer had already been dereferenced, a null dereference is \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour}, so the pointer could not
+be null and the test was dead code. On a machine where address zero could be mapped, the deletion became an exploit. The
+compiler did nothing wrong; it read the program's contract literally. This chapter is about that contract and about the
+other levers the compiler offers a latency engineer: optimisation levels and target flags, profile-guided and \omterm{def:ll:cpp-for-latency-iii-the-compiler:lto}{link-time
+optimisation}, and the habit that ties them together, reading the assembly and measuring every flag against a checksum.
+
+\section{Undefined behaviour as an optimisation contract}
+
+\begin{definition}[Undefined behaviour]\label{def:ll:cpp-for-latency-iii-the-compiler:ub}
+\emph{Undefined behaviour}\index{undefined behaviour} is behaviour for which the C++ standard imposes no requirements:
+signed integer overflow, a null or dangling dereference, an out-of-bounds access, a data race, reading an object through a
+pointer of an unrelated type. The compiler may assume it never happens, and optimises every program as if it did not.
+\end{definition}
+
+The assumption is where much of the optimiser's power comes from. Because signed overflow cannot happen, \texttt{x + 1 > x}
+is true, a loop counter cannot wrap, and a loop's trip count can be computed in advance; because dereferencing null cannot
+happen, a pointer dereferenced once is non-null afterwards. The assembly in
+\cref{lst:ll:cpp-for-latency-iii-the-compiler:plus,lst:ll:cpp-for-latency-iii-the-compiler:null} shows both on this book's
+compiler: the comparison compiles to ``return 1'' even without optimisation, and the null check of the 2009 pattern is gone
+at \texttt{-O2}.
+
+\omcode{code/low-latency/08-cpp-for-latency-iii-the-compiler/cpp/asm/plus_one_greater_O2.s}{1}{2}{\texttt{plus\_one\_greater(int x)}, \texttt{return x + 1 > x;}, at -O2 (g++ 11.4): a constant.}\label{lst:ll:cpp-for-latency-iii-the-compiler:plus}
+\omcode{code/low-latency/08-cpp-for-latency-iii-the-compiler/cpp/asm/first_then_check_O2.s}{1}{2}{\texttt{first\_then\_check(const int* p)}: dereference, then test for null; the test is gone.}\label{lst:ll:cpp-for-latency-iii-the-compiler:null}
+
+For a trading system the lesson is double. \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{Undefined behaviour} is not ``the machine does something odd''; it is a license
+for the compiler to remove checks, reorder work and assume invariants that the code violates, and the result can change
+with the compiler version or a flag. And the same contract is what makes C++ fast: the idioms that give the optimiser
+facts (signed loop counters, no aliasing between unrelated types) are the ones that let it keep values in registers and
+vectorise. The tools that catch violations run in test builds: the undefined-behaviour sanitiser
+(\texttt{-fsanitize=undefined}) reports each overflow as it happens, the address sanitiser each invalid access.
+
+\section{Aliasing}
+
+\begin{definition}[Strict aliasing]\label{def:ll:cpp-for-latency-iii-the-compiler:alias}
+Under the \emph{strict aliasing}\index{strict aliasing} rule an object may be accessed only through an lvalue of its own
+type (or a closely related one: a signed or unsigned variant, a character type), so the compiler may assume that pointers
+to unrelated types never refer to the same memory. GCC applies the rule from \texttt{-O2}.
+\end{definition}
+
+\omcode{code/low-latency/08-cpp-for-latency-iii-the-compiler/cpp/asm/alias_O2.s}{1}{4}{\texttt{alias(int* i, float* f)}: store 1 through \texttt{i}, 0 through \texttt{f}, return \texttt{*i}; the compiler returns 1 without reloading.}\label{lst:ll:cpp-for-latency-iii-the-compiler:alias}
+
+In \cref{lst:ll:cpp-for-latency-iii-the-compiler:alias} the compiler returns 1 without reading \texttt{*i} again, because a
+store through a \texttt{float*} cannot change an \texttt{int}. Called with two pointers to the same four bytes, the function
+returns 1 where the memory holds 0. Decoders are where this bites: reading a price out of a byte buffer by casting the
+buffer's address to \texttt{std::int32\_t*} is an aliasing violation and, for unaligned fields, also undefined. The correct
+forms, \texttt{std::memcpy} into a local or C++20's \texttt{std::bit\_cast}, compile to a single load; the compiler knows
+what they do (chapter~16 builds its codecs this way).
+
+\section{Flags and target selection}
+
+The optimisation level is a bundle of passes: \texttt{-O2} is the conventional release level, \texttt{-O3} adds more
+aggressive \omterm{def:ll:cpp-for-latency-ii-compile-time:inline}{inlining}, cloning and vectorisation, and \texttt{-Ofast} adds \texttt{-ffast-math}. \texttt{-march=native}
+lets the compiler use every instruction of the build machine (AVX2 on this laptop), which makes the binary unfit for older
+machines; production builds name the target explicitly. \texttt{-ffast-math} allows the compiler to reorder floating-point
+operations as if they were associative and to assume there are no NaNs or infinities.
+
+\begin{definition}[Function multiversioning]\label{def:ll:cpp-for-latency-iii-the-compiler:fmv}
+\emph{Function multiversioning}\index{function multiversioning} compiles one function several times for different
+instruction sets and chooses a version at run time by the processor's features: GCC's \texttt{target\_clones(\textquotedbl{}avx2\textquotedbl{},
+\textquotedbl{}default\textquotedbl{})} attribute builds both and dispatches when the program loads.
+\end{definition}
+
+\Cref{fig:ll:cpp-for-latency-iii-the-compiler:flags} measures the feed decoder of One Quant Book~1 with a per-message
+handler in a second translation unit, under seven flag sets, and a floating-point sum under three. On the decoder,
+\texttt{-O3} was more than three times faster than \texttt{-O2}, \omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{profile-guided optimisation} alone two and a half times,
+and the combination of everything nearly five times; \texttt{-march=native} and \omterm{def:ll:cpp-for-latency-iii-the-compiler:lto}{link-time optimisation} alone changed almost
+nothing. On the float sum, \texttt{-ffast-math} was seven times faster and gave a different answer, because it summed in
+another order: the benchmark's checksum caught it, and \texttt{firm.flagbench} does not rank a flag set whose output
+differs.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=dec,width=8.4cm,height=6cm,xbar,bar width=7pt,xmin=0,xmax=5,
+  symbolic y coords={O0,O2,O2 native,O2 LTO,O2 PGO,O3,O3 native LTO PGO},ytick=data,enlarge y limits=0.1,
+  xlabel={speed-up over -O2},title={\small feed decoder},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\scriptsize},
+  every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=2},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[y=name,x=speedup]{figdata/low-latency/08-cpp-for-latency-iii-the-compiler/measured_flags.csv};
+\end{axis}
+\begin{axis}[at={(dec.east)},anchor=west,xshift=1.9cm,width=5.8cm,height=6cm,xbar,bar width=9pt,xmin=0,xmax=9,
+  symbolic y coords={O2,O3 native,O3 native fast-math},ytick=data,yticklabels={O2,O3 native,{O3 native\\fast-math}},
+  y tick label style={align=right},enlarge y limits=0.3,xlabel={speed-up over -O2},title={\small float sum},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},nodes near coords,
+  nodes near coords style={font=\scriptsize},every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[y=name,x=speedup]{figdata/low-latency/08-cpp-for-latency-iii-the-compiler/measured_fastmath.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Left: the decode benchmark (Book~1's 2\,020-message sample decoded 300 times, a per-message handler in another
+translation unit) under seven flag sets; every set gave the same checksum. Right: summing $2^{20}$ floats; with
+\texttt{-ffast-math} the sum changed. Best of five runs, g++ 11.4. Measured on a laptop (Intel Core Ultra 7 155H) under
+WSL2, no isolated cores, pinned to one CPU. Data: \texttt{bench\_flags.py}.}\label{fig:ll:cpp-for-latency-iii-the-compiler:flags}
+\end{omfigure}
+
+\section{Profile-guided and link-time optimisation}
+
+\begin{definition}[Profile-guided optimisation]\label{def:ll:cpp-for-latency-iii-the-compiler:pgo}
+In \emph{profile-guided optimisation}\index{profile-guided optimisation} (PGO) the program is built with instrumentation,
+run on a representative workload that records how often each branch goes each way and which values and calls are common,
+and rebuilt with the profile, so that the compiler inlines, unrolls and lays out code according to measured behaviour
+rather than guesses.
+\end{definition}
+
+\begin{definition}[Link-time optimisation]\label{def:ll:cpp-for-latency-iii-the-compiler:lto}
+In \emph{link-time optimisation}\index{link-time optimisation} (LTO) the compiler stores its intermediate representation
+in the object files and optimises the whole program again when linking, as if all translation units were one: functions
+can be inlined across files.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum height=0.75cm,align=center,text width=2.1cm},
+  io/.style={draw=gray,fill=gray!10,rounded corners=2pt,minimum height=0.75cm,align=center,text width=1.9cm}]
+\node[st] (a) at (0,0) {instrumented\\ build};
+\node[st] (b) at (3.1,0) {train on a\\ replayed day};
+\node[io] (c) at (6.0,0) {profile\\ (counts)};
+\node[st] (d) at (8.9,0) {rebuild using\\ the profile};
+\node[io] (e) at (11.6,0) {release\\ binary};
+\foreach \x/\y in {a/b,b/c,c/d,d/e} \draw[-Stealth,thick] (\x) -- (\y);
+\node[st] (f) at (0,-1.6) {each file to\\ intermediate code};
+\node[st] (g) at (3.1,-1.6) {link: optimise\\ all files as one};
+\node[io] (h) at (6.0,-1.6) {binary};
+\draw[-Stealth,thick] (f) -- (g); \draw[-Stealth,thick] (g) -- (h);
+\node[anchor=east,font=\footnotesize\bfseries] at (-1.3,0) {PGO};
+\node[anchor=east,font=\footnotesize\bfseries] at (-1.3,-1.6) {LTO};
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{Profile-guided optimisation} builds twice around a training run, whose workload decides what the compiler
+optimises for; \omterm{def:ll:cpp-for-latency-iii-the-compiler:lto}{link-time optimisation} defers the optimisation of the whole program to the link.}\label{fig:ll:cpp-for-latency-iii-the-compiler:pgo}
+\end{omfigure}
+
+The training run is the critical input of PGO. A profile taken on a quiet morning optimises the quiet-morning paths; a
+trading system must be trained on a replay of a busy, representative day (chapter~23), and retrained when the workload
+changes, or it will be optimised for the wrong branches. LTO's benefit depends on the code's structure: here the
+per-message handler was small and its cost was dominated by the decoder's own calls, so LTO alone gained nothing. Both
+lengthen the build and make the binary depend on more than the source; both belong in the release pipeline, measured by
+the flag matrix on every release, not applied once and forgotten.
+
+\section{Reading assembly}
+
+The compiler's output answers questions no benchmark can: whether a function was inlined, a loop vectorised, a check
+removed, a value kept in a register. \texttt{g++ -O2 -S -masm=intel} writes it for one file; \texttt{objdump -d
+-M intel} disassembles a binary; online compiler explorers show it line by line. The book's listings of assembly are
+generated by scripts from tested sources, and their tests check properties (no call, a constant return) with whatever
+compiler is installed, never the exact bytes, which change with the compiler.
+
+\begin{method}[Choosing release flags]\label{met:ll:cpp-for-latency-iii-the-compiler:flags}
+\begin{enumerate}
+\item Give the benchmark a checksum of its output and a realistic workload (a replayed day, not one message in a loop).
+\item Build it under a matrix of flag sets, including profile-guided sets trained on a different day than the one measured.
+\item Reject every set whose checksum differs from the reference build's, whatever its speed.
+\item Rank the rest by measured percentiles over repeated runs (chapter~25), and read the assembly of the hot functions to
+understand the winner.
+\item Pin the chosen flags, compiler version and target in the build system; rerun the matrix on every compiler upgrade.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: a flag matrix and three contracts}\label{tut:ll:cpp-for-latency-iii-the-compiler:tut}
+
+\begin{tutorial}
+\textbf{Goal.} See the optimiser act on \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour}, catch it with a sanitiser, and choose flags by measurement.
+\textbf{End state:} the three assembly listings, a sanitiser report, and
+\cref{fig:ll:cpp-for-latency-iii-the-compiler:flags}.
+\begin{tutsteps}
+\item \textbf{Three contracts.} \texttt{python ll\_ub.py} compiles \texttt{ll\_ub.cpp} to assembly at \texttt{-O0} and
+\texttt{-O2} and writes the listings above.
+\item \textbf{Catch an overflow.} \texttt{ll\_ub.ubsan(2147483647)} builds a call of \texttt{increment(x)}, \texttt{return
+x + 1}, with \texttt{-fsanitize=undefined} and runs it: ``runtime error: signed integer overflow: 2147483647 + 1 cannot
+be represented in type int''.
+\item \textbf{Build with a profile.} \texttt{firm.flagbench} builds a profile-guided set in three steps: instrumented
+build, training run, rebuild with the profile.
+\omcode{code/firm/flagbench/firm_flagbench.py}{38}{51}{Building a flag set, profile-guided or not.}\label{lst:ll:cpp-for-latency-iii-the-compiler:build}
+\item \textbf{Run the matrix} with \texttt{python bench\_flags.py}: seven sets on the decoder, three on the float sum, each
+checked against the \texttt{-O2} checksum.
+\end{tutsteps}
+\textbf{What to change next.} Find which of the passes that \texttt{-O3} adds to \texttt{-O2} makes the decoder faster by
+adding them one at a time to \texttt{-O2}; train the profile-guided build on only the first hundred messages of the sample
+and measure again.
+\end{tutorial}
+
+\section{Build: the flag matrix}\label{bld:ll:cpp-for-latency-iii-the-compiler:flagbench}
+
+\begin{build}
+\bfield{Purpose} The firm's release flags are chosen, and re-chosen at every compiler upgrade, by measurement with a
+correctness check, never by habit.
+\bfield{Interface} Python \texttt{firm\_flagbench}: \texttt{FlagSet(name, flags, pgo)}, \texttt{build(sources, fs,
+out\_dir, train\_args, includes)}, \texttt{run\_matrix(sources, flag\_sets, args, reference, repeats, cpus)} returning
+rows with name, flags, checksum, time, ok and speed-up. The benchmark prints its checksum on its first line and its time
+per unit on its second.
+\bfield{Rules} A set whose checksum differs from the reference's is marked not ok and never recommended; profile-guided
+sets are trained with the benchmark's own arguments (or a separate training workload); every run is pinned and repeated.
+\bfield{Acceptance tests} \texttt{code/firm/flagbench/tests/}: a small program under \texttt{-O2}, \texttt{-O0} and a
+profile-guided build (all ok) and under \texttt{-ffast-math} (not ok, its float sum differs).
+\bfield{Stretch} Separate training and measurement workloads; report percentiles instead of the best time; bisect the
+passes of \texttt{-O3} automatically.
+\end{build}
+
+\begin{omsources}
+\item J.~Corbet, ``Fun with NULL pointers, part 1'', LWN.net, 20 July 2009.
+\item C.~Lattner, ``What every C programmer should know about undefined behavior'', LLVM blog, 2011.
+\item GCC 11.4 manual, ``Options that control optimization'' and ``Common function attributes''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:1}
+From \cref{fig:ll:cpp-for-latency-iii-the-compiler:flags}, what does the decoder cost per message at \texttt{-O0},
+\texttt{-O2} and with every optimisation, and what would each cost for 5 million messages a second?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:2}
+Which of these are undefined: \texttt{INT\_MAX + 1}; \texttt{UINT\_MAX + 1u}; reading a \texttt{uint32\_t} from a byte
+buffer with \texttt{std::memcpy}; reading it by casting the buffer's address to \texttt{uint32\_t*}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:3}
+Why does \texttt{plus\_one\_greater} compile to a constant even at \texttt{-O0}, and why can the sanitiser not catch it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:4}
+The exact sum of $1/k$ for $k = 1$ to $2^{20}$ is about 14.44. Which of the float sums of
+\cref{fig:ll:cpp-for-latency-iii-the-compiler:flags} is closer to it, and does that make \texttt{-ffast-math} safe?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:5}
+A decoder reads a 32-bit price with \texttt{*reinterpret\_cast<const std::uint32\_t*>(buf + 16)}. Name two rules it breaks
+and write the correct line.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:6}
+A profile-guided build was trained on a replay of a quiet day and deployed on the day of an index rebalance. What can go
+wrong?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:7}
+\emph{Coding.} Add a flag set \texttt{-O2 -fno-strict-aliasing} to the matrix and compile \texttt{alias} with it. What
+changes in the assembly, and in the decoder's speed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-iii-the-compiler:8}
+\emph{Find the flaw.} ``We compile with \texttt{-Ofast -march=native} on the build server; it was 30\% faster in our
+benchmark.''
+\end{exercise}
+
+\section{Problem: The Fast Build That Was Wrong}
+
+\begin{problem}[{Weekend problem --- a release flag review}]\label{pb:ll:cpp-for-latency-iii-the-compiler:1}
+A team's release uses \texttt{-O2}. An engineer proposes \texttt{-O3 -march=native -flto} with \omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{profile-guided
+optimisation}, another \texttt{-Ofast}. The team runs \texttt{firm.flagbench}
+(\cref{fig:ll:cpp-for-latency-iii-the-compiler:flags}).
+
+\medskip\noindent\textbf{Part I --- The decoder.}
+\begin{enumerate}
+\item What speed-up over \texttt{-O2} does each flag set give?
+\item Which single change gives most of the gain?
+\item Why did \omterm{def:ll:cpp-for-latency-iii-the-compiler:lto}{link-time optimisation} alone give nothing here?
+\item Did any set change the decoder's checksum?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The float sum.}
+\begin{enumerate}[resume]
+\item What do the three sets give, in time and in value?
+\item Why did \texttt{-ffast-math} change the value?
+\item Which value is closer to the exact sum?
+\item Why must the team still refuse \texttt{-ffast-math} for its pricing and risk code?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{Undefined behaviour}.}
+\begin{enumerate}[resume]
+\item The decoder reads fields by casting. Why might it work at \texttt{-O2} and break at \texttt{-O3}?
+\item What does the undefined-behaviour sanitiser report for an overflowing increment?
+\item In which builds should the sanitisers run?
+\item What does the 2009 kernel bug teach a team that checks pointers after using them?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The decision.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the speed-up of the combined optimisations over \texttt{-O2} on the decoder, and what
+\texttt{-ffast-math} did to the float sum.
+\item Which flags should the release use, and what must accompany them?
+\item How should the profile's training day be chosen?
+\item What does \texttt{-march=native} commit the firm to?
+\item How would \omterm{def:ll:cpp-for-latency-iii-the-compiler:fmv}{function multiversioning} change that?
+\item How often should the matrix be rerun?
+\item Why check assembly properties rather than bytes in the tests?
+\item In one sentence: what is a compiler flag worth without a checksum?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:1}
+What is \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour}, and why does it exist in C++?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:2}
+What is the \omterm{def:ll:cpp-for-latency-iii-the-compiler:alias}{strict aliasing} rule? How do you read an integer from a network buffer correctly?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:3}
+What does \omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{profile-guided optimisation} do, and what are its risks?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:4}
+Would you use \texttt{-ffast-math} in a trading system? Where, and where not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:5}
+A check \texttt{if (ptr == nullptr)} disappears from the optimised binary. Why might that be?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-iii-the-compiler:6}
+How would you decide, and keep deciding, the compiler flags of a latency-critical binary?
+\end{interviewq}

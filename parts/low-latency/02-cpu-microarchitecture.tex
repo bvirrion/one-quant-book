@@ -1,0 +1,409 @@
+\chapter{CPU Microarchitecture}\label{ch:ll:cpu-microarchitecture}
+
+In June 2012 a programmer asked why twelve lines of C++, adding up the elements of an array that are at least 128,
+ran in 11.5 seconds on random data and 1.9 seconds once the same data had been sorted. Nothing in the source had
+changed; only the order of the values, and with it how often the processor guessed correctly which way an
+\texttt{if} would go. The answer became one of the most read in the history of the site. A trading system's hot path
+is a few thousand instructions long, and the processor that runs them is not the sequential machine the source code
+describes: it overlaps dozens of instructions, executes them out of order, guesses at branches, and changes its own
+clock speed. This chapter describes that machine from the program's side, measures each effect on this book's laptop,
+and builds the harness every later chapter times itself with.
+
+\section{Pipelines and superscalar execution}
+
+\begin{definition}[Instruction pipeline, instructions per cycle]\label{def:ll:cpu-microarchitecture:pipeline}
+An \emph{instruction pipeline}\index{instruction pipeline} splits the execution of an instruction into stages (fetch,
+decode, rename, schedule, execute, retire), each handled by its own hardware, so that many instructions are in
+flight at once, each in a different stage. A superscalar pipeline handles several instructions per stage per cycle.
+\emph{Instructions per cycle}\index{instructions per cycle} (IPC) is the number of instructions a core completes in a
+cycle of its clock, averaged over a piece of code.
+\end{definition}
+
+A current performance core decodes and renames six instructions a cycle and can sustain six instructions a cycle
+retired, when the instructions are independent. Code rarely comes close: an IPC between one and three is ordinary.
+The difference between the width of the machine and the IPC achieved is where latency engineering lives: every
+cycle in which fewer instructions retire than could is a cycle spent waiting, for a result, for memory, or for the
+front of the pipeline to recover from a wrong guess.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum height=0.8cm,minimum width=1.55cm,align=center}]
+\node[st] (f) at (0,0) {fetch\\ (predict)};
+\node[st] (d) at (2.1,0) {decode};
+\node[st] (r) at (4.2,0) {rename};
+\node[st] (s) at (6.3,0) {schedule};
+\node[st,minimum height=2.0cm] (x) at (8.5,0) {execute\\ (ALUs,\\ loads,\\ stores)};
+\node[st] (t) at (10.7,0) {retire};
+\foreach \a/\b in {f/d,d/r,r/s,s/x,x/t} \draw[-Stealth,thick] (\a) -- (\b);
+\draw[draw=omThm,fill=omThm!8,rounded corners=2pt] (3.4,-1.9) rectangle (11.5,-1.3);
+\node[font=\footnotesize] at (7.45,-1.6) {reorder buffer: program order, completed out of order};
+\draw[-Stealth,omThm] (r.south) -- (4.2,-1.3);
+\draw[-Stealth,omThm] (10.7,-1.3) -- (t.south);
+\draw[-Stealth,thick,omProp] (x.north) to[out=120,in=60,looseness=0.6] node[pos=0.5,above,font=\footnotesize]{mispredicted branch: flush and refetch} (f.north);
+\end{tikzpicture}
+
+\omcaption{The pipeline of an out-of-order core, simplified. Instructions enter and leave in program order; in between,
+the scheduler starts each one as soon as its inputs are ready, and the \omterm{def:ll:cpu-microarchitecture:ooo}{reorder buffer} keeps the program's order for
+retirement. A mispredicted branch discards every instruction fetched after it.}\label{fig:ll:cpu-microarchitecture:pipeline}
+\end{omfigure}
+
+\section{Out-of-order execution and the reorder buffer}
+
+\begin{definition}[Out-of-order execution, reorder buffer]\label{def:ll:cpu-microarchitecture:ooo}
+In \emph{out-of-order execution}\index{out-of-order execution} the core starts each instruction as soon as its inputs
+are available rather than in program order, and makes the results visible in program order. The
+\emph{reorder buffer}\index{reorder buffer} holds the instructions between rename and retirement; its size bounds how
+far ahead of a stalled instruction the core can find independent work.
+\end{definition}
+
+The \omterm{def:ll:cpu-microarchitecture:ooo}{reorder buffer} of the performance core family in this laptop holds 512 instructions. When a load misses every cache
+and waits a hundred nanoseconds for memory (chapter~3), the core keeps executing the independent instructions behind
+it until the buffer is full, then stalls. What it cannot do is shorten a dependency chain: each instruction that
+needs the previous one's result waits for it, whatever the width of the machine.
+
+To see these effects the book times small pieces of code in isolation.
+
+\begin{definition}[Microbenchmark, compiler barrier]\label{def:ll:cpu-microarchitecture:ubench}
+A \emph{microbenchmark}\index{microbenchmark} times a small piece of code in isolation, many times, to measure one
+property of the machine or of the code. A \emph{compiler barrier}\index{compiler barrier} is a statement the compiler
+must treat as reading or writing memory (or a given value) although it emits no instruction; it stops the optimiser
+from deleting or moving the code being timed.
+\end{definition}
+
+A \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} measures what it measures: a loop over data that stays in the first-level cache, on a warm core,
+after its branches have been learnt. That is the best case of the hot path, not its behaviour after a quiet period
+(cold caches, a core in a low-power state), which is often what matters in trading (chapter~5).
+
+\begin{proposition}[Chains needed to saturate the units]\label{prop:ll:cpu-microarchitecture:little}
+If an operation has latency $\ell$ cycles and the core can start $w$ of them per cycle, a loop needs at least $\ell w$
+independent dependency chains to start $w$ a cycle; with $k < \ell w$ chains it completes at most $k/\ell$ a cycle.
+\end{proposition}
+
+\begin{proof}
+Each chain has at most one operation in flight, occupying $\ell$ cycles; $k$ chains have at most $k$ in flight. By
+Little's law the completion rate is at most $k/\ell$, which reaches $w$ only when $k \ge \ell w$.
+\end{proof}
+
+\Cref{fig:ll:cpu-microarchitecture:chains} sums 4\,096 doubles, held in cache, with one to sixteen accumulators. A
+floating-point addition on this core has a latency of two cycles when followed by another addition, and two can start
+per cycle: \cref{prop:ll:cpu-microarchitecture:little} predicts four chains, and the measured cost per addition halves
+from one accumulator to two, halves again to four, and stops improving there. The compiler does not do this itself:
+without permission to reassociate floating-point additions (\texttt{-ffast-math}, chapter~8) it must keep the one
+chain the source wrote.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.2cm,ybar,bar width=14pt,ymin=0,enlarge y limits={upper,value=0.2},
+  symbolic x coords={1,2,4,8,16},xtick=data,enlarge x limits=0.15,
+  xlabel={independent accumulators},ylabel={ns per addition},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  point meta=y,every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=2},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=accumulators,y=ns_per_add]{figdata/low-latency/02-cpu-microarchitecture/measured_chains.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Cost per floating-point addition when summing 4\,096 doubles with 1 to 16 independent accumulators. Two
+cycles of latency and two adders make four chains enough (\cref{prop:ll:cpu-microarchitecture:little}). Measured on a
+laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores, pinned to one CPU, best of 30 runs. Data:
+\texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:chains}
+\end{omfigure}
+
+The core can also remove dependencies the program contains. A chain of ten dependent additions of a register runs at
+one addition a cycle, as it should; the same chain adding the constant 1 ran at about five additions a cycle on this
+laptop, because the renamer of this core family resolves small-immediate additions itself, up to six a cycle, without
+sending them to an execution unit. A \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} that uses \texttt{add \$1} to count cycles measures the renamer;
+the harness below measures the clock with the register form.
+
+\section{Branch prediction}
+
+\begin{definition}[Branch prediction, branch misprediction]\label{def:ll:cpu-microarchitecture:branch}
+\emph{Branch prediction}\index{branch prediction} is the core's guess, made at fetch, of the direction and target of
+each branch, so that the pipeline can keep fetching before the branch is executed. A \emph{branch
+misprediction}\index{branch misprediction} is a wrong guess: the core discards every instruction fetched after the
+branch and refetches from the right target, losing the depth of the front of the pipeline in cycles.
+\end{definition}
+
+\begin{proposition}[When branchless code wins]\label{prop:ll:cpu-microarchitecture:breakeven}
+A loop body with a data-dependent branch costs $c_0 + mP$ cycles per iteration on average, where $m$ is the
+misprediction rate and $P$ the misprediction penalty; a branchless rewrite that always does the work of both sides
+costs $c_0 + c$. The rewrite is cheaper exactly when $m > c/P$.
+\end{proposition}
+
+\begin{proof}
+Each iteration mispredicts with probability $m$ and then pays $P$; linearity of expectation gives $c_0 + mP$. Compare
+with $c_0 + c$.
+\end{proof}
+
+\Cref{fig:ll:cpu-microarchitecture:branch} reruns the 2012 loop. On sorted data the predictor is right on all but one
+of 32\,768 iterations and the branchy loop is the fastest; on shuffled data it is right half the time and the loop is
+about thirteen times slower. The branchless loop, which masks each element with all ones or all zeros, costs the same
+on both. Half the iterations mispredict on shuffled data, so the difference between the two branchy bars is half the
+penalty per element: about \qty{5.2}{\nano\second}, or some 24 cycles at this core's measured clock, a little above the
+``sometimes exceeding 20 clock cycles'' a published measurement gives for this core family. The branchless loop
+costs about \qty{0.11}{\nano\second} more per element on sorted data, so by
+\cref{prop:ll:cpu-microarchitecture:breakeven} it wins as soon as more than about two iterations in a hundred
+mispredict.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.2cm,ybar,bar width=16pt,ymin=0,
+  symbolic x coords={sorted,shuffled},xtick=data,enlarge x limits=0.5,
+  ylabel={ns per element},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=order,y=branchy]{figdata/low-latency/02-cpu-microarchitecture/measured_branch.csv};
+\addplot[fill=omDef!45,draw=omDef] table[x=order,y=branchless]{figdata/low-latency/02-cpu-microarchitecture/measured_branch.csv};
+\legend{branchy,branchless}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The loop of the 2012 question (sum the elements $\ge 128$ of 32\,768 random bytes) with a branch and with a
+mask, on sorted and shuffled data. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores,
+pinned to one CPU, best of 30 runs. Data: \texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:branch}
+\end{omfigure}
+
+The trading lesson is not ``remove branches''. Most branches on a hot path are predictable (the message type is
+usually the same, the risk check usually passes) and cost almost nothing. The expensive ones depend on the market:
+which side a message is on, whether a price improves the book. They mispredict in bursts, exactly when the market is
+busy, and they are worth measuring one by one.
+
+\section{Frequency scaling, turbo and idle states}
+
+\begin{definition}[Dynamic frequency scaling, idle state]\label{def:ll:cpu-microarchitecture:dvfs}
+\emph{Dynamic frequency scaling}\index{dynamic frequency scaling} changes a core's clock (and voltage) while it runs,
+according to load, temperature, power budget and the number of active cores; the highest frequencies, called turbo,
+are available only while the package stays within its limits. An \emph{idle state}\index{idle state} (a C-state) is a
+low-power state a core enters when it has nothing to run, from which it takes microseconds to wake, deeper states
+taking longer.
+\end{definition}
+
+\begin{definition}[Time-stamp counter]\label{def:ll:cpu-microarchitecture:tsc}
+The \emph{time-stamp counter}\index{time-stamp counter} (TSC) is a 64-bit register of each x86 core that counts at a
+constant rate on current processors, whatever the core's clock, read by the instructions \texttt{rdtsc} and
+\texttt{rdtscp} in a few nanoseconds.
+\end{definition}
+
+The two definitions interact. The TSC counts time, not cycles: on this laptop it ticks at about 3.0~GHz while the core
+runs at anything from its idle clock to several gigahertz. A benchmark that reports TSC ticks as ``cycles'' is off by
+the ratio. The harness reports nanoseconds and, when cycles matter, measures the core's clock with a chain of dependent
+register additions, one cycle each. On a server the lesson is operational: a core that has been idle for a while
+answers its first message from a deep \omterm{def:ll:cpu-microarchitecture:dvfs}{idle state} and at a low clock, so a trading host limits \omterm{def:ll:cpu-microarchitecture:dvfs}{idle states} and fixes
+its frequency (chapter~13).
+
+\begin{dated}{2026-09}{The laptop this book measures on}\label{dat:ll:cpu-microarchitecture:laptop}
+The Intel Core Ultra 7 155H, launched in the fourth quarter of 2023, has 16 cores: 6 performance cores with two
+hardware threads each, 8 efficient cores and 2 low-power efficient cores, 22 threads in all, with maximum turbo
+frequencies of 4.8~GHz on the performance cores and 3.8~GHz on the efficient cores, and 24~MB of shared cache (Intel's
+specification page).
+\end{dated}
+
+\section{Simultaneous multithreading and heterogeneous cores}
+
+\begin{definition}[Simultaneous multithreading, heterogeneous cores]\label{def:ll:cpu-microarchitecture:smt}
+In \emph{simultaneous multithreading}\index{simultaneous multithreading} (SMT, hyper-threading) one core runs two
+hardware threads, sharing its execution units, caches and predictors; each appears to the operating system as a CPU.
+A processor has \emph{heterogeneous cores}\index{heterogeneous cores} when its cores differ in design, typically large
+performance cores and small efficient cores, with different speeds for the same code.
+\end{definition}
+
+Both matter to a latency-sensitive thread. Its sibling hardware thread competes for the same execution units and
+first-level caches, so trading hosts either disable SMT or leave the sibling of every hot core idle. On a
+heterogeneous processor the same code runs at different speeds depending on where the operating system places it; a
+hot thread must be pinned to a performance core.
+
+This laptop adds a layer that servers in a colocation site usually do not have: it runs Linux inside a virtual
+machine. The 22 CPUs Linux sees are virtual CPUs, which the hypervisor schedules on whatever physical core it chooses,
+and the processor's report of its own core types is hidden from the guest. \Cref{fig:ll:cpu-microarchitecture:freq}
+measures the clock seen by each virtual CPU: the performance and efficient cores do not appear as two groups, and
+pinning a thread to a virtual CPU need not pin it to one physical core. The measurements of this book are therefore the laptop's
+best-effort figures, and each caption says so.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5cm,ybar,bar width=6pt,ymin=0,ymax=5.5,xmin=-0.8,xmax=21.8,
+  xtick={0,2,4,6,8,10,12,14,16,18,20},xlabel={virtual CPU},ylabel={measured clock (GHz)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=cpu,y=ghz_reg]{figdata/low-latency/02-cpu-microarchitecture/measured_freq.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The clock each of the laptop's 22 virtual CPUs runs a chain of dependent register additions at (one
+addition a cycle), best of 15 runs. The hypervisor hides which physical core runs which virtual CPU; the six
+performance and ten efficient cores do not appear as groups. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2,
+no isolated cores, the machine otherwise idle. Data: \texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:freq}
+\end{omfigure}
+
+\section{Tutorial: timing a kernel honestly}\label{tut:ll:cpu-microarchitecture:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} harness, then use it to measure a \omterm{def:ll:cpu-microarchitecture:branch}{branch misprediction}, a dependency chain and
+the clock. \textbf{End state:}
+\cref{fig:ll:cpu-microarchitecture:branch,fig:ll:cpu-microarchitecture:chains,fig:ll:cpu-microarchitecture:freq} and an
+estimate of the misprediction penalty in cycles.
+\begin{tutsteps}
+\item \textbf{Keep the code alive and fence the counter.} An empty \texttt{asm} statement that takes the value as an
+input is a \omterm{def:ll:cpu-microarchitecture:ubench}{compiler barrier}: the optimiser must compute the value and cannot move work across it. The timed region
+starts with \texttt{lfence; rdtsc} and ends with \texttt{rdtscp; lfence}, so that earlier work finishes before the
+first read and the second read waits for the region.
+\omcode{code/firm/ubench/cpp/firm_ubench.hpp}{22}{41}{The C++20 harness: barriers and fenced reads of the time-stamp counter.}\label{lst:ll:cpu-microarchitecture:cpp}
+\item \textbf{The same in Rust.} Rust has \texttt{std::hint::black\_box} for the barrier; the counter needs the
+intrinsics of \texttt{std::arch} and an \texttt{unsafe} block, whose safety argument is a comment.
+\omcode{code/firm/ubench/rust/src/lib.rs}{7}{27}{The Rust twin's fenced reads.}\label{lst:ll:cpu-microarchitecture:rust}
+\item \textbf{The kernels.} The branchy loop keeps its branch because an opaque \texttt{asm} statement sits inside it;
+without it, the compiler may turn the \texttt{if} into a conditional move and the experiment disappears.
+\omcode{code/low-latency/02-cpu-microarchitecture/cpp/ll_cpu.hpp}{9}{31}{The 2012 loop with a branch and with a mask.}\label{lst:ll:cpu-microarchitecture:kernels}
+\item \textbf{Run} \texttt{python bench\_cpu.py}: it compiles \texttt{ll\_cpu\_bench.cpp}, runs the three modes pinned
+with \texttt{taskset}, and writes the measured CSVs and their \texttt{.meta} files; \texttt{ll\_cpu.penalty()} turns
+the branch figures into a penalty in cycles.
+\end{tutsteps}
+\textbf{What to change next.} Remove the \texttt{asm} statement from \texttt{sum\_branchy}, look at the disassembly
+(\texttt{objdump -d}) and time it again; replace the random bytes by a pattern of period 8 and watch the predictor
+learn it.
+\end{tutorial}
+
+\section{Build: the microbenchmark harness}\label{bld:ll:cpu-microarchitecture:ubench}
+
+\begin{build}
+\bfield{Purpose} One way to time code across the book, in C++20, Rust and the Python drivers that produce every
+measured figure, so that numbers from different chapters are comparable and say where they came from.
+\bfield{Interface} C++20 \texttt{firm::ubench}: \texttt{do\_not\_optimize(x)}, \texttt{clobber()},
+\texttt{tsc\_start()}, \texttt{rdtscp()}, \texttt{Clock::calibrate(ms)} and \texttt{Clock::ns(ticks)},
+\texttt{overhead()}, \texttt{run(fn, reps, warm)}, \texttt{quantile(v, p)}. Rust \texttt{firm\_ubench}: the same
+functions. Python \texttt{firm\_ubench}: \texttt{compile\_cpp}, \texttt{run(exe, *args, cpus)},
+\texttt{machine()}, \texttt{write\_measured(csv, header, rows, **meta)}, \texttt{quantiles}.
+\bfield{Rules} Every timed region is fenced; results are nanoseconds (ticks only inside the harness); every measured CSV
+carries a \texttt{.meta} file naming the machine, compiler, flags, CPU list and load; drivers are named
+\texttt{bench\_*.py} and are never run by \texttt{make figdata}.
+\bfield{Acceptance tests} \texttt{code/firm/ubench/}: calibration between 0.5 and 6 ticks per nanosecond, a monotonic
+counter, work costing more than an empty region (C++, Rust), the driver's CSV and metadata round trip (Python).
+\bfield{Stretch} Read the core's cycle counter through \texttt{perf\_event\_open} where it is permitted; report the
+spread of repeated runs with each figure.
+\end{build}
+
+\begin{omsources}
+\item Stack Overflow, ``Why is processing a sorted array faster than processing an unsorted array?'', question
+11227809, 2012.
+\item A.~Fog, \emph{The microarchitecture of Intel, AMD and VIA CPUs}, updated 2026.
+\item Chips and Cheese, ``Popping the hood on Golden Cove'' (2021) and ``Lion Cove: Intel's P-core roars'' (2024).
+\item Intel, \emph{Intel 64 and IA-32 Architectures Optimization Reference Manual}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:1}
+A core retires 2.4 instructions a cycle at 4.0~GHz. How many instructions does a hot path of \qty{600}{\nano\second}
+execute?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:2}
+A benchmark reports 3\,000 TSC ticks for a function on a laptop whose TSC ticks at 3.0~GHz while the core runs at
+4.5~GHz. How long did the function take, and how many core cycles?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:3}
+An operation has a latency of 4 cycles and the core can start two per cycle. How many independent chains does a loop
+need to reach the core's throughput, and what fraction of it does a loop with three chains reach?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:4}
+A message handler has a branch on the message's side that mispredicts 30\% of the time, with a penalty of 20 cycles. A
+branchless version costs 4 extra cycles every message. Which is faster, and by how much per message?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:5}
+From \cref{fig:ll:cpu-microarchitecture:branch}, estimate the misprediction penalty in nanoseconds, then in cycles at
+the clock of \cref{fig:ll:cpu-microarchitecture:freq} for CPU~2. What assumption about the shuffled data does the
+estimate rest on?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:6}
+Why can the \omterm{def:ll:cpu-microarchitecture:ooo}{reorder buffer} not hide a dependency chain, however large it is? What does it hide instead?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpu-microarchitecture:7}
+\emph{Coding.} Add a mode to \texttt{ll\_cpu\_bench.cpp} that runs the branchy loop on data whose values alternate in
+blocks of $b$ elements above and below 128, for $b = 1, 2, 4, 8, 64$. What does the predictor learn, and at which $b$
+does the loop reach the sorted speed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpu-microarchitecture:8}
+\emph{Find the flaw.} ``We measured our order encoder at 40 cycles with a loop of \texttt{add \$1} instructions as a
+cycle reference, on a warm core, calling it ten million times in a row on the same order.''
+\end{exercise}
+
+\section{Problem: The Branch That Cost a Quote}
+
+\begin{problem}[{Weekend problem --- one \texttt{if} in the quoting path}]\label{pb:ll:cpu-microarchitecture:1}
+A quoting engine's hot path has one data-dependent branch: whether an incoming trade was on the bid or the ask. On a
+quiet day the sides alternate in long runs; on a busy day they are close to random. The team measures the 2012 loop as
+a stand-in (\cref{fig:ll:cpu-microarchitecture:branch}) and must decide whether to rewrite the branch.
+
+\medskip\noindent\textbf{Part I --- The measurement.}
+\begin{enumerate}
+\item What are the four measured costs per element?
+\item Why is the sorted branchy loop faster than the branchless one?
+\item Estimate the misprediction penalty in nanoseconds.
+\item Convert it to cycles with the measured clock of CPU~2.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The model.}
+\begin{enumerate}[resume]
+\item Write the expected cost per iteration of the branchy and branchless loops as functions of the misprediction
+rate.
+\item At what misprediction rate do they cost the same?
+\item On a quiet day the branch mispredicts on 1\% of trades. Which version wins, by how much per trade?
+\item On a busy day it mispredicts on 35\%. Which wins, by how much?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- What it is worth.}
+\begin{enumerate}[resume]
+\item On the busy day trades arrive at 50\,000 a second in bursts. How much processing time a second does the branchy
+version waste?
+\item Compared with the path's budget of \qty{1.3}{\micro\second} for software stages (chapter~1), is the penalty per
+mispredicted trade large or small?
+\item Why do mispredictions cluster on the days that matter?
+\item What would a predictor that learnt the busy day's pattern change?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The decision.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the misprediction penalty measured on this laptop, in nanoseconds and cycles, and the
+misprediction rate above which the branchless rewrite wins.
+\item Why is the measured penalty above the published figure for the core family?
+\item What does the TSC measure in this experiment, and why is it not cycles?
+\item Why pin the benchmark to one CPU, and what does pinning mean under a hypervisor?
+\item What would a compiler do to the branchy loop if the \texttt{asm} statement were removed?
+\item Name another branch on a trading hot path that is predictable, and one that is not.
+\item How would you measure the misprediction rate on the production host?
+\item In one sentence: when is branchless code worth writing?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:1}
+Why can sorting an array make a loop over it several times faster, when the loop's work does not depend on the order?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:2}
+Explain \omterm{def:ll:cpu-microarchitecture:ooo}{out-of-order execution}. What limits how much independent work the core can find?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:3}
+Why does summing an array with four accumulators run faster than with one? Why does the compiler not do it for you?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:4}
+You want to time a function that takes 50 nanoseconds. How do you do it, and what can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:5}
+Should a latency-critical thread share a core with its hyper-threading sibling? Why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:cpu-microarchitecture:6}
+The first order after a quiet minute is always slower than the next ones. Name three causes in the processor and how
+you would confirm each.
+\end{interviewq}

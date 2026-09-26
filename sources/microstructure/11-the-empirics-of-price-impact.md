@@ -1,0 +1,29 @@
+# 11. The Empirics of Price Impact — brief and source ledger
+
+## Brief
+
+- **Hook.** Buy one per cent of a day's volume and the price moves, on average, by some amount; buy four per cent and it moves about twice as much, not four times. That the impact of an order grows like the square root of its size is one of the most robust regularities in finance, and nobody designed it.
+- **Sections.** The impact of a single trade; Aggregate impact of order flow; The impact of a metaorder: during and after; The square-root law; Measurement pitfalls.
+- **Defines.** aggregate impact, impact curve, peak impact, impact reversion, impact prefactor, alpha contamination.
+- **Uses (defined earlier).** market impact (B7.18), temporary impact (B7.27), permanent impact (B7.27), square-root impact law (B7.27), metaorder (B7.9), percentage of volume (B7.27), Kyle's lambda (B7.9), trade sign (B7.9), order-sign autocorrelation (B7.9), counterfactual impact (B7.18), trade price impact (ch5), implementation shortfall (B7.19), arrival price (B7.19), HAC estimator (B4.11), bootstrap (B4.13).
+- **Tutorial.** Trade metaorders of random sizes and durations into firm.exchsim with the tape's background flow; measure single-trade, aggregate and metaorder impact; fit the square-root law's exponent and prefactor with robust errors; show the concave single-trade curve, the decay after completion, and the bias when the orders were sent because of a forecast. Data: simulated; published estimates.
+- **Build.** `firm.impactfit`: impact estimation from fills and a market-data stream (single-trade response, aggregate impact on intervals, metaorder impact paths and their decay, exponent and prefactor fits with robust errors, a correction for alpha contamination); Python, reusing Book 7's firm.tcost fit where it applies.
+- **Weekend problem.** The square root in our own data -- named result: the exponent and prefactor of the square-root law fitted on the firm's simulated metaorders with confidence intervals, and their bias when order timing carries a forecast.
+- **Facts to verify.** Almgren, Thum, Hauptmann, Li 2005 direct estimation of equity market impact (Risk); Toth et al. 2011 anomalous price impact and the critical nature of liquidity in financial markets (PRX); Bacry, Iuga, Lasnier, Lehalle 2015 market impacts and the life cycle of investors orders (Market Microstructure and Liquidity); Frazzini, Israel, Moskowitz 2018 trading costs (working paper, AQR); Moro et al. 2009 market impact and trading profile of hidden orders in stock markets (PRE); Zarinelli, Treccani, Farmer, Lillo 2015 beyond the square root (Market Microstructure and Liquidity); Loeb 1983 trading cost: the critical link between investment information and results (FAJ).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | B. Toth, Y. Lemperiere, C. Deremble, J. de Lataillade, J. Kockelkoren and J.-P. Bouchaud, "Anomalous price impact and the critical nature of liquidity in financial markets", Physical Review X 1 (2011) 021006: the average supply/demand profile is V-shaped and vanishes around the current price; large metaorders must be fragmented, and the small local liquidity breaks linear response | Crossref record; abstract of the working paper (SSRN 1836508) | https://doi.org/10.1103/physrevx.1.021006 | 2026-09-25 | "the average supply/demand profile is V-shaped and vanishes around the current price"; "large metaorders have to be fragmented in order to be digested by the liquidity funnel" | §4, omsources |
+| F2 | E. Bacry, A. Iuga, M. Lasnier and C.-A. Lehalle, "Market impacts and the life cycle of investors orders", Market Microstructure and Liquidity 1(2) (2015) 1550009: 400,000 metaorders of 2010 in European markets; a square-root temporary impact in the daily participation, with a duration factor | Crossref record with abstract | https://doi.org/10.1142/s2382626615500094 | 2026-09-25 | "the very concentrated nature of the database (400,000 metaorders ...)"; "we confirm a square root temporary impact in the daily participation, and we shed light on a duration factor" | §3, §4, omsources |
+| F3 | E. Zarinelli, M. Treccani, J. D. Farmer and F. Lillo, "Beyond the square root: evidence for logarithmic dependence of market impact on size and participation rate", Market Microstructure and Liquidity 1(2) (2015) 1550004: US metaorders 2007-2009; the square root fits across about two orders of magnitude, a logarithm across almost five | Crossref record with abstract | https://doi.org/10.1142/s2382626615500045 | 2026-09-25 | "the square root market impact formula ... provides a good fit only across about two orders of magnitude in order size. A logarithmic functional form fits the data better" | §4, omsources |
+| F4 | E. Moro, J. Vicente, L. G. Moyano, A. Gerig, J. D. Farmer, G. Vaglica, F. Lillo and R. N. Mantegna, "Market impact and trading profile of hidden orders in stock markets", Physical Review E 80 (2009) 066102 | Crossref record | https://doi.org/10.1103/physreve.80.066102 | 2026-09-25 | bibliographic record | §3, omsources |
+| F5 | T. F. Loeb, "Trading cost: the critical link between investment information and results", Financial Analysts Journal 39(3) (1983) 39-44 | Crossref record | https://doi.org/10.2469/faj.v39.n3.39 | 2026-09-25 | bibliographic record | §4, omsources |
+
+## EXCLUDED
+
+- The hook's numbers (one and four per cent of a day's volume) illustrate the square-root law; they are not a measurement.
+- Almgren, Thum, Hauptmann and Li (2005, Risk) and Frazzini, Israel and Moskowitz (2018): no DOI record fetched; not cited.
+- Published exponents and prefactors: only the qualitative findings of F2 and F3 are quoted.
+- All simulated statistics (responses, aggregate impact, counterfactual metaorder impact, the replay difference, the fits on the simulated metaorder panel) are computed on firm.agentmkt, firm.exchsim and firm.impactfit and tested.

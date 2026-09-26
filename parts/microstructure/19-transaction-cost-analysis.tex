@@ -1,0 +1,333 @@
+\chapter{Transaction-Cost Analysis}\label{ch:mx:transaction-cost-analysis}
+
+A portfolio manager's order cost 25 basis points against the arrival price; the broker's report says it beat VWAP by three. Both numbers are right, and
+only one of them says what the order cost the fund. Transaction-cost analysis (One Quant Book 7, chapter~23) is the discipline of choosing the number
+that answers the question asked, of explaining it, and of comparing orders that were not equally hard. This chapter builds a simulated order log in
+which every order was worked by two algorithms, so that the true difference between them is known, and then analyses the log a desk would actually
+have, in which each order saw only one.
+
+\section{Benchmarks and what each hides}
+
+\begin{definition}[Execution benchmark]\label{def:mx:transaction-cost-analysis:benchmark}
+An \emph{execution benchmark}\index{execution benchmark} is the reference price an execution is measured against: the decision or arrival price
+(implementation shortfall), the volume-weighted price over the order's interval or the day, the close. The slippage against it is the average
+execution price minus the benchmark, signed so that a positive number is a cost.
+\end{definition}
+
+The simulated log has 100 days of \texttt{firm.agentmkt} on \texttt{firm.exchsim}, each 18 minutes long, with a volatility regime (the hidden value
+jumping 0.1, 0.2 or 0.4 times a second) and an activity level (0.7, 1 or 1.4 times the base flow) drawn per day. Each day carries two \omterm{def:mx:the-almgren-chriss-framework:parent}{parent orders},
+a buy or a sell of 2\,000 to 12\,000 shares (2\% to 24\% of the volume over their window), decided 30 seconds before they start, worked over five minutes
+in ten 30-second slices, with a limit 20 ticks from the arrival price. Two algorithms (chapter~16's schedules on chapter~17's executor) work them:
+\begin{itemize}
+\item \emph{patient}: equal slices, each resting at the best quote and repriced, with a \omterm{def:mx:child-order-placement:risk}{clean-up trade} at the slice's end;
+\item \emph{urgent}: an Almgren--Chriss schedule front-loaded with $\kappa T=3$ (chapter~14), every slice crossed at once.
+\end{itemize}
+Every order is worked by both, and the day is also run without it, all with the same exogenous order flow (chapter~11's counterfactual). Prices are
+in ticks: a tick is a cent on a USD~100 stock, about a basis point.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+algorithm & vs arrival & vs interval VWAP & vs day VWAP & vs close \\
+\midrule
+patient & 2.42 & $-0.29$ & 1.90 & 2.51 \\
+urgent & 3.66 & 1.40 & 3.39 & 4.10 \\
+\bottomrule
+\end{tabular}
+\caption{Average slippage per filled share (ticks) of the 200 simulated orders under each algorithm, against four benchmarks. Data:
+\texttt{mx\_tca.study}.}\label{tab:mx:transaction-cost-analysis:benchmarks}
+\end{table}
+
+The patient algorithm ``beats'' the interval VWAP by 0.29 ticks while costing 2.42 against the arrival price: the VWAP over its own window includes its
+own trades and the price they pushed, so it moves with the order. Against the day's VWAP or the close, both algorithms look better or worse depending
+on what the rest of the day did. Only the arrival price, or the decision price before it, is fixed before the order touches the market. Perold (1988)
+set the paper portfolio, traded at the decision price, against the real one: the implementation shortfall.
+
+\section{Pre-trade estimates}
+
+\begin{definition}[Pre-trade cost estimate]\label{def:mx:transaction-cost-analysis:pretrade}
+A \emph{pre-trade cost estimate}\index{pre-trade cost estimate} is the expected cost of an order computed before it is sent, from its size, the
+stock's volume, volatility and spread, and a model of impact; it prices the decision to trade and sets the yardstick for the result.
+\end{definition}
+
+The square-root law (One Quant Book 7, chapter~27, and chapter~11) gives the model: a half-spread plus $\eta\,\sigma\sqrt{Q/V}$, with $\sigma$ the price's
+volatility over the order's horizon and $Q/V$ its participation. The desk estimates $\sigma$ for each volatility regime from its days without orders
+(7.6, 10.0 and 11.5 ticks over five minutes) and fits $\eta$ on the patient algorithm's orders of the first 50 days (with $-0.5$ tick, the half-spread
+it earns, as the intercept): $\eta=1.04$ with a standard error of 0.18 (\texttt{firm\_tca.fit\_pretrade}, on Book~7's \texttt{firm.tcost}). On the
+next 50 days the model predicts 2.47 ticks a share on average and the orders cost 2.73 (standard error 0.52): right on average, but the correlation
+between prediction and outcome across orders is only 0.25 (\cref{fig:mx:transaction-cost-analysis:calibration}). A single order's cost is mostly the
+price's own move; a pre-trade model is a statement about averages.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.6cm,height=5.8cm,xlabel={\small predicted cost (ticks a share)},ylabel={\small realised cost (ticks a share)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=5,ymin=-2,ymax=8,table/col sep=comma]
+\addplot[omDef,only marks,mark=*,error bars/.cd,y dir=both,y explicit] table[x=pred,y=real,y error=se]{figdata/microstructure/19-transaction-cost-analysis/calibration.csv};
+\addplot[black,dashed,domain=0:5] {x};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The pre-trade model out of sample: the patient algorithm's orders of the last 50 days in five groups by predicted cost, their mean realised
+cost against arrival and its standard error. Data: \texttt{mx\_tca.study}.}\label{fig:mx:transaction-cost-analysis:calibration}
+\end{omfigure}
+
+\section{Post-trade attribution}
+
+\begin{definition}[Slippage attribution]\label{def:mx:transaction-cost-analysis:attribution}
+\emph{Slippage attribution}\index{slippage attribution} splits an order's implementation shortfall into parts that add up to it: the delay before the
+order reaches the market, the spread paid or earned on each fill, the impact (the price's move caused by the order), the timing (the price's move it
+did not cause), the opportunity cost of what was not filled, and fees.
+\end{definition}
+
+With a decision price $d$, arrival $a$, fills $q_i$ at $p_i$ when the mid was $m_i$ (just before the fill) and would have been $\tilde m_i$ without the
+order, target $X$ and final mid $e$, the shortfall of a buy is
+\[
+\underbrace{\textstyle\sum q_i(a-d)}_{\text{delay}}+\underbrace{\textstyle\sum q_i(p_i-m_i)}_{\text{spread}}+\underbrace{\textstyle\sum q_i(m_i-\tilde m_i-(a-\tilde a))}_{\text{impact}}+\underbrace{\textstyle\sum q_i(\tilde m_i-\tilde a)}_{\text{timing}}+\underbrace{(X-\textstyle\sum q_i)(e-d)}_{\text{opportunity}}+\text{fees},
+\]
+which is Perold's delay, execution, opportunity and fees (\texttt{firm\_markout.shortfall}) with the execution split in three. Real TCA does not see
+$\tilde m$; it splits impact from timing with a model or with the market's move. The simulator sees it, which is what makes the split below exact.
+
+\omcode{code/firm/tca/firm_tca.py}{44}{60}{Attribution of a parent order's implementation shortfall, per share of its target: the mid before each fill against the fill price (spread), against the mid the same market had without the order (impact), and that mid's own move (timing).}\label{lst:mx:transaction-cost-analysis:attribute}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ybar,bar width=8pt,ylabel={\small ticks per share of target},
+  xtick={0,1,2,3,4,5,6},xticklabels={delay,spread,impact,timing,{opport.},fees,total},
+  tick label style={font=\footnotesize},ymin=-1.5,ymax=4.5,grid=major,grid style={gray!25},enlarge x limits=0.08,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=i,y=patient]{figdata/microstructure/19-transaction-cost-analysis/attribution.csv};
+\addplot[fill=omProp!70,draw=omProp] table[x=i,y=urgent]{figdata/microstructure/19-transaction-cost-analysis/attribution.csv};
+\legend{patient,urgent}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Attribution of the implementation shortfall of the 200 orders under each algorithm: the parts add up to the total exactly. Data:
+\texttt{mx\_tca.study}.}\label{fig:mx:transaction-cost-analysis:attribution}
+\end{omfigure}
+
+The two algorithms spend differently (\cref{fig:mx:transaction-cost-analysis:attribution}). The patient one earns 0.65 ticks of spread and pays 2.41 of
+impact: resting a large order at the best quote for five minutes holds the price on its side. The urgent one pays 2.43 of spread, which includes walking
+the book on its large early slices, and 1.13 of impact. Timing averages near zero (0.59 and $-0.07$), as it should with random sides; opportunity is
+small (99.5\% and 98.0\% filled within the limit); fees are a rebate for the patient algorithm ($-0.20$) and a charge for the urgent one (0.29). In
+total, 1.90 against 3.79 ticks per share, with standard deviations of 5.98 and 4.60: the urgent algorithm costs more and varies less.
+
+\begin{definition}[Post-trade reversion]\label{def:mx:transaction-cost-analysis:reversion}
+\emph{Post-trade reversion}\index{post-trade reversion} is the move of the price after an order's last fill, signed against the order: a price that
+gives back the order's push (negative) shows temporary impact; a price that keeps going shows that the order carried information or that it leaked
+(chapter~9).
+\end{definition}
+
+Two minutes after the last fill the price has given back 3.51 ticks for the patient algorithm and 1.06 for the urgent one (1.37 and 0.07 after 30
+seconds). The patient algorithm's last fills are often its \omterm{def:mx:child-order-placement:risk}{clean-up trades}, which push the price at the end of the window; the urgent algorithm's last
+slices are small. No simulated order carries information, so no price keeps going; in real logs, a continuation after completion is the leakage signal.
+
+\section{Comparing across orders, brokers and peers}
+
+Which algorithm is cheaper? In the full log the answer is known: working every order with both, the urgent algorithm costs 1.89 ticks a share more,
+with a standard error of 0.25 clustered by day. The desk's log is different. Its routing gave the urgent algorithm large orders on volatile days more
+often (53.5\% of orders went to it, averaging 7\,039 shares against 4\,126 for the patient one), so the raw difference in its log is 3.36 ticks
+(standard error 0.76): hard orders made the urgent algorithm look worse than it is.
+
+\begin{definition}[Peer-universe comparison]\label{def:mx:transaction-cost-analysis:peer}
+A \emph{peer-universe comparison}\index{peer-universe comparison} measures an execution's cost against that of comparable orders from other traders,
+brokers or funds, after adjusting for how hard each order was (size against volume, volatility, spread, \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgency}), usually as the residual of a cost
+model fitted on the universe.
+\end{definition}
+
+Adjusting means regressing the cost on the algorithm and on the order's difficulty (the regime's volatility, the participation, the square-root
+term and its interaction with the algorithm), with standard errors clustered by day because the two orders of a day share its market (clustered errors are One Quant Book 4,
+chapter~16's); \texttt{firm\_tca.adjusted\_difference} returns both the raw and the adjusted coefficient.
+
+\omcode{code/microstructure/19-transaction-cost-analysis/python/mx_tca.py}{148}{152}{The desk's routing in the simulated log: the probability of sending an order to the urgent algorithm rises with its size and on volatile days, which is what makes the raw comparison biased.}\label{lst:mx:transaction-cost-analysis:assigned}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=4.4cm,xlabel={\small urgent minus patient (ticks a share)},xmin=-0.5,xmax=5.5,ymin=0.4,ymax=3.6,
+  ytick={1,2,3},yticklabels={{truth (both algorithms)},{adjusted},{raw}},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[omDef,only marks,mark=*,mark size=2.4pt,error bars/.cd,x dir=both,x explicit]
+  table[x=est,y=y,x error plus expr=\thisrow{hi}-\thisrow{est},x error minus expr=\thisrow{est}-\thisrow{lo}]{figdata/microstructure/19-transaction-cost-analysis/estimates.csv};
+\addplot[black,dashed] coordinates {(0,0.4) (0,3.6)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost difference between the two algorithms with 95\% intervals: raw on the desk's log, adjusted for difficulty on the same log, and the
+truth from working every order with both. Data: \texttt{mx\_tca.study}.}\label{fig:mx:transaction-cost-analysis:estimates}
+\end{omfigure}
+
+The adjusted difference is 2.00 ticks, with a 95\% interval from 0.32 to 3.68 (\cref{fig:mx:transaction-cost-analysis:estimates}): the adjustment
+removes most of the bias (3.36 raw against 1.89 true) and the interval covers the truth, but it is wide, because 200 orders with a cost standard
+deviation of five or six ticks do not pin down a two-tick difference. Measured against the pre-trade model instead, the patient algorithm's orders
+cost 0.77 ticks less than predicted (standard error 0.56) and the urgent one's 1.50 more (0.46): the same conclusion, with the model's own error on top.
+Anand, Irvine, Puckett and Venkataraman (2012) found in institutional trade data that trading desks sustain their relative performance from one
+period to the next; Frazzini, Israel and Moskowitz (2018), on a large manager's live executions, found real trading costs an order of magnitude
+smaller than earlier studies suggested. Both needed difficulty adjustment of this kind before any comparison.
+
+\begin{dated}{2026-09}{Best-execution reports in Europe}\label{dat:mx:transaction-cost-analysis:rts}
+MiFID II required execution venues to publish execution-quality reports (``RTS~27'') and investment firms to publish their top five venues each year
+(``RTS~28''). Directive (EU) 2021/338 suspended the venues' periodic reports until 28 February 2023. Directive (EU) 2024/790 of 28 February 2024, noting
+that the reports were rarely read and did not allow meaningful comparisons, deleted the top-five-venue report and replaced the execution-quality report
+with a duty to tell each client where its order was executed; member states had until 29 September 2025 to transpose it. In the United Kingdom the
+FCA removed both reports from 1 December 2021 (policy statement PS21/20).
+\end{dated}
+
+\section{Closing the loop}
+
+TCA pays for itself when it changes what the desk does. The loop here fits the cost on the algorithm and its interaction with difficulty on the first
+50 days of the desk's log, and routes each order of the last 50 days to the algorithm with the lower prediction. The model sends every order to the
+patient algorithm; scored with the truth, that costs 2.17 ticks a share on those days, against 3.24 for the desk's routing and 3.88 for sending
+everything to the urgent algorithm. The urgent algorithm's lower dispersion is the reason a desk might still choose it: a manager who penalises the
+variance of cost enough (exercise~6) pays the 1.9 ticks gladly. The comparison of algorithms by experiment rather than by regression, with orders
+assigned at random, is chapter~20's algo wheel; the refinements of A/B testing (One Quant Book 7, chapter~21, including variance reduction by CUPED)
+apply directly.
+
+\section{Tutorial: analysing an order log}\label{tut:mx:transaction-cost-analysis:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Generate a parent-order log in the simulated market, run TCA against every benchmark, attribute the shortfall, fit and test a pre-trade
+model, and compare two algorithms with and without difficulty adjustment against the truth.
+\textbf{End state:} \cref{tab:mx:transaction-cost-analysis:benchmarks}, \cref{fig:mx:transaction-cost-analysis:calibration,fig:mx:transaction-cost-analysis:attribution,fig:mx:transaction-cost-analysis:estimates}
+and the numbers of sections 4 and 5.
+\begin{tutsteps}
+\item \textbf{Log.} \texttt{mx\_tca.conditions(d)}, \texttt{orders(d)}, \texttt{day\_runs(d)} (the day without orders, patient, urgent),
+\texttt{log()}.
+\item \textbf{Measure.} \texttt{firm\_tca.attribute}, \texttt{benchmarks}, \texttt{reversion}.
+\item \textbf{Pre-trade.} \texttt{fit\_pretrade}, \texttt{pretrade}.
+\item \textbf{Compare.} \texttt{assigned(r)}, \texttt{adjusted\_difference}, \texttt{peer\_compare}; \texttt{study()}; draw with \texttt{fig\_tca.py}.
+\end{tutsteps}
+\textbf{What to change next.} Give some orders information (a price drift in their direction) and watch reversion turn into continuation; route at
+random and see the adjustment become unnecessary; add a third algorithm.
+\end{tutorial}
+
+\section{Build: transaction-cost analysis}\label{bld:mx:transaction-cost-analysis:tca}
+
+\begin{build}
+\bfield{Purpose} The measurement layer behind the algo wheel of chapter~20, the \omterm{def:mx:benchmark-algorithms:algo}{execution algorithm} of chapter~28 and the desk's reports.
+\bfield{Interface} \texttt{attribute(side, target, decision, arrival, fills, mid, cf\_mid, end, t\_arrival)}, \texttt{benchmarks(side, fills, arrival,
+window, day, close)}, \texttt{reversion(side, t\_end, mid, horizons)}, \texttt{pretrade(half\_spread, eta, sigma, participation)},
+\texttt{fit\_pretrade}, \texttt{cluster\_ols(y, X, clusters)}, \texttt{adjusted\_difference(cost, treat, controls, clusters)},
+\texttt{peer\_compare(cost, predicted, groups, clusters)}.
+\bfield{Rules} Costs positive when paid; attribution per share of target (opportunity counts), benchmarks per filled share; the mid just before each
+fill; clustered errors by the unit that shares a market (the day).
+\bfield{Acceptance tests} \texttt{code/firm/tca/tests/}: the attribution on a hand example, adding up to Book~7's shortfall; benchmarks and reversion;
+the clustered adjustment recovers a planted effect that the raw difference overstates; the peer comparison.
+\bfield{Stretch} Attribution without a counterfactual (impact from the pre-trade model); peer universes by size and liquidity bucket.
+\end{build}
+
+\begin{omsources}
+\item A.~F.~Perold, ``The implementation shortfall: paper versus reality'', \emph{Journal of Portfolio Management} 14(3), 1988.
+\item A.~Anand, P.~Irvine, A.~Puckett and K.~Venkataraman, ``Performance of institutional trading desks: an analysis of persistence in trading
+costs'', \emph{Review of Financial Studies} 25(2), 2012.
+\item R.~Kissell, \emph{The Science of Algorithmic Trading and Portfolio Management}, Academic Press, 2014.
+\item A.~Frazzini, R.~Israel and T.~J.~Moskowitz, ``Trading costs'', working paper, SSRN 3229719, 2018.
+\item Directive (EU) 2021/338 and Directive (EU) 2024/790 amending Directive 2014/65/EU (MiFID II); FCA, PS21/20, 2021.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:mx:transaction-cost-analysis:1}
+A buy of 1,000 shares is decided at 100.00 and arrives at 100.02; 800 shares fill at an average of 100.05, the price ends at 100.10, and fees are 0.3
+cents a share. Compute the delay, execution, opportunity and fee costs and the shortfall per share of target.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:transaction-cost-analysis:2}
+The same order's interval VWAP was 100.06. What does the VWAP report say, and what does the arrival report say?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:transaction-cost-analysis:3}
+With the fitted model ($-0.5$ tick of spread, $\eta=1.04$), what is the pre-trade estimate for an order at 10\% participation in the middle regime
+($\sigma=10.0$ ticks)?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:transaction-cost-analysis:4}
+Why is the raw difference between the algorithms in the desk's log larger than the truth?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:transaction-cost-analysis:5}
+Why is the patient algorithm's reversion larger than the urgent one's, when it trades more gently?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:transaction-cost-analysis:6}
+A manager minimises expected cost plus $\lambda$ times its variance (per share, in ticks). Above what $\lambda$ does the urgent algorithm's lower
+standard deviation justify its higher mean?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:transaction-cost-analysis:7}
+\emph{Coding.} Adjust the comparison for participation only. What difference and interval do you get, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:transaction-cost-analysis:8}
+\emph{Find the flaw.} ``The patient algorithm beat the VWAP by 0.3 ticks on average, so its orders cost our clients nothing.''
+\end{exercise}
+
+\section{Problem: Bad Broker or Hard Day?}
+
+\begin{problem}[{Weekend problem --- bad broker or hard day?}]\label{pb:mx:transaction-cost-analysis:1}
+A desk's TCA report says the urgent algorithm costs 3.4 ticks a share more than the patient one. The broker behind it says its orders were harder.
+
+\medskip\noindent\textbf{Part I --- Benchmarks.}
+\begin{enumerate}
+\item Define the four benchmarks of the chapter.
+\item Give each algorithm's slippage against them.
+\item Why does the patient algorithm beat its interval VWAP?
+\item Which benchmark answers ``what did the order cost the fund'', and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Estimates and attribution.}
+\begin{enumerate}[resume]
+\item State the pre-trade model and its fitted coefficient.
+\item How well does it predict out of sample, on average and order by order?
+\item Write the attribution and show it adds up to the implementation shortfall.
+\item Give the attribution of each algorithm.
+\item What does the reversion after the last fill say?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The comparison.}
+\begin{enumerate}[resume]
+\item Describe the desk's routing and the orders each algorithm received.
+\item Give the raw difference and its standard error.
+\item Write the adjusted regression and explain the clustering.
+\item \emph{State the named result}: the difficulty-adjusted cost difference between the two algorithms with its confidence interval, against the
+raw difference.
+\item How does it compare with the truth, and why can a real desk not see the truth?
+\item What does the comparison against the pre-trade model give?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- Closing the loop.}
+\begin{enumerate}[resume]
+\item What routing does the fitted model recommend, and what does it save?
+\item Why might a manager still choose the urgent algorithm?
+\item How would randomised routing change the analysis?
+\item Bad broker or hard day: what do you answer?
+\item In one sentence: what makes two execution costs comparable?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:transaction-cost-analysis:1}
+Your order beat VWAP but cost 20 basis points against arrival. Explain both numbers to the portfolio manager.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:transaction-cost-analysis:2}
+How would you split an order's slippage into spread, impact and timing without a counterfactual?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:mx:transaction-cost-analysis:3}
+Two brokers' average costs differ by 3 basis points. What do you need before concluding that one is better?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:mx:transaction-cost-analysis:4}
+What does \omterm{def:mx:transaction-cost-analysis:reversion}{post-trade reversion} tell you, and how would you use it to detect \omterm{def:mx:dark-pools-and-blocks:leakage}{information leakage}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:mx:transaction-cost-analysis:5}
+Design the data a TCA system must capture for each parent and \omterm{def:mx:the-almgren-chriss-framework:parent}{child order}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{bank}]\label{iq:mx:transaction-cost-analysis:6}
+A client's TCA vendor ranks your algorithms last in its peer universe. How do you examine the claim?
+\end{interviewq}

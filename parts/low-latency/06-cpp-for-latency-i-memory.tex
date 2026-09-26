@@ -1,0 +1,310 @@
+\chapter{C++ for Latency I: Memory}\label{ch:ll:cpp-for-latency-i-memory}
+
+Writing one byte to a page of memory that has just been mapped cost this book's laptop about \qty{1.3}{\micro\second};
+writing the same byte to the same page a second time cost \qty{30}{\nano\second}. The first write went to the kernel,
+which found a free physical page, zeroed it and installed it in the page tables; the second was an ordinary store. A
+trading process that asks the heap for memory while it handles a message may, now and then, take that path, or several
+others inside the allocator that are fast on average and slow once in a while. This chapter is about memory in C++ on
+the hot path: how objects are laid out, what an allocation costs and when, and the arenas, pools and \omterm{def:ll:cpp-for-latency-i-memory:sbo}{fixed-capacity
+containers} that let the hot path run without allocating at all.
+
+\section{Object layout, padding and alignment}
+
+\begin{definition}[Structure padding]\label{def:ll:cpp-for-latency-i-memory:padding}
+Every scalar type has an alignment, equal to its size on x86-64 (a \texttt{double} starts at a multiple of 8). The
+compiler lays out a structure's fields in declaration order and inserts \emph{structure padding}\index{structure
+padding}, unused bytes, before any field that would otherwise be misaligned and at the end, so that the structure's size
+is a multiple of its largest alignment.
+\end{definition}
+
+\begin{example}[Ordering fields]\label{ex:ll:cpp-for-latency-i-memory:layout}
+An order written as a first draft declares a \texttt{char} side, a \texttt{double} price, a \texttt{char} flag, a 64-bit
+id, a 32-bit quantity and a \texttt{char} time in force: 23 bytes of data in 40 bytes, 17 of them padding. Ordered by size
+(id, price, quantity, then the three characters) the same fields take 24 bytes: eight orders occupy three 64-byte \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines}
+instead of five. The compiler will not reorder fields itself: the order is part of the type's interface.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=0.17cm,y=1cm]
+\newcommand{\fld}[4]{\draw[fill=#4] (#1,#3) rectangle (#1+#2,#3+0.55);}
+\node[anchor=east] at (-1,0.28) {first draft (40 bytes)};
+\fld{0}{1}{0}{omDef!45}\fld{1}{7}{0}{gray!15}\fld{8}{8}{0}{omDef!45}\fld{16}{1}{0}{omDef!45}\fld{17}{7}{0}{gray!15}
+\fld{24}{8}{0}{omDef!45}\fld{32}{4}{0}{omDef!45}\fld{36}{1}{0}{omDef!45}\fld{37}{3}{0}{gray!15}
+\node at (4,0.28) {pad}; \node at (12,0.28) {price}; \node at (20.5,0.28) {pad}; \node at (28,0.28) {id}; \node at (34,0.28) {qty};
+\node[anchor=east] at (-1,-0.72) {by size (24 bytes)};
+\fld{0}{8}{-1}{omMeth!40}\fld{8}{8}{-1}{omMeth!40}\fld{16}{4}{-1}{omMeth!40}\fld{20}{3}{-1}{omMeth!40}\fld{23}{1}{-1}{gray!15}
+\node at (4,-0.72) {id}; \node at (12,-0.72) {price}; \node at (18,-0.72) {qty};
+\foreach \x in {0,8,16,24,32,40,48,56,64} {\draw[gray] (\x,-1.25) -- (\x,-1.1); \node[below,font=\scriptsize] at (\x,-1.2) {\x};}
+\draw[omThm,dashed] (64,-1.1) -- (64,0.7);
+\node[omThm,anchor=south,font=\scriptsize] at (64,0.7) {end of a 64-byte line};
+\end{tikzpicture}
+
+\omcaption{The order of \cref{ex:ll:cpp-for-latency-i-memory:layout} laid out byte by byte: the first draft carries 17
+bytes of padding (grey) in 40; the same fields sorted by size need 24, with the side, flag and time in force in the three
+bytes after the quantity.}\label{fig:ll:cpp-for-latency-i-memory:layout}
+\end{omfigure}
+
+Three further rules. Put the fields the hot path reads together at the start of the structure, so that one line serves the
+common case, and move the rest (text, audit fields) to a separate structure. Align structures written by different threads
+to separate \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} (chapter~3). And prefer indices into arrays to pointers in hot structures: a 32-bit index is half a
+pointer and survives a relocation of the array.
+
+\section{What an allocation costs, and when}
+
+\texttt{new} and \texttt{malloc} are fast on average. The GNU C library's allocator keeps small freed blocks in per-thread
+caches and hands them back in a few tens of nanoseconds. It also, occasionally, does much more: it consolidates free
+blocks, grows the heap with a system call, maps large blocks directly from the kernel (by default at 128~KiB and above, a
+threshold it adjusts as the program runs), returns memory to the kernel when the top of the heap is free (by default beyond
+128~KiB), and every new page it touches costs a \omterm{def:ll:cpp-for-latency-i-memory:fault}{page fault}.
+
+\begin{definition}[Page fault, pre-faulting]\label{def:ll:cpp-for-latency-i-memory:fault}
+A \emph{page fault}\index{page fault} is the processor's trap into the kernel when a program touches a virtual page that
+is not yet backed by physical memory (a minor fault: the kernel allocates and zeroes a page) or whose contents are on disk
+(a major fault). \emph{Pre-faulting}\index{pre-faulting} is touching every page of a buffer at start-up, so that no fault
+happens later on the hot path.
+\end{definition}
+
+\Cref{fig:ll:cpp-for-latency-i-memory:faults} measures both costs. Replacing one of 10\,000 live 64-byte orders at random
+costs a new-and-delete pair about \qty{25}{\nano\second} at the median, a pool slightly less, and both reach tens of
+microseconds at their maximum, where the thread was interrupted. The first write to each page of a fresh 64~MiB mapping
+costs over a microsecond a page: 16\,384 faults, forty times the cost of the same writes once the pages exist. A hot path
+that allocates is exposed to the allocator's slow paths and to faults on memory it has not touched; one that does not
+allocate is exposed to neither.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=churn,width=7.2cm,height=5.4cm,ybar,bar width=5pt,ymode=log,log origin y=infty,ymin=5,ymax=200000,
+  symbolic x coords={new/delete,pool,pmr pool},xtick=data,enlarge x limits=0.3,title={\small replacing one order},
+  ylabel={ns (log scale)},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(1.15,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=allocator,y=p50]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=allocator,y=p99]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=allocator,y=p999]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=gray!40,draw=gray] table[x=allocator,y=max]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\begin{axis}[at={(churn.east)},anchor=west,xshift=2.1cm,width=5.2cm,height=5.4cm,ybar,bar width=14pt,ymode=log,log origin y=infty,
+  ymin=5,ymax=5000,symbolic x coords={first touch,pre-faulted},xtick=data,enlarge x limits=0.5,title={\small writing a page},
+  ylabel={ns per page (log scale)},tick label style={font=\footnotesize},label style={font=\small},grid=major,
+  grid style={gray!25},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=kind,y=ns_per_page]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_faults.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Left: destroying and creating one of 10\,000 live 64-byte orders at random with the C++ heap, the build's pool
+and the standard library's pool resource (400\,000 replacements). Right: the first write to each 4~KiB page of a fresh
+64~MiB mapping, and to the same pages once written. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no
+isolated cores, pinned to one CPU. Data: \texttt{bench\_alloc.py}.}\label{fig:ll:cpp-for-latency-i-memory:faults}
+\end{omfigure}
+
+\section{Arenas, pools and free lists}
+
+\begin{definition}[Arena allocator]\label{def:ll:cpp-for-latency-i-memory:arena}
+An \emph{arena allocator}\index{arena allocator} hands out consecutive pieces of one pre-allocated block by advancing an
+offset, and frees them all at once by resetting it; individual objects are never freed.
+\end{definition}
+
+\begin{definition}[Object pool, free list]\label{def:ll:cpp-for-latency-i-memory:pool}
+An \emph{object pool}\index{object pool} pre-allocates storage for a fixed number of objects of one type and recycles it:
+creating takes a free slot, destroying returns it. A \emph{free list}\index{free list} is the list of free slots; an
+intrusive free list stores its links inside the free slots themselves, so it needs no memory of its own.
+\end{definition}
+
+An arena suits memory whose lifetime is a phase: the scratch space of one message, rebuilt for the next; the parsed fields
+of a batch. A pool suits objects of one type with independent lifetimes: orders, which are created and cancelled in any
+order. Both have fixed capacity decided in advance, and the design question they force is the right one: what happens when
+it runs out. On the hot path the answer is never ``ask the heap''; it is to refuse (reject the order, drop to a degraded
+mode) and raise an alarm, and to size the pool from the measured peak with a margin.
+
+The standard library has the same ideas as memory resources (\texttt{std::pmr}, since C++17): a monotonic buffer resource
+is an arena, a pool resource keeps \omterm{def:ll:cpp-for-latency-i-memory:pool}{free lists} by size. They let standard containers use them, at the price of an indirect
+call per allocation; the general-purpose pool of \cref{fig:ll:cpp-for-latency-i-memory:faults} is slower than a pool for one
+type.
+
+\section{Small buffers and fixed-capacity containers}
+
+\begin{definition}[Small-buffer optimisation, fixed-capacity container]\label{def:ll:cpp-for-latency-i-memory:sbo}
+A type with a \emph{small-buffer optimisation}\index{small-buffer optimisation} stores small contents inside the object and
+allocates only for large ones: the GNU implementation of \texttt{std::string} holds up to 15 characters inline. A
+\emph{fixed-capacity container}\index{fixed-capacity container} always stores its elements inside the object, up to a
+capacity fixed at compile time, and refuses to grow beyond it.
+\end{definition}
+
+The \omterm{def:ll:cpp-for-latency-i-memory:sbo}{small-buffer optimisation} makes allocation depend on the data: a symbol of four letters does not allocate, a client
+order identifier of 22 characters does, and a test with short identifiers will not see it. The handler of
+\cref{lst:ll:cpp-for-latency-i-memory:naive} is typical of first drafts. Counted with a replaced global \texttt{operator
+new}, it allocates nine times per message: one for the long identifier, three as the vector of fills grows to three, two
+for the new map entry (the tree node and its copy of the identifier), one when the lambda copies the fills, and two when
+\texttt{std::function} stores the lambda on the heap and copies it. The rewrite with a fixed string, a fixed vector of
+fills and a fixed table of entries does the same work with none.
+
+\begin{method}[Removing allocation from a hot path]\label{met:ll:cpp-for-latency-i-memory:remove}
+\begin{enumerate}
+\item Count: replace the global \texttt{operator new} in a test build and assert the count per message after warm-up.
+\item For each allocation, decide the capacity: identifiers and symbols in fixed strings, per-message lists in fixed
+vectors, objects with lifetimes in pools, per-message scratch in an arena reset per message.
+\item Replace type-erased callables that allocate (\texttt{std::function} with large captures) by templates (chapter~7) or
+function pointers with a context.
+\item Allocate and touch every pool, arena and table at start-up, on the thread that will use it (chapter~4).
+\item Keep the assertion in the tests, so that a later change that allocates fails the build.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: counting and removing allocations}\label{tut:ll:cpp-for-latency-i-memory:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Count the allocations of a message handler, remove them, and measure what allocation and \omterm{def:ll:cpp-for-latency-i-memory:fault}{page faults} cost.
+\textbf{End state:} a handler with zero allocations per message after warm-up, and
+\cref{fig:ll:cpp-for-latency-i-memory:faults}.
+\begin{tutsteps}
+\item \textbf{The first draft.} Strings, a vector that grows, a map, a callback.
+\omcode{code/low-latency/06-cpp-for-latency-i-memory/cpp/ll_alloc.hpp}{22}{35}{A message handler that allocates nine times per message.}\label{lst:ll:cpp-for-latency-i-memory:naive}
+\item \textbf{Count.} \texttt{firm\_alloc\_count.hpp} replaces the global \texttt{operator new} with one that increments an
+atomic counter; the test handles a message, reads the counter, and asserts 9 for the draft and 0 for the rewrite.
+\item \textbf{A pool with an intrusive \omterm{def:ll:cpp-for-latency-i-memory:pool}{free list}.} Each free slot holds the pointer to the next free slot; creating pops
+the list, destroying pushes.
+\omcode{code/firm/arena/cpp/firm_arena.hpp}{45}{80}{The object pool.}\label{lst:ll:cpp-for-latency-i-memory:pool}
+\item \textbf{The same guarantee in Rust.} A counting global allocator (\texttt{firm\_arena::CountingAlloc}) installed
+in the test binary asserts that the pool's operations allocate nothing.
+\item \textbf{Measure} with \texttt{python bench\_alloc.py}: allocator churn and \omterm{def:ll:cpp-for-latency-i-memory:fault}{page faults}.
+\end{tutsteps}
+\textbf{What to change next.} Shorten the client identifier to 15 characters and count again; make the pool's slots
+cache-line aligned and compare the churn percentiles.
+\end{tutorial}
+
+\section{Build: the allocation-free toolkit}\label{bld:ll:cpp-for-latency-i-memory:arena}
+
+\begin{build}
+\bfield{Purpose} The storage every hot-path component of Part~IV uses (the order pool of the book builder, the gateway's
+order states, per-message scratch), and the allocation counter every acceptance test asserts with.
+\bfield{Interface} C++20 \texttt{firm::arena}: \texttt{Arena(bytes)} with \texttt{allocate(n, align)}, \texttt{make<T>},
+\texttt{reset}; \texttt{Pool<T, N>} with \texttt{create}, \texttt{destroy}, \texttt{live}; \texttt{FixedVector<T, N>};
+\texttt{FixedString<N>}; \texttt{firm\_alloc\_count.hpp} with \texttt{allocations()}. Rust \texttt{firm\_arena}:
+\texttt{Arena} (offsets), \texttt{Pool<T>} (indices), \texttt{CountingAlloc} and \texttt{allocations()}.
+\bfield{Rules} Capacities are fixed at construction; exhaustion returns a null result, never a heap allocation; storage is
+pre-faulted at construction; no operation after construction allocates.
+\bfield{Acceptance tests} \texttt{code/firm/arena/}: aligned bumps, refusal when full and reset; the pool's reuse order and
+exhaustion; fixed strings; zero allocations counted around all of it, in C++20 and Rust.
+\bfield{Stretch} A pool whose slots are aligned to \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines} for objects written by different threads; an arena that
+records its high-water mark for sizing.
+\end{build}
+
+\begin{omsources}
+\item Linux man page \texttt{mallopt(3)}: \texttt{M\_MMAP\_THRESHOLD}, \texttt{M\_TRIM\_THRESHOLD}.
+\item cppreference, ``\texttt{std::pmr::memory\_resource}'' and its derived resources.
+\item C.~Cook, ``When a microsecond is an eternity'', CppCon 2017 (reusing memory on the hot path).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:1}
+What are the size and padding of a structure holding, in this order, a \texttt{char}, an \texttt{int32}, a \texttt{char},
+a \texttt{double} and an \texttt{int16}? And with the fields sorted by size?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:2}
+A pool of 50\,000 orders of 64 bytes: how much memory, and how many 4~KiB pages must be pre-faulted?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:3}
+At the measured cost per page, how long does touching a fresh 512~MiB buffer take at start-up, and what would it cost if
+it happened on the hot path instead, a page at a time?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:4}
+Which of these allocate with the GNU standard library: \texttt{std::string s(\textquotedbl{}AAPL\textquotedbl{})};
+\texttt{std::string s(\textquotedbl{}CLIENT-ORDER-ID-42\textquotedbl{})}; \texttt{std::vector<int> v; v.reserve(0)};
+\texttt{std::vector<int> v(1)}?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:5}
+The draft handler allocates nine times per message. Which three changes remove the most allocations, and how many does each
+remove?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:6}
+Read \cref{fig:ll:cpp-for-latency-i-memory:faults}: at the median the heap is almost as fast as the pool. Why use a pool
+at all?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-i-memory:7}
+\emph{Coding.} Give \texttt{firm::arena::Pool} a capacity check that records the high-water mark of live objects, run the
+churn benchmark with it, and propose a sizing rule for a pool whose peak is measured over a year of busy days.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-i-memory:8}
+\emph{Find the flaw.} ``Our handler allocates nothing: we checked it with a test that sends the same message, symbol
+\texttt{ESZ6} and client id \texttt{A1}, a million times.''
+\end{exercise}
+
+\section{Problem: Four Hundred Microseconds, Once a Minute}
+
+\begin{problem}[{Weekend problem --- a handler that allocated}]\label{pb:ll:cpp-for-latency-i-memory:1}
+A strategy's handler takes about \qty{2}{\micro\second} a message, except once or twice a minute when it takes several
+hundred. The team suspects memory. The handler is the draft of \cref{lst:ll:cpp-for-latency-i-memory:naive}, fed 50\,000
+messages a second.
+
+\medskip\noindent\textbf{Part I --- Counting.}
+\begin{enumerate}
+\item How many allocations a second does the draft make?
+\item List the nine allocations of one message and the line that makes each.
+\item Which of them would disappear with an identifier of 15 characters or fewer?
+\item Why does the count not depend on how many fills a message has, beyond three?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The costs.}
+\begin{enumerate}[resume]
+\item From \cref{fig:ll:cpp-for-latency-i-memory:faults}, what does a pair of heap operations cost at the median?
+\item How much time a second do the draft's allocations cost at that median?
+\item What does a \omterm{def:ll:cpp-for-latency-i-memory:fault}{page fault} cost, and how many would put a message at several hundred microseconds?
+\item Name three events inside the allocator that are rare but slow.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The rewrite.}
+\begin{enumerate}[resume]
+\item What replaces each allocation in the fixed handler?
+\item What capacities did the rewrite choose, and what happens when one is exceeded?
+\item Why must the fixed handler's storage be touched at start-up, and by which thread?
+\item What does the rewrite's linear search over 64 entries cost, and when would it need a hash table instead?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: allocations per message before and after the rewrite, and the cost of a \omterm{def:ll:cpp-for-latency-i-memory:fault}{page fault}
+against a pre-faulted write on this laptop.
+\item How does the test keep the result from regressing?
+\item What else, besides allocation, can make one message in a minute slow?
+\item How would you show which cause it was on the production host?
+\item Why is ``refuse when full'' acceptable on the hot path, and ``allocate when full'' not?
+\item Where does the Rust twin enforce the same rule?
+\item What should the pool's size be if the peak of live orders in a year was 38\,000?
+\item In one sentence: what is the memory rule of a hot path?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:1}
+Why can reordering the fields of a structure make a program faster?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:2}
+Why do low-latency systems avoid heap allocation on the hot path, if \texttt{malloc} takes 20 nanoseconds?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:3}
+Implement an \omterm{def:ll:cpp-for-latency-i-memory:pool}{object pool} for a fixed-size type. What happens when it is empty?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:4}
+What is the small-string optimisation, and why can it hide allocations from a test?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:5}
+What is a \omterm{def:ll:cpp-for-latency-i-memory:fault}{page fault}, and how do you keep them off a hot path?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:cpp-for-latency-i-memory:6}
+How would you prove, in continuous integration, that a component never allocates after start-up?
+\end{interviewq}

@@ -1,0 +1,392 @@
+\chapter{Protocols II: Binary Exchange Protocols}\label{ch:ll:protocols-ii-binary-exchange-protocols}
+
+A futures exchange sends every packet of its market data twice, over two separate networks, as binary messages at fixed
+offsets that a program reads without parsing. CME Group's documentation tells its clients to ``process both the Incremental
+Feed A and Incremental Feed B due to the unreliable nature of UDP transport'', to keep each sequence number from whichever
+line brings it first, and to treat a sequence number that neither brought as a loss on both lines, which calls for
+recovery. The feed handler's first job is therefore not to understand the market but to keep the first copy of everything
+and forget the second. This chapter reads the binary protocols of the exchange simulator of One Quant Book~10, which follow
+the public Nasdaq specifications: order-by-order messages at fixed offsets, packets that carry sequence numbers over
+\omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast}, snapshot and retransmission channels for recovery, and order entry over a sequenced session. It generates the
+codecs from a schema instead of writing them by hand, arbitrates two lossy lines, and measures what decoding costs.
+
+\section{Order-by-order feeds and their messages}
+
+A venue's direct feed (One Quant Book~1, chapter~9) publishes every event of its book: an order added, executed, reduced,
+deleted, replaced, a trade against hidden liquidity, an auction's cross. This is the market-by-order view of One Quant
+Book~1, chapter~19, from which a subscriber rebuilds the book to any depth. Nasdaq's TotalView-ITCH is the model the
+simulator follows: each message starts with a one-byte type, then fields at fixed offsets, with ``all integer fields \dots\
+big endian (network byte order)''. An Add Order is 36 bytes: the type at offset 0, a two-byte stock locate code at 1 (a small
+integer ``employed with the intent of serving as an array index''), a tracking number at 3, a six-byte timestamp in
+nanoseconds since midnight at 5, the order reference at 11, the side at 19, the shares at 20, the symbol at 24 and the price
+at 32, an integer in ten-thousandths (\cref{fig:ll:protocols-ii-binary-exchange-protocols:layout}). Nothing needs to be
+searched: the price of an Add Order is always the four bytes at offset 32.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,b/.style={draw=gray!70,minimum height=0.55cm,inner sep=1pt,anchor=west,align=center}]
+\def\u{0.33}
+\node[anchor=west,font=\footnotesize\bfseries] at (0,1.0) {MoldUDP64 packet};
+\node[b,fill=gray!12,minimum width=10*\u cm] (s) at (0,0.35) {session (10)};
+\node[b,fill=omDef!25,minimum width=8*\u cm] (q) at (s.east) {sequence number (8)};
+\node[b,fill=omDef!12,minimum width=2*\u cm] (c) at (q.east) {count};
+\node[b,fill=gray!12,minimum width=2*\u cm] (l) at (c.east) {len};
+\node[b,fill=omThm!15,minimum width=7*\u cm] (m) at (l.east) {message 1};
+\node[b,fill=gray!12,minimum width=2*\u cm] (l2) at (m.east) {len};
+\node[anchor=west,font=\footnotesize\bfseries] at (0,-0.55) {Add Order message (36 bytes)};
+\foreach \w/\c/\t [count=\k] in {1/omThm!35/A,2/gray!12/loc,2/gray!12/trk,6/omMeth!20/time (ns),8/omDef!20/reference,
+  1/omThm!35/B,4/omMeth!20/shares,8/gray!12/stock,4/omDef!20/price} {
+  \ifnum\k=1 \node[b,fill=\c,minimum width=\w*\u cm,font=\tiny] (f\k) at (0,-1.2) {\t};
+  \else \pgfmathtruncatemacro{\j}{\k-1}\node[b,fill=\c,minimum width=\w*\u cm,font=\tiny] (f\k) at (f\j.east) {\t}; \fi
+}
+\foreach \k/\o in {1/0,2/1,3/3,4/5,5/11,6/19,7/20,8/24,9/32} {
+  \node[font=\tiny,anchor=north] at ([yshift=-0.02cm]f\k.south west) {\o};
+}
+\node[font=\tiny,anchor=north] at ([yshift=-0.02cm]f9.south east) {36};
+\node[anchor=west,font=\scriptsize] at (0,-2.2) {byte offsets below each field; integers big-endian; price in 1/10\,000};
+\end{tikzpicture}
+
+\omcaption{A MoldUDP64 packet (session, the sequence number of its first message, a message count, then length-prefixed
+message blocks) and the 36-byte Add Order message it carries, with the byte offset of each field. The layout is the one of
+Nasdaq's specifications, which the simulator of One Quant Book~10 follows.}\label{fig:ll:protocols-ii-binary-exchange-protocols:layout}
+\end{omfigure}
+
+\begin{definition}[Flyweight codec]\label{def:ll:protocols-ii-binary-exchange-protocols:flyweight}
+A \emph{flyweight codec}\index{flyweight codec} reads and writes a message in place: a small object that holds only a
+pointer to the message's bytes and decodes a field from its fixed offset when the field is asked for, so that decoding a
+message copies nothing and costs nothing for the fields not read.
+\end{definition}
+
+The build generates one flyweight per message from Book~10's machine-readable schema, a reader and a writer, and a dispatcher
+that calls a visitor with the right type for a message's first byte (\cref{lst:ll:protocols-ii-binary-exchange-protocols:flyweight}).
+Book~1's decoder of chapter~28 did the opposite: it copied every message into a common structure and called a
+\texttt{std::function} for it. Both are correct; \cref{fig:ll:protocols-ii-binary-exchange-protocols:decode} measures the
+difference.
+
+\omcode{code/firm/wirecodec/cpp/firm_wirecodec.hpp}{39}{51}{The generated flyweight of the Add Order message: a pointer, and
+a byte swap at a fixed offset for each field read.}\label{lst:ll:protocols-ii-binary-exchange-protocols:flyweight}
+
+\section{Packets, sequence numbers and multicast}
+
+\begin{definition}[Multicast, message gap]\label{def:ll:protocols-ii-binary-exchange-protocols:multicast}
+\emph{Multicast}\index{multicast} is IP delivery of one packet to every host that has joined a group address: the sender
+transmits once, and the network copies the packet towards each subscriber. A \emph{message gap}\index{message gap} is a range
+of sequence numbers that a receiver has not received when a later one arrives.
+\end{definition}
+
+Market data is published over UDP \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast} because one packet then reaches every subscriber at the same time, whatever their
+number: MoldUDP64, the packet protocol of the simulator's feed, is described by its specification as a ``lightweight
+protocol layer built on top of UDP'' in which ``each outbound packet is transmitted only once regardless of the number of
+listeners''. UDP delivers without acknowledgement, retransmission or ordering, so the protocol above it carries what the
+receiver needs to notice a loss: each packet's header gives the sequence number of its first message and the number of
+messages it carries (\cref{fig:ll:protocols-ii-binary-exchange-protocols:layout}). A packet whose first number is above the
+next expected one reveals a gap of the difference. When there is no data, the publisher sends \omterm{def:ll:protocols-i-fix:session}{heartbeats}, packets with a count
+of zero carrying the next sequence number, ``typically \dots\ once per second'', so that a loss is noticed even in a quiet
+market; a count of 65\,535 marks the end of the session. The sequence numbers are those of One Quant Book~1, chapter~28, on a
+wire.
+
+\section{Incremental and snapshot channels, retransmission and recovery}
+
+\begin{definition}[Incremental channel, snapshot channel]\label{def:ll:protocols-ii-binary-exchange-protocols:channels}
+An \emph{incremental channel}\index{incremental channel} carries the feed's messages, each a change to the book, in sequence.
+A \emph{snapshot channel}\index{snapshot channel} publishes, at a regular interval, the full state of each instrument's book
+together with the incremental sequence number it reflects, so that a receiver that has lost messages, or just started, can
+rebuild the book without replaying the day.
+\end{definition}
+
+A gap leaves the receiver two ways back. Retransmission asks a server for the missing sequence numbers: MoldUDP64 has a
+request packet for this, the simulator answers up to 1\,000 messages per request from a window of its last 100\,000, and a
+small gap is closed in a round trip. A gap beyond the window, or a receiver starting in the middle of the day, needs the
+\omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{snapshot channel}: the simulator publishes, for each instrument, a begin marker with the incremental sequence number the
+snapshot reflects, the trading state, every displayed order in priority order, and an end marker with a checksum. The
+receiver keeps buffering incremental messages, waits for the next snapshot, loads it, discards the buffered messages the
+snapshot already reflects and applies the rest (the snapshot-and-delta pattern of One Quant Book~3, chapter~26, and the
+snapshot recovery of One Quant Book~10, chapter~26). CME's snapshot messages carry the same synchronisation field,
+\emph{LastMsgSeqNumProcessed}, ``used to synchronize the snapshot loop with the real-time feed''. The recovery time is set
+by the snapshot interval, and \cref{prop:ll:protocols-ii-binary-exchange-protocols:both} says how often it is needed.
+
+\section{Arbitration of redundant lines}
+
+\begin{definition}[Line arbitration]\label{def:ll:protocols-ii-binary-exchange-protocols:arbitration}
+\emph{Line arbitration}\index{line arbitration} merges the identical packets of redundant feed lines (One Quant Book~10,
+chapter~26) into one stream: each sequence number is processed from whichever line delivers it first and discarded when the
+other line delivers it again, and a gap is declared only when a later sequence number arrives before any line has delivered
+the missing ones.
+\end{definition}
+
+\omcode{code/low-latency/16-protocols-ii-binary-exchange-protocols/cpp/ll_arb.hpp}{39}{57}{The arbiter: a duplicate is
+dropped, a jump forward is a gap lost on both lines, everything else is new.}\label{lst:ll:protocols-ii-binary-exchange-protocols:arb}
+
+Redundancy multiplies probabilities only when the lines fail independently, which is the point of sending them over separate
+networks, and the reason the simulator draws each line's losses from its own random stream.
+
+\begin{proposition}[Losing a packet on both lines]\label{prop:ll:protocols-ii-binary-exchange-protocols:both}
+Let each line lose a given packet with probability $p$, independently of the other, and let a common cause (a shared switch,
+the publisher itself) lose it on both with probability $c$, independently of the lines' own losses. The arbitrated stream
+loses the packet with probability $c + (1 - c)p^2$. If each line's losses follow a two-state Gilbert--Elliott process that
+moves from the good to the bad state with probability $g$ per packet, back with probability $h$, and loses a packet with
+probability $\ell$ in the bad state and none in the good one, the stationary loss rate of a line is $p = \ell\, g/(g+h)$.
+\end{proposition}
+
+\begin{proof}
+The packet is lost on the arbitrated stream if the common cause strikes, or if it does not and both lines lose it; the latter
+events are independent, with probability $p^2$. For the two-state chain, the stationary probability $\pi$ of the bad state
+balances the flows between states, $\pi h = (1-\pi) g$, so $\pi = g/(g+h)$, and a packet is lost with probability $\ell\pi$.
+\end{proof}
+
+Burstiness does not change a line's average loss rate, but it does change what a receiver sees: losses arrive in runs,
+several packets at once, too many for a quick retransmission at the worst moment. And a common cause, however rare, dominates:
+at $p = 10^{-4}$, independent losses on both lines cost $10^{-8}$ per packet, and a shared failure of $10^{-6}$ is a hundred
+times more.
+
+\Cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps} runs the arithmetic on the simulator. Sixty seconds of a busy
+instrument, about 32\,000 packets, with each line losing 0.1\% of packets independently plus Gilbert--Elliott bursts, and a
+60-millisecond outage on each line, the two overlapping by 25 milliseconds. Line A shows 56 gaps and 160 missing messages, line
+B 65 gaps and 186; the arbitrated stream shows two: the 17 messages published while both lines were out, and one packet lost on
+line B while line A was down.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=4.8cm,xmin=0,xmax=61,ymin=0.4,ymax=3.6,ytick={1,2,3},
+  yticklabels={arbitrated,line B,line A},xlabel={seconds after the open},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},
+  scatter/classes={1={omThm},2={omDef},3={omDef}},table/col sep=comma]
+\addplot[only marks,mark=|,mark size=4pt,omDef,thick] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_A.csv};
+\addplot[only marks,mark=|,mark size=4pt,omMeth,thick] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_B.csv};
+\addplot[only marks,mark=*,mark size=2.5pt,omThm] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_arb.csv};
+\draw[omThm,dashed] (axis cs:10.03,0.5) -- (axis cs:10.03,3.5);
+\node[anchor=west,font=\scriptsize,omThm] at (axis cs:10.6,1.35) {both lines out: 17 messages, and 1 more};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Gaps on each line and on the arbitrated stream over 60 seconds of the simulator's feed (about 32\,000 packets), with
+0.1\% independent loss per line, Gilbert--Elliott bursts, and outages of 60 milliseconds on each line overlapping by 25.
+Each mark is one gap. Data: \texttt{fig\_gaps.py} (deterministic: the simulator is seeded).}\label{fig:ll:protocols-ii-binary-exchange-protocols:gaps}
+\end{omfigure}
+
+Arbitration costs little: the build's arbiter handles a packet in about \qty{1.3}{\nano\second}, a comparison of two sequence
+numbers. What costs is the design around it: two network interfaces, two paths through two sets of switches, and a feed
+handler that reads both without letting one line's delay hold up the other (chapter~18).
+
+\begin{dated}{2026-09}{CME market data}\label{dat:ll:protocols-ii-binary-exchange-protocols:cme}
+CME Group's MDP~3.0 market data (client systems documentation, consulted September 2026) is sent on Incremental Feeds A and B
+over UDP, and CME ``strongly recommends that client systems process both''; any packet ``can arrive first on either feed''.
+Its messages use Simple Binary Encoding, little-endian, ``optimized for low latency of encoding and decoding''; recovery uses
+snapshot loops whose messages carry the last incremental sequence number processed.
+\end{dated}
+
+\section{Binary order entry and simple binary encoding}
+
+\begin{definition}[Simple binary encoding]\label{def:ll:protocols-ii-binary-exchange-protocols:sbe}
+\emph{Simple binary encoding}\index{simple binary encoding} (SBE) is the FIX Trading Community's standard for binary messages:
+fields of native binary types at fixed positions described by an XML message schema, each message preceded by a small header
+that gives the length of its fixed block, a template identifier, the schema's identifier and its version; the byte order is a
+property of the schema, little-endian by default.
+\end{definition}
+
+Order entry is binary too at most venues where speed matters. The simulator's order-entry protocol (One Quant Book~10,
+chapter~26) runs over SoupBinTCP, which Nasdaq's specification calls ``a lightweight point-to-point protocol, built on top of
+TCP/IP sockets'' that delivers the server's sequenced messages in order ``even across underlying TCP/IP socket connection
+failures'': its sequenced messages carry no explicit number, both sides count them, and a client that logs in again asks for
+the next number it wants. It plays the part of the \omterm{def:ll:protocols-i-fix:session}{FIX session} of chapter~15 at a fraction of the cost: a new order is a
+38-byte message with its fields at fixed offsets.
+
+SBE is the FIX Trading Community's answer to the same needs, standardised in 2016: its specification states a ``preference
+for fixed positions and fixed length fields, supporting direct access to data''. The build derives an SBE-style schema for the
+simulator's feed messages from the same JSON schema, little-endian, with the eight-byte message header and natural field sizes
+(the six-byte timestamp widened to eight), and generates a second set of flyweights from that XML alone.
+
+\omcode{code/firm/wirecodec/sbe/feed_sbe.xml}{14}{23}{The Add Order message in the generated SBE-style schema.}\label{lst:ll:protocols-ii-binary-exchange-protocols:sbe}
+
+\Cref{fig:ll:protocols-ii-binary-exchange-protocols:decode} compares the decoders on 60 seconds of line A. Book~1's decoder,
+which copies each message and calls a \texttt{std::function}, takes about \qty{11}{\nano\second} per message; the generated
+flyweights about \qty{5}{\nano\second}, whichever the byte order: a byte swap is one instruction and costs nothing
+measurable here, while the copy and the indirect call cost half. Framing whole packets and dispatching every message costs
+about \qty{7}{\nano\second} per message in C++ and \qty{8}{\nano\second} in Rust. At a million messages a second, decoding is
+under 1\% of a core: the protocol was designed for that.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ybar,bar width=16pt,ymin=0,ymax=14,
+  symbolic x coords={book1,flyweight,sbe,packets,rust},xtick=data,
+  xticklabels={{Book~1\\ decoder},{flyweight,\\ big-endian},{SBE-style,\\ little-endian},{packets,\\ C++},{packets,\\ Rust}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.12,ylabel={ns per message},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},point meta=explicit symbolic,
+  table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=key,y=ns_per_msg,meta=ns_per_msg]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/measured_decode.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Decoding the order messages of 60 seconds of the simulator's line A (about 32\,000 messages), median of 21 passes:
+Book~1's decoder (a copy and a \texttt{std::function} call per message), the generated flyweights in both byte orders, and,
+in the last two bars, every packet framed and every message dispatched. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2,
+no isolated cores; GCC~11 at \texttt{-O2}, Rust 1.97 release. Data: \texttt{bench\_wire.py}.}\label{fig:ll:protocols-ii-binary-exchange-protocols:decode}
+\end{omfigure}
+
+\section{Tutorial: generated codecs and two lossy lines}\label{tut:ll:protocols-ii-binary-exchange-protocols:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Generate the codecs from the simulator's schema, hold them to Book~10's golden messages, record two lossy
+lines, arbitrate them and measure. \textbf{End state:}
+\cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps,fig:ll:protocols-ii-binary-exchange-protocols:decode}, and green
+tests in Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Generate} with \texttt{python gen\_wirecodec.py}: the C++ and Rust flyweights from
+\path{code/firm/exchsim/schema.json}, the SBE-style XML schema, and the little-endian flyweights from that XML. The test runs
+the generator again and requires no difference.
+\item \textbf{Check against the golden messages.} The C++ test decodes every message of Book~10's golden fixtures (feed,
+order entry in both directions, control), compares each with its row in the golden CSV files, re-encodes it with the writer
+and compares the bytes, and sends every feed message through the SBE-style layout and back; the Rust test decodes the same
+messages and the recorded MoldUDP64 packets.
+\item \textbf{Record two lossy lines.} \texttt{ll\_lines.record(60, dir)} runs the simulator with the losses of
+\cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps} and writes both lines in the recorded-file format.
+\item \textbf{Arbitrate} with \cref{lst:ll:protocols-ii-binary-exchange-protocols:arb}; \texttt{bench\_wire.py} checks the C++
+counts against the Python reference, then measures the decoders.
+\end{tutsteps}
+\textbf{What to change next.} Remove the outage overlap and check that the arbitrated stream has no gap; put the two lines
+behind one simulated switch (the same outage on both) and watch every gap pass through.
+\end{tutorial}
+
+\section{Build: the wire codecs}\label{bld:ll:protocols-ii-binary-exchange-protocols:wirecodec}
+
+\begin{build}
+\bfield{Purpose} Every byte the firm reads from or writes to the simulator: the feed handler (chapter~18) decodes the feed
+with it, the order gateway (chapter~21) encodes and decodes order entry, and the capture tools (chapter~23) read recorded
+files.
+\bfield{Interface} Generated by \texttt{gen\_wirecodec.py} from \path{code/firm/exchsim/schema.json}: C++20
+\texttt{firm::wire} with a reader \texttt{Feed<T>}, \texttt{In<T>}, \texttt{Out<T>}, \texttt{Ctl<T>} and a writer
+\texttt{Writer} per message (\texttt{FeedAWriter} and so on), \texttt{dispatch\_feed}, \texttt{dispatch\_in}, \texttt{dispatch\_out},
+\texttt{dispatch\_ctl}, \texttt{MoldHeader}, \texttt{for\_each\_block}, \texttt{csv} and \texttt{rewrite}; the SBE-style
+\texttt{firm::sbe} readers and writers and \texttt{to\_sbe}; Rust \texttt{firm\_wirecodec} with the same readers,
+\texttt{csv\_feed}, \texttt{csv\_in}, \texttt{csv\_out}, \texttt{csv\_ctl}, \texttt{MoldHeader} and \texttt{for\_each\_block}.
+\bfield{Rules} No hand-written layout: every offset comes from the schema; generated files are committed and regenerated
+without difference; readers copy nothing and allocate nothing; a message whose length does not match its type is refused by
+the dispatcher.
+\bfield{Acceptance tests} \texttt{code/firm/wirecodec/}: every message of Book~10's golden fixtures decoded to its golden
+values and re-encoded to the same bytes in C++, decoded in Rust; every feed message round-tripped through the SBE-style layout;
+the recorded MoldUDP64 fixture framed; the generator deterministic and its outputs current.
+\bfield{Stretch} Generate the SoupBinTCP frames and a MoldUDP64 retransmission request; generate from the XML schema in Rust
+as well; a codec for a real venue's published schema.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{TotalView-ITCH 5.0}, \emph{MoldUDP64} and \emph{SoupBinTCP} specifications.
+\item CME Group Client Systems Wiki, MDP~3.0: ``Incremental Feed Arbitration'', ``Simple Binary Encoding'', ``Market Data
+Snapshot -- Full Recovery''.
+\item FIX Trading Community, \emph{Simple Binary Encoding}, version 1.0 (GitHub).
+\item E.~N.~Gilbert, ``Capacity of a burst-noise channel'', \emph{Bell System Technical Journal} 39(5), 1960; E.~O.~Elliott,
+``Estimates of error rates for codes on burst-noise channels'', \emph{Bell System Technical Journal} 42(5), 1963.
+\item The protocol description of the simulator, \path{code/firm/exchsim/PROTOCOL.md} (One Quant Book~10, chapter~26).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:1}
+A MoldUDP64 packet has sequence number 1\,000 and count 3; the next packet on the same line has sequence number 1\,007. Which
+messages are missing, and what does a \omterm{def:ll:protocols-i-fix:session}{heartbeat} with sequence number 1\,010 then tell you?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:2}
+Decode by hand the price of an Add Order whose bytes 32--35 are \texttt{00 0F 42 A4}. What is it in currency units?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:3}
+Each line loses 0.2\% of packets independently. What fraction does the arbitrated stream lose? And if both lines pass through
+one switch that drops 0.01\% of packets?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:4}
+Compute the stationary loss rate of the simulator's Gilbert--Elliott parameters (good to bad 0.0005, bad to good 0.1, 80\%
+lost in the bad state) and the mean length of a bad period in packets. Why does burstiness matter for retransmission?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:5}
+Why is market data sent over UDP \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast} rather than TCP, and what does a subscriber give up?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:6}
+The SBE-style layout widens the six-byte timestamp to eight bytes. What does that cost in bytes for an Add Order, and what does
+it save?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:7}
+\emph{Coding.} Extend \texttt{gen\_wirecodec.py} to generate the SoupBinTCP frames of the schema's \texttt{soup\_client} and
+\texttt{soup\_server} protocols, and test them on Book~10's \texttt{fixture\_soup.bin}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:8}
+\emph{Find the flaw.} ``Our feed handler reads line A; if it sees a gap it switches to line B until the next gap.''
+\end{exercise}
+
+\section{Problem: Two Copies of Everything}
+
+\begin{problem}[{Weekend problem --- how often redundancy fails, and what recovery costs}]\label{pb:ll:protocols-ii-binary-exchange-protocols:1}
+A feed publishes 50\,000 packets a second over a 6.5-hour session on two lines. Assume each line loses a packet with probability
+$10^{-4}$, independently; retransmission serves gaps of up to 1\,000 messages in a round trip of \qty{0.5}{\milli\second}; a
+snapshot of the instrument arrives every second and takes \qty{20}{\milli\second} to receive; applying a buffered message costs
+\qty{8}{\nano\second} (a little above the measured cost of framing and dispatching one).
+
+\medskip\noindent\textbf{Part I --- Independent loss.}
+\begin{enumerate}
+\item How many packets does a session carry, and how many does one line lose?
+\item What is the probability that the arbitrated stream loses a packet, and how many losses is that per session?
+\item In the simulation of \cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps}, why are there any arbitrated gaps at all?
+\item What does each arbitrated loss cost with retransmission?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Correlation.}
+\begin{enumerate}[resume]
+\item A shared switch drops $10^{-6}$ of packets on both lines. What is the arbitrated loss rate now (\cref{prop:ll:protocols-ii-binary-exchange-protocols:both}), and how many losses per session?
+\item What stationary loss rate do the simulator's burst parameters give each line, and what arbitrated rate if the lines are
+independent?
+\item Why do bursts make retransmission less useful even when the average loss rate is unchanged?
+\item Name three common causes a firm can remove, and one it cannot.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Recovery.}
+\begin{enumerate}[resume]
+\item When is retransmission not enough?
+\item How long does recovery from the \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{snapshot channel} take on average, and at worst?
+\item How many incremental messages arrive meanwhile, and how long does applying them take?
+\item Which buffered messages must be discarded after the snapshot, and how does the handler know?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the arbitrated loss probability with independent and with correlated losses, and the
+recovery time from the \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{snapshot channel}.
+\item What should a strategy do with its view of the book during a recovery?
+\item Would a snapshot every 100 milliseconds help? What does it cost the venue and the subscriber?
+\item Why must the arbiter never wait for the slower line?
+\item How would you test the recovery path before production?
+\item What should be logged for every gap?
+\item What does the measured cost of decoding say about where the latency of a feed handler lies?
+\item In one sentence: what does a second line buy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:protocols-ii-binary-exchange-protocols:1}
+Why do exchanges publish market data over UDP \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast}, and how does a receiver detect a lost packet?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-ii-binary-exchange-protocols:2}
+Implement A/B \omterm{def:ll:protocols-ii-binary-exchange-protocols:arbitration}{line arbitration}. What state do you keep, and what do you do on a gap?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-ii-binary-exchange-protocols:3}
+What is a flyweight decoder, and why is it faster than decoding into structs?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-ii-binary-exchange-protocols:4}
+You joined the feed in the middle of the day. How do you build a correct book?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:protocols-ii-binary-exchange-protocols:5}
+Big-endian or little-endian on the wire: does it matter for latency? What does?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:protocols-ii-binary-exchange-protocols:6}
+Your two lines are ``redundant'' but you see simultaneous gaps on both several times a day. What do you investigate?
+\end{interviewq}

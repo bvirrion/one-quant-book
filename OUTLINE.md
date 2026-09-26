@@ -71,10 +71,10 @@ about 20 pages of front and back matter per book.
 | 7 | One Quant Book 7 — Research Craft: Predictors, Backtests, Measurement, Portfolios | 29 | 345 (written) | `outline/research-strategies.md` |
 | 8 | One Quant Book 8 — Strategies I: Equities and Futures | 29 | 330 (written) | `outline/research-strategies.md` |
 | 9 | One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks | 29 | 333 (written) | `outline/research-strategies.md` |
-| 10 | One Quant Book 10 — Microstructure and Execution | 28 | ~378 | `outline/microstructure-hft-ml.md` |
-| 11 | One Quant Book 11 — Market Making and High-Frequency Trading | 29 | ~396 | `outline/microstructure-hft-ml.md` |
-| 12 | One Quant Book 12 — Machine Learning for Markets | 29 | ~392 | `outline/microstructure-hft-ml.md` |
-| 13 | One Quant Book 13 — Low-Latency Software | 26 | ~364 | `outline/engineering-firm-interviews.md` |
+| 10 | One Quant Book 10 — Microstructure and Execution | 28 | 303 (written) | `outline/microstructure-hft-ml.md` |
+| 11 | One Quant Book 11 — Market Making and High-Frequency Trading | 29 | 330 (written) | `outline/microstructure-hft-ml.md` |
+| 12 | One Quant Book 12 — Machine Learning for Markets | 29 | 348 (written) | `outline/microstructure-hft-ml.md` |
+| 13 | One Quant Book 13 — Low-Latency Software | 26 | 314 (written) | `outline/engineering-firm-interviews.md` |
 | 14 | One Quant Book 14 — Networks, Hardware and Trading Infrastructure | 29 | ~384 | `outline/engineering-firm-interviews.md` |
 | 15 | One Quant Book 15 — Research, Data and Risk Platforms | 30 | ~398 | `outline/engineering-firm-interviews.md` |
 | 16 | One Quant Book 16 — The Desk and the Firm | 30 | ~400 | `outline/engineering-firm-interviews.md` |
@@ -85,8 +85,9 @@ Total: 524 chapters, about 7,070 pages, and about 300 strategy files
 (231 in Books 8–9, 75 in Book 11). Books 6 and 13 have the most headroom;
 Books 1, 2 and 18 run slightly over 400.
 
-Measured (2026-09-25): Books 1–9 are written, 3,090 pages against the
-outline's 3,558 for them (−13 %), with 236 strategy files in Books 8–9 (outline
+Measured (2026-09-26): Books 1–13 are written, 4,385 pages against the
+outline's 5,088 for them (−14 %; Books 10–13, written in one parallel batch, 1,295 against 1,530,
+−15 %). Books 1–9 alone: 3,090 pages against the outline's 3,558 for them (−13 %), with 236 strategy files in Books 8–9 (outline
 231). Written books run 10.8–12.4 pages a chapter all-in; the per-chapter
 figures above overstate by 1–3 pages wherever they exceed 12, so the series
 total will land nearer 6,200 than 7,070.

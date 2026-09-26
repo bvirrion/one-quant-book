@@ -1,0 +1,365 @@
+\chapter{Targets, Labels and Sample Weights}\label{ch:ml:targets-labels-and-sample-weights}
+
+A classifier is trained to say whether an asset will be up ten days from now, and it does so a little better than a
+coin. The trader who will use it asks what it does about the stop-loss: every position is closed if it loses one
+ten-day volatility, and taken profit if it gains one. On twenty synthetic assets over ten years, one trade in five hits
+its stop before day ten; the label the classifier learned never saw the stop. And the \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set} that looked like
+49\,000 examples holds, once the overlap of ten-day windows is counted, the information of 4\,900. This chapter builds
+labels that describe the trade, measures how much labels overlap, and turns the overlap into \omterm{def:ml:targets-labels-and-sample-weights:weights}{sample weights} and
+honest statistics.
+
+\section{Fixed-horizon labels and their flaws}
+
+The data of the chapter come from \texttt{firm.mlsynth.series}: twenty assets, 2\,520 days, daily volatility 1.5\% with
+GARCH clustering and Student-$t$ shocks, and a planted drift, persistent with a half-life of 20 days, whose correlation
+with the next day's return is 0.04. The features, known at each close, are a noisy reading of the drift, the 5- and
+20-day past returns, a ratio of short to long realised volatility and three pure-noise columns. An event is every day
+of every asset; the primary trade is long when the drift reading is positive and short otherwise.
+
+\begin{definition}[Fixed-horizon label]\label{def:ml:targets-labels-and-sample-weights:fixed}
+Given an event at bar $t_0$ and a horizon $h$, the \emph{fixed-horizon label}\index{fixed-horizon label} is
+$\sign(\sum_{s=t_0+1}^{t_0+h}R_s)$, or the return itself for regression, settled at $t_1 = t_0 + h$.
+\end{definition}
+
+The \omterm{def:ml:targets-labels-and-sample-weights:fixed}{fixed-horizon label} is Book~7's forward return (chapter~6) turned into a class. It has three flaws. It ignores the
+path: a position that would have been stopped out on day three and a position that ended up on day ten get the same
+label if the price came back. It ignores the volatility: a 1\% move is noise on a volatile day and news on a quiet one.
+And it ends at a fixed time, so the labels of consecutive events overlap in $h - 1$ of their $h$ bars. The first two
+are fixed by the barrier label below; the third by counting (\cref{sec:ml:labels:overlap}).
+
+\section{Barrier labels and meta-labelling}
+
+\begin{definition}[Triple-barrier label]\label{def:ml:targets-labels-and-sample-weights:triple}
+For an event at $t_0$ with position side $\pm1$, widths $w^+, w^- > 0$ and a horizon $h$, the \emph{triple-barrier
+label}\index{triple-barrier label} settles at the first bar $t_1$ at which the position's cumulative log return reaches
+$+w^+$ (profit-taking), $-w^-$ (stop-loss), or $t_1 = t_0 + h$ (the vertical barrier); it is the sign of the position's
+return at $t_1$. The widths are usually scaled by the volatility known at $t_0$: $w = k\hat\sigma_{t_0}\sqrt h$
+(López de Prado, 2018).
+\end{definition}
+
+With $k = 1$ and $h = 10$, the long-or-short trade of the chapter hits its profit barrier first 22.7\% of the time, its
+stop 20.3\% of the time, and the vertical barrier otherwise; a label lasts 8.3 days on average instead of 10.
+\Cref{fig:ml:labels:path} shows one event of the first asset: a long position stopped on day three at $-5.04\%$ (the
+width was 4.87\%), when the price went on to end day ten 1.84\% higher. The \omterm{def:ml:targets-labels-and-sample-weights:fixed}{fixed-horizon label} calls that trade a
+winner. It is one case of many: of the trades stopped out, 5.3\% end positive at day ten. Signs disagree for 1.9\% of
+all events; what differs everywhere is the size, since the barrier label's returns are truncated at the barriers as the
+trade's are.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.6cm,xlabel={days after the event},ylabel={cumulative return (\%)},
+  tick label style={font=\small},label style={font=\small},xmin=-0.3,xmax=10.3,ymin=-7,ymax=6.5,
+  xtick={0,1,2,3,4,5,6,7,8,9,10},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.6pt] table[x=day,y=ret]{figdata/ml/02-targets-labels-and-sample-weights/path.csv};
+\addplot[omProp,thick,dashed] table[x=day,y=up]{figdata/ml/02-targets-labels-and-sample-weights/path.csv};
+\addplot[omThm,thick,dashed] table[x=day,y=down]{figdata/ml/02-targets-labels-and-sample-weights/path.csv};
+\draw[black!70,thick] (axis cs:10,-7) -- (axis cs:10,6.5);
+\node[font=\footnotesize,omProp,anchor=south west] at (axis cs:0.2,4.87) {profit-taking};
+\node[font=\footnotesize,omThm,anchor=north] at (axis cs:8.2,-5.0) {stop-loss};
+\node[font=\footnotesize,black!70,anchor=east] at (axis cs:9.9,5.6) {vertical barrier};
+\draw[omThm,thick] (axis cs:3,-5.04) circle[radius=4pt];
+\node[font=\footnotesize,omThm,anchor=west] at (axis cs:3.3,-6.2) {stopped on day 3};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One event of asset~0, a long position: the barriers are one ten-day volatility, 4.87\%, known at the event.
+The stop is touched on day three; the ten-day return ends at $+1.84\%$. Data: \texttt{firm.mlsynth.series}, seed~1,
+through \texttt{firm.labeling.triple\_barrier}.}\label{fig:ml:labels:path}
+\end{omfigure}
+
+The side of a trade and its size are different questions. A primary model (a rule, a researcher's signal, a
+discretionary call) may be good at the side and poor at knowing when it is right.
+
+\begin{definition}[Meta-labelling]\label{def:ml:targets-labels-and-sample-weights:meta}
+\emph{Meta-labelling}\index{meta-labelling} labels each event of a primary model with 1 if the trade in the primary
+model's direction made money (for example, its triple-barrier return is positive) and 0 otherwise, and trains a
+secondary model on these labels to estimate the probability that the primary call is right; the probability is then
+used to filter or size the trade (López de Prado, 2018; Joubert, 2022).
+\end{definition}
+
+\omterm{def:ml:targets-labels-and-sample-weights:meta}{Meta-labelling} the chapter's trade with gradient-boosted trees (\cref{fig:ml:labels:meta}), trained on the first 60\%
+of the dates and scored on the last 40\%, raises the hit rate of the trades it keeps from 53.0\% to 54.5\% and the
+average return per trade from 0.064 to 0.097 barrier widths when it keeps the third of the trades it is most confident
+about. The overlap-adjusted $t$-statistic falls from 3.48 to 3.19: the kept trades are better, and there are fewer of
+them. \omterm{def:ml:targets-labels-and-sample-weights:meta}{Meta-labelling} reallocates risk to the better trades; it does not create a signal the primary model lacks.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.7cm},width=6.6cm,height=5.2cm,
+  xlabel={\small trades kept (\%)},tick label style={font=\footnotesize},label style={font=\small},x dir=reverse,
+  xmin=5,xmax=105,grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[ylabel={mean per trade (widths)},ymin=0.05,ymax=0.13,
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},scaled y ticks=false]
+\addplot[omDef,very thick,mark=*] table[x=share,y=mean]{figdata/ml/02-targets-labels-and-sample-weights/meta.csv};
+\nextgroupplot[ylabel={overlap-adjusted $t$},ymin=2,ymax=3.8]
+\addplot[omThm,very thick,mark=square*] table[x=share,y=t]{figdata/ml/02-targets-labels-and-sample-weights/meta.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ml:targets-labels-and-sample-weights:meta}{Meta-labelling} the primary trade: keeping the trades whose estimated probability of success exceeds 0.50 to
+0.55 (100\% = the primary model alone). Left, the average return per trade in barrier widths; right, the $t$-statistic
+with the number of trades adjusted for overlap. Out of sample, last 40\% of the dates. Data: \texttt{ml\_labels.meta}.}\label{fig:ml:labels:meta}
+\end{omfigure}
+
+\section{Overlap, concurrency and uniqueness}\label{sec:ml:labels:overlap}
+
+\begin{definition}[Label concurrency, average uniqueness]\label{def:ml:targets-labels-and-sample-weights:uniqueness}
+Label $i$ spans the bars $(t_{0,i}, t_{1,i}]$. The \emph{label concurrency}\index{label concurrency} $c_t$ of bar $t$
+is the number of labels whose span contains it. The \emph{average uniqueness}\index{average uniqueness} of label $i$ is
+$\bar u_i = \frac{1}{t_{1,i} - t_{0,i}}\sum_{t\in(t_{0,i}, t_{1,i}]}1/c_t$: the share of its information it holds alone.
+\end{definition}
+
+\Cref{fig:ml:labels:toy} is the smallest example: three labels over seven bars, two of them overlapping in two bars.
+Book~7 named the phenomenon (label overlap, chapter~20) and removed its leak from cross-validation by purging; here it is
+measured, because it changes how much the sample is worth.
+
+\begin{omfigure}
+\begin{tikzpicture}[x=1.15cm,y=0.62cm,font=\small]
+\foreach \b in {1,2,3,4,5,6,7} { \draw[gray!50] (\b-0.5,-0.2) -- (\b-0.5,4.4); \node at (\b,4.1) {\b}; }
+\draw[gray!50] (7.5,-0.2) -- (7.5,4.4);
+\node[anchor=east] at (0.3,4.1) {bar};
+\draw[omDef,line width=4pt] (0.55,3) -- (3.45,3); \node[anchor=east] at (0.3,3) {label A};
+\draw[omProp,line width=4pt] (1.55,2) -- (4.45,2); \node[anchor=east] at (0.3,2) {label B};
+\draw[omThm,line width=4pt] (5.55,1) -- (7.45,1); \node[anchor=east] at (0.3,1) {label C};
+\node[anchor=east] at (0.3,0) {$c_t$};
+\foreach \b/\c in {1/1,2/2,3/2,4/1,5/0,6/1,7/1} { \node at (\b,0) {\c}; }
+\node[anchor=west,align=left,font=\footnotesize] at (7.8,2) {$\bar u_A = (1+\tfrac12+\tfrac12)/3 = 0.67$\\
+$\bar u_B = (\tfrac12+\tfrac12+1)/3 = 0.67$\\ $\bar u_C = 1$};
+\end{tikzpicture}
+
+\omcaption{Concurrency and \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} on seven bars: labels A and B share bars 2 and 3; C is alone. The three
+labels are worth $0.67 + 0.67 + 1 = 2.33$ independent labels, the number of bars they cover divided by their length only
+when all lengths are equal (\cref{prop:ml:labels:sum}).}\label{fig:ml:labels:toy}
+\end{omfigure}
+
+\begin{proposition}[How much overlapping labels are worth]\label{prop:ml:labels:sum}
+\begin{enumerate}
+\item If every label spans $h$ bars, $\sum_i\bar u_i = N_{\mathrm{cov}}/h$, where $N_{\mathrm{cov}}$ is the number of
+bars covered by at least one label. With an event on every bar, $\bar u_i = 1/h$ away from the ends.
+\item If returns are uncorrelated with variance $\sigma^2$ and the $n$ labels are the overlapping $h$-bar sums of one
+series, the sample mean of the labels has variance about $h^2\sigma^2/n$, $h$ times the $h\sigma^2/n$ that treating them
+as independent assumes: a $t$-statistic computed on $n$ rows is inflated by about $\sqrt h$.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+(1) $\sum_i\bar u_i = \frac1h\sum_i\sum_{t\in i}1/c_t = \frac1h\sum_t\sum_{i\ni t}1/c_t = \frac1h\#\{t: c_t\ge1\}$,
+since the inner sum has $c_t$ terms equal to $1/c_t$. (2) Away from the ends each return enters $h$ of the $n$ sums, so
+the mean of the sums is about $\frac hn\sum_tR_t$, of variance $\frac{h^2}{n^2}\,n\sigma^2 = h^2\sigma^2/n$.
+\end{proof}
+
+On the chapter's data the \omterm{def:ml:targets-labels-and-sample-weights:fixed}{fixed-horizon labels} have a concurrency of exactly 10 and an \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} of 0.100:
+48\,980 labels are worth 4\,916, as part 1 predicts ($20\times2\,458/10$). The barrier labels, shorter, have a uniqueness
+of 0.123 and are worth 6\,040. The primary trade's average return has a $t$-statistic of 9.4 computed on the rows and
+3.3 with the number of trades replaced by the sum of uniqueness: the ratio, 2.85, is $\sqrt{1/0.123}$.
+
+\section{Sample weights and the sequential bootstrap}
+
+\begin{definition}[Sample weight, time-decay weight]\label{def:ml:targets-labels-and-sample-weights:weights}
+A \emph{sample weight}\index{sample weight} $\omega_i\ge0$ scales observation $i$'s term in the empirical loss,
+$\mathcal L_n(\theta) = \sum_i\omega_i\ell(y_i, f_\theta(x_i))/\sum_i\omega_i$. Three are common on market data:
+uniqueness weights $\omega_i = \bar u_i$; return-attribution weights, $\omega_i\propto|\sum_{t\in i}R_t/c_t|$, which
+favour labels whose moves they own; and a \emph{time-decay weight}\index{time-decay weight}, which falls linearly from 1
+for the newest label to a floor for the oldest, in units of cumulative uniqueness, so that old data count less.
+\end{definition}
+
+\begin{definition}[Sequential bootstrap]\label{def:ml:targets-labels-and-sample-weights:seqboot}
+The \emph{sequential bootstrap}\index{sequential bootstrap} draws labels one at a time, with replacement, each with
+probability proportional to the \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} it would have given the labels already drawn; overlapping labels
+become less likely once one of them is in the sample.
+\end{definition}
+
+The case for these tools is that a bagged ensemble whose bootstrap samples are full of near-duplicates grows correlated
+trees, each fitted to the same few independent observations. Drawing 40 of the first 400 ten-day labels of one asset
+(about their effective number), the plain bootstrap's samples have an \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} of 0.65 and the \omterm{def:ml:targets-labels-and-sample-weights:seqboot}{sequential
+bootstrap}'s 0.69. Whether it matters for prediction is an empirical question, and on this data the answer is no
+(\cref{tab:ml:labels:bagging}): bagged trees trained on plain bootstrap samples, on samples as small as the \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average
+uniqueness} times the sample size, and on those samples weighted by uniqueness have the same out-of-sample AUC in three
+simulated markets, within $\pm0.007$ of each other and in no consistent order. The trees were regularised (at least 50
+labels per leaf, 5 in the small samples), and none of the features identifies a date, which is what lets
+near-duplicates leak in the first place. Where overlap does bite without fail is in every statistic that counts rows:
+standard errors, $t$-statistics, bootstrap intervals and out-of-bag scores.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+bootstrap samples & market 1 & market 2 & market 3 & mean\\
+\midrule
+plain, full size & 0.504 & 0.517 & 0.509 & 0.510\\
+average-uniqueness size & 0.511 & 0.512 & 0.506 & 0.510\\
+same, weighted by uniqueness & 0.506 & 0.511 & 0.510 & 0.509\\
+\bottomrule
+\end{tabular}
+\caption{Out-of-sample AUC of 30 bagged trees predicting the sign of the ten-day return, trained on the first 60\% of
+the dates (purged) of three simulated markets. Data: \texttt{ml\_labels.bagging\_table}.}\label{tab:ml:labels:bagging}
+\end{table}
+
+\begin{method}[Labels and weights for a new study]\label{met:ml:labels:method}
+\begin{enumerate}
+\item Write the trade first (side, entry, exits, horizon), then the label that settles it: barriers at the trade's
+stop and target, scaled by volatility known at the event.
+\item Store every label with its $t_0$ and $t_1$; compute concurrency and uniqueness per asset.
+\item Report the effective sample $\sum_i\bar u_i$ beside the number of rows, and compute every standard error with it
+(or with a block bootstrap of Book~4, chapter~13).
+\item Try uniqueness and \omterm{def:ml:targets-labels-and-sample-weights:weights}{time-decay weights} as \omterm{def:ml:why-financial-machine-learning-is-different:sets}{hyperparameters}, on validation folds that are purged (chapter~3); keep
+them only if they help there.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: labels that describe the trade}\label{tut:ml:targets-labels-and-sample-weights:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Label twenty assets' daily events with fixed-horizon and \omterm{def:ml:targets-labels-and-sample-weights:triple}{triple-barrier labels}, measure overlap, compare
+bootstrap schemes and meta-label the primary trade. \textbf{End state:} the numbers of the chapter,
+\cref{fig:ml:labels:path,fig:ml:labels:meta}, \cref{tab:ml:labels:bagging}.
+\begin{tutsteps}
+\item \textbf{Barrier labels}: the first touch of either barrier, or the vertical one.
+\omcode{code/firm/labeling/firm_labeling.py}{41}{70}{The triple-barrier label.}\label{lst:ml:labels:triple}
+\item \textbf{Concurrency and uniqueness} by cumulative sums.
+\omcode{code/firm/labeling/firm_labeling.py}{77}{92}{Concurrency and average uniqueness.}\label{lst:ml:labels:uniq}
+\item \textbf{The \omterm{def:ml:targets-labels-and-sample-weights:seqboot}{sequential bootstrap}}: each draw favours the labels that overlap least with those already drawn.
+\omcode{code/firm/labeling/firm_labeling.py}{110}{123}{The sequential bootstrap.}\label{lst:ml:labels:seq}
+\item \textbf{Run} \texttt{ml\_labels.label\_stats()}, \texttt{bagging\_table()}, \texttt{bootstrap\_uniqueness()},
+\texttt{meta()} and \texttt{fig\_labels.py}.
+\end{tutsteps}
+\textbf{What to change next.} Set the barriers at two volatilities and see how the share of vertical-barrier exits and
+the uniqueness change; meta-label with a logistic regression instead of boosted trees.
+\end{tutorial}
+
+\section{Build: labels and sample weights}\label{bld:ml:targets-labels-and-sample-weights:labeling}
+
+\begin{build}
+\bfield{Purpose} Every study labels its events the way the desk trades them, and knows how many independent
+observations it holds.
+\bfield{Interface} \texttt{fixed\_horizon(r, t0, h)}, \texttt{triple\_barrier(r, t0, up, down, h, side)},
+\texttt{vol\_widths(sigma, t0, h, k)}, \texttt{meta\_labels(side, ret)}, \texttt{concurrency(t0, t1, n)},
+\texttt{average\_uniqueness(t0, t1, n)}, \texttt{attribution\_weights(t0, t1, r, n)}, \texttt{time\_decay(u, last)},
+\texttt{sequential\_bootstrap(t0, t1, n, size, rng)}.
+\bfield{Rules} Every label carries $t_0$ and $t_1$; bar $t_0$'s close is the decision time and the label uses bars
+$t_0 + 1$ to $t_1$; barrier widths use only information known at $t_0$.
+\bfield{Acceptance tests} \texttt{code/firm/labeling/tests/}: labels and touches by hand, for a long and a short;
+concurrency, uniqueness, attribution and decay weights on a three-label example; the \omterm{def:ml:targets-labels-and-sample-weights:seqboot}{sequential bootstrap} raises the
+\omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} of small samples.
+\bfield{Stretch} Trend-scanning labels (the horizon with the most significant trend); labels for market-making fills
+(chapter~29); a vectorised barrier search over many events at once.
+\end{build}
+
+\begin{omsources}
+\item M.~López de Prado, \emph{Advances in Financial Machine Learning}, Wiley, 2018, chapters 3--4.
+\item J.~F.~Joubert, ``Meta-labeling: theory and framework'', \emph{Journal of Financial Data Science} 4(3), 2022.
+\item L.~Breiman, ``Bagging predictors'', \emph{Machine Learning} 24, 1996.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:targets-labels-and-sample-weights:1}
+Labels of 5 bars start on every bar of a 1\,000-bar series (the last ones truncated at the end). About how many
+independent labels do they amount to, and what is their \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} away from the ends?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:targets-labels-and-sample-weights:2}
+Four labels span bars $(0,2]$, $(1,4]$, $(2,4]$ and $(6,8]$. Write the concurrency of bars 1 to 8 and each label's
+\omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:targets-labels-and-sample-weights:3}
+The daily volatility known at an event is 1.2\%. What are the barrier widths for $k = 1.5$ and a horizon of 16 days?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:targets-labels-and-sample-weights:4}
+A strategy's average trade has a $t$-statistic of 6.1 computed on 25\,000 overlapping 20-day trades opened every day.
+What $t$-statistic should be reported, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:targets-labels-and-sample-weights:5}
+Why does \omterm{def:ml:targets-labels-and-sample-weights:meta}{meta-labelling} raise the average return per trade but not the $t$-statistic of the whole book, in
+\cref{fig:ml:labels:meta}? When would it raise both?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:targets-labels-and-sample-weights:6}
+\emph{Find the flaw.} ``Our barrier widths are set at one standard deviation of each asset's daily returns over the whole
+sample, times the square root of the horizon.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:targets-labels-and-sample-weights:7}
+\emph{Coding.} Rebuild \texttt{ml\_labels.events} with barriers at two ten-day volatilities ($k = 2$). Report the shares
+of profit, stop and vertical exits and the \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} of the barrier labels, and explain the change.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:targets-labels-and-sample-weights:8}
+With \omterm{def:ml:targets-labels-and-sample-weights:weights}{time-decay weights} falling linearly from 1 to 0.5 in cumulative uniqueness, and every label of uniqueness 0.1, what
+is the weight of the label halfway through the sample? Show that the weights' mean is 0.75 whatever the uniqueness if it
+is constant, and say what changes when it is not.
+\end{exercise}
+
+\section{Problem: Five Hundred Overlapping Days}
+
+\begin{problem}[{Weekend problem --- what a training set is worth}]\label{pb:ml:targets-labels-and-sample-weights:1}
+The chapter's twenty assets, their daily events and the primary long-or-short trade.
+
+\medskip\noindent\textbf{Part I --- Two labels.}
+\begin{enumerate}
+\item How often does the trade hit its profit barrier, its stop, the vertical barrier?
+\item How long does a barrier label last on average, and why is it shorter than ten days?
+\item In \cref{fig:ml:labels:path}, what do the fixed-horizon and the barrier label say, and which describes the trade?
+\item What share of all events have labels of opposite signs, and why is that not the whole difference?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Overlap.}
+\begin{enumerate}[resume]
+\item What are the concurrency and the \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} of the \omterm{def:ml:targets-labels-and-sample-weights:fixed}{fixed-horizon labels}?
+\item How many independent labels are the 48\,980 worth, by \cref{prop:ml:labels:sum}? And the barrier labels?
+\item Give the trade's $t$-statistic on rows and adjusted for overlap, and explain their ratio.
+\item Which statistics of a study are wrong if overlap is ignored?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Weights and bootstraps.}
+\begin{enumerate}[resume]
+\item What \omterm{def:ml:targets-labels-and-sample-weights:uniqueness}{average uniqueness} do plain and \omterm{def:ml:targets-labels-and-sample-weights:seqboot}{sequential bootstrap} samples of 40 labels have?
+\item What AUC do the three bagging schemes reach, market by market?
+\item Why did uniqueness make no difference to the AUC here?
+\item Design a setting where it would.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- \omterm{def:ml:targets-labels-and-sample-weights:meta}{Meta-labelling} and the verdict.}
+\begin{enumerate}[resume]
+\item What do the kept trades gain at a threshold of 0.52, and what does the book lose?
+\item Why is \omterm{def:ml:targets-labels-and-sample-weights:meta}{meta-labelling} sizing, not alpha?
+\item Would you use the probability to size rather than to filter? How?
+\item State the \emph{named result}: the effective number of observations against the nominal one, the $t$-statistic
+before and after, and the AUC gain of uniqueness weighting over plain bagging with its spread.
+\item What would the effective sample be with 20-day labels?
+\item How should a research log record the size of a \omterm{def:ml:why-financial-machine-learning-is-different:sets}{training set}?
+\item What does purging (Book~7) have to do with uniqueness?
+\item In one sentence: what is a label?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle}]\label{iq:ml:targets-labels-and-sample-weights:1}
+What is wrong with labelling each day by the sign of the next 20 days' return?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:ml:targets-labels-and-sample-weights:2}
+Explain the triple-barrier method in two minutes.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:ml:targets-labels-and-sample-weights:3}
+You have a million rows of 10-day labels sampled daily from 400 stocks over ten years. How many independent observations
+do you have, roughly, and how does that change your model choice?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:targets-labels-and-sample-weights:4}
+What is \omterm{def:ml:targets-labels-and-sample-weights:meta}{meta-labelling}, and when is it useful?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:targets-labels-and-sample-weights:5}
+A random forest's out-of-bag score on overlapping labels is much better than its score on a later test period. Why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:targets-labels-and-sample-weights:6}
+Show that the mean of $n$ overlapping $h$-period sums of white noise has about $h$ times the variance you would compute
+if you treated them as independent.
+\end{interviewq}

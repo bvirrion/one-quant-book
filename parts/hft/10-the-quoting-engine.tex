@@ -1,0 +1,303 @@
+\chapter{The Quoting Engine}\label{ch:hf:the-quoting-engine}
+
+A market maker changes its mind about its price tens of thousands of times a day in a busy instrument. Every change is a cancel and a new order, or
+a modification; each can cross a fill already on its way, and the venue counts them all. The component that turns ``where I want to be'' into the
+fewest messages that get there is the quoting engine. In this chapter's simulated market, a one-level quoter sends 758 messages an hour for 250
+fills. A three-level ladder sends 980 and earns more, because its orders are already in the queue when the price moves. A hysteresis that looks
+like thrift, keeping an order one tick from its target, turns the mark-out negative.
+
+\section{From target quotes to orders}
+
+The policies of chapters 3 to 9 produce targets: on each side, the prices and sizes the market maker wants to show. The engine owns the orders:
+which are resting, which are on their way, which the venue has not yet acknowledged, which it has been asked to cancel. It compares the target with
+the orders and sends the difference. Its rules (\cref{lst:hf:the-quoting-engine:diff}):
+
+\begin{method}[Diffing a target against the working orders]\label{met:hf:the-quoting-engine:diff}
+On each side, visit the working orders in price priority. An order at a target price covers it: if it holds more than the target, amend it down;
+if less, add a new order for the difference, never increase it. An order at no target price is cancelled, unless it is within a hysteresis of a
+target it can cover. Every target left uncovered gets a new order. Leave orders awaiting acknowledgement alone. Send cancels first, then
+amendments, then new orders.
+\end{method}
+
+The order matters. Cancels go first because a cancel protects capital and a new order commits it; when messages must be rationed, the ones that
+remove risk are sent. Orders in flight are left alone because the engine does not yet know whether they are in the book; acting on them twice is how
+engines produce duplicate orders.
+
+\begin{definition}[Quote ladder]\label{def:hf:the-quoting-engine:ladder}
+A \emph{quote ladder}\index{quote ladder} is a set of orders resting at several consecutive prices on one side, each intended to trade: the best
+level earns the spread now, and the levels behind it hold places in queues that become the best when the price moves.
+\end{definition}
+
+In a large-tick book (chapter 5) a ladder's deeper levels rarely fill where they are; their value is the place they hold. When the price ticks up,
+a one-level quoter cancels its bid and joins the back of the new best queue; a ladder's second level is already in that queue.
+
+\section{Cancel-replace, priority and in-flight states}
+
+\begin{definition}[Cancel-replace]\label{def:hf:the-quoting-engine:replace}
+A \emph{cancel-replace}\index{cancel-replace} changes a resting order's price or size in one message, the venue cancelling the old order and entering
+a new one; under the usual venue rule the order keeps its place in the queue only if its size is reduced at the same price, and goes to the back for
+any other change.
+\end{definition}
+
+One Quant Book 10, chapter 26 specifies the simulator's replace message with exactly this rule: a size decrease at the same price is published as a
+partial cancel and keeps priority; anything else loses it. That is why the engine amends only downwards and adds a separate order to increase size.
+
+An order has a life the engine must follow (\cref{fig:hf:the-quoting-engine:states}): sent, then acknowledged; asked to change or cancel, then acknowledged again. A fill can arrive at any
+point, including after the engine has decided to cancel the order: the cancel is still travelling, or reached the venue just after the fill, which
+answers ``too late to cancel''. This cancel--fill race is not an error; it is a certainty at high message rates, and the engine counts it. In the
+chapter's runs a one-level quoter meets 19.5 such races an hour.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>=stealth,st/.style={draw,rounded corners,fill=omThm!8,minimum width=2.3cm,minimum height=0.7cm}]
+\node[st] (pn) at (0,0) {pending new};
+\node[st] (lv) at (4.2,0) {live};
+\node[st] (pa) at (4.2,1.8) {pending amend};
+\node[st] (pc) at (8.4,0) {pending cancel};
+\node[st,fill=gray!10] (gone) at (8.4,-1.8) {gone};
+\draw[->] (pn) -- node[above] {ack} (lv);
+\draw[->] (lv.north west) to[bend left=15] node[left] {amend down} (pa.south west);
+\draw[->] (pa.south east) to[bend left=15] node[right] {ack} (lv.north east);
+\draw[->] (lv) -- node[above] {cancel} (pc);
+\draw[->] (pc) -- node[right] {ack} (gone);
+\draw[->,dashed] (lv.south) |- node[pos=0.25,left] {fill of the whole leaves} (gone.west);
+\draw[->,dashed,omDef] (pc.north east) to[out=40,in=320,looseness=5] node[right,align=left] {fill: the\\cancel--fill race} (pc.south east);
+\end{tikzpicture}
+
+\omcaption{The engine's states for one order. Solid arrows are the engine's own actions and the venue's acknowledgements; dashed arrows are fills,
+which can arrive in any state; a fill received while a cancel is in flight is counted as a race. An increase in size is never an amendment: it is a
+new order at the same price. Source: \texttt{firm.quoteengine}.}\label{fig:hf:the-quoting-engine:states}
+\end{omfigure}
+
+\section{Throttles, message limits and order-to-trade ratios}
+
+\begin{definition}[Message throttle]\label{def:hf:the-quoting-engine:throttle}
+A \emph{message throttle}\index{message throttle} is a limit on the rate of messages a trading system sends, imposed by the venue on each session or by
+the firm on itself, and the policy for what is sent when the limit binds: which messages go first, which are deferred and which are dropped.
+\end{definition}
+
+The engine's throttle is a token bucket (One Quant Book 13, chapter 21 builds one for the gateway): tokens refill at the permitted rate up to a burst
+depth, each message takes one, and when none is left the remaining actions are dropped. Dropping, not queueing, is the right policy for quotes: the
+next update recomputes the difference from the latest target, so a stale action is never sent late.
+
+Venues limit messages in three ways: a hard rate per session (a throttle rejects the excess), a charge on messages beyond a ratio to trades, and the
+regulatory \emph{order-to-trade ratio} of One Quant Book 10, chapter 24.
+
+\begin{dated}{2026-09}{Message limits in rules and fee schedules}\label{dat:hf:the-quoting-engine:limits}
+Under Commission Delegated Regulation (EU) 2017/566, each trading venue computes, for each member and instrument at least at the end of every
+session, the ratio of unexecuted orders to transactions in volume terms and in number terms (orders over transactions, minus one), counting each order
+type as its annex prescribes, and a member exceeding the venue's maximum ratio in either measure has exceeded it. CME Group's messaging efficiency
+programme, as filed with the CFTC in 2019, weights messages by type into a messaging score, divides it by the firm's traded volume in a product group
+during regular trading hours, and compares the resulting volume ratio with product-group benchmarks set each quarter.
+\end{dated}
+
+\section{Self-trade prevention and multiple strategies}
+
+A firm running several strategies in one instrument can find its own bid crossing its own offer: a quoting strategy resting at the ask and a
+momentum strategy buying. The trade is real on the venue's books but moves no risk, pays two fees, and prints a wash trade that surveillance will
+see (One Quant Book 9, chapter 29). Venues offer \emph{self-trade prevention} (One Quant Book 10, chapter 26): orders tagged with the same group are
+never matched against each other, and the venue cancels the newer, the older or both, as the firm chose. The engine's side of the problem is to
+know every strategy's resting orders and to route internal crossings to the netting logic of chapter 11 before they reach the venue.
+
+\section{Quote ladders and the line not to cross}
+
+A ladder of orders on one side, cancelled and moved as the market moves, looks from the outside like the layering of One Quant Book 9, chapter
+29: orders at several prices that rarely trade. The difference is intent. The statute under which the Seventh Circuit upheld Coscia's conviction in
+2017 defines spoofing as ``bidding or offering with the intent to cancel the bid or offer before execution''. The court rejected his argument that
+the definition was vague because high-frequency traders cancel 98\% of their orders. Cancelling most orders is normal; placing them never meaning to
+let them trade is not. A market maker's ladder is defensible when each level is priced and sized to trade, fills are taken when they come, both sides
+are quoted, and the cancellation logic is the policy's, documented. The engine is where that evidence is produced: it logs, for every order, the
+target it served.
+
+\section{Tutorial: one engine, four configurations}\label{tut:hf:the-quoting-engine:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Drive the engine from a quoting policy on the simulated market and measure messages, fills, races, queue places and edge.
+\textbf{End state:} the table below.
+\begin{tutsteps}
+\item \textbf{The diff} (\cref{met:hf:the-quoting-engine:diff}), in \texttt{firm.quoteengine.QuoteEngine.update}; its C++20 and Rust twins produce the
+same 1,154 actions on a 3,000-event fixture.
+\omcode{code/firm/quoteengine/firm_quoteengine.py}{71}{102}{Cover targets with working orders, amend down, add, cancel, or keep within the hysteresis.}\label{lst:hf:the-quoting-engine:diff}
+\item \textbf{Issuing under a budget}: cancels first, then amendments, then new orders, one token each.
+\omcode{code/firm/quoteengine/firm_quoteengine.py}{103}{124}{The token bucket decides what is sent; the rest is re-derived at the next update.}\label{lst:hf:the-quoting-engine:issue}
+\item \textbf{The quoter.} \texttt{hf\_engine.EngineQuoter} targets the others' best prices (and the prices behind them for a ladder), one lot per
+level, and translates the engine's actions into orders; on \texttt{firm.tape}, which has no modify message, an amendment becomes a cancel and a new
+order.
+\item \textbf{Compare} four configurations on four twenty-minute sessions with \texttt{compare()}.
+\end{tutsteps}
+\textbf{What to change next.} Run the same quoter on \texttt{firm.exchsim}, whose replace message keeps priority on a size decrease; add a second
+strategy in the same instrument and count the self-trades prevented.
+\end{tutorial}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+configuration & messages & fills & races & 10-s mark-out & edge & median age\\
+& an hour & an hour & an hour & (ticks a share) & (\$ an hour) & of a fill (s)\\
+\midrule
+one level & 758 & 250 & 19.5 & 0.141 & 35.25 & 9.6\\
+three levels & 980 & 282 & 20.3 & 0.144 & 40.50 & 17.3\\
+three levels, hysteresis of two ticks & 806 & 364 & 1.5 & $-0.064$ & $-23.25$ & 9.6\\
+three levels, 2 messages a second & 884 & 282 & 9.8 & 0.154 & 43.50 & 17.7\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Four lessons (\cref{fig:hf:the-quoting-engine:configs}). The ladder sends 29\% more messages and earns 15\% more edge an hour, because its fills come from orders that waited in the queue (a
+median of 17 seconds against 10). The hysteresis saves messages but keeps orders a tick away from where the policy wants them, including a bid one
+tick above a best bid that has fallen: that order is alone at a stale price and gets picked off, and the mark-out turns negative; hysteresis in a
+one-tick book must only ever keep orders behind the target, never in front. The throttle of two messages a second drops 1,396 derived actions an hour
+and loses nothing: the actions dropped were re-derived and sent when a token was free, and the budget cut the races by half. The messages per fill,
+3.0 to 3.5, are what a venue's order-to-trade ratio would count.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=10pt,ymin=0,ymax=1100,xmin=-0.5,xmax=3.5,xtick={0,1,2,3},
+  xticklabels={one level,three levels,hysteresis,throttle},ylabel={\small an hour},tick label style={font=\footnotesize},
+  axis y line*=left,area legend,table/col sep=comma,legend style={font=\scriptsize,at={(0.5,-0.22)},anchor=north},legend columns=3]
+\addplot[fill=omThm!60,draw=omThm] table[x=i,y=messages]{figdata/hft/10-the-quoting-engine/configs.csv};
+\addplot[fill=gray!40,draw=gray] table[x=i,y=fills]{figdata/hft/10-the-quoting-engine/configs.csv};
+\addlegendentry{messages}\addlegendentry{fills}
+\addlegendimage{line legend,omDef,only marks,mark=*}\addlegendentry{edge, \$ an hour (right)}
+\end{axis}
+\begin{axis}[width=11cm,height=5.4cm,ymin=-40,ymax=60,xmin=-0.5,xmax=3.5,axis y line*=right,axis x line=none,
+  ylabel={\small edge (\$ an hour)},tick label style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,only marks,mark=*,mark size=2pt] table[x=i,y=edge]{figdata/hft/10-the-quoting-engine/configs.csv};
+\draw[omDef!50,dotted] (axis cs:-0.5,0) -- (axis cs:3.5,0);
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Messages and fills an hour (bars, left) and the ten-second edge in dollars an hour (dots, right) for the four configurations of the
+tutorial: one level, a three-level ladder, the ladder with a two-tick hysteresis, and the ladder under a throttle of two messages a second with a
+burst of five; one lot a level, four twenty-minute sessions. Data: \texttt{hf\_engine.compare}.}\label{fig:hf:the-quoting-engine:configs}
+\end{omfigure}
+
+\section{Build: the quoting engine}\label{bld:hf:the-quoting-engine:quoteengine}
+
+\begin{build}
+\bfield{Purpose} Turn target quotes into the fewest messages under a venue's priority rules and a message budget, and track every order's state.
+\bfield{Interface} \texttt{QuoteEngine(min\_move, min\_size, rate, burst)}: \texttt{update(t, side, targets) -> actions} (\texttt{('new', oid, side, price,
+qty)}, \texttt{('amend', oid, qty)}, \texttt{('cancel', oid)}); \texttt{ack(oid)}, \texttt{fill(oid, qty)}, \texttt{orders}, \texttt{stats}
+(new, amend, cancel, dropped, fills, races); \texttt{TokenBucket(rate, burst).take(t)}. C++20: \texttt{cpp/firm\_quoteengine.hpp}; Rust:
+\texttt{rust/}.
+\bfield{Rules} Amend only downwards; orders in flight are untouched; cancels before amendments before new orders; an empty bucket drops actions,
+never queues them; a fill during a pending cancel is counted as a race.
+\bfield{Acceptance tests} \texttt{code/firm/quoteengine/tests/}: no message when the book already matches the target; a price move cancels one
+order and adds one; a size decrease amends, an increase adds; the hysteresis keeps an order within one tick; the throttle drops and the next update
+re-derives; a cancel--fill race is counted; the Python, C++20 and Rust engines produce the same action log on the fixture.
+\bfield{Stretch} Replace messages with the venue's priority rule on \texttt{firm.exchsim}; per-strategy self-trade groups; an order-to-trade budget per
+instrument and session.
+\end{build}
+
+\begin{omsources}
+\item Commission Delegated Regulation (EU) 2017/566 on the ratio of unexecuted orders to transactions.
+\item CME Group, CME Globex Messaging Efficiency Program, rule filing with the CFTC, November 2019.
+\item \emph{United States v. Coscia}, 866 F.3d 782 (7th Cir. 2017).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:hf:the-quoting-engine:1}
+The engine rests 300 shares at 100 and the target becomes 100 shares at 100. What does it send, and does the order keep its place?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:the-quoting-engine:2}
+A member sent 12,000 orders and made 400 transactions in an instrument in a session. What is its ratio of unexecuted orders to transactions in number
+terms?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:the-quoting-engine:3}
+A token bucket refills at 2 tokens a second with a depth of 5. It is full at $t=0$ and five actions are sent at once. How many can be sent at
+$t=1.2$?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:the-quoting-engine:4}
+Why should a throttled engine drop actions rather than queue them?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:the-quoting-engine:5}
+Why did the two-tick hysteresis turn the mark-out negative, and how would you fix it without losing its message savings?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:the-quoting-engine:6}
+What makes a \omterm{def:hf:the-quoting-engine:ladder}{quote ladder} defensible against an accusation of layering?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:the-quoting-engine:7}
+\emph{Coding.} Replay the component's fixture through an engine with \texttt{rate=5} and \texttt{burst=2}
+(\texttt{hf\_engine.fixture\_stats}), report the counts, and explain why they say nothing about what a tighter throttle would do.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:the-quoting-engine:8}
+\emph{Find the flaw.} ``To save messages we increase an order's size with a modify instead of sending a second order.''
+\end{exercise}
+
+\section{Problem: Ten Thousand Changes of Mind}
+
+\begin{problem}[{Weekend problem --- ten thousand changes of mind}]\label{pb:hf:the-quoting-engine:1}
+A market maker's engine must keep a three-level ladder current in a busy one-tick stock without exceeding its message budget or its venue's
+order-to-trade ratio.
+
+\medskip\noindent\textbf{Part I --- The engine.}
+\begin{enumerate}
+\item State the diff of \cref{met:hf:the-quoting-engine:diff} and justify the order in which actions are sent.
+\item Define a \omterm{def:hf:the-quoting-engine:ladder}{quote ladder} and say what its deeper levels are for in a one-tick book.
+\item Define a \omterm{def:hf:the-quoting-engine:replace}{cancel-replace} and the priority rule, and explain why the engine never amends upwards.
+\item What is a cancel--fill race, and how often did it happen here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Limits.}
+\begin{enumerate}[resume]
+\item Define a \omterm{def:hf:the-quoting-engine:throttle}{message throttle} and describe the token bucket.
+\item Summarise the two message limits of the dated box.
+\item What is self-trade prevention and why does a multi-strategy firm need it?
+\item Where is the line between a ladder and layering, and what did the Coscia court say about cancellation rates?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Measurements.}
+\begin{enumerate}[resume]
+\item Give messages, fills and edge for the one-level and three-level quoters.
+\item Why do the ladder's fills come from older orders?
+\item What did the two-tick hysteresis do, and why?
+\item What did the throttle drop, and what did it cost?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: messages an hour and the median age of a fill under the one-level, three-level and throttled configurations,
+against the edge each earns.
+\item Which configuration would you run, and with what change to the hysteresis?
+\item What would the messages-per-fill figures mean for a venue's order-to-trade ratio?
+\item How would results change on a venue whose replace keeps priority on size decreases?
+\item Why must the Python, C++ and Rust engines agree action for action?
+\item What does the engine log to defend the firm's quoting?
+\item How would a second strategy in the same stock change the engine?
+\item In one sentence: what does a quoting engine optimise?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:hf:the-quoting-engine:1}
+Your engine sends a cancel and immediately receives a fill for the same order. What states must it handle, and what does it tell the strategy?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:hf:the-quoting-engine:2}
+Design the data structure for working orders so that the diff against a ten-level ladder runs in constant time per level.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:hf:the-quoting-engine:3}
+Your venue caps you at 50 messages a second and the market is moving fast. Which messages do you send first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risk}]\label{iq:hf:the-quoting-engine:4}
+A regulator asks why your firm cancels 97\% of its orders. What do you show them?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:hf:the-quoting-engine:5}
+How would you measure the value of a place in the queue that your ladder preserves when the price moves?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:hf:the-quoting-engine:6}
+Prove that a token bucket of rate $r$ and depth $b$ never lets more than $b+r\,T$ messages through in any window of length $T$.
+\end{interviewq}

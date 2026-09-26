@@ -1,0 +1,395 @@
+\chapter{Monitoring and Retraining}\label{ch:ml:monitoring-and-retraining}
+
+On a Tuesday the model stopped trading: every prediction was inside the threshold. Nothing had failed. An upstream vendor had
+begun sending volumes in lots instead of shares, and the model was obediently scaling them. No test had broken, because every
+number was still a number; the only sign was that the desk had nothing to do. This chapter builds the monitors that would have
+paged someone before lunch, and asks of each the question that decides whether it is worth having: how long does it take to
+see a real failure when it is only allowed to cry wolf once a month? Three failures are planted in a simulated production run: a
+unit change upstream, a reversal of the strongest feature's effect, and a feature whose effect fades while its spread grows.
+Monitors on the inputs see the first on the day it happens and are blind to the second; the outcome monitor sees the second in a
+day and cannot see the first for months; nothing sees the third's lost accuracy, and the input monitors catch it only through its
+side effect, six weeks in.
+
+\section{What to monitor: inputs, outputs, outcomes}
+
+\begin{definition}[Model monitoring, prediction drift]\label{def:ml:monitoring-and-retraining:monitoring}
+\emph{Model monitoring}\index{model monitoring} is the continuous comparison of a production model's inputs, outputs and
+realised outcomes with what was expected when it was validated, with alarms that page a person when they differ by more than
+chance allows. \emph{Prediction drift}\index{prediction drift} is a change in the distribution of the model's outputs relative to
+the validation period, whatever its cause.
+\end{definition}
+
+Chapter~12 separated \omterm{def:ml:online-learning-and-drift:drift}{covariate shift}, a change in the inputs, from \omterm{def:ml:online-learning-and-drift:drift}{concept drift}, a change in how the inputs relate to the
+target, and built \omterm{def:ml:online-learning-and-drift:detector}{drift detectors} on a model's errors. A production model is watched at three layers, because each sees failures
+the others miss. Inputs are available at once and in bulk: every feature of every name, every day, compared with the training
+reference, after the schema and delivery checks of chapter~15 and the freshness checks of chapter~24. Outputs are available at
+once too: the distribution of predictions, the share of names whose forecast clears the trading threshold, the positions and
+turnover they imply. Outcomes (the realised information coefficient, the P\&L) arrive only after the forecast horizon, and they
+are noisy: a model with a true daily information coefficient of 0.10 shows a standard deviation of about 0.07 from one day to the
+next. Outcomes are what matter, and they are the slowest to speak.
+
+The chapter's production model is deliberately plain, so that every failure is known exactly. Each day 200 names carry five
+standardised features; the next day's returns load on the first three with coefficients 0.08, $-0.06$ and 0.05, plus noise of
+unit variance. A linear model is fitted on 60 days and then runs for 400 more; it trades the names whose forecast is larger in
+absolute value than the training median, half of them. (Chapter~29's order-book model is monitored with the same code at the end
+of the book.) Three failures start on day 200, each in 20 independent runs (\cref{lst:ml:mon:day}):
+\begin{itemize}
+\item \emph{unit change}: the second feature arrives a hundred times smaller, as volumes in lots would;
+\item \emph{reversal}: the first feature's effect changes sign, a regime change the inputs do not show;
+\item \emph{slow fade}: over 150 days the third feature's effect falls to zero while its spread grows by half.
+\end{itemize}
+
+\section{Drift statistics and alarm design}
+
+\begin{definition}[Population stability index]\label{def:ml:monitoring-and-retraining:psi}
+Cut a reference sample of a variable into $B$ bins (here its deciles) with shares $r_1,\dots,r_B$, and let $q_1,\dots,q_B$ be the
+shares of a new sample in the same bins. The \emph{population stability index}\index{population stability index} is
+\[
+\mathrm{PSI}=\sum_{b=1}^{B}(q_b-r_b)\ln\frac{q_b}{r_b},
+\]
+the symmetrised Kullback--Leibler divergence between the two binned distributions (empty bins are floored at a small share).
+\end{definition}
+
+The index comes from credit scoring, where the rules of thumb are that below 0.10 a population has shifted little and above 0.25
+it has shifted significantly; Yurdakul and Naranjo point out that these benchmarks are used without reference to their error
+rates. The Kolmogorov--Smirnov statistic of Book~4 (chapter~12), the largest gap between the two empirical distribution
+functions, is the other workhorse (\cref{lst:ml:mon:psi}). Both are computed each day on each feature against the training
+reference, and the monitor takes the largest over the five features. With many features, one test per feature multiplies the
+false alarms; Rabanser and co-authors, comparing ways of detecting dataset shift, found two-sample tests on a reduced
+representation of the inputs the most effective: a single multivariate test, like chapter~16's \omterm{def:ml:generative-models-and-synthetic-data:tests}{classifier two-sample test}. The output monitors compute the index on the predictions
+and track the share of names inside the trading threshold, which is where the Tuesday's failure would show first.
+
+An alarm is a threshold, and a threshold is a false-alarm rate. The chapter fixes one false page a month, 1 in 21 trading days,
+and sets each threshold on 20 runs of 400 days without failures (\cref{lst:ml:mon:calib}). A page is counted when an alarm
+starts, not for every day it lasts, because a statistic that stays above its threshold for a week pages the on-call person once.
+The calibrated thresholds are 0.115 for the largest feature index, 0.115 for the largest Kolmogorov--Smirnov statistic, 0.089
+for the index of the predictions and 0.07 for the change in the share inside the threshold. The first is above the credit-scoring
+rule of thumb: with 200 names a day, deciles hold 20 names each, and sampling noise alone pushes the largest of five indices past
+0.10 on more than one day in twenty. A threshold copied from a rule of thumb would page more often than the team agreed to, and
+a team paged too often stops reading the pages.
+
+Two numbers describe each monitor's response to a failure. The \emph{first alarm} is the number of days from the failure to the
+monitor's first page; since every monitor pages falsely once a month, a monitor that sees nothing still pages after about two
+weeks, and a first alarm is only a detection when it comes well before that. The \emph{sustained alarm} is the number of days to
+the first 21-day window with at least five alarm days, a page that keeps coming back; without a failure, no monitor's median
+reaches one within 200 days.
+
+\section{Performance alarms on noisy outcomes}
+
+\begin{definition}[Performance alarm]\label{def:ml:monitoring-and-retraining:performance-alarm}
+A \emph{performance alarm}\index{performance alarm} is a monitor on realised outcomes (the information coefficient, hit rate,
+P\&L or mark-outs of the model's trades) that pages when their level falls below what validation led the firm to expect, by more
+than the outcomes' own noise allows at the chosen false-alarm rate.
+\end{definition}
+
+The chapter's \omterm{def:ml:monitoring-and-retraining:performance-alarm}{performance alarm} is the one-sided CUSUM test of Book~7 (chapter~13) on the daily information coefficient
+(\cref{lst:ml:mon:cusum}): it accumulates the shortfall of each day's coefficient below its expected level of 0.103, less an
+allowance $k$ of half its daily standard deviation (0.035), and pages when the sum exceeds $h$, then starts again. At one false
+page a month, $h$ is 0.11, about one and a half days' standard deviation: the monitor can afford to wait very little.
+
+That tells how much it can see. A fall of the mean coefficient by $\Delta$, measured with daily noise $\sigma$, needs about
+\[
+n\approx\Bigl(\frac{(z_{0.95}+z_{0.90})\,\sigma}{\Delta}\Bigr)^2
+\]
+days to be told from noise with a one-sided test at 5\% and 90\% power. After the reversal the coefficient falls from 0.103 to
+0.003, and $n$ is about 4 days; after the unit change it falls to 0.087, and $n$ is about 150 days; at the end of the slow fade it
+has fallen to 0.081, and $n$ is about 80 days, but the fade takes 150 days to get there. Outcomes cannot see small losses of
+accuracy on any horizon a desk would accept; they see large ones fast.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+ & none & \multicolumn{2}{c}{unit change} & \multicolumn{2}{c}{reversal} & \multicolumn{2}{c}{slow fade}\\
+\cmidrule(lr){2-2}\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+monitor & first & first & sustained & first & sustained & first & sustained\\
+\midrule
+largest feature PSI & 12 & 0 & 0 & 12 & never & 12 & 42\\
+largest feature KS & 10 & 0 & 0 & 10 & never & 8 & 60\\
+prediction PSI & 17 & 0 & 0 & 17 & never & 19.5 & never\\
+share inside threshold & 11 & 0 & 0 & 11 & never & 9.5 & never\\
+IC CUSUM & 13 & 9.5 & never & 1 & 0 & 13 & never\\
+\bottomrule
+\end{tabular}
+\caption{Days from the failure (day 200) to each monitor's first alarm and to a sustained alarm (five alarm days in 21), medians
+over 20 runs, every monitor calibrated to one false page a month; ``none'' is the same count on runs without a failure, what a
+blind monitor scores; ``never'' means no sustained alarm in the 200 days that follow. Data: \texttt{ml\_monitor.delays}.}
+\label{tab:ml:mon:delays}
+\end{table}
+
+\Cref{tab:ml:mon:delays} is the chapter's result. The unit change is seen by every input and output monitor on its first day:
+the second feature's index is about 7, sixty times its threshold, and the share of names inside the trading threshold rises from
+50\% to 63\%, a quarter fewer names traded. The outcome monitor pages once after a median of 9.5 days and never insists. The
+reversal is invisible to every input and output monitor (their columns equal the ``none'' column: the inputs and the
+distribution of predictions have not changed at all), and the CUSUM pages within two days in 13 of the 20 runs and keeps paging. The
+slow fade's lost accuracy is seen by nothing; its growing spread is seen by the input monitors, sustained after a median of 42
+days for the index and 60 for the Kolmogorov--Smirnov statistic (\cref{fig:ml:mon:fade}). Had the fade come without the change
+in spread, nothing in the table would have caught it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={production day},ylabel={alarm days per month},xmin=0,xmax=400,ymin=0,ymax=22,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},legend pos=north west,
+  legend cell align=left,legend style={font=\small},table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.3pt] table[x=day,y=psi]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[omDef,very thick,dashed,mark=square*,mark size=1.3pt,mark options={solid}] table[x=day,y=ks]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[gray,thick,mark=triangle*,mark size=1.5pt] table[x=day,y=predpsi]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[omThm,very thick,dotted,mark=diamond*,mark size=1.6pt,mark options={solid}] table[x=day,y=cusum]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[black,thin,dashed,forget plot] coordinates {(200,0) (200,22)};
+\legend{largest feature PSI,largest feature KS,prediction PSI,IC CUSUM}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Alarm days per month (21 days) under the slow fade, in 25-day windows, averaged over 20 runs; the fade starts on day
+200 (dashed) and ends on day 350. A blind monitor alarms on about one day a month. Data:
+\texttt{ml\_monitor.alarm\_rates}.}\label{fig:ml:mon:fade}
+\end{omfigure}
+
+\begin{method}[Designing a model's monitors]\label{met:ml:mon:design}
+\begin{enumerate}
+\item Monitor inputs, outputs and outcomes: each layer sees failures the others cannot.
+\item Choose the false-page rate the team will actually answer, and calibrate every threshold to it on history or simulation
+without failures; do not copy thresholds from rules of thumb.
+\item Count pages at the onset of an alarm, and distinguish a first page from a sustained alarm.
+\item Measure each monitor's delay on planted failures, and compare it with a blind monitor's; a monitor that never beats that
+column is noise.
+\item Accept that outcome monitors see only large losses quickly; cover small ones with scheduled revalidation.
+\end{enumerate}
+\end{method}
+
+\section{Shadow, canary and champion--challenger rollouts}
+
+\begin{definition}[Shadow deployment, champion--challenger]\label{def:ml:monitoring-and-retraining:shadow}
+In a \emph{shadow deployment}\index{shadow deployment} a new model receives the production inputs and records its predictions,
+but its decisions are not executed; its outcomes are computed as if they had been. \emph{Champion--challenger}\index{champion--challenger}
+is the discipline of keeping the production model (the champion) in place until a challenger, run beside it on the same data,
+has shown with a test chosen in advance that it is better.
+\end{definition}
+
+A shadow run costs nothing but computation and gives a clean comparison, because champion and challenger see the same names on
+the same days. After the reversal, the CUSUM pages within days. A challenger is refitted on the 40 days that
+follow (its coefficient on the first feature is $-0.081$ on average over the runs, against the true $-0.08$) and runs in shadow
+from day 240. Its mean information coefficient is 0.105, the champion's 0.003. The comparison uses Book~7's always-valid
+sequential test (chapter~21) on the daily differences (\cref{lst:ml:mon:shadow}), which may be looked at every day without
+inflating its error rate; the standard error is estimated from the days seen, so the test gives no verdict for ten days, since on
+three days a small sample standard deviation makes any difference look certain. The challenger is promoted in all 20 runs, after
+a median of 10 shadow days and at most 19 (\cref{fig:ml:mon:shadow}). Without a failure, a challenger refitted on 40 ordinary
+days is promoted in 2 of 100 runs, within the test's 5\%.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.8cm,xlabel={shadow day},ylabel={always-valid p-value},ymode=log,xmin=1,xmax=20,
+  ymin=1e-7,ymax=2,tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[omProp,thick,mark=*,mark size=1.2pt] table[x=day,y=run0]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[omDef,thick,mark=square*,mark size=1.2pt] table[x=day,y=run1]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[omThm,thick,mark=triangle*,mark size=1.4pt] table[x=day,y=run2]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[gray,thick,mark=diamond*,mark size=1.4pt] table[x=day,y=run3]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[black,thick,mark=o,mark size=1.2pt] table[x=day,y=run4]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[black,thin,dashed] coordinates {(1,0.05) (20,0.05)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Always-valid p-values of the challenger's advantage over the champion, day by day in shadow after the reversal, five
+of the 20 runs; the test gives no verdict for ten days; dashed: 0.05, where the challenger is promoted. Data:
+\texttt{ml\_monitor.shadow\_run}.}\label{fig:ml:mon:shadow}
+\end{omfigure}
+
+Shadow comparisons measure forecasts, not the market's reaction to trading on them; a model whose orders move prices is compared
+in a canary deployment (Book~7, chapter~21), trading a small share of capital. The canary's value is in what it limits. The
+chapter promotes a challenger with a sign error on its second feature, a bug a shadow run would have caught but suppose it did
+not: the CUSUM rolls it back after a median of 3 days (at most 18). The information coefficient given up, summed over those days
+and weighted by capital, is 0.26 IC-days when the challenger trades the whole book and 0.026 when it trades a tenth of it. The
+rollback itself is a registry action (\cref{lst:ml:mon:rollback}): the version that was in production before is promoted back,
+with the reason, into chapter~25's \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{audit trail}.
+
+\section{Retrain, roll back, or retire}
+
+Each alarm calls for a different action, and the wrong one hides the failure. An input alarm with no fall in outcomes (the unit
+change) calls for fixing the data: retraining on volumes in lots would teach the model a new scale for one feature and bury the
+vendor's error in its coefficients, until the vendor corrected it. An outcome alarm with calm inputs (the reversal) says the
+relation has changed: cut the model's size or stop it (the kill switch of Book~11, chapter~27, for a model trading at speed),
+refit on data from after the change once there is enough, and promote through shadow and canary. A slow loss that no monitor
+sees is the case for scheduled retraining (chapter~12's \omterm{def:ml:online-learning-and-drift:schedule}{retraining schedule}) and periodic revalidation of the model against a
+simple benchmark. A model is retired when its refitted challengers no longer beat a null: when the effect is gone, retraining
+only fits noise faster. Sculley and co-authors list ``changes in the external world'' among the debts of machine-learning
+systems, and Breck and co-authors make monitoring half of their rubric for a model's production readiness. In the interviews
+of machine-learning engineers by Shankar and co-authors, false-positive alerts were the most commonly discussed pain point, and
+the alert fatigue that follows leads teams to silence alerts and miss real drops: the reason to count pages.
+
+\begin{method}[After an alarm]\label{met:ml:mon:after}
+\begin{enumerate}
+\item Input or output alarm: check the data path first (units, schema, vendor changes); fix the data, not the model.
+\item Outcome alarm with calm inputs: reduce or stop trading, refit on post-change data, and promote only through shadow and a
+canary.
+\item A challenger is promoted by a sequential test chosen in advance, and rolled back by the \omterm{def:ml:monitoring-and-retraining:performance-alarm}{performance alarm}, both recorded in
+the registry.
+\item Retrain on a schedule for the losses no monitor sees; retire the model when retraining no longer beats a null.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: the Tuesday the model went quiet}\label{tut:ml:monitoring-and-retraining:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Plant three failures in a simulated production run, calibrate five monitors to one false page a month, measure
+their delays, promote a challenger from shadow and roll back a faulty one. \textbf{End state:} \cref{tab:ml:mon:delays},
+\cref{fig:ml:mon:fade}, \cref{fig:ml:mon:shadow}.
+\begin{tutsteps}
+\item \textbf{The three failures.}
+\omcode{code/ml/27-monitoring-and-retraining/python/ml_monitor.py}{44}{58}{One day of production data, with the planted failures.}\label{lst:ml:mon:day}
+\item \textbf{Drift statistics.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{49}{65}{The population stability index and the Kolmogorov--Smirnov statistic against a prepared reference.}\label{lst:ml:mon:psi}
+\item \textbf{Thresholds at a page rate.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{94}{110}{Alarm onsets, and the threshold that pages at a chosen rate.}\label{lst:ml:mon:calib}
+\item \textbf{The \omterm{def:ml:monitoring-and-retraining:performance-alarm}{performance alarm}.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{75}{86}{A one-sided CUSUM on the daily information coefficient.}\label{lst:ml:mon:cusum}
+\item \textbf{The shadow test.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{118}{127}{Always-valid p-values of a challenger's advantage, with no verdict before ten days.}\label{lst:ml:mon:shadow}
+\item \textbf{Rollback.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{130}{143}{Putting the previous production version back through the registry.}\label{lst:ml:mon:rollback}
+\item \textbf{Run} \texttt{ml\_monitor.thresholds()}, \texttt{delays()}, \texttt{shadow()}, \texttt{rollbacks()} and
+\texttt{fig\_monitor.py} (about 15 seconds on one core).
+\end{tutsteps}
+\textbf{What to change next.} Pool the last 20 days of each feature into one index and calibrate it the same way: it sees the
+slow fade's spread sooner, but its false alarms come in spells, and one page a month means something different for it
+(\cref{exo:ml:monitoring-and-retraining:7}).
+\end{tutorial}
+
+\section{Build: model monitoring}\label{bld:ml:monitoring-and-retraining:mlmonitor}
+
+\begin{build}
+\bfield{Purpose} Monitors on a production model's inputs, outputs and outcomes, calibrated to a false-page rate, and the
+promotion and rollback decisions they feed.
+\bfield{Interface} \texttt{Reference(ref, bins)}; \texttt{psi(ref, x)}; \texttt{ks(ref, x)}; \texttt{daily\_ic(pred, y)};
+\texttt{Cusum(target, k, h).update(v)}; \texttt{calibrate\_daily(null, rate)}; \texttt{onsets(alarms)};
+\texttt{calibrate\_pages(null, rate)}; \texttt{first\_alarm(stats, threshold, start)}; \texttt{shadow\_verdict(ic\_challenger,
+ic\_champion, tau, min\_days)} on \texttt{firm.abtest}; \texttt{rollback(registry, name, ts, reason)} on \texttt{firm.exptrack}.
+\bfield{Rules} Every threshold is calibrated on data without failures at a stated rate; pages are counted at onsets; promotions
+use a test fixed in advance; rollbacks go through the registry with a reason.
+\bfield{Acceptance tests} \texttt{code/firm/mlmonitor/tests/}: the index is zero on its own reference and grows with a shift; the
+Kolmogorov--Smirnov statistic and the information coefficient match SciPy, ties included; the CUSUM pages on a drop and resets;
+calibrated thresholds page at their rate; the shadow test gives no verdict before ten days and promotes a null challenger in at
+most 5\% of runs; a rollback restores the previous version and keeps the \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{audit trail} intact.
+\bfield{Stretch} Multivariate drift (a \omterm{def:ml:generative-models-and-synthetic-data:tests}{classifier two-sample test}, chapter~16) and monitors on P\&L and mark-outs, calibrated the
+same way.
+\end{build}
+
+\begin{omsources}
+\item S.~Rabanser, S.~Günnemann and Z.~C.~Lipton, ``Failing loudly: an empirical study of methods for detecting dataset
+shift'', \emph{NeurIPS}, 2019.
+\item E.~Breck, S.~Cai, E.~Nielsen, M.~Salib and D.~Sculley, ``The ML test score: a rubric for ML production readiness and
+technical debt reduction'', \emph{IEEE International Conference on Big Data}, 2017.
+\item B.~Yurdakul and J.~D.~Naranjo, ``Statistical properties of the population stability index'', \emph{Journal of Risk Model
+Validation}, 2020.
+\item D.~Sculley and co-authors, ``Hidden technical debt in machine learning systems'', \emph{NeurIPS}, 2015.
+\item S.~Shankar, R.~Garcia, J.~M.~Hellerstein and A.~G.~Parameswaran, ``Operationalizing machine learning: an interview
+study'', arXiv:2209.09125, 2022; published in \emph{Proceedings of the ACM on Human-Computer Interaction}, 2024.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:1}
+For each of the three layers (inputs, outputs, outcomes), name one failure it sees that the other two do not, from the chapter's
+three.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:2}
+Why is the calibrated threshold on the largest feature index (0.115) above the credit-scoring rule of thumb of 0.10, and what
+would a threshold of 0.10 do?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:3}
+Why does a blind monitor, calibrated to one false page a month, still show a first alarm about two weeks after a failure?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:4}
+Check the chapter's figure of about 150 days for the outcome monitor to see the unit change, from the information coefficients
+0.103 and 0.087 and the daily standard deviation 0.071. How many days would a firm trading 2,000 names need?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:5}
+Why does the shadow test give no verdict for ten days? What goes wrong without that rule?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:6}
+\emph{Find the flaw.} ``The PSI alarm went off after the vendor change, so we retrained the model on the new data and the alarm
+stopped.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:monitoring-and-retraining:7}
+\emph{Coding.} Add the pooled monitor of the tutorial's last step (the largest feature index over the last 20 days of samples),
+calibrate it to one page a month, and report its delays. Why do its false alarms come in spells?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:monitoring-and-retraining:8}
+Design the monitors for a fade with no change of spread: the third feature's effect falls to zero over 150 days and its
+distribution is unchanged. Which layer can see it, how fast, and what would you do instead?
+\end{exercise}
+
+\section{Problem: The Tuesday the Model Went Quiet}
+
+\begin{problem}[{Weekend problem --- the Tuesday the model went quiet}]\label{pb:ml:monitoring-and-retraining:1}
+The chapter's simulated production run, three planted failures, five monitors.
+
+\medskip\noindent\textbf{Part I --- The model and its monitors.}
+\begin{enumerate}
+\item Describe the production model and the three failures.
+\item What does each layer (inputs, outputs, outcomes) monitor, and when is each available?
+\item Define the \omterm{def:ml:monitoring-and-retraining:psi}{population stability index} and give the calibrated thresholds.
+\item Why count pages at the onset of an alarm?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- \omterm{def:ml:monitoring-and-retraining:performance-alarm}{Performance alarms}.}
+\begin{enumerate}[resume]
+\item How is the CUSUM on the information coefficient set up and calibrated?
+\item How many days does an outcome monitor need to see each failure?
+\item Why can outcomes not see the unit change?
+\item What is the difference between a first alarm and a sustained alarm?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The delays.}
+\begin{enumerate}[resume]
+\item Which monitors see the unit change, and when?
+\item Which see the reversal?
+\item What sees the slow fade, and through what?
+\item What would have caught the fade without its change in spread?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: each monitor's detection delay for the three planted failures at one false alarm a month.
+\item What happens in shadow after the reversal, and how often is a null challenger promoted?
+\item What does a canary save when a faulty challenger is promoted?
+\item What should the desk have done on the Tuesday?
+\item When should a model be retrained, and when retired?
+\item Who should be paged by each monitor?
+\item What should the monitoring record in the registry?
+\item In one sentence: what does a monitor need before it is worth having?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle}]\label{iq:ml:monitoring-and-retraining:1}
+What would you monitor for a model in production, and why at more than one layer?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, researcher}]\label{iq:ml:monitoring-and-retraining:2}
+What is the \omterm{def:ml:monitoring-and-retraining:psi}{population stability index}, and how would you choose its alarm threshold?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:monitoring-and-retraining:3}
+Your model's daily IC is 0.10 with a standard deviation of 0.07. How long before you could tell it had fallen to 0.08?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:monitoring-and-retraining:4}
+Explain \omterm{def:ml:monitoring-and-retraining:shadow}{shadow deployment}, canary and \omterm{def:ml:monitoring-and-retraining:shadow}{champion--challenger}. When is each the right tool?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:monitoring-and-retraining:5}
+Your input drift alarm fires. Do you retrain?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{mle}]\label{iq:ml:monitoring-and-retraining:6}
+Your monitors page the team twenty times a week and nobody looks any more. What do you change?
+\end{interviewq}

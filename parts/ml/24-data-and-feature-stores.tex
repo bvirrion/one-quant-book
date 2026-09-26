@@ -1,0 +1,302 @@
+\chapter{Data and Feature Stores}\label{ch:ml:data-and-feature-stores}
+
+A one-second order-book forecast has a rank information coefficient of 0.44 in its backtest and 0.36 live. Nothing is
+wrong with the model. In research its features were computed on one-second bars and joined to each decision at the end of
+its second; in production they are computed from every message up to the decision. The research features had seen up to a
+second of the future, and the model had learned to use it. This chapter is about making that impossible: declaring each
+feature once and computing it the same way for training and for trading, storing it with the time it became known, knowing
+how fresh each value is, and testing continuously that the two computations agree. Its measurements use the book's synthetic
+order-book market and four planted skews; the parity test catches all four, and only one of them costs the model anything,
+which is a reason to catch them all rather than guess which matter.
+
+\section{The same feature twice: offline and online}
+
+\begin{definition}[Feature store, offline store, online store, feature definition]\label{def:ml:data-and-feature-stores:store}
+A \emph{feature store}\index{feature store} is the system that computes, stores and serves a firm's model inputs from one
+set of declarations. Its \emph{offline store}\index{offline store} holds feature values for history, keyed by entity and
+time, for training and backtests; its \emph{online store}\index{online store} holds the latest values, updated as data
+arrive, for models in production. A \emph{feature definition}\index{feature definition} declares a feature as data (its
+inputs, its aggregation, its window, its clock and its version) so that both stores compute it from the same declaration
+(Sculley and co-authors, 2015, on why this matters; Hermann and Del Balso, 2017, for an early production design).
+\end{definition}
+
+The chapter declares twelve features of the order book (\cref{tab:ml:fs:skew}): the spread, the queue and depth imbalances
+and the weighted mid (the last values after each message, from Book~7's streaming \texttt{firm.lobfeat} engine), order-flow
+imbalance over five and thirty seconds, traded and signed volume over thirty seconds, trade and message counts over ten, and
+the mid's change over five and thirty. Each is a \texttt{FeatureDef}: a name, the per-event input, an aggregation (last,
+sum, count, change) and a window. The \omterm{def:ml:data-and-feature-stores:store}{offline store} computes all twelve for a whole history at a list of decision times at
+once, from cumulative sums and as-of lookups (\cref{lst:ml:fs:offline}); the online engine consumes the messages one by one
+and keeps running windows (\cref{lst:ml:fs:online}). On eight thirty-minute sessions of \texttt{firm.tape}, 313\,681 messages
+and 7\,714 decisions (one at each trade), the two agree exactly at every decision: that is the store's contract.
+
+\section{Point-in-time correctness in the store}
+
+Every value in the \omterm{def:ml:data-and-feature-stores:store}{offline store} carries the time it became known, and a query for a decision at time $t$ sees only values
+known at $t$: the as-of join of Book~7 (chapter~3), applied to features. For event-driven features, knowledge time is the
+time of the last message the feature has read; for features from slower data (fundamentals, alternative data, chapter~15)
+it is the delivery time, and the store is bitemporal. The two bugs this rules out are the ones planted here: a research
+pipeline that reads one message past the decision (an off-by-one in a join), and one that computes features on a coarser
+clock and attaches to each decision the value at the end of its bar.
+
+\section{Freshness and materialisation}
+
+\begin{definition}[Materialisation, feature freshness]\label{def:ml:data-and-feature-stores:fresh}
+\emph{Materialisation}\index{materialisation} is the job that computes feature values from their definitions and writes them
+to a store, in batch for the \omterm{def:ml:data-and-feature-stores:store}{offline store} or continuously for the online one. \emph{Feature freshness}\index{feature
+freshness} is the age of a served value: the time since the newest input it reflects, which a production system monitors
+and bounds.
+\end{definition}
+
+Freshness is where production differs from research even when the code is shared: an input feed that arrives late makes every
+online value that depends on it stale. The fourth planted skew delays trade prints by 200~milliseconds relative to the book
+updates, as a separate trade feed might; the three trade-count and volume features then differ from research at 92 to 94\% of
+decisions, by 7 to 17\% of their standard deviation, while the book features are untouched.
+
+\section{Testing for skew}
+
+\begin{definition}[Training--serving skew]\label{def:ml:data-and-feature-stores:skew}
+\emph{Training--serving skew}\index{training--serving skew} is any difference between the feature values a model was trained
+on and those it receives in production for the same moment: different code, different clocks, different inputs, different
+arithmetic or different data timing.
+\end{definition}
+
+The parity test (\cref{lst:ml:fs:parity}) recomputes production's values offline for a sample of recent decisions and compares
+them feature by feature. \Cref{tab:ml:fs:skew} shows each planted skew's footprint, and \cref{tab:ml:fs:parity} what the test
+and the model see. A check of five random decisions per session, run five times on each of the eight sessions, flags every
+skew every time: each changes most decisions. The tolerance is a design choice: at $10^{-9}$ the test also flags production's
+float32 storage (a change of at most $10^{-7}$, harmless to the model), and at $10^{-6}$ it stops flagging it and still
+flags the other three at 96 to 100\% of decisions.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+& \multicolumn{4}{c}{RMS difference as a share of the feature's standard deviation}\\
+\cmidrule(l){2-5}
+feature & one event ahead & one-second bars & float32 & late trades\\
+\midrule
+spread & 0.38 & 0.92 & 0 & 0\\
+imbalance & 0.24 & 0.73 & 0.00 & 0\\
+depth imbalance & 0.11 & 0.41 & 0.00 & 0\\
+weighted mid minus mid & 0.30 & 0.79 & 0.00 & 0\\
+OFI 5 s & 0.03 & 0.24 & 0 & 0\\
+OFI 30 s & 0.01 & 0.07 & 0 & 0\\
+volume 30 s & 0.01 & 0.07 & 0 & 0.07\\
+signed volume 30 s & 0.02 & 0.10 & 0 & 0.11\\
+trades 10 s & 0.02 & 0.18 & 0 & 0.17\\
+mid change 5 s & 0.09 & 0.39 & 0 & 0\\
+mid change 30 s & 0.03 & 0.13 & 0 & 0\\
+messages 10 s & 0.00 & 0.04 & 0 & 0\\
+\bottomrule
+\end{tabular}
+\caption{Size of each planted skew, feature by feature, over 7\,714 decisions (0.00: a difference smaller than half a
+hundredth; 0: none). Data: \texttt{ml\_featstore.feature\_skew}.}\label{tab:ml:fs:skew}
+\end{table}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+& decisions & detected & \multicolumn{2}{c}{rank IC} & live P\&L\\
+\cmidrule(lr){4-5}
+skew & mismatched & (5-sample check) & backtest & live & (ticks)\\
+\midrule
+none & 0 & 0 & 0.411 & 0.411 & 0.089\\
+research one event ahead & 100\% & 100\% & 0.395 & 0.418 & 0.091\\
+research on one-second bars & 96\% & 100\% & 0.438 & 0.360 & 0.078\\
+production float32 storage & 92\% & 100\% & 0.411 & 0.411 & 0.089\\
+production trade prints 200 ms late & 100\% & 100\% & 0.411 & 0.411 & 0.089\\
+\bottomrule
+\end{tabular}
+\caption{Parity test (tolerance $10^{-9}$) and a ridge forecast of the mid's change over the next second, trained on four
+sessions with each research pipeline and tested on four others: its backtest on research features and its live result on
+production features, rank IC and mean P\&L per decision of trading the forecast's sign. Data:
+\texttt{ml\_featstore.parity\_table}, \texttt{model\_effects}.}\label{tab:ml:fs:parity}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,ybar,bar width=10pt,ymin=0.3,ymax=0.46,ylabel={rank IC, one-second forecast},area legend,
+  xtick={0,1,2,3,4},xticklabels={{none},{one event\\ahead},{one-second\\bars},{float32\\storage},{late trade\\prints}},
+  xticklabel style={align=center},tick label style={font=\small},label style={font=\small},xmin=-0.5,xmax=4.5,grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none},
+  table/col sep=comma]
+\addplot[fill=omThm,draw=none,bar shift=-5.5pt] table[x=i,y=backtest]{figdata/ml/24-data-and-feature-stores/ic.csv};
+\addplot[fill=omDef,draw=none,bar shift=5.5pt] table[x=i,y=live]{figdata/ml/24-data-and-feature-stores/ic.csv};
+\legend{backtest (research features),live (production features)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{What each skew does to the model: the rank IC its research backtest reports and the one it earns live. Data:
+\texttt{ml\_featstore.model\_effects}.}\label{fig:ml:fs:ic}
+\end{omfigure}
+
+The chapter's named result is in the table's third row. Research on one-second bars inflates the backtest's IC from 0.411 to
+0.438 and, because the model learned to lean on features that had seen the future, delivers 0.360 live, below what the clean
+pipeline earns; the P\&L per decision falls from 0.089 ticks to 0.078. The one-event look-ahead does the reverse here: the
+message after a trade is usually a quote update deep in the book, which adds noise rather than information, and the backtest
+understates the live result (0.395 against 0.418). On the five-second forecast the same skews move the IC by less than 0.01:
+whether a skew costs anything depends on how its error correlates with the target, which is not knowable in advance. The
+store's job is to make the stores agree, not to judge which disagreements are harmless.
+
+\begin{method}[Running features in production]\label{met:ml:fs:method}
+\begin{enumerate}
+\item Declare every feature once, as data, with its clock and window, and version it.
+\item Compute offline and online from the same declarations; in the \omterm{def:ml:data-and-feature-stores:store}{offline store}, stamp every value with its knowledge time
+and join point in time.
+\item Run a parity test on a sample of recent decisions every day, with tolerances set per feature, and alert on any mismatch.
+\item Monitor each online feature's freshness against a bound, and fall back or halt when inputs go stale.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: same features twice}\label{tut:ml:data-and-feature-stores:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Declare twelve features, compute them offline and online on eight sessions, plant four skews, and measure what
+the parity test and the model see. \textbf{End state:} \cref{tab:ml:fs:skew,tab:ml:fs:parity}, \cref{fig:ml:fs:ic}.
+\begin{tutsteps}
+\item \textbf{The \omterm{def:ml:data-and-feature-stores:store}{offline store}: every decision at once.}
+\omcode{code/firm/featstore/firm_featstore.py}{61}{79}{Vectorised point-in-time feature values.}\label{lst:ml:fs:offline}
+\item \textbf{The online engine: running windows.}
+\omcode{code/firm/featstore/firm_featstore.py}{108}{124}{Online values at any moment.}\label{lst:ml:fs:online}
+\item \textbf{The parity test.}
+\omcode{code/firm/featstore/firm_featstore.py}{143}{151}{Comparing the stores on a sample of decisions.}\label{lst:ml:fs:parity}
+\item \textbf{Run} \texttt{ml\_featstore.parity\_table()}, \texttt{parity\_table(tol=1e-6)}, \texttt{model\_effects()},
+\texttt{model\_effects(5.0)}, \texttt{feature\_skew()} and \texttt{fig\_featstore.py}.
+\end{tutsteps}
+\textbf{What to change next.} Plant a skew that affects only one decision in a thousand and find the sample size a daily check
+needs to catch it within a week.
+\end{tutorial}
+
+\section{Build: the feature store}\label{bld:ml:data-and-feature-stores:featstore}
+
+\begin{build}
+\bfield{Purpose} Model inputs computed once by definition, point in time offline, fresh online, and continuously checked
+against each other.
+\bfield{Interface} \texttt{FeatureDef(name, input, agg, window, version)}, \texttt{events\_from\_tape(tape, levels)} (on
+\texttt{firm.lobfeat}), \texttt{offline(events, defs, times, lag\_events)}, \texttt{OnlineEngine(defs)} with \texttt{on} and
+\texttt{values}, \texttt{stream(events, defs, times)}, \texttt{parity(off, on, tol, sample, seed)}, \texttt{freshness(engine,
+now)}.
+\bfield{Rules} No feature exists outside a definition; the \omterm{def:ml:data-and-feature-stores:store}{offline store} never returns a value known after the query time;
+parity runs daily; stale inputs are alarms.
+\bfield{Acceptance tests} \texttt{code/firm/featstore/tests/}: offline equals online exactly on a session; each window
+aggregation matches a brute-force recomputation; a one-event look-ahead is flagged; freshness grows when inputs stop.
+\bfield{Stretch} A bitemporal \omterm{def:ml:data-and-feature-stores:store}{offline store} on \texttt{firm.pit} for slow features; tolerances per feature learned from the
+arithmetic; C++ or Rust online engines checked against the Python reference, as Book~7 did for \texttt{firm.lobfeat}.
+\end{build}
+
+\begin{omsources}
+\item D.~Sculley and co-authors, ``Hidden technical debt in machine learning systems'', \emph{Advances in Neural Information
+Processing Systems} 28, 2015.
+\item J.~Hermann and M.~Del Balso, ``Meet Michelangelo: Uber's machine learning platform'', Uber engineering blog, 2017.
+\item N.~Polyzotis, S.~Roy, S.~E.~Whang and M.~Zinkevich, ``Data lifecycle challenges in production machine learning: a
+survey'', \emph{SIGMOD Record} 47(2), 2018.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:1}
+A thirty-second volume feature is computed at a decision at 10:00:07.300. Which trades does the \omterm{def:ml:data-and-feature-stores:store}{online store} include, and which
+does a research pipeline on one-second bars joined to the end of the decision's second include?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:2}
+A skew changes one decision in a thousand. How many randomly sampled decisions must a check compare to catch it with
+probability 95\%?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:3}
+Why does float32 storage change the imbalance features but not the volume and count features?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:4}
+Why did the one-second bars hurt the one-second forecast and not the five-second one?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:5}
+Why did the one-event look-ahead make the backtest worse rather than better here? Would it always?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:6}
+\emph{Find the flaw.} ``We checked that production and research features have the same mean and standard deviation every day,
+so there is no \omterm{def:ml:data-and-feature-stores:skew}{training--serving skew}.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:data-and-feature-stores:7}
+\emph{Coding.} Retrain the one-second model on the values the production engine computes when it replays the training
+sessions, instead of the one-second-bar research features, and score it live. What does it recover, and what does it cost?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:data-and-feature-stores:8}
+Design the tolerance of the parity test for a sum over a window of float64 inputs whose online and offline computations add in
+different orders.
+\end{exercise}
+
+\section{Problem: Same Features Twice}
+
+\begin{problem}[{Weekend problem --- one definition, two computations}]\label{pb:ml:data-and-feature-stores:1}
+The chapter's twelve features, eight sessions and four skews.
+
+\medskip\noindent\textbf{Part I --- The store.}
+\begin{enumerate}
+\item What does a \omterm{def:ml:data-and-feature-stores:store}{feature definition} contain, and why as data?
+\item How do the offline and online computations differ, and how do we know they agree?
+\item What is the knowledge time of an order-book feature, and of a quarterly fundamental?
+\item What is freshness, and what made it fail here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The skews.}
+\begin{enumerate}[resume]
+\item Describe the four skews and which features each touches.
+\item Which are research bugs and which production bugs?
+\item What share of decisions does each change?
+\item How does the parity test's tolerance change what it flags?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The model.}
+\begin{enumerate}[resume]
+\item What are the backtest and live ICs under each skew?
+\item Why does the one-second-bar skew inflate the backtest and hurt the live result?
+\item What changes at a five-second horizon?
+\item What would the IC gap look like on a desk's dashboard?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the IC and P\&L lost to the misaligned window, and the parity test's detection rate for each
+planted skew.
+\item Which skew is the most dangerous, and why?
+\item How would you roll out a change to a feature's definition?
+\item What would you do on the day the parity test fires?
+\item How should a vendor's features be brought into the store?
+\item What does the store owe the model's validator (chapter~21)?
+\item What is the cost of a \omterm{def:ml:data-and-feature-stores:store}{feature store} for a small team, and when is it worth it?
+\item In one sentence: what does a \omterm{def:ml:data-and-feature-stores:store}{feature store} guarantee?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle}]\label{iq:ml:data-and-feature-stores:1}
+What is \omterm{def:ml:data-and-feature-stores:skew}{training--serving skew}? Give three causes.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:data-and-feature-stores:2}
+Design a \omterm{def:ml:data-and-feature-stores:store}{feature store} for order-book features used by a model that trades on every message.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, mle}]\label{iq:ml:data-and-feature-stores:3}
+Your model's live IC is half its backtest's. How do you find out whether the features are to blame?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:data-and-feature-stores:4}
+What is a point-in-time join, and how does a \omterm{def:ml:data-and-feature-stores:store}{feature store} implement it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle, dev}]\label{iq:ml:data-and-feature-stores:5}
+How do you monitor \omterm{def:ml:data-and-feature-stores:fresh}{feature freshness}, and what do you do when a feature goes stale?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{mle}]\label{iq:ml:data-and-feature-stores:6}
+How would you make an online and an offline implementation of a windowed sum agree bit for bit?
+\end{interviewq}

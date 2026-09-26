@@ -1,0 +1,340 @@
+\chapter{Queues, Ring Buffers and Shared Memory}\label{ch:ll:queues-ring-buffers-and-shared-memory}
+
+In 2011 the engineers of a retail exchange published the numbers that had made them redesign their system. Passing an
+event through a three-stage pipeline built on the standard Java blocking queue took 32\,757 nanoseconds per hop on
+average, and its 99.99th percentile was over four milliseconds; through the \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{ring buffer} they built instead, 52
+nanoseconds on average and under 8\,192 at the 99.99th percentile (Thompson et al., 2011). The work in each stage was
+the same; the queues were the latency. A trading process is a pipeline of threads (feed handler, book, strategy, gateway,
+logger), and how data moves between them decides much of its tail. This chapter builds the structures that move it: the
+single-producer single-consumer ring, the broadcast ring of the ``disruptor'' pattern, the \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock} for data where
+only the latest value matters, and the same structures across processes in shared memory, with what to do when a
+consumer cannot keep up.
+
+\section{The single-producer single-consumer ring}
+
+\begin{definition}[Ring buffer, single-producer single-consumer queue]\label{def:ll:queues-ring-buffers-and-shared-memory:ring}
+A \emph{ring buffer}\index{ring buffer} is a fixed array of slots used circularly: a writer's position and a reader's position
+increase forever and index the array modulo its size, a power of two so that the modulo is a mask. A \emph{single-producer
+single-consumer queue}\index{single-producer single-consumer queue} (SPSC) is a ring with exactly one writing thread and one
+reading thread; each position is written by one thread only, so no \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} is needed.
+\end{definition}
+
+The producer writes the slot at its position and then publishes the new position with a release store; the consumer loads
+the producer's position with acquire, reads every slot before it, and publishes its own position the same way, handing the
+slots back (chapter~11). Both operations are \omterm{def:ll:lock-free-programming:progress}{wait-free}. Lamport proved such a queue correct without locks in 1983; what
+decades of practice added are the details that make it fast. The two positions live on separate \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines}, so that the
+producer's writes do not invalidate the consumer's position (chapter~3). And each side keeps a private copy of the other's
+position and refreshes it only when the ring looks full or empty: while the ring is neither, a message costs one \omterm{def:ll:memory-hierarchy-and-caches:line}{cache
+line} transfer (the slot) instead of three.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\foreach \i/\c in {0/5,1/5,2/30,3/30,4/30,5/5,6/5,7/5} {
+  \pgfmathsetmacro{\a}{90 - 45*\i}
+  \draw[fill=omDef!\c,draw=omDef] (\a+22.5:1.3) arc (\a+22.5:\a-22.5:1.3) -- (\a-22.5:2.3) arc (\a-22.5:\a+22.5:2.3) -- cycle;
+  \node at (\a:1.8) {\i};
+}
+\node[align=center] at (0,0) {8 slots\\ (mask 7)};
+\draw[-Stealth,very thick,omThm] (3.9,0.9) node[right,align=left]{read = 2\\ (consumer's line)} -- (0:2.4);
+\draw[-Stealth,very thick,omMeth] (-3.9,-2.3) node[left,align=right]{write = 5\\ (producer's line)} -- (-135:2.4);
+\node[anchor=west,align=left] at (3.9,-1.0) {shaded: slots 2, 3, 4,\\ written, not yet read};
+\node[anchor=west,align=left] at (3.9,-1.9) {full when write $-$ read $=$ 8};
+\end{tikzpicture}
+
+\omcaption{A ring of eight slots after five messages were written and two read (the state of the build's shared fixture).
+The producer's and consumer's positions each sit on a \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} of their own and only grow; the slot of position $p$ is
+$p \bmod 8$.}\label{fig:ll:queues-ring-buffers-and-shared-memory:ring}
+\end{omfigure}
+
+\Cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt} measures a round trip between two pinned threads: one sends an
+eight-byte message through a ring, the other sends it back through a second ring. About \qty{200}{\nano\second} at the
+median: four cache-line transfers between cores. The same round trip through a queue protected by a mutex and a condition
+variable costs about \qty{30}{\micro\second}, over a hundred times more, because the waiting thread goes to sleep in the
+kernel and must be woken. One-way, the ring streams about 250 million eight-byte messages a second on this laptop.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=7pt,ymode=log,log origin y=infty,ymin=100,ymax=5000000,
+  symbolic x coords={threads,other-pair,processes,locked},
+  xtick=data,xticklabels={{SPSC ring,\\ threads},{SPSC ring,\\ other CPU pair},{SPSC ring,\\ two processes},{mutex and\\ condition variable}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.15,
+  ylabel={ns per round trip (log scale)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=p50]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=key,y=p99]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=p999]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=gray!40,draw=gray] table[x=key,y=max]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Round trips of an eight-byte message between two pinned threads (or processes) through two SPSC rings, and through
+two queues protected by a mutex and a condition variable; 100\,000 round trips each. Measured on a laptop (Intel Core Ultra 7
+155H) under WSL2, no isolated cores. Data: \texttt{bench\_rings.py}.}\label{fig:ll:queues-ring-buffers-and-shared-memory:rtt}
+\end{omfigure}
+
+\section{Many readers: the disruptor pattern}
+
+\begin{definition}[Disruptor pattern]\label{def:ll:queues-ring-buffers-and-shared-memory:disruptor}
+In the \emph{disruptor pattern}\index{disruptor pattern} one ring carries every event to several consumers, each reading at its
+own position; consumers that depend on each other wait on each other's positions rather than on queues between them, so a
+pipeline of stages becomes one ring with several cursors and no copies.
+\end{definition}
+
+Market data is the natural case: one feed handler, several consumers (the book builder, a second strategy, the recorder,
+a risk monitor), each needing every message. Two policies differ in who waits. With \omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{back-pressure} (next section) the
+producer waits for the slowest consumer, which is right for an order path, where nothing may be lost. For market data the
+producer must not wait: the exchange will not slow down. The build's broadcast ring therefore never blocks its producer; each
+slot carries the sequence number of the message it holds, so a reader that has been lapped sees a later sequence than it
+expected and knows it lost messages, instead of reading a mixture.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\foreach \i/\c in {0/8,1/9,2/10,3/11,4/12,5/13,6/14,7/15} {
+  \draw[fill=omDef!10,draw=omDef] (1.3*\i,0) rectangle ++(1.2,0.8);
+  \node at (1.3*\i+0.6,0.52) {slot \i};
+  \node[font=\scriptsize] at (1.3*\i+0.6,0.2) {msg \c};
+}
+\draw[-Stealth,very thick,omMeth] (0.6,1.6) node[above]{producer: next = 16, into slot 0} -- (0.6,0.85);
+\draw[-Stealth,thick,omDef] (7.1,-0.8) -- (7.1,-0.05);
+\node[anchor=north east,align=right,omDef] at (7.0,-0.75) {recorder\\ at 13};
+\draw[-Stealth,thick,omDef] (9.7,-0.8) -- (9.7,-0.05);
+\node[anchor=north west,align=left,omDef] at (9.8,-0.75) {book builder\\ at 15};
+\draw[-Stealth,thick,omThm] (8.4,-1.95) -- (8.4,-0.05);
+\node[anchor=north,align=center,omThm] at (8.4,-1.95) {slow monitor at 6: slot 6\\ holds msg 14, lapped};
+\end{tikzpicture}
+
+\omcaption{A broadcast ring of eight slots after 16 messages. Each reader keeps its own position; the producer never waits. A
+reader at position 6 finds slot 6 holding message 14, a later sequence than it expects: it has been lapped (a \omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{slow consumer})
+and must resynchronise.}\label{fig:ll:queues-ring-buffers-and-shared-memory:broadcast}
+\end{omfigure}
+
+\section{Sequence locks for last-value data}
+
+\begin{definition}[Sequence lock]\label{def:ll:queues-ring-buffers-and-shared-memory:seqlock}
+A \emph{sequence lock}\index{sequence lock} publishes a small value that one writer updates and many readers read: the writer
+increments a counter to an odd value, writes the value, and increments it again to an even value; a reader reads the
+counter, copies the value, reads the counter again, and retries if the two readings differ or are odd.
+\end{definition}
+
+The Linux kernel documentation describes the mechanism as having lockless readers with read-only retry loops and no writer
+starvation, for data rarely written relative to how often it is read. In trading the pattern suits the top of the book or a
+reference price, where readers want the latest consistent value, not every intermediate one. Two details make it correct in
+C++ as well as on x86: the value must be copied with \omterm{def:ll:lock-free-programming:atomic}{atomic operations} (relaxed ones suffice), since a copy that races with
+the writer's non-atomic stores is a \omterm{def:ll:rust-for-low-latency:race}{data race} and \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{undefined behaviour} (Boehm, 2012); and the reader's second counter read
+must be ordered after the copy by an acquire fence. The build's test runs a writer in a tight loop against a reader that
+checks two hundred thousand pairs for tearing.
+
+\section{Shared memory between processes}
+
+\begin{definition}[Shared-memory transport]\label{def:ll:queues-ring-buffers-and-shared-memory:shm}
+A \emph{shared-memory transport}\index{shared-memory transport} carries messages between processes through a region of memory
+that each maps into its address space (on Linux, a POSIX shared-memory object from \texttt{shm\_open}, or a file on a
+memory filesystem), laid out as rings whose positions are atomics; no system call is made per message.
+\end{definition}
+
+Processes isolate failures: a strategy that crashes need not take the feed handler with it, and components written in
+different languages can share a feed. The ring does not care: \cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt} shows
+the same round trip between two processes as between two threads. What changes is the contract between the processes: the
+layout must be specified to the byte and versioned, since two binaries built at different times read it; every field must
+be of fixed size and alignment; and nothing in the region may be a pointer, which means nothing in the other process.
+The build's layout is a 192-byte header (magic number, version, slot size, capacity, then the two positions on their own
+lines) followed by the slots, and its C++ and Rust implementations both reproduce the same byte image of a ring, written
+independently from the specification by a script.
+
+\section{Back-pressure, slow consumers and conflation}
+
+\begin{definition}[Back-pressure, slow consumer, conflation]\label{def:ll:queues-ring-buffers-and-shared-memory:bp}
+\emph{Back-pressure}\index{back-pressure} is the propagation of a consumer's slowness to its producer, which must wait or
+refuse new work when the queue between them is full. A \emph{slow consumer}\index{slow consumer} is a consumer whose rate is
+below its input's, so that its queue grows or, on a ring that does not wait, it is lapped. \emph{Conflation}\index{conflation}
+is the deliberate delivery of only the latest value of each item (a price level, a quote) to a consumer that cannot take every
+update.
+\end{definition}
+
+A queue's size is a statement about bursts. One Quant Book~4, chapter~8, gives the M/M/1 answer for a stage with Poisson
+arrivals at rate $\lambda$ and exponential service at rate $\mu$: with utilisation $\rho = \lambda/\mu$, the stationary number
+in the system exceeds $n$ with probability $\rho^n$. A ring that must overflow less than once in a billion messages at
+$\rho = 0.9$ therefore needs $n$ with $0.9^n < 10^{-9}$, about 197 slots, 256 as a power of two. Market data is burstier than
+Poisson: the sizing starts from the M/M/1 figure and is checked against recorded bursts (chapter~18).
+
+\begin{proposition}[Time before a slow consumer is lapped]\label{prop:ll:queues-ring-buffers-and-shared-memory:lap}
+A broadcast ring of $N$ slots whose producer writes at rate $\lambda_b$ during a burst, read by a consumer at rate $\mu < \lambda_b$
+that starts the burst with an empty backlog, laps the consumer after $N/(\lambda_b - \mu)$ seconds.
+\end{proposition}
+
+\begin{proof}
+The consumer's backlog grows at $\lambda_b - \mu$ messages a second; the producer overwrites the consumer's next unread slot when
+the backlog reaches $N$.
+\end{proof}
+
+A ring of 65\,536 slots, a burst at 2 million messages a second and a monitor that reads 1.5 million gives the monitor 131
+milliseconds; an opening burst lasting longer laps it. The design answers are to give such consumers conflated views (a
+\omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock} per instrument instead of every message), to size their rings for measured bursts, or to let them fall behind
+by design and resynchronise from a snapshot, as the feed handler of chapter~18 does from the exchange.
+
+\section{Tutorial: rings in threads, processes and two languages}\label{tut:ll:queues-ring-buffers-and-shared-memory:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the rings, check the shared layout in C++ and Rust against one fixture, and measure round trips and
+throughput. \textbf{End state:} \cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt}, a throughput figure, and green tests in
+both languages.
+\begin{tutsteps}
+\item \textbf{Write and publish.} The producer copies the message into its slot and publishes its position with a release store;
+it reads the consumer's position only when the ring looks full.
+\omcode{code/firm/ring/cpp/firm_ring.hpp}{68}{95}{The SPSC ring's producer and consumer.}\label{lst:ll:queues-ring-buffers-and-shared-memory:spsc}
+\item \textbf{The same in Rust}, over the same bytes: a region of atomic words, written through their interior mutability.
+\omcode{code/firm/ring/rust/src/lib.rs}{80}{101}{The Rust producer, writing the layout the C++ reader expects.}\label{lst:ll:queues-ring-buffers-and-shared-memory:rust}
+\item \textbf{A \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock}} whose value is copied as relaxed atomic words.
+\omcode{code/firm/ring/cpp/firm_ring.hpp}{155}{179}{Writer and reader of the sequence lock.}\label{lst:ll:queues-ring-buffers-and-shared-memory:seqlock}
+\item \textbf{Check the layout.} \texttt{make\_ring\_fixture.py} writes the byte image of a ring from the specification; both
+test suites build the same ring and compare, then consume the fixture.
+\item \textbf{Measure} with \texttt{python bench\_rings.py}: round trips between two threads on two pairs of CPUs, between two
+processes, and through a locked queue, then one-way throughput.
+\end{tutsteps}
+\textbf{What to change next.} Remove the cached copies of the other side's position and measure the throughput again; put the two
+positions on the same \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} and measure the round trip.
+\end{tutorial}
+
+\section{Build: the firm's rings}\label{bld:ll:queues-ring-buffers-and-shared-memory:ring}
+
+\begin{build}
+\bfield{Purpose} The transport of every Part~IV component: the feed handler publishes normalised events on a broadcast ring
+(chapter~18), the strategy engine reads them and hands orders to the gateway through an SPSC ring (chapters~20--21), the binary
+logger drains a ring (chapter~23), and the top of each book is published with a \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock}.
+\bfield{Interface} C++20 \texttt{firm::ring}: \texttt{format(base, capacity, slot\_size)}, \texttt{region\_size},
+\texttt{Spsc(base)} with \texttt{try\_write(msg, len)} and \texttt{try\_read(out, cap)}; \texttt{Broadcast(base)} with
+\texttt{write}, \texttt{read(pos, out, len)} returning \texttt{Ok}, \texttt{Empty} or \texttt{Overrun}, and \texttt{head()};
+\texttt{SeqLock<T>} with \texttt{store} and \texttt{load}; \texttt{Segment(name, bytes, create)}. Rust \texttt{firm\_ring}:
+\texttt{Region}, \texttt{format}, \texttt{Spsc::attach} with \texttt{try\_write} and \texttt{try\_read}, \texttt{SeqLock2}.
+\bfield{Rules} The byte layout above, little-endian, versioned by a magic number and a version; capacities are powers of two;
+positions on separate \omterm{def:ll:memory-hierarchy-and-caches:line}{cache lines}; the SPSC ring reports full and empty, the broadcast ring never waits and reports overruns;
+no allocation after construction.
+\bfield{Acceptance tests} \texttt{code/firm/ring/}: the fixture's bytes reproduced and consumed in C++ and Rust; 200\,000
+messages in order across two threads in both; broadcast overrun detection and resynchronisation; no torn read in 200\,000
+sequence-lock reads under a writer in a tight loop; 1\,000 messages from a child process over shared memory.
+\bfield{Stretch} A broadcast ring with a declared slowest-consumer policy (wait, drop, conflate); a ring in a file on a huge-page
+filesystem.
+\end{build}
+
+\begin{omsources}
+\item M.~Thompson, D.~Farley, M.~Barker, P.~Gee and A.~Stewart, \emph{Disruptor: high performance alternative to bounded queues
+for exchanging data between concurrent threads}, 2011.
+\item L.~Lamport, ``Specifying concurrent program modules'', \emph{ACM TOPLAS} 5(2), 1983.
+\item H.-J.~Boehm, ``Can seqlocks get along with programming language memory models?'', MSPC 2012; Linux kernel documentation,
+``Sequence counters and sequential locks''.
+\item Linux man page \texttt{shm\_open(3)}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:1}
+A ring has 1\,024 slots; the producer's position is 70\,001 and the consumer's 69\,500. How many messages are waiting, which slot
+will the producer write next, and how many more can it write before the ring is full?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:2}
+At 250 million messages a second, how long does a 64-bit position take to wrap? And a 32-bit one?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:3}
+A stage runs at $\rho = 0.8$. What ring size makes an M/M/1 overflow rarer than one in a million?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:4}
+Why does each side of the SPSC ring keep a private copy of the other's position? What does removing the copies cost per message?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:5}
+A risk monitor reads the broadcast ring at 400\,000 messages a second. A burst of 3 million messages a second lasts 80
+milliseconds on a ring of 131\,072 slots. Is the monitor lapped, and if so when?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:6}
+Why must the \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock}'s value be copied with \omterm{def:ll:lock-free-programming:atomic}{atomic operations} in C++, although the reader discards any copy taken during a
+write?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:7}
+\emph{Coding.} Put the producer's and consumer's positions on the same \omterm{def:ll:memory-hierarchy-and-caches:line}{cache line} (edit the header offsets in a copy of
+\texttt{firm\_ring.hpp}) and rerun the round-trip and throughput benchmarks. What changes, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:8}
+\emph{Find the flaw.} ``Our shared-memory ring stores a pointer to the head message and a \texttt{std::string} for the instrument
+name in its header.''
+\end{exercise}
+
+\section{Problem: Three Strategies, One Feed}
+
+\begin{problem}[{Weekend problem --- sizing a broadcast ring}]\label{pb:ll:queues-ring-buffers-and-shared-memory:1}
+A feed handler publishes normalised events on a broadcast ring of 65\,536 slots of 64 bytes. Three consumers read it: a book
+builder at up to 4 million events a second, a strategy at 2.5 million, and a monitor at 1.5 million. On an ordinary day the feed
+averages 300\,000 events a second; at the open, bursts reach 2 million a second for up to half a second.
+
+\medskip\noindent\textbf{Part I --- The ring.}
+\begin{enumerate}
+\item How many bytes does the ring occupy, and does it fit the second-level cache of chapter~3?
+\item What is each consumer's utilisation on an ordinary day?
+\item Which consumers can fall behind during a burst?
+\item Why does the producer never wait for them?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The burst.}
+\begin{enumerate}[resume]
+\item How long before the monitor is lapped (\cref{prop:ll:queues-ring-buffers-and-shared-memory:lap})?
+\item Is it lapped during a half-second burst?
+\item What ring size would carry the monitor through the burst?
+\item How much memory would that cost?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The alternatives.}
+\begin{enumerate}[resume]
+\item The monitor needs only the latest price of each of 5\,000 instruments. What does a \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock} per instrument cost in memory,
+and what share of updates does the monitor skip during the burst?
+\item What does the monitor do when it detects an overrun on the ring?
+\item Why is \omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{back-pressure} wrong for this producer and right for the order path?
+\item What does the M/M/1 model say about the strategy's ring at 300\,000 events a second, and why is it optimistic?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the time before the monitor is lapped in a burst, and the share of updates a conflating monitor
+skips.
+\item What does the measured round trip say about the cost of adding a consumer?
+\item Why is the ring's layout versioned?
+\item What would the published comparison of a blocking queue and a ring predict for a blocking queue here?
+\item Which placement rule of chapter~4 applies to the feed handler and the book builder?
+\item How would you record the burst sizes that the ring must carry?
+\item What must the strategy do after a gap in its input?
+\item In one sentence: what is a \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{ring buffer}'s size a statement about?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:queues-ring-buffers-and-shared-memory:1}
+Implement a single-producer single-consumer \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{ring buffer}. Which \omterm{def:ll:lock-free-programming:ordering}{memory orderings} does it need?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:queues-ring-buffers-and-shared-memory:2}
+Why is a \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{ring buffer} faster than a queue protected by a mutex and a condition variable?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:queues-ring-buffers-and-shared-memory:3}
+What is a \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{sequence lock}, when would you use one, and what are its pitfalls?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:queues-ring-buffers-and-shared-memory:4}
+One market-data feed, three consumers of different speeds. Design the distribution.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:queues-ring-buffers-and-shared-memory:5}
+What must a data structure in shared memory between two processes avoid?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:ll:queues-ring-buffers-and-shared-memory:6}
+How would you size the queue in front of a stage whose input is bursty? What does queueing theory give you, and what does it
+miss?
+\end{interviewq}

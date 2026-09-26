@@ -1,0 +1,329 @@
+\chapter{Reinforcement Learning for Execution and Market Making}\label{ch:ml:reinforcement-learning-for-execution-and-market-making}
+
+Execution and market making both have optimal policies in closed form in their textbook models: the Almgren--Chriss
+schedule (Book~10, chapter~14) and the inventory-aware quotes of Book~11 (chapter~3). The reason to learn a \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} instead
+is everything the textbook model leaves out; the risk, as chapter~17 showed, is that a learned \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} exploits what its
+training world gets wrong. This chapter measures both on problems whose optimum is known. A \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{deep Q-network} learns the
+Almgren--Chriss schedule to within 0.4 basis points; moved to a market whose impact is three times higher, it loses 9.1
+basis points to that market's optimum, four times what the textbook schedule of the wrong model loses. Trained on randomised
+impact and allowed to see the impact of its own fills, it loses 0.9 there and 0.6 at home. A tabular learner for market
+making, given 1.6 million steps, still falls short of the closed form and of a constant quote.
+
+\section{State, action and reward design}
+
+\begin{definition}[Reward shaping, action masking]\label{def:ml:reinforcement-learning-for-execution-and-market-making:design}
+\emph{Reward shaping}\index{reward shaping} changes the \omterm{def:ml:reinforcement-learning-foundations:mdp}{rewards} an agent learns from without changing the \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} that is
+optimal, for instance by removing a term whose expectation is known to be zero, or by adding a potential difference, to make
+learning faster or more stable. \emph{Action masking}\index{action masking} removes the actions that are not allowed in a
+state (selling more than is held, quoting a side that would breach an inventory limit) from the agent's choice and from the
+maximum in its learning target.
+\end{definition}
+
+Design decides most of what an agent can learn. The execution agent sells one unit over ten steps in lots of a twentieth;
+its state is the time, the holdings and one number described below; its action is the number of lots to sell, with every
+sale above the holdings masked and the whole remainder forced at the last step. Its \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward} is the Almgren--Chriss objective
+split by step: minus the temporary-impact cost $\eta u^2/\tau$ of the sale, minus the risk charge $\lambda\sigma^2\tau x^2$ on
+what is still held, with $\eta = 0.001$, $\sigma = 0.02$ and $\lambda = 10$ (in basis points, TWAP costs 21.4 and the optimum
+18.85). The realised P\&L of the holdings over the step, $\sigma\sqrt\tau Z x$, has expectation zero; leaving it out is
+\omterm{def:ml:reinforcement-learning-for-execution-and-market-making:design}{reward shaping}. Leaving it in is not harmless: with that noise in its \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward}, the same network after the same 1\,500
+episodes learned to sell the same amount every step, TWAP exactly, 2.55 basis points from the optimum.
+
+\section{Deep Q-networks and their stabilisers}
+
+\begin{definition}[Deep Q-network, experience replay, target network]\label{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}
+A \emph{deep Q-network}\index{deep Q-network} (DQN) is \omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning} (chapter~17) with the \omterm{def:ml:reinforcement-learning-foundations:bellman}{action-value function} represented by
+a \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{neural network}, trained by stochastic gradient steps on the temporal-difference error (Mnih and co-authors, 2015). Two
+stabilisers make it work: \emph{experience replay}\index{experience replay} stores past transitions and trains on random
+batches of them, breaking the correlation of consecutive steps; a \emph{target network}\index{target network} is a copy of the
+network, updated only every few hundred steps, used to compute the learning targets so that they do not move with every
+update.
+\end{definition}
+
+The chapter's DQN (\cref{lst:ml:rlt:dqn}) is a two-layer network of 64 units with 21 outputs, a replay memory of 20\,000
+transitions, a \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{target network} copied every 200 updates and exploration decaying from 1 to 0.05 over the first half of
+training. After 1\,500 episodes its greedy schedule costs 19.29 basis points, 0.44 above the continuous Almgren--Chriss
+optimum; 0.20 of that gap is the lot grid, whose own optimum costs 19.05. Maximisation over noisy estimates biases \omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning}
+upwards; double \omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning}, which chooses the action with one network and values it with the other (van Hasselt, Guez and
+Silver, 2016), is the usual remedy and the design Ning and co-authors (2021) used for execution.
+
+\section{Learning to execute}
+
+\begin{definition}[Domain randomisation]\label{def:ml:reinforcement-learning-for-execution-and-market-making:dr}
+\emph{Domain randomisation}\index{domain randomisation} trains a \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} on many versions of a simulator whose uncertain
+parameters are drawn at random for each episode, so that the \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} works across them instead of exploiting one (Tobin and
+co-authors, 2017).
+\end{definition}
+
+The textbook's weakness is its parameters: impact is estimated with error and changes with the market. Three worlds test the
+agents: the model's ($\eta = 0.001$), a market with three times the impact, and one with a third of it; each has its own
+Almgren--Chriss optimum, and every schedule is scored exactly against it (\cref{fig:ml:rlt:gaps}). The third state variable
+is the impact the agent has observed in its own fills so far, as the logarithm of its ratio to the model's value (zero before
+the first sale): a real execution algorithm measures its impact as it trades.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,ybar,bar width=7pt,ymin=0,ymax=10,ylabel={gap to that world's optimum (bp)},
+  area legend,xtick={0,1,2},xticklabels={model impact,impact $\times3$,impact $/3$},tick label style={font=\small},
+  label style={font=\small},xmin=-0.5,xmax=2.5,grid=major,grid style={gray!25},legend columns=3,legend cell align=left,
+  legend style={font=\footnotesize,at={(0.5,-0.18)},anchor=north,draw=none,fill=none},table/col sep=comma]
+\addplot[fill=black!60,draw=none,bar shift=-16pt] table[x=i,y=acmodel]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/gaps.csv};
+\addplot[fill=gray!40,draw=none,bar shift=-8pt] table[x=i,y=twap]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/gaps.csv};
+\addplot[fill=omThm,draw=none,bar shift=0pt] table[x=i,y=dqn]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/gaps.csv};
+\addplot[fill=omThm!40,draw=none,bar shift=8pt] table[x=i,y=noisy]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/gaps.csv};
+\addplot[fill=omDef,draw=none,bar shift=16pt] table[x=i,y=dr]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/gaps.csv};
+\legend{Almgren--Chriss (model),TWAP,DQN,DQN noisy reward,DQN randomised}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Each schedule's objective minus the Almgren--Chriss optimum of the world it trades in (basis points). The closed
+form and the first DQN were built for the model's impact; the randomised DQN was trained on impact drawn over a factor of
+three either way. Data: \texttt{ml\_rltrade.execution}.}\label{fig:ml:rlt:gaps}
+\end{omfigure}
+
+The model-trained DQN is the chapter's warning. In its own world it is 0.44 from the optimum; where impact is three times
+higher it is 9.09 away, and where impact is lower 4.60: it has never seen its third input take those values, and a network
+off its training distribution does something arbitrary. The closed form built on the same wrong impact loses 2.20 and 1.21:
+a formula degrades smoothly where a network need not. The randomised DQN, trained for 3\,000 episodes with the impact drawn
+anew each episode, learned to read its fills: it sells a little more slowly than the model's optimum at first and then
+follows the impact it observes, and its gaps are 0.55, 0.86 and 1.24: the best of all in the high-impact world, and within 0.03 of the best (the
+closed form, by luck of the direction of its error) in the low-impact one.
+\Cref{fig:ml:rlt:schedules} shows the schedules in the high-impact world.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xlabel={step},ylabel={holdings (share of the order)},tick label style={font=\small},
+  label style={font=\small},xmin=0,xmax=10,ymin=0,ymax=1.02,grid=major,grid style={gray!25},legend columns=3,legend cell align=left,
+  legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[black,ultra thick] table[x=step,y=optimum]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/schedules.csv};
+\addplot[black!50,thick,dashed] table[x=step,y=acmodel]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/schedules.csv};
+\addplot[gray,thick,dotted] table[x=step,y=twap]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/schedules.csv};
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=step,y=dqn]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/schedules.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.4pt] table[x=step,y=dr]{figdata/ml/18-reinforcement-learning-for-execution-and-market-making/schedules.csv};
+\legend{optimum for impact $\times3$,Almgren--Chriss (model),TWAP,DQN,DQN randomised}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Holdings over the ten steps in the world with three times the model's impact. Data:
+\texttt{ml\_rltrade.agents}.}\label{fig:ml:rlt:schedules}
+\end{omfigure}
+
+\section{Learning to make markets}
+
+Market making in the model of Book~11 (chapter~3) has an exact solution: a mid-price that diffuses, fills at depth $\delta$
+with intensity $Ae^{-k\delta}$, a running penalty $\phi q^2$ on inventory and a terminal penalty $\alpha q^2$, here with
+$A = 140$, $k = 1.5$, $\sigma = 2$, $\phi = 0.02$, $\alpha = 0.01$ and inventory within $\pm10$. The optimal depths at the start
+are 0.68 on both sides when flat and 0.57 and 0.79 when five units long (tighter on the side that reduces inventory). The
+learner is tabular \omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning} (\cref{lst:ml:rlt:mm}) over 20 time buckets and the 21 inventories, choosing each side's depth
+among six values, with the zero-mean inventory P\&L shaped out of its \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward} and inventory-breaching sides masked.
+\Cref{tab:ml:rlt:mm} scores every \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} with the firm's market-making simulator on 5\,000 common paths.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} & objective & (s.e.) & P\&L s.d. & $|q_T|$ & fills\\
+\midrule
+exact optimum (Book~11) & 67.95 & 0.12 & 8.53 & 2.67 & 101.8\\
+Avellaneda--Stoikov, $\gamma = 0.1$ & 64.73 & 0.09 & 6.50 & 2.26 & 97.0\\
+constant depth $1/k$ & 66.67 & 0.17 & 11.61 & 5.03 & 101.0\\
+\omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning}, 2\,000 episodes & 62.34 & 0.12 & 8.31 & 4.40 & 91.7\\
+\omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning}, 8\,000 episodes & 62.84 & 0.12 & 8.53 & 4.38 & 93.1\\
+\bottomrule
+\end{tabular}
+\caption{Market making for one unit of time: mean of P\&L minus the running and terminal inventory penalties (with its
+standard error), P\&L standard deviation, mean closing inventory and fills per path, on 5\,000 paths with common random
+numbers. Data: \texttt{ml\_rltrade.market\_making}.}\label{tab:ml:rlt:mm}
+\end{table}
+
+The learner improves slowly and stays below the constant quote: 1.6 million steps of experience are not enough to rank six
+depths whose expected values differ by less than the noise of a fill. The spread earned per step is a small signal under a
+large noise, which is the market maker's problem in general. Closed forms or parametric policies fitted by \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} search in
+a simulator (a depth that is a line in inventory has two parameters, where the table has 420 states and 36 actions) are what work at this scale;
+learning earns its place on the parts the model leaves out, such as queue position, adverse selection and several venues,
+where no closed form exists.
+
+\section{What works in the published evidence}
+
+The evidence is thinner than the attention. Nevmyvaka, Feng and Kearns (2006) applied \omterm{def:ml:reinforcement-learning-foundations:mdp}{reinforcement learning} to execution on
+a year and a half of millisecond limit-order data from NASDAQ, with a state space factorised to keep learning tractable;
+Ning and co-authors (2021) trained a double \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{deep Q-network} with \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{experience replay} on order-book features for nine stocks and
+found it beat the standard benchmark on most of them; Spooner and co-authors
+(2018) built a high-fidelity limit-order-book simulator and a temporal-difference market maker with a custom \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward} that
+controls inventory risk, which beat simple benchmarks and an online-learning approach in that simulator. Hambly, Xu and Yang
+(2023) survey the field. The common thread is the simulator: results are reported in a simulator, often the authors' own, and
+the transfer to live trading is rarely documented in public. A desk should read them as evidence that the methods work where
+the simulator is right, and build its own evidence with the tests of chapter~17 and this chapter: exact benchmarks, several
+worlds, \omterm{def:ml:reinforcement-learning-foundations:ope}{off-policy evaluation} on its own logs.
+
+\begin{method}[Deploying a learned execution or quoting policy]\label{met:ml:rlt:method}
+\begin{enumerate}
+\item Benchmark against the closed form of the textbook model in that model; a learner that cannot match it there is not
+ready.
+\item Shape \omterm{def:ml:reinforcement-learning-foundations:mdp}{rewards} to remove known zero-mean noise, mask forbidden actions, and give the state the signals a trader would
+use (fills, observed impact, queue position).
+\item Train on randomised simulators whose parameters span their estimation error, and evaluate in held-out parameter
+settings, never only in the training one.
+\item Bound the \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} (participation limits, inventory limits, a fallback to the closed form) and compare live against the
+incumbent by \omterm{def:ml:reinforcement-learning-foundations:ope}{off-policy evaluation} and small controlled trials.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: beating a closed form}\label{tut:ml:reinforcement-learning-for-execution-and-market-making:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Train a DQN on the Almgren--Chriss liquidation with and without \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dr}{domain randomisation} and score it in three
+worlds; train a tabular market maker and score it against the exact optimum. \textbf{End state:}
+\cref{fig:ml:rlt:gaps,fig:ml:rlt:schedules}, \cref{tab:ml:rlt:mm}.
+\begin{tutsteps}
+\item \textbf{A DQN update with replay, a \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{target network} and masking.}
+\omcode{code/firm/rltrade/firm_rltrade.py}{113}{143}{The training loop of deep Q-learning.}\label{lst:ml:rlt:dqn}
+\item \textbf{\omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning} for market making.}
+\omcode{code/firm/rltrade/firm_rltrade.py}{228}{243}{Tabular Q-learning with decaying step sizes.}\label{lst:ml:rlt:mm}
+\item \textbf{Run} \texttt{ml\_rltrade.execution()} (about a minute on one core), \texttt{market\_making()} and
+\texttt{fig\_rltrade.py}.
+\end{tutsteps}
+\textbf{What to change next.} Use double \omterm{def:ml:reinforcement-learning-foundations:td}{Q-learning}; replace the market maker's table by a two-parameter \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} fitted by
+\omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} search; add a passive-order action whose fills come from queue position in Book~10's exchange simulator.
+\end{tutorial}
+
+\section{Build: trading environments and learners}\label{bld:ml:reinforcement-learning-for-execution-and-market-making:rltrade}
+
+\begin{build}
+\bfield{Purpose} Execution and market-making policies learned where their optimum is known, and tested away from it.
+\bfield{Interface} \texttt{ACEnv(X, T, n, lots, eta, sigma, lam, eta\_range, noise)} with \texttt{reset}, \texttt{step},
+\texttt{mask}; \texttt{DQN}, \texttt{train\_dqn(env, episodes, seed)}, \texttt{dqn\_schedule(env, net, eta)},
+\texttt{grid\_optimum}, \texttt{ac\_objective} (on \texttt{firm.acexec}); \texttt{MMEnv}, \texttt{q\_learning\_mm},
+\texttt{mm\_policy}, \texttt{mm\_objective} (with \texttt{firm.invmm.simulate}).
+\bfield{Rules} Every learned \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} is scored exactly or on common random numbers against the closed form of the world it
+is tested in; training parameters and test parameters are reported separately.
+\bfield{Acceptance tests} \texttt{code/firm/rltrade/tests/}: the environment's \omterm{def:ml:reinforcement-learning-foundations:mdp}{rewards} sum to the Almgren--Chriss objective of
+the schedule followed; masking never allows an illegal sale; the lot-grid optimum is no worse than any enumerated schedule;
+DQN training is deterministic and beats TWAP in the model world; the market-making environment's inventory changes match
+fills with probability $Ae^{-k\delta}\,dt$ per side.
+\bfield{Stretch} Double DQN; \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} search for quoting; the exchange-simulator wrapper (Book~10, chapter~26) with queue
+position as state.
+\end{build}
+
+\begin{omsources}
+\item V.~Mnih and co-authors, ``Human-level control through deep reinforcement learning'', \emph{Nature} 518, 2015.
+\item H.~van Hasselt, A.~Guez and D.~Silver, ``Deep reinforcement learning with double Q-learning'', arXiv:1509.06461, 2016.
+\item J.~Tobin and co-authors, ``Domain randomization for transferring deep neural networks from simulation to the real
+world'', arXiv:1703.06907, 2017.
+\item Y.~Nevmyvaka, Y.~Feng and M.~Kearns, ``Reinforcement learning for optimized trade execution'', ICML, 2006.
+\item B.~Ning and co-authors, ``Double deep Q-learning for optimal execution'', \emph{Applied Mathematical Finance}, 2021.
+\item T.~Spooner, J.~Fearnley, R.~Savani and A.~Koukorinis, ``Market making via reinforcement learning'', arXiv:1804.04216,
+2018.
+\item B.~Hambly, R.~Xu and H.~Yang, ``Recent advances in reinforcement learning in finance'', arXiv:2112.04553, 2023.
+\item R.~Almgren and N.~Chriss, ``Optimal execution of portfolio transactions'', \emph{Journal of Risk} 3(2), 2001.
+\item M.~Avellaneda and S.~Stoikov, ``High-frequency trading in a limit order book'', \emph{Quantitative Finance} 8(3), 2008.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:1}
+Compute TWAP's objective in the model world: ten sales of 0.1 with $\eta = 0.001$, $\tau = 0.1$, and the risk charge with
+$\sigma = 0.02$, $\lambda = 10$. Give it in basis points.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:2}
+At what depth does $\delta Ae^{-k\delta}$, the expected spread earned per unit time on one side, peak? Compare with the exact
+optimum's flat depth.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:3}
+Why must the mask also enter the target $\max_{u'}Q(x', u')$, not only the choice of action?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:4}
+Show that removing $\sigma\sqrt\tau Zx$ from each step's \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward} leaves the optimal \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} unchanged. Why did the noisy agent
+end at TWAP?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:5}
+Why did the model-trained DQN do worse than the wrong closed form in the high-impact world?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:6}
+\emph{Find the flaw.} ``We trained the market maker with \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dr}{domain randomisation} over volatility and it was profitable in every
+one of 10\,000 randomised simulator runs, so it is robust.''
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:7}
+\emph{Coding.} Replace the market maker's table by the \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} $\delta_{b,a} = c\pm dq$ and choose $(c, d)$ on a grid by the
+simulator's mean objective on 2\,000 paths. How close do you get to the exact optimum?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:reinforcement-learning-for-execution-and-market-making:8}
+Derive the discrete Almgren--Chriss schedule for the chapter's objective by writing the first-order conditions in the
+holdings $x_1,\dots,x_{n-1}$.
+\end{exercise}
+
+\section{Problem: Beating a Closed Form}
+
+\begin{problem}[{Weekend problem --- when to learn a policy}]\label{pb:ml:reinforcement-learning-for-execution-and-market-making:1}
+The chapter's liquidation and market-making problems.
+
+\medskip\noindent\textbf{Part I --- Design.}
+\begin{enumerate}
+\item What are the execution agent's state, actions and \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward}?
+\item Why is the P\&L noise removed from the \omterm{def:ml:reinforcement-learning-foundations:mdp}{reward}, and what happened when it was not?
+\item What does \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:design}{action masking} prevent?
+\item Why give the agent the impact it has observed?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Execution.}
+\begin{enumerate}[resume]
+\item What do TWAP, the lot-grid optimum and the DQN cost in the model world?
+\item What are the gaps of each schedule in the three worlds?
+\item Why does the randomised agent lose a little at home?
+\item What would change with a price that trends during the order?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Market making.}
+\begin{enumerate}[resume]
+\item What are the exact optimum's depths at the start?
+\item How do the five policies score?
+\item Why does the tabular learner stay below a constant quote?
+\item What would you learn, and what would you keep in closed form?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the learned \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy}'s shortfall against the Almgren--Chriss optimum in the model world and
+in the mis-specified worlds, with and without \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dr}{domain randomisation}.
+\item What does the published evidence show, and what does it not?
+\item How would you deploy the randomised execution agent?
+\item What is the fallback if the agent's observed impact leaves its training range?
+\item Why does a table not scale to a real order book?
+\item Which stabiliser matters most in the DQN here, and how would you check?
+\item What should the comparison with the incumbent algorithm look like?
+\item In one sentence: when is a learned \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy} worth more than a closed form?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{mle}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:1}
+What are \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{experience replay} and \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dqn}{target networks} for?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:2}
+How would you frame optimal execution as a reinforcement-learning problem? What goes in the state?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:3}
+What is \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:design}{reward shaping}, and how can it go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{mle}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:4}
+Your DQN's Q-values keep growing during training. What is happening and what do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, trader}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:5}
+Would you use \omterm{def:ml:reinforcement-learning-foundations:mdp}{reinforcement learning} for market making? Where would it help and where not?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher}]\label{iq:ml:reinforcement-learning-for-execution-and-market-making:6}
+What is \omterm{def:ml:reinforcement-learning-for-execution-and-market-making:dr}{domain randomisation}, and why can it help and hurt a trading \omterm{def:ml:reinforcement-learning-foundations:mdp}{policy}?
+\end{interviewq}

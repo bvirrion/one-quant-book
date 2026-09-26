@@ -1,0 +1,393 @@
+\chapter{Pre-Trade Risk and Kill Switches}\label{ch:ll:pre-trade-risk-and-kill-switches}
+
+On 1 August 2012, one of the eight servers of a broker-dealer's order router, Knight Capital Americas, still carried an old
+piece of code that a new deployment should have replaced. For 212 incoming orders it sent child orders to the market ``without
+regard to the number of share executions'' already received, in the words of the regulator's order: 4 million executions in 154
+stocks, more than 397 million shares, in about 45 minutes, and a loss of \$460 million (One Quant Book~7, chapter~21, tells the
+deployment story, and One Quant Book~11, chapter~27, the risk policy it produced). This chapter reads the same order as an
+engineer would: as a list of requirements. Every paragraph that says what the firm lacked (a control that compared orders
+leaving the router with those that entered it, a position limit that counted outstanding orders, a firm-wide threshold that
+stopped orders automatically, a way to halt the router on its own misbehaviour) is a check to implement, on the path of every
+order, in a few tens of nanoseconds. The chapter builds that gate, then replays a runaway of the 2012 shape through it with
+one check at a time, and finds that most of the checks a firm would think of first would not have stopped it.
+
+\section{The requirements document}
+
+\begin{definition}[Risk gate, fail-closed design]\label{def:ll:pre-trade-risk-and-kill-switches:gate}
+A \emph{risk gate}\index{risk gate} is the component on the path of every order, between the code that decides to send it and
+the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}, that checks it against the firm's limits and refuses it if any is exceeded; nothing reaches the venue
+without passing it. A \emph{fail-closed design}\index{fail-closed design} is one whose failures stop the activity it protects:
+a risk gate that has lost its limits, its reference prices or its view of the firm's position refuses orders rather than
+passing them.
+\end{definition}
+
+The regulator's order (Release 34-70694) is precise about what was missing. The firm had controls before orders reached the
+router, but none after it: nothing compared ``orders leaving SMARS with those that entered it'', and there were no procedures
+``to halt SMARS's operations in response to its own aberrant activity''. It had a price cap, 9.5\% from the best price when the
+parent order arrived, which did not help while prices moved less than that and did not apply to orders meant for the opening
+auction. It had position limits for some groups, but ``these limits did not account for the firm's exposure from outstanding
+orders''. It had no firm-wide capital thresholds linked to automated controls, and its position monitor ``relied entirely on
+human monitoring''. The rule it was charged under, the market access rule, asks for controls that prevent the entry of orders
+that exceed ``pre-set credit or capital thresholds'' and of erroneous orders that ``exceed appropriate price or size
+parameters, on an order-by-order basis or over a short period of time, or that indicate duplicative orders''. The engineering
+translation is a list: a price collar, size and notional limits per order, a position limit that counts orders in flight, a
+capital threshold across the firm, a rate limit, a duplicate check, and a kill switch that the gate itself can pull. The pre-trade
+risk check and the price collar are defined in One Quant Book~11 (chapter~27), which sets the policy; this chapter is about
+doing them fast and doing them right.
+
+\begin{dated}{2026-09}{What the rules ask of pre-trade controls}\label{dat:ll:pre-trade-risk-and-kill-switches:rules}
+In the United States, Rule 15c3-5 of the Securities Exchange Act (consulted September 2026) requires a broker or dealer with
+market access to have controls that prevent the entry of orders exceeding pre-set credit or capital thresholds in the aggregate
+for each customer and for itself, and of erroneous orders exceeding price or size parameters, order by order or over a short
+period, or indicating duplicative orders. In the European Union, Commission Delegated Regulation (EU) 2017/589 requires an
+investment firm to be able to cancel immediately any or all of its unexecuted orders on any or all venues (article 12); to have
+price collars, maximum order values, maximum order volumes and maximum message limits (article 15), and repeated automated
+execution throttles; and to generate real-time alerts within five seconds of the relevant event.
+\end{dated}
+
+The gate sits in the trading process, on the strategy engine's thread or right after it, before the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}
+(\cref{fig:ll:pre-trade-risk-and-kill-switches:where}): the engine's order becomes the gateway's message only if the gate
+says so. Everything else in the figure feeds it. The limits come from a risk service, as whole snapshots, with a \omterm{def:ll:protocols-i-fix:session}{heartbeat}; the
+reference prices come from the \omterm{def:ll:the-order-book-builder:builder}{book builder}; the fills and cancellations come back from the gateway, so that the gate's view of
+the position and of the orders in flight is the gateway's; and the kill switch can be pulled by the gate itself, by a person on
+the risk desk, or by the venue.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.75cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (eng) at (0,0) {strategy\\ engine};
+\node[box,fill=omThm!18,minimum width=2.2cm,minimum height=1.1cm] (gate) at (3.3,0) {\textbf{risk gate}\\ 12 checks, one mask};
+\node[box] (gw) at (6.6,0) {order\\ gateway};
+\node[box,fill=gray!10] (venue) at (9.4,0) {venue};
+\node[box,fill=omMeth!15] (lim) at (1.6,2.0) {risk service:\\ limit snapshots,\\ heartbeats};
+\node[box,fill=omMeth!15] (bb) at (5.0,2.0) {book builder:\\ reference prices};
+\node[box,fill=omMeth!15] (desk) at (3.3,-2.1) {risk desk:\\ kill switch};
+\draw[->,thick] ([yshift=2mm]eng.east) -- node[above]{order} ([yshift=2mm]gate.west);
+\draw[->,thick] (gate) -- node[above]{accepted} (gw);
+\draw[->,thick] (gw) -- (venue);
+\node[box,fill=gray!10] (mon) at (9.4,2.0) {post-trade\\ monitor};
+\draw[->] (lim) -- (gate);
+\draw[->] (bb) -- (gate);
+\draw[->] (desk) -- (gate);
+\draw[->,dashed] (gw.south) -- ++(0,-0.7) -| node[pos=0.25,below]{fills, cancels} ([xshift=8mm]gate.south);
+\draw[->,dashed] (venue) -- node[right]{drop copy} (mon);
+\draw[->,omThm] ([yshift=-2.5mm]gate.west) -- node[below,text=omThm]{refused} ([yshift=-2.5mm]eng.east);
+\end{tikzpicture}
+
+\omcaption{Where the gate sits: on the path of every order, before the gateway, fed by limits with \omterm{def:ll:protocols-i-fix:session}{heartbeats}, reference
+prices and the gateway's own view of fills and orders in flight. A post-trade monitor on the \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} (chapter~21) is a
+second line, not a substitute: it sees what has already happened.}\label{fig:ll:pre-trade-risk-and-kill-switches:where}
+\end{omfigure}
+
+\section{Checks in nanoseconds}
+
+\begin{definition}[Worst-case exposure]\label{def:ll:pre-trade-risk-and-kill-switches:worst}
+The \emph{worst-case exposure}\index{worst-case exposure} of a firm in an instrument is its position plus everything its open
+orders could still add if they all filled: on the long side, the position plus the remaining quantity of every open buy order,
+including those whose acknowledgement or cancellation has not arrived; on the short side, the same with sell orders. A limit is
+respected in the worst case if a new order fits under it on top of this exposure.
+\end{definition}
+
+A \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{risk gate} is checked on every order, so it must cost little, and cost the same whether it accepts or refuses: a gate that is
+fast on the common path and slow on the rare one is slowest exactly when a runaway is sending orders. The build's gate is
+organised for that. The limits are held in dense tables indexed by instrument (the venue's locate code) and by strategy, not in
+maps keyed by name. Whatever can be computed before the order arrives is: the collar is kept as two prices, recomputed when the
+reference price or the limits change, so that the collar check is one comparison; the exposures are running sums, updated by
+the reports as in chapter~21, so that the position check is an addition and a comparison. And every check is computed, without
+a branch, into one bit of a mask (\cref{lst:ll:pre-trade-risk-and-kill-switches:check}); the order passes if the mask is zero,
+and a refusal reports the lowest bit set, while the audit record keeps the whole mask, because the second reason matters when
+the first is fixed.
+
+\omcode{code/firm/riskgate/cpp/firm_riskgate.hpp}{124}{140}{Twelve checks, one mask: each condition sets one bit without a
+branch, and a refusal reports the first.}\label{lst:ll:pre-trade-risk-and-kill-switches:check}
+
+\Cref{fig:ll:pre-trade-risk-and-kill-switches:cost} measures it. With every order accepted and the duplicate check off, a check
+costs about \qty{11}{\nano\second} at the median; the duplicate check, which compares the order with the strategy's sixteen
+most recent ones, adds about \qty{10}{\nano\second}. The first version of that check compared five fields per remembered order
+and cost more than all the other checks together; packing quantity and price into one word and instrument and side into another
+(the wire's quantity and price are 32-bit fields, so the packing is exact) brought it to this. On the fixture's stream, where every kind of
+refusal occurs and each check follows the parsing of its input line, a check costs about \qty{26}{\nano\second} at the median,
+the same for accepted and refused orders: the mask makes the refusals no cheaper and no dearer.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=14pt,ymin=0,ymax=45,xmin=-0.6,xmax=4.6,
+  xtick={0,1,2,3,4},xticklabels={{fixture:\\ all},{fixture:\\ accepted},{fixture:\\ refused},{all accepted},{all accepted:\\ duplicates on}},
+  xticklabel style={align=center,font=\footnotesize},ylabel={ns per check (median)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x expr=\coordindex/2,y=ns,
+  restrict expr to domain={mod(\coordindex,2)}{0:0}]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/measured_check.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost of one pass through the gate's twelve checks, median of TSC-timed calls: on the fixture's 4\,874 orders
+(every kind of refusal, cold tables), split by outcome; and on a stream where every order passes, with the duplicate check off
+and on. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2. Data:
+\texttt{bench\_risk.py}.}\label{fig:ll:pre-trade-risk-and-kill-switches:cost}
+\end{omfigure}
+
+Tens of nanoseconds are small next to the path of an order through the kernel and the network (chapter~1), and there is no
+reason to make them smaller by checking less. The temptation runs the other way: to move the checks out of the trading
+process, into a separate risk process that sees the orders on a ring and answers. That costs a round trip between cores, about \qty{200}{\nano\second} through the
+rings of chapter~12, eight times the check itself, and, worse, it creates a second failure to handle: if the risk process stops answering, the trading process must
+either wait or send unchecked. A gate in the trading process, with limits it can check alone, fails in one way only.
+
+\section{Limits in a hierarchy, updated live}
+
+Limits are set at several levels: the firm has a capital threshold, each desk a share of it, each strategy a rate, a number of
+open orders and its own share, each instrument a collar, a size and a position limit (the risk hierarchy of One Quant Book~6,
+chapter~29, and the policy of Book~11, chapter~27). An order is checked at every level it belongs to, and the gate keeps one
+running exposure per level. The limits change during the day, when a trader asks for more or the risk desk takes some away,
+and the gate applies changes the way the strategy engine applies parameters (chapter~20): as whole, versioned snapshots,
+between two orders, never in the middle of a check, so that no order is checked against half an old snapshot and half a new
+one.
+
+The gate fails closed. A snapshot carries a maximum age: the risk service sends \omterm{def:ll:protocols-i-fix:session}{heartbeats}, and if the last snapshot or
+\omterm{def:ll:protocols-i-fix:session}{heartbeat} is older than its age, every order is refused as stale. The build's fixture includes a risk service that goes
+quiet for three seconds with a maximum age of two: from the moment its last \omterm{def:ll:protocols-i-fix:session}{heartbeat} is two seconds old until the next one
+arrives, the gate refuses every order, 50 of them. The same holds for the reference prices behind the collar: an instrument whose reference is older than its maximum age
+cannot be traded, because a collar around a stale price is no collar. Failing closed has a cost, since a strategy stops when a
+monitoring service fails, and the firm must decide which services the trading depends on. The rule of the build is that
+anything a check needs is such a service.
+
+\section{Kill switches: block, cancel, flatten}
+
+\begin{definition}[Mass cancel]\label{def:ll:pre-trade-risk-and-kill-switches:mass}
+A \emph{mass cancel}\index{mass cancel} is a request that cancels many orders at once, all the open orders of a session, of an
+instrument or of a side, either as one message the venue offers (the simulator's \texttt{M} message) or as a cancel for every
+open order sent together; the orders remain in flight, and may still fill, until each cancellation is confirmed.
+\end{definition}
+
+A kill switch stops a node of the hierarchy (a strategy, a desk, the firm) and can do three things, in increasing order of
+consequence. \emph{Block} refuses every new order under the node: nothing more goes out, and nothing already out is touched.
+\emph{Cancel} also sends a \omterm{def:ll:pre-trade-risk-and-kill-switches:mass}{mass cancel} for the node's open orders; until each cancellation is confirmed, the orders count in
+the exposure, and those that fill in the meantime are races of the kind of chapter~21. \emph{Flatten} also sends orders that
+close the positions, at the reference price, which the collar admits; it is the most dangerous of the three, since it trades,
+into a market the runaway may have moved, and the build returns those orders for a person to confirm rather than sending them.
+Who pulls the switch is a policy question (Book~11): the gate pulls it on a breach of a hard limit, the risk desk can pull it
+by hand, and many venues offer their own. Unkilling is always a person's decision.
+
+\omcode{code/firm/riskgate/firm_riskgate.py}{198}{210}{The kill switch of the Python reference: block, cancel (a mass cancel of
+the node's open orders), flatten (the closing orders, returned for confirmation).}\label{lst:ll:pre-trade-risk-and-kill-switches:kill}
+
+\section{Where the checks sit}
+
+Checks can sit in four places, and a firm uses several. In the trading process, as here: the cheapest and the only place
+that sees every order before it leaves, with the firm's own view of the orders in flight. In a separate risk process or
+appliance on the path: independent of the trading code, at the cost of a hop, and the only protection against a bug in
+the trading process itself. At the broker, when the firm reaches the venue through a broker's sponsored access (One Quant
+Book~1, chapter~4): the broker is responsible under the market access rule for the orders it lets through, whatever the
+firm checks. And at the venue, whose collars, limits and kill switches protect the market rather than the firm. The 2012 router
+had checks upstream and a monitor downstream, and nothing on the path of its own output. A useful test of any architecture is to
+ask, for each component that generates orders, which check sees its output before the venue does.
+
+\section{Tutorial: a runaway, one check at a time}\label{tut:ll:pre-trade-risk-and-kill-switches:tut}
+
+\texttt{firm\_riskgate\_runaway.py} rebuilds the 2012 shape against Book 10's matching engine. The runaway sends buy child orders
+of 100 shares in bursts of fifteen, a microsecond apart, every \qty{10}{\milli\second}: 1\,500 a second on average, the rate
+of 4 million executions in 45 minutes, of about 99 shares each. It prices them five ticks above the last trade and never looks
+at its fills. A liquidity provider keeps a ladder of sell orders and moves it up a tick every ten fills, so the runaway pushes
+the price up as it buys. \Cref{tab:ll:pre-trade-risk-and-kill-switches:runaway} and
+\cref{fig:ll:pre-trade-risk-and-kill-switches:runaway} give five seconds of it, with each check switched on in turn.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+check switched on & orders sent & shares bought & first refusal & carried over 45 min \\
+\midrule
+none & 7\,500 & 750\,000 & --- & 405 million \\
+collar, 5\% around the last trade & 7\,500 & 750\,000 & --- & 405 million \\
+size and notional per order & 7\,500 & 750\,000 & --- & 405 million \\
+throttle, 500 orders a second & 2\,545 & 254\,500 & \qty{40}{\milli\second} & 135 million \\
+duplicates within \qty{100}{\milli\second} & 55 & 5\,500 & first repeat & 3.0 million \\
+position 20\,000, fills only & 210 & 21\,000 & \qty{140}{\milli\second} & 21\,000 \\
+position 20\,000, in flight & 200 & 20\,000 & \qty{130}{\milli\second} & 20\,000 \\
+capital threshold, \$2.5 million & 249 & 24\,900 & \qty{160}{\milli\second} & 24\,900 \\
+\bottomrule
+\end{tabular}
+\caption{A runaway of the 2012 shape, five seconds against the matching engine, with one check at a time. ``Carried over
+45 minutes'' extends the rate of the last second when the runaway is still sending, and keeps the position when it has been
+stopped. Data: \texttt{fig\_runaway.py} (deterministic).}\label{tab:ll:pre-trade-risk-and-kill-switches:runaway}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ymode=log,xmin=0,xmax=5000,ymin=50,ymax=2e6,
+  xlabel={time since the runaway started (ms)},ylabel={position (shares)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=outer north east,legend style={font=\scriptsize,cells={anchor=west}},table/col sep=comma]
+\addplot[omThm,thick] table[x=t_ms,y=none]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{none (or collar, size)}
+\addplot[omMeth,thick] table[x=t_ms,y=throttle]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{throttle}
+\addplot[gray,thick,dashed] table[x=t_ms,y=duplicates]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{duplicates}
+\addplot[omDef,thick] table[x=t_ms,y=position_in_flight]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{position, in flight}
+\addplot[black,thick,dotted] table[x=t_ms,y=capital_threshold]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{capital threshold}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The runaway's position, every \qty{50}{\milli\second}, with one check at a time. Checks on each order in isolation
+never trip; a throttle slows the runaway and the duplicate check nearly stops it; a position limit that counts orders in flight,
+or a capital threshold, stops it within 250 orders. Data: \texttt{fig\_runaway.py}.}\label{fig:ll:pre-trade-risk-and-kill-switches:runaway}
+\end{omfigure}
+
+The table is the chapter's argument. The checks that look at each order alone (collar, size, notional) never trip: every child
+order is small, and priced near a market that the runaway itself is moving, so a collar around the last trade moves with it
+(the price rose 7.5\% in the five seconds, more than the collar, and the collar never noticed). A throttle slows the runaway to
+its rate and does not stop it: 135 million shares in 45 minutes is still a disaster. The duplicate check nearly stops this
+runaway, because its child orders repeat, and would miss one that varied its quantity. What stops it is a limit on what the
+firm holds, counted in the worst case: the position limit at 20\,000 shares after 200 orders, the capital threshold at
+24\,900. Counting only fills overshoots by the orders in flight, here one burst of ten orders, 1\,000 shares; with more orders
+in flight, or a slower report path, it overshoots by more. The kill switch changes what happens next: without it, the runaway
+keeps sending and the gate keeps refusing, 7\,300 refusals in five seconds; with it, the strategy is blocked at the first
+breach and its open orders are cancelled.
+
+\section{Build: the risk gate}\label{bld:ll:pre-trade-risk-and-kill-switches:riskgate}
+
+\begin{build}
+\bfield{Purpose} The check on the path of every order, between the strategy engine (chapter~20) and the \omterm{def:ll:order-gateway-and-order-management:gateway}{order gateway}
+(chapter~21); the policy it enforces is One Quant Book~11's (\texttt{firm.riskctl}, chapter~27), and its audit records go to the
+binary log (chapter~23).
+\bfield{Interface} Python reference \texttt{firm\_riskgate}: \texttt{Limits.from\_dict}, \texttt{from\_riskctl},
+\texttt{Gate(limits, t)} with \texttt{check}, \texttt{set\_limits}, \texttt{heartbeat}, \texttt{set\_reference},
+\texttt{on\_fill}, \texttt{on\_done}, \texttt{kill}, \texttt{unkill}, \texttt{audit}; \texttt{replay}, \texttt{decisions};
+\texttt{firm\_riskgate\_runaway.run} against Book 10's engine. C++20 \texttt{firm::risk}: \texttt{parse\_limits},
+\texttt{Gate} with the same operations and \texttt{Decision\{code, mask\}}. Rust \texttt{firm\_riskgate}: \texttt{Gate},
+\texttt{parse\_limits}, \texttt{replay}.
+\bfield{Rules} Every check computed into a mask, no branch on the outcome; limits as whole snapshots between orders; stale limits
+or reference prices refuse (fail closed); exposure counts every order in flight; no allocation per check; a kill is undone
+only by a person.
+\bfield{Acceptance tests} \texttt{code/firm/riskgate/}: the fixture's 4\,874 orders replayed to the same decisions in Python, C++
+and Rust, with every check refusing at least once; each check at its boundary; fail closed on stale limits and references; the
+kill switch's three actions at firm, desk and strategy level; the running sums equal to a recount after random streams; zero
+allocations; the runaway stopped by the position limit and the capital threshold, and not by the collar; Book 11's
+\texttt{firm.riskctl} limits, exported for the gate, replayed in Python and C++.
+\bfield{Stretch} A loss limit on realised and unrealised profit (exercise~7); per-venue message limits; limits shared by
+several gateways through shared memory, with one writer; Book 11's monitors (loss, message rate) feeding the kill switch.
+\end{build}
+
+\begin{omsources}
+\item U.S. Securities and Exchange Commission, Release No. 34-70694, \emph{In the Matter of Knight Capital Americas LLC}, 2013.
+\item 17 CFR 240.15c3-5, \emph{Risk management controls for brokers or dealers with market access}.
+\item Commission Delegated Regulation (EU) 2017/589 of 19 July 2016 (RTS 6).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:1}
+The reference price is 25.0000 (250\,000 in units of \num{e-4}) and the collar is 500 basis points. Which of buy orders at
+26.2500 and 26.2600, and sell orders at 23.7500 and 23.7400, pass?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:2}
+The long limit is 5\,000 shares. The position is 2\,000 long, and buy orders for 1\,500 and 1\,000 are open, one of them not
+yet acknowledged. Is a buy of 600 accepted? What is the largest buy that is?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:3}
+From the regulator's totals, compute the incident's average number of executions a second and of shares per execution.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:4}
+A burst of fifteen identical child orders leaves a microsecond apart. The duplicate window is \qty{100}{\milli\second}. How
+many of the fifteen pass, and how would the runaway have to change to pass them all?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:5}
+The limits' maximum age is two seconds and \omterm{def:ll:protocols-i-fix:session}{heartbeats} come every \qty{400}{\milli\second}. The risk service stops at time
+$t$. Until when are orders accepted, and why is ``until the service comes back'' the wrong answer?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:6}
+A check costs about \qty{26}{\nano\second} on the fixture's stream. What fraction of a tick-to-trade budget of
+\qty{1}{\micro\second} is that, and what would checking in a separate process on another core add?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:7}
+\emph{Coding.} Add a loss limit per strategy: realised profit from fills plus unrealised profit at the reference price, with
+a kill (block and cancel) when it falls below the limit. Where is the loss updated, and why is it not a pre-trade check like the
+others?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:8}
+\emph{Find the flaw.} ``Our risk checks run in their own process, which reads a copy of every order the gateway sends and sends
+a kill as soon as it sees a breach. It keeps the checks out of the latency path.''
+\end{exercise}
+
+\section{Problem: Forty-Five Minutes}
+
+\begin{problem}[{Weekend problem --- which checks would have stopped the 2012 runaway}]\label{pb:ll:pre-trade-risk-and-kill-switches:1}
+Use \cref{tab:ll:pre-trade-risk-and-kill-switches:runaway} (\texttt{runaway.csv}) and the regulator's totals: 4 million
+executions, more than 397 million shares, about 45 minutes.
+
+\medskip\noindent\textbf{Part I --- The rates.}
+\begin{enumerate}
+\item Compute the incident's execution rate and check that the runaway's 1\,500 orders a second match it.
+\item How many shares does the unchecked runaway buy in five seconds, and in 45 minutes at the same rate? Compare with the
+incident.
+\item In the simulation, the price rose by a tick every ten fills. By how much did it rise in five seconds?
+\item Why did the collar never trip, although the price moved by more than the collar?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The checks that do not stop it.}
+\begin{enumerate}[resume]
+\item Why do the size and notional limits per order never trip?
+\item The throttle trips after \qty{40}{\milli\second}. Why so late, and what is the runaway's rate afterwards?
+\item Carry the throttled rate over 45 minutes.
+\item The duplicate check lets 55 orders through in five seconds. Which ones, and what small change to the runaway would defeat
+it?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The checks that do.}
+\begin{enumerate}[resume]
+\item How many orders does the position limit of 20\,000 shares, counted in flight, let through, and when does it trip?
+\item The limit that counts only fills ends at 21\,000. Explain the difference.
+\item In what circumstances would that difference be large?
+\item The capital threshold is \$2.5 million. At about \$100 a share, why does it stop the runaway near 24\,900 shares?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: orders and shares before each check trips, carried over 45 minutes, against the
+incident's totals.
+\item What does the kill switch add to the position limit in this simulation?
+\item The runaway traded 154 stocks. What does that change for a per-instrument position limit, and which check is immune to it?
+\item Which of the missing controls listed in the regulator's order corresponds to each row of the table?
+\item Why must the gate fail closed?
+\item Why is a post-trade monitor, however fast, not a substitute for the gate?
+\item What false positives would the duplicate check raise on an ordinary day?
+\item In one sentence: what kind of limit stops a runaway?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:pre-trade-risk-and-kill-switches:1}
+List the pre-trade checks you would put on every order, and say which of them you would expect to catch a runaway algorithm.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:pre-trade-risk-and-kill-switches:2}
+How do you make a risk check cost a few nanoseconds, and cost the same whether it accepts or refuses?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:ll:pre-trade-risk-and-kill-switches:3}
+Your risk service stops sending limits. What does the trading system do, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:ll:pre-trade-risk-and-kill-switches:4}
+What should a kill switch do, and who should be able to pull it and undo it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:pre-trade-risk-and-kill-switches:5}
+How do you change a strategy's limits during the day without stopping it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk}]\label{iq:ll:pre-trade-risk-and-kill-switches:6}
+Read the 2012 incident as a requirements document. Design the controls, where they sit, and how you would test that they stop a
+runaway.
+\end{interviewq}

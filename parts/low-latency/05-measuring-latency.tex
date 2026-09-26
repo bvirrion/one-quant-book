@@ -1,0 +1,366 @@
+\chapter{Measuring Latency}\label{ch:ll:measuring-latency}
+
+A team changed its service, re-ran its load test, and saw the 99th percentile improve. The change had in fact made the
+service stall longer, and the test had got better at not noticing: it sent each request only after the previous reply,
+so during every stall it simply stopped asking, and the requests it would have sent, the ones that would have waited,
+were never measured. The effect has a name, \omterm{def:ll:measuring-latency:co}{coordinated omission}, and a correction, both from a talk that has become
+required viewing for anyone who reports a percentile (Tene, 2015). Measurement is where most latency work goes wrong: the
+clock costs as much as the code, the benchmark sees a warm machine, the histogram rounds away the tail, the tester
+coordinates with the system it tests. This chapter builds the measurement machinery of the book and the rules for using
+it.
+
+\section{Clocks}
+
+Chapter~2 introduced the \omterm{def:ll:cpu-microarchitecture:tsc}{time-stamp counter}, a register that counts at a constant rate.
+
+\begin{definition}[Invariant time-stamp counter]\label{def:ll:measuring-latency:invtsc}
+An \emph{invariant time-stamp counter}\index{invariant time-stamp counter} runs at a constant rate in every power and
+frequency state of the processor, so that differences of its readings are proportional to elapsed time on every core.
+The processor reports the property through a CPUID bit; Linux shows it as the flags \texttt{constant\_tsc} and
+\texttt{nonstop\_tsc}.
+\end{definition}
+
+With an invariant counter, a latency measurement reduces to two reads and a subtraction; the conversion to nanoseconds is
+one multiplication by a rate calibrated once against the operating system's monotonic clock. The alternatives go through
+the kernel's clock interface, \texttt{clock\_gettime}, which Linux answers in user space (the vDSO) when its clock source
+is itself the TSC, and otherwise by a system call. \Cref{fig:ll:measuring-latency:clocks} measures the cost of each read on
+this laptop: about \qty{6.5}{\nano\second} for \texttt{rdtsc}, some \qty{11}{\nano\second} for \texttt{rdtscp}, which waits
+for earlier instructions, and 14 to \qty{16}{\nano\second} for every kernel clock. Calibration needs care about which kernel clock it trusts. \texttt{CLOCK\_MONOTONIC}, behind \texttt{std::chrono::steady\_clock},
+is disciplined by time synchronisation, which speeds it up or slows it down to converge on true time;
+\texttt{CLOCK\_MONOTONIC\_RAW} is not. Ten calibrations of 50 milliseconds against the raw clock agree to six digits,
+2.9952 ticks per nanosecond, the processor's nominal 2.995~GHz; against the disciplined clock the same intervals give a
+rate about 2\% higher on the day of the measurement, and the difference moves whenever the synchronisation adjusts. The harness calibrates against the
+raw clock.
+
+\begin{definition}[Measurement overhead]\label{def:ll:measuring-latency:overhead}
+The \emph{measurement overhead}\index{measurement overhead} of an instrumented region is the time the measurement itself
+adds: the clock reads, the fences around them, and recording the result. It is included in every figure taken and must
+be small against the quantity measured, or subtracted.
+\end{definition}
+
+A stage of \qty{40}{\nano\second} timed with a \qty{20}{\nano\second} clock is half measurement. Chapter~1's per-stage
+figures carried about \qty{15}{\nano\second} of overhead each; chapter~26 timestamps only stage boundaries of the whole
+path, with the counter, and records the raw ticks for later conversion.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.4cm,xbar,bar width=9pt,xmin=0,enlarge x limits={upper,value=0.18},
+  symbolic y coords={gettimeofday,CLOCK_REALTIME,CLOCK_MONOTONIC_RAW,CLOCK_MONOTONIC,steady_clock,rdtscp,rdtsc},
+  ytick=data,yticklabels={rdtsc,rdtscp,steady\_clock,CLOCK\_MONOTONIC,CLOCK\_MONOTONIC\_RAW,CLOCK\_REALTIME,gettimeofday},
+  enlarge y limits=0.12,y tick label style={font=\ttfamily\footnotesize},
+  xlabel={ns per call},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=1},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[y=clock,x=ns_per_call]{figdata/low-latency/05-measuring-latency/measured_clocks.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Cost of one read of each clock available to a Linux program (best of seven batches of a million calls, pinned
+to one CPU, clock source \texttt{tsc}, so every kernel clock is served in user space). Measured on a laptop (Intel Core
+Ultra 7 155H) under WSL2, no isolated cores. Data: \texttt{bench\_clocks.py}.}\label{fig:ll:measuring-latency:clocks}
+\end{omfigure}
+
+\section{Timestamping at the wire}
+
+A program's clock can only say when the program saw a packet, not when the packet arrived.
+
+\begin{definition}[Hardware timestamp]\label{def:ll:measuring-latency:hwts}
+A \emph{hardware timestamp}\index{hardware timestamp} is written by a network card, a switch or a capture device when a
+packet's bits pass its port, from a clock in that device, and delivered with the packet (by the card) or recorded with a
+copy of it (by a capture device on a tap or mirror port).
+\end{definition}
+
+The receive timestamp of One Quant Book~1, chapter~28, is best taken in hardware: the time between a \omterm{def:ll:measuring-latency:hwts}{hardware timestamp}
+and the program's first read of the packet is the receive path (card, bus, kernel or bypass library) that a software
+timestamp cannot see. \omterm{def:ll:where-latency-comes-from:t2t}{Wire-to-wire latency} (chapter~1) needs two \omterm{def:ll:measuring-latency:hwts}{hardware timestamps}, in and out, from clocks that agree:
+either the same device (a capture appliance watching both directions) or devices synchronised to a common reference
+(the precision time protocol, One Quant Book~14, chapter~4).
+
+\section{Histograms and percentiles}
+
+\begin{definition}[Latency histogram]\label{def:ll:measuring-latency:hist}
+A \emph{latency histogram}\index{latency histogram} counts recorded latencies in buckets. In a log-linear histogram the
+buckets are exact for small values and grow in proportion to the value beyond, so that every bucket's width is at most a
+fixed fraction of the values it holds; percentiles are then known to that relative precision over any range, from a
+fixed table and without storing samples.
+\end{definition}
+
+Storing every sample of a day of messages is possible offline but not on the hot path; a histogram of fixed size is.
+The book's histogram, \texttt{firm.lathist}, keeps 256 exact buckets and then, for each power of two, 128 buckets: each
+bucket's width is at most $2^{-7}$ of its values, below 0.8\%, from one nanosecond to the largest 64-bit value, in 7\,424
+counters.
+
+\begin{proposition}[Relative precision of the log-linear buckets]\label{prop:ll:measuring-latency:precision}
+With $S$ sub-bucket bits, a value $v \ge 2^S$ falls in a bucket of width $2^{b(v)-S}$, where $b(v)$ is its bit length, and
+the width is at most $2^{-(S-1)}v$.
+\end{proposition}
+
+\begin{proof}
+Write $v = m \cdot 2^{s} + r$ with $s = b(v) - S$, $m = \lfloor v/2^s \rfloor$ and $0 \le r < 2^s$. The bucket holds the
+values with the same $m$ and $s$, an interval of width $2^s$. Since $v$ has $b(v)$ bits, $v \ge 2^{b(v)-1} = 2^{S-1}2^s$,
+so $2^s \le 2^{-(S-1)}v$.
+\end{proof}
+
+Percentiles are read from the counts by nearest rank: the $p$-quantile is the upper edge of the bucket in which the
+cumulative count first reaches $\lceil p\,n \rceil$ (capped by the largest value recorded). Histograms from several
+threads, hosts or days merge by adding counts, which quantiles of stored samples cannot do without the samples.
+
+\section{Coordinated omission}
+
+\begin{definition}[Coordinated omission]\label{def:ll:measuring-latency:co}
+\emph{Coordinated omission}\index{coordinated omission} is the loss of the slowest measurements when a load generator
+waits for each response before sending the next request: while the system stalls, the generator sends nothing, so the
+requests that would have waited during the stall are never issued and never measured.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=1cm,y=1cm]
+\fill[omThm!10] (2,-2.3) rectangle (6,1.3);
+\node[omThm,anchor=south] at (4,1.3) {service frozen};
+\draw[-Stealth] (0,-2.5) -- (10.4,-2.5) node[right]{time (ms)};
+\foreach \x in {0,1,2,3,4,5,6,7,8,9} {\draw (\x,-2.58) -- (\x,-2.42) node[below=3pt]{\x}; \draw[gray!40,dotted] (\x,-2.4) -- (\x,1.2);}
+\node[anchor=east] at (-0.2,0.8) {closed loop};
+\foreach \a/\b in {0/0.3,1/1.3,7/7.3,8/8.3,9/9.3} {\draw[omDef,line width=3pt] (\a,0.8) -- (\b,0.8);}
+\draw[omDef,line width=3pt] (2,0.8) -- (6.1,0.8);
+\node[omDef,anchor=south west] at (6.2,0.8) {one slow sample; 3 to 6 never sent};
+\node[anchor=east] at (-0.2,-0.4) {open loop};
+\foreach \a/\b/\y in {0/0.3/-0.4,1/1.3/-0.4,2/6.1/-0.4,3/6.2/-0.8,4/6.3/-1.2,5/6.4/-1.6,6/6.5/-2.0,7/7.3/-0.4,8/8.3/-0.4,9/9.3/-0.4} {\draw[omMeth,line width=3pt] (\a,\y) -- (\b,\y);}
+\node[omMeth,anchor=west] at (6.7,-1.6) {every scheduled request measured};
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:measuring-latency:co}{Coordinated omission}. Each bar runs from a request's intended send time to its reply. The closed-loop tester (top) sends at 2,
+waits through the freeze, and records a single slow sample; the requests due at 3, 4, 5 and 6 are never issued. The
+open-loop tester (bottom) sends on schedule and measures each request from its intended send time, so every request that
+waited is counted.}\label{fig:ll:measuring-latency:co-timeline}
+\end{omfigure}
+
+The correction, when the intended rate is known, is to add the missing samples: a reply that took $v$ at an intended
+interval $\Delta$ stands for requests that would have waited $v-\Delta$, $v-2\Delta$, and so on down to $\Delta$. It is
+exact only if the service would have answered each of them the moment the stall ended; a queue that drains after the stall
+makes the true figures larger still. The cure is not to need the correction: generate load on a schedule, open loop, and
+measure each request from when it should have been sent.
+
+\begin{example}[One stall a second]\label{ex:ll:measuring-latency:co}
+A service answers in about \qty{100}{\micro\second} and freezes for \qty{10}{\milli\second} at the start of every second;
+the testers intend one request a millisecond for 100 seconds (\cref{fig:ll:measuring-latency:spectrum}). The closed-loop
+tester collects 99\,000 samples and reports a p99 of \qty{0.16}{\milli\second}: the one sample it takes per freeze is 0.1\%
+of the total. Corrected, it reports \qty{1.06}{\milli\second}; the open-loop tester, which also sees the queue drain after
+each freeze, \qty{1.87}{\milli\second}. The service is slow for 1\% of the requests that users send, and the naive test
+says otherwise by an order of magnitude.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ymode=log,xmin=0.3,xmax=4,ymin=0.05,ymax=20,
+  xtick={0.3010,1,2,3,4},xticklabels={50\%,90\%,99\%,99.9\%,99.99\%},
+  ytick={0.1,1,10},yticklabels={0.1,1,10},xlabel={percentile},ylabel={latency (ms, log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=nines,y=closed_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.2pt] table[x=nines,y=corrected_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\addplot[omMeth,thick,mark=triangle*,mark size=1.4pt] table[x=nines,y=open_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\legend{closed loop (raw),closed loop (corrected),open loop}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Latency by percentile for a service with a \qty{10}{\milli\second} freeze each second, measured by three
+testers intending one request a millisecond. From the 99th to the 99.8th percentile the closed-loop tester is wrong by a
+factor of ten to fifty. Data: \texttt{ll\_measure.spectrum}, a deterministic simulation of 100
+seconds.}\label{fig:ll:measuring-latency:spectrum}
+\end{omfigure}
+
+In a trading system the ``tester'' is often the market. A strategy that measures its own reaction time only on the
+messages it managed to process has the same bias: during a stall, the messages that queued behind it are processed late,
+and a measurement that timestamps each message when the program first touches it, rather than when the packet arrived,
+records none of the delay. The receive timestamp belongs to the wire (a \omterm{def:ll:measuring-latency:hwts}{hardware timestamp}) or at least to the moment
+the packet left the kernel.
+
+\section{Profilers and hardware counters}
+
+\begin{definition}[Sampling profiler, hardware performance counter]\label{def:ll:measuring-latency:prof}
+A \emph{sampling profiler}\index{sampling profiler} interrupts a program at regular intervals (of time or of hardware
+events) and records where it was, estimating the share of time spent in each function. A \emph{hardware performance
+counter}\index{hardware performance counter} is a register of the processor that counts events (cycles, instructions
+retired, cache misses, \omterm{def:ll:cpu-microarchitecture:branch}{branch mispredictions}) for the code running on a core; on Linux they are read through
+\texttt{perf\_event\_open} and the \texttt{perf} tool.
+\end{definition}
+
+Both answer ``where does the time go on average'', which is the wrong question for a tail. A \omterm{def:ll:measuring-latency:prof}{sampling profiler} sees
+nothing of an event that happens once a minute; counters report totals unless read around a region. Their use in latency
+work is diagnostic: count cache misses and mispredictions in the region that the timestamps say is slow, on a
+reproduction of the slow case. Access is often restricted: the kernel setting \texttt{perf\_event\_paranoid}, 2 by default,
+allows only user-space measurements, and virtual machines, including this book's laptop, usually do not expose the
+counters at all. The book's measurements therefore use only the clock and what can be counted in software.
+
+\begin{method}[Reporting a latency measurement]\label{met:ll:measuring-latency:report}
+\begin{enumerate}
+\item Name the two instants and who timestamped each (\cref{def:ll:where-latency-comes-from:t2t} in chapter~1).
+\item Drive the system on a schedule (open loop) at a stated rate, or correct for \omterm{def:ll:measuring-latency:co}{coordinated omission} and say so.
+\item Record every measurement in a histogram of bounded relative error; report p50, p99, p99.9 and the maximum, with the
+count.
+\item State the machine, placement, compiler and flags, clock and its overhead, warm-up, and what else ran.
+\item Repeat, and report the spread of the percentiles between runs before comparing two versions (chapter~25).
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: a histogram and a load generator}\label{tut:ll:measuring-latency:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the log-linear histogram in three languages on one fixture, measure the clocks, and reproduce
+\omterm{def:ll:measuring-latency:co}{coordinated omission}. \textbf{End state:} \cref{fig:ll:measuring-latency:clocks,fig:ll:measuring-latency:spectrum}.
+\begin{tutsteps}
+\item \textbf{Index a value.} Below $2^S$ the value is its own index; above, its top $S$ bits and its bit length choose the
+bucket.
+\omcode{code/firm/lathist/cpp/firm_lathist.hpp}{12}{18}{The bucket of a value: a bit length and a shift.}\label{lst:ll:measuring-latency:index}
+\item \textbf{Correct for omission.} The corrected record adds the samples the stall hid.
+\omcode{code/firm/lathist/cpp/firm_lathist.hpp}{39}{44}{Recording with the expected interval.}\label{lst:ll:measuring-latency:corrected}
+\item \textbf{Check the twins.} \texttt{make\_lathist\_fixture.py} writes 20\,000 values from a nanosecond to ten seconds,
+their non-zero buckets and seven quantiles; the Python, C++20 and Rust tests reproduce both files exactly.
+\item \textbf{Simulate the testers.} The closed-loop tester sends when the previous reply arrives; the open-loop one on the
+millisecond. \texttt{fig\_measure.py} writes the spectrum.
+\omcode{code/low-latency/05-measuring-latency/python/ll_measure.py}{45}{53}{A closed-loop tester, the source of coordinated omission.}\label{lst:ll:measuring-latency:closed}
+\item \textbf{Measure the clocks} with \texttt{python bench\_clocks.py}.
+\end{tutsteps}
+\textbf{What to change next.} Make the freeze last \qty{50}{\milli\second} once every five seconds and compare the three
+p99s; add a \texttt{record\_corrected} to chapter~1's benchmark, with the interval of a real feed, and see whether anything
+changes.
+\end{tutorial}
+
+\section{Build: the latency histogram}\label{bld:ll:measuring-latency:lathist}
+
+\begin{build}
+\bfield{Purpose} The one way the firm records a latency distribution, on the hot path and off it, in every language, so
+that histograms from the feed handler, the strategy engine and the gateway can be merged and compared.
+\bfield{Interface} Python \texttt{LatHist(sub\_bits)} with \texttt{record(v, n)}, \texttt{record\_corrected(v,
+interval)}, \texttt{merge}, \texttt{quantile(p)}, \texttt{mean}, \texttt{nonzero}; \texttt{index\_of}, \texttt{bucket\_range}.
+C++20 \texttt{firm::lathist::LatHist} and Rust \texttt{firm\_lathist::LatHist}: the same, with the counters as a fixed
+vector.
+\bfield{Rules} Values are non-negative integers (nanoseconds, or ticks converted once); a bucket's width is at most
+$2^{-(S-1)}$ of its values; quantiles by nearest rank from the upper bucket edge, capped by the maximum; recording never
+allocates; the three implementations agree on the fixture exactly.
+\bfield{Acceptance tests} \texttt{code/firm/lathist/}: buckets that tile the line, the relative-error bound, quantiles and
+merge, the omission correction, and the shared fixture in Python, C++20 and Rust.
+\bfield{Stretch} Serialise a histogram compactly for logging (run-length of zero buckets); an interval histogram that
+rotates every second without stopping the recorder.
+\end{build}
+
+\begin{omsources}
+\item G.~Tene, ``How NOT to measure latency'', QCon San Francisco 2015.
+\item HdrHistogram, project documentation (``Corrected vs.\ raw value recording calls'').
+\item Intel, \emph{Intel 64 and IA-32 Architectures Software Developer's Manual}, vol.~3, ``Invariant TSC''.
+\item Linux man pages \texttt{clock\_gettime(2)}, \texttt{vdso(7)}, \texttt{perf\_event\_open(2)}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:1}
+A region is timed at 3\,020 ticks on a counter calibrated at 3.02 ticks per nanosecond, with an overhead of 45 ticks. What
+is its latency?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:2}
+Which bucket of \texttt{firm.lathist} (with $S = 8$) holds \qty{1\,000}{\nano\second}, and what range of values does it
+cover?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:3}
+How many counters does the histogram need with $S = 10$, and what is its relative precision?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:4}
+A closed-loop tester intending one request every \qty{2}{\milli\second} records a reply of \qty{9}{\milli\second}. Which
+values does the correction add?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:5}
+Why does the open-loop tester of \cref{ex:ll:measuring-latency:co} report a higher p99 than the corrected closed-loop
+tester?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:6}
+A strategy's reaction time is measured from the moment its event loop reads each message. During a \qty{2}{\milli\second}
+stall, 400 messages queue in the socket. What does the measurement record for them, and what should it record?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:measuring-latency:7}
+\emph{Coding.} Run \texttt{ll\_measure} with a freeze of \qty{50}{\milli\second} every five seconds. What are the three p99s
+now, and why does the closed-loop figure barely move?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:measuring-latency:8}
+\emph{Find the flaw.} ``Our service's p99.99 is \qty{40}{\micro\second}: we timed a million requests from one client
+thread, sending each request as soon as the previous reply arrived, and kept the samples in a histogram with 1\,000
+buckets of \qty{100}{\nano\second}.''
+\end{exercise}
+
+\section{Problem: The Benchmark That Lied}
+
+\begin{problem}[{Weekend problem --- a stall a second}]\label{pb:ll:measuring-latency:1}
+The service of \cref{ex:ll:measuring-latency:co} answers in about \qty{100}{\micro\second} and freezes for
+\qty{10}{\milli\second} at the start of every second. Three testers intend one request a millisecond for 100 seconds.
+
+\medskip\noindent\textbf{Part I --- Counting.}
+\begin{enumerate}
+\item How many requests do the open-loop and the closed-loop testers send, and why do they differ?
+\item What share of the closed-loop samples is slow?
+\item What share of the requests an open-loop client sends arrives during a freeze or queues behind one?
+\item How many samples does the correction add per freeze, and in all?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Percentiles.}
+\begin{enumerate}[resume]
+\item Read the three p99s from \cref{fig:ll:measuring-latency:spectrum}.
+\item Why do the three testers agree at the median and at p99.9?
+\item Why is the corrected figure below the open-loop one?
+\item Which figure would a user of the service experience?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The histogram.}
+\begin{enumerate}[resume]
+\item What is the relative precision of the histogram used, and does it matter here?
+\item How many counters does it hold?
+\item Could the testers' three histograms be merged, and what would the merged one mean?
+\item What would a histogram of fixed \qty{100}{\micro\second} buckets up to \qty{10}{\milli\second} report?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The report.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the p99 reported by the closed-loop tester, raw and corrected, against the open-loop
+tester's.
+\item Rewrite the naive report in the form of \cref{met:ll:measuring-latency:report}.
+\item Why is ``one freeze a second'' realistic for a service with a garbage collector or a periodic job?
+\item How would you detect \omterm{def:ll:measuring-latency:co}{coordinated omission} in a report you did not produce?
+\item What is the market's analogue of a closed-loop tester?
+\item Why must the clock's overhead be stated with each figure?
+\item What does a \omterm{def:ll:measuring-latency:hwts}{hardware timestamp} add to the measurement of a feed handler?
+\item In one sentence: what does an honest latency figure state?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:ll:measuring-latency:1}
+How do you read the time with the least overhead on x86 Linux, and what must be true for the reading to be meaningful
+across cores?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:measuring-latency:2}
+What is \omterm{def:ll:measuring-latency:co}{coordinated omission}, and how would you design a load test that avoids it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:measuring-latency:3}
+You must record a p99.9 of a stream of a million latencies a second in constant memory. How?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:ll:measuring-latency:4}
+Why is the mean latency a poor summary, and what would you report instead?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:ll:measuring-latency:5}
+When is a \omterm{def:ll:measuring-latency:prof}{sampling profiler} useful for latency work, and when is it useless?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:ll:measuring-latency:6}
+Two builds of a trading engine differ by 3\% at p99 in one run each. What do you need before believing it?
+\end{interviewq}
