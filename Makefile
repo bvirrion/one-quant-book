@@ -10,8 +10,8 @@ venv:
 	# --without-pip: Debian/Ubuntu system pythons often lack ensurepip; the
 	# outer pip installs into the venv with --python instead.
 	test -x $(PY) || python3 -m venv --without-pip .venv
-	python3 -m pip --python $(PY) -q install numpy pandas pytest ruff scipy scikit-learn lightgbm statsmodels
-	python3 -m pip --python $(PY) -q install torch --index-url https://download.pytorch.org/whl/cpu
+	# Exact versions: an unpinned install gave CI other digits than figdata/.
+	python3 -m pip --python $(PY) -q install -r requirements.txt
 
 # make test-code                      -> everything
 # make test-code CH=markets-1/07-pnl  -> one chapter

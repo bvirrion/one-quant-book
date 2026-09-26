@@ -13,7 +13,7 @@ the industry, interviews).
 **Status (2026-09-26): Books 1–13 are written; Books 14–18 are outline only.**
 Books 1–9 are committed (7–9, written 2026-09-24/25 in the main session with no
 subagents per the user's ruling, in 2322893). **Books 10–13 were written 2026-09-25/26 in
-one parallel batch, one agent per book, and are uncommitted** (`sources/BATCH_BOOKS_10-13.md`;
+one parallel batch, one agent per book** (committed as PP-114) (`sources/BATCH_BOOKS_10-13.md`;
 the exchange simulator all four share, `firm.exchsim`, is specified in
 `code/firm/INTERFACES.md` §7 and documented in `code/firm/exchsim/PROTOCOL.md` and `STATUS.md`). Books 3–6 were written in one parallel batch, one agent per
 book (`sources/BATCH_BOOKS_3-6.md`; series definition map
@@ -57,7 +57,9 @@ equity risk model, portfolio construction, costs, capacity, workflow; 234 with B
 `synthfut`; 264 with Book 9's thirty, §6, several built on earlier books' engines); Book 5's `pricing` library (Python, core in
 C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
 `styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
-code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas; since the Books 10–13 batch also scipy, scikit-learn, LightGBM, statsmodels and PyTorch CPU — user ruling 2026-09-25), CI.
+code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas; since the Books 10–13 batch also scipy, scikit-learn, LightGBM, statsmodels and PyTorch CPU — user ruling 2026-09-25).
+Versions are pinned in `requirements.txt`, which `make venv` installs. To add a library, install it, run the tests, then re-freeze with `python3 -m pip --python .venv/bin/python freeze`.
+CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `tools/test_code.sh <slug>`, then `tools/figdata.sh <slug>` and `tools/figdata_diff.sh`, which skips `figdata/MACHINE_DEPENDENT.txt`.
 Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 ## Commands

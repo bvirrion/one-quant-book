@@ -52,7 +52,8 @@ def test_summation_and_variance():
 
 def test_linear_algebra():
     ne = {k: row for k, *row in normal_equations()}
-    assert (r(ne[1e7][0] * 1e3, 1), r(ne[1e7][1] * 1e10, 1)) == (5.3, 1.2)
+    # The QR error is rounding noise: its digits move with the BLAS/LAPACK build and the CPU (1.2e-10 here, 0.3e-10 on CI).
+    assert r(ne[1e7][0] * 1e3, 1) == 5.3 and 1e-12 < ne[1e7][1] < 1e-9
     ch = cholesky_on_pairwise()
     assert (ch["ok"], ch["fail_index"], r(ch["pivot"]), r(ch["min_eig"]), ch["fixed_ok"]) == (False, 5, -0.14, -1.42, True)
     assert ch["jitter_needed"] == 2.0

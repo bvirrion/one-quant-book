@@ -954,6 +954,19 @@ outline budget or the difference explained.
     Book 7 added to `test_code.sh`/`figdata.sh` it is 1,884 (four threads: 1,900), so its test and its
     chart CSV had silently stopped reproducing. Print ill-conditioned iterative counts as "about", and
     run a new book's figure scripts under the pin before committing CSVs.
+  - *CI is not the laptop (2026-09-26).* Every CI run from Book 2 on had failed.
+    - CI's ubuntu-24.04 `python3` is 3.12, whose built-in `sum()` of floats is compensated. That moved
+      the Book 2 ch. 30 market-making learner's P&L CSV in the 3rd decimal.
+    - The unpinned `make venv` pulled newer numpy/OpenBLAS than the laptop's. Together with a different
+      CPU, that turned Book 4 ch. 25's QR error from 1.2e-10 into 0.3e-10.
+    - The fix:
+      - `requirements.txt` freezes the exact venv, including torch, and `make venv` installs it.
+      - CI uses `actions/setup-python` 3.10 and Rust 1.97.1, runs one matrix job per code root, and
+        triggers on tags and manual runs only.
+      - To add a library: install it, run the tests, re-freeze.
+    - Never assert or print rounding noise to more than its order of magnitude. A CSV whose digits still
+      move with the processor goes in `figdata/MACHINE_DEPENDENT.txt` with its reason, and only on CI
+      evidence; `tools/figdata_diff.sh` skips it.
   - *Shared simulator first.* Freezing `firm.exchsim` at the sync (MoldUDP64 feed, SoupBinTCP/OUCH-style
     order entry, `schema.json`, golden fixtures, `STATUS.md`) let Book 13 generate its codecs, Book 11
     run its venue playbook and Book 12 serve a model on the same venue while all were written at once.
