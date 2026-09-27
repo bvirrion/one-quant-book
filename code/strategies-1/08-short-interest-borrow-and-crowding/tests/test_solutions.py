@@ -2,6 +2,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from s1_lending import avoidance, book, ic, levels, squeeze  # noqa: E402
 
@@ -10,6 +12,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_levels_and_ics():
     lv = levels()
     assert (r(100 * lv["si_median"], 1), r(100 * lv["si_p90"], 1), r(100 * lv["si_max"], 0), r(100 * lv["util_p90"], 0),
@@ -18,6 +22,8 @@ def test_levels_and_ics():
     assert [r(ic(n), 3) for n in ("si", "dtc", "fee", "crowding")] == [0.061, 0.048, 0.006, 0.058]
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_books():
     got = {n: book(n) for n in ("si", "fee", "crowding")}
     f = lambda b: (r(b["sr_gross"]), r(b["sr_fee"]), r(b["sr_net"]), r(100 * b["ret_gross"], 1),  # noqa: E731
@@ -31,6 +37,8 @@ def test_books():
     assert (r(100 * a["all"], 1), r(100 * a["avoid"], 1), r(100 * a["diff"], 2), r(a["t"], 1)) == (9.1, 10.0, 0.94, 7.2)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_squeeze():
     s = squeeze(0.5, 5)
     assert (r(100 * s["median"], 1), r(100 * s["worst"], 1), r(100 * s["actual_worst"], 1), s["n"]) == (-4.0, -8.3, -3.0, 96)

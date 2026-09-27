@@ -5,6 +5,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_train as m  # noqa: E402
@@ -20,6 +21,8 @@ def test_data():
     assert m.gather_parity()
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_precision():
     p = m.precision()
     assert (round(p["max diff"], 4), round(p["max rel diff"], 2), round(p["last 50 fp32"], 4), round(p["last 50 bf16"], 4)) == (
@@ -28,6 +31,8 @@ def test_precision():
     assert (2.0**-7, round(2.0**-10, 5), round(2.0**-23 * 1e7, 1)) == (0.0078125, 0.00098, 1.2)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_parallel_and_resume():
     assert f"{m.accumulation():.1e}" == "1.4e-07"
     d, g = m.data_parallel()

@@ -2,6 +2,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_sor import partial_study, passive_study, race, sweep_study, trial  # noqa: E402
 
@@ -46,6 +48,8 @@ def test_jitter_and_ranking():
     assert (r(100 * p[(False, True)]["ratio"]), r(p[(False, True)]["cost"], 2)) == (100.0, 0.30)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_passive_allocation():
     p = passive_study()
     got = {k: (r(v["cost"], 2), r(100 * v["filled"])) for k, v in p.items()}

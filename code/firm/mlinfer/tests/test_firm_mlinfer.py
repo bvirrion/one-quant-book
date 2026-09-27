@@ -2,6 +2,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 HERE = pathlib.Path(__file__).resolve().parents[1]
@@ -10,6 +11,8 @@ import firm_mlinfer as mi  # noqa: E402
 import make_mlinfer_fixture as fx  # noqa: E402
 
 
+# The committed model files are this machine's training run; elsewhere the weights differ: skipped by CI.
+@pytest.mark.reference
 def test_fixture_reproducible_and_export_exact(tmp_path):
     forest, mlp, X, _ = fx.models()
     f = mi.export_forest(forest)
@@ -23,6 +26,19 @@ def test_fixture_reproducible_and_export_exact(tmp_path):
     mi.write_mlp(q, tmp_path / "m.txt")
     assert (tmp_path / "m.txt").read_text() == (HERE / "data" / "mlp.txt").read_text()
     assert np.array_equal(mi.int8_forward(q, V[:, :16]), V[:, 17])
+
+
+def test_export_round_trip_matches_the_model(tmp_path):
+    # The machine-independent half of the test above: whatever weights this CPU trains, the exported and
+    # re-read forest predicts exactly what the model does, and quantising the network is deterministic.
+    forest, mlp, X, _ = fx.models()
+    f = mi.export_forest(forest)
+    assert np.array_equal(mi.forest_predict(f, X[:500]), forest.predict(X[:500]))
+    mi.write_forest(f, tmp_path / "f.txt")
+    assert np.array_equal(mi.forest_predict(mi.read_forest(tmp_path / "f.txt"), X[:500]), forest.predict(X[:500]))
+    mi.write_mlp(mi.quantise(mlp, X[:2000]), tmp_path / "m1.txt")
+    mi.write_mlp(mi.quantise(mlp, X[:2000]), tmp_path / "m2.txt")
+    assert (tmp_path / "m1.txt").read_text() == (tmp_path / "m2.txt").read_text()
 
 
 def test_int8_close_to_float_and_requant_rounding():

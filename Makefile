@@ -1,4 +1,4 @@
-.PHONY: all clean distclean venv test-code figdata gates
+.PHONY: all clean distclean venv test-code test-fast reproduce figdata gates
 
 PY := .venv/bin/python
 CH ?=
@@ -17,6 +17,16 @@ venv:
 # make test-code CH=markets-1/07-pnl  -> one chapter
 test-code:
 	tools/test_code.sh $(CH)
+
+# Without the `reference` tests (the book's exact printed numbers): what CI runs.
+test-fast:
+	OQB_TESTS=fast tools/test_code.sh $(CH)
+
+# Everything, then every chart CSV regenerated with no diff: the full check, on the machine that wrote them.
+reproduce:
+	tools/test_code.sh $(CH)
+	tools/figdata.sh $(CH)
+	git diff --exit-code figdata/
 
 # Regenerate every chart CSV under figdata/ from its script.
 figdata:

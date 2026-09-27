@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from rs_decay import (
@@ -24,6 +25,8 @@ def r(x, d=3):
     return round(float(x), d)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_decay_table():
     d = decay_table()
     assert [r(d[k]["ic"][1]) for k in ("reversal", "surprise", "momentum", "book-to-price")] == [0.037, 0.010, 0.008, 0.004]

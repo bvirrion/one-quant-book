@@ -4,6 +4,8 @@ import csv
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "firm" / "mlinfer"))
 import firm_mlinfer as mi  # noqa: E402
@@ -12,6 +14,8 @@ import ml_infer as m  # noqa: E402
 FIG = pathlib.Path(__file__).resolve().parents[4] / "figdata" / "ml" / "26-low-latency-inference"
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_models_and_parity():
     a = m.accuracy()
     assert (round(a["forest"], 3), round(a["MLP float"], 3)) == (0.224, 0.182)

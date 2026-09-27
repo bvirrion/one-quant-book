@@ -5,6 +5,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_hedge as m  # noqa: E402
@@ -16,6 +17,8 @@ def test_setup():
     assert (round(bs_cost, 3), round(deep_cost, 3)) == (0.123, 0.099) and bs_cost > m.vega_point()
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_hedging():
     h = m.hedging()
     ind = {c: tuple(round(h[c][k]["entropic"], 3) for k in ("deep hedge", "Black-Scholes delta", "Whalley-Wilmott"))
@@ -44,6 +47,8 @@ def test_bands_wider_below_the_money_narrower_above():
     assert dh - dl < wh - wl
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_shortfall():
     s = m.shortfall_hedge()
     got = {k: (round(v["entropic"], 3), round(v["ES"], 3), round(v["mean cost"], 3), round(v["sd"], 3))
@@ -57,6 +62,8 @@ def test_surrogates():
                  (1024, True): (0.218, 0.021), (4096, False): (0.297, 0.042), (4096, True): (0.279, 0.020)}
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_calibration():
     c = m.calibration()
     e = {k: round(100 * v, 1) for k, v in c["parameter rmse / range"].items()}

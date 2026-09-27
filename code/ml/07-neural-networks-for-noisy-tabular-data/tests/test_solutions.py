@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_nets as m  # noqa: E402
@@ -13,6 +14,8 @@ def r(x, d=3):
     return round(float(x), d)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_seeds():
     s = m.seed_study()
     a, b = s["small"], s["large"]
@@ -28,6 +31,8 @@ def test_seeds():
     assert min(epochs) >= 1 and max(epochs) <= 4 and [m.net(m.SMALL, k)["best_epoch"] for k in (1, 2, 3)] == [2, 2, 4]
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_ensembles_and_ablation():
     e = m.ensemble()
     assert (r(e["ic"]), r(100 * e["r2"], 2), r(e["ls_sr_net"], 2), r(m.ensemble(hidden=m.LARGE)["ic"])) == (

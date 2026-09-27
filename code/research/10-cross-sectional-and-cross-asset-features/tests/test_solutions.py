@@ -4,6 +4,7 @@ import sys
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "firm" / "leadlag"))
@@ -35,6 +36,8 @@ def test_size_quintiles():
     assert (r(d[0].partial_t, 1), r(d[1].partial_t, 1)) == (13.4, -4.4)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_links():
     m = customer_momentum()
     assert m["months"] == 107 and 0.25 < m["n_suppliers"] / m["n_listings"] < 0.35

@@ -59,7 +59,7 @@ C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
 `styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
 code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas; since the Books 10–13 batch also scipy, scikit-learn, LightGBM, statsmodels and PyTorch CPU — user ruling 2026-09-25).
 Versions are pinned in `requirements.txt`, which `make venv` installs. To add a library, install it, run the tests, then re-freeze with `python3 -m pip --python .venv/bin/python freeze`.
-CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `tools/test_code.sh <slug>`, then `tools/figdata.sh <slug>` and `tools/figdata_diff.sh`, which skips `figdata/MACHINE_DEPENDENT.txt`.
+CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `make test-fast`, which skips the tests marked `reference`. Those tests assert printed digits that move with the processor's floating-point kernels; 26 are marked. Chart regeneration is not in CI: `make reproduce` runs everything, `reference` tests and figdata included, on the machine that wrote the book.
 Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 ## Commands
@@ -67,6 +67,8 @@ Working notes: `sources/<slug>/PROGRESS.md` per book.
 ```sh
 make                          # build the book(s) into build/
 make test-code                # ruff + pytest + g++ -std=c++20 + cargo + listing ranges + chart CSVs
+make test-fast                # the same without `reference` tests (what CI runs)
+make reproduce                # test-code + figdata, must leave no diff (before a release)
 make figdata                  # regenerate every chart CSV (must leave no diff)
 tools/gates.sh chapter markets-2/NN-slug
 tools/gates.sh book markets-2 # (any slug) all chapters + duplicate labels + terms defined twice + problem numbering + links + log

@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from s1_intraml import naive, scores, trading, without_own_returns  # noqa: E402
 
@@ -11,6 +13,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_scores():
     got = {h: scores(h) for h in (5, 30, 120)}
     f = lambda s: (r(100 * s["r2_ridge"], 1), r(100 * s["r2_gbm"], 1), r(s["ic_ridge"]), r(s["ic_gbm"]),  # noqa: E731

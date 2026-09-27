@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_represent as m  # noqa: E402
 
@@ -11,6 +13,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_learning_curve():
     a, b, c = m.compare(300), m.compare(1000), m.compare(0)
     assert (r(a["predictive probe"]), r(a["raw ridge"]), r(a["from scratch"])) == (0.22, 0.12, 0.18)

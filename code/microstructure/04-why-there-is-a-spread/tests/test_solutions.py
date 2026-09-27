@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_spread import gm_learning, gm_with_cost, kyle_check, pin_bias, roll_on_tape  # noqa: E402
 
@@ -30,6 +32,8 @@ def test_kyle_and_roll():
     assert (r(ro["roll"]), r(ro["quoted"]), r(ro["sign_autocorr"])) == (0.88, 1.08, 0.29)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_pin():
     got = {(a, sd): r(pin_bias(sd, a)["mean"], 3) for a in (0.0, 0.4) for sd in (0.0, 0.25, 0.5, 0.75)}
     assert got == {(0.0, 0.0): 0.006, (0.0, 0.25): 0.085, (0.0, 0.5): 0.153, (0.0, 0.75): 0.207,

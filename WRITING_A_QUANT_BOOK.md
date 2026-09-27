@@ -964,9 +964,30 @@ outline budget or the difference explained.
       - CI uses `actions/setup-python` 3.10 and Rust 1.97.1, runs one matrix job per code root, and
         triggers on tags and manual runs only.
       - To add a library: install it, run the tests, re-freeze.
-    - Never assert or print rounding noise to more than its order of magnitude. A CSV whose digits still
-      move with the processor goes in `figdata/MACHINE_DEPENDENT.txt` with its reason, and only on CI
-      evidence; `tools/figdata_diff.sh` skips it.
+    - Never assert or print rounding noise to more than its order of magnitude.
+    - *Other processors (the tag v0.0.1 run).* Even with Python and packages pinned, 21 tests failed on a
+      CI runner, because other floating-point kernels sum in another order.
+      - Training runs, optimisers and Monte Carlo loops amplify that last bit into printed digits. Marked: Book 12
+        ×16, research ×2, strategies-1 ×4, microstructure ×2, firm ×2.
+      - The rule (user ruling 2026-09-26): a test asserting such digits carries `@pytest.mark.reference`.
+        `make test-code` and `make reproduce` run it on the machine that wrote the book. `make test-fast`
+        and CI skip it.
+      - Every chapter keeps at least one unmarked test of its code. Where marking would leave none, split
+        out the machine-independent half (`firm/mlinfer`'s export round trip).
+      - Find these tests locally before CI does. Run `tools/test_code.sh` with other kernels:
+        `OPENBLAS_CORETYPE=Sandybridge ATEN_CPU_CAPABILITY=default ONEDNN_MAX_CPU_ISA=SSE41
+        MKL_CBWR=COMPATIBLE NPY_DISABLE_CPU_FEATURES="AVX2 FMA3 AVX512F …"`. A test that fails there
+        asserts noise. Passing proves less: it caught 16 of CI's 21 failures (none of research's two) and
+        found 5 more (strategies-1 ×4, Book 12 ch. 13). So mark CI's failures and the perturbation's: 26 in all.
+      - The scripts pin the kernels this laptop picks anyway (`OPENBLAS_CORETYPE=Haswell`,
+        `ATEN_CPU_CAPABILITY=avx2`, no AVX-512), which narrows the differences elsewhere.
+    - *Memory.* One pytest process for a whole book peaked at 15.6 GB (strategies-1), against 3.9 GB for
+      its largest chapter, and the 7 GB runner was killed. `test_code.sh` now runs one process per chapter.
+    - *Chart regeneration* (`figdata.sh` plus the no-diff check) left CI: it reproduces printed figures,
+      so it is part of `make reproduce`.
+    - *Ignore rules and kernels.* `.gitignore`'s `code/**/bin/` also swallowed Rust `src/bin/` sources,
+      so it is now `code/**/cpp/bin/`. A page-fault count needs `MADV_NOHUGEPAGE`, because runners have
+      transparent huge pages set to "always".
   - *Shared simulator first.* Freezing `firm.exchsim` at the sync (MoldUDP64 feed, SoupBinTCP/OUCH-style
     order entry, `schema.json`, golden fixtures, `STATUS.md`) let Book 13 generate its codecs, Book 11
     run its venue playbook and Book 12 serve a model on the same venue while all were written at once.

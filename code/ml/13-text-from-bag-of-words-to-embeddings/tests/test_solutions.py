@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_text as m  # noqa: E402
 from firm_textml import EVENTS, extract_event, ngrams, tokenize  # noqa: E402
@@ -60,6 +62,8 @@ def test_supervised_list():
     assert sorted(w, key=w.get)[1] == "halves" and "to" in w and "be" in w
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_topics():
     top, purity = m.topics()
     assert top[0] == ["analysts", "fell", "short", "expectations", "forecasts", "exceeded"]

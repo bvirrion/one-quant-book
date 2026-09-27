@@ -16,16 +16,22 @@ int main() {
         return t;
     };
     const Hiccups h = hiccup_meter(fake, 5000, 50, 16);
-    if (h.gaps.size() != 3 || h.worst != 2000 || h.stolen != 2590 || h.elapsed < 5000) return 1;
+    if (h.gaps.size() != 3 || h.worst != 2000 || h.stolen != 2590 || h.elapsed < 5000) {
+        std::printf("hiccups: %zu gaps, worst %llu, stolen %llu\n", h.gaps.size(),
+                    static_cast<unsigned long long>(h.worst), static_cast<unsigned long long>(h.stolen));
+        return 1;
+    }
     const auto ex = exceedance(h.gaps, {50, 100, 1000, 5000});
-    if (ex != std::vector<std::uint64_t>{3, 2, 1, 0}) return 2;
+    if (ex != std::vector<std::uint64_t>{3, 2, 1, 0}) { std::printf("exceedance mismatch\n"); return 2; }
 
     // Without locking, the first write to each page of a fresh mapping faults.
     constexpr std::size_t kBytes = 8u << 20;
     void* a = mmap(nullptr, kBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // 4 KiB pages even where transparent huge pages are "always" (CI runners): one 2 MiB page takes one fault.
+    madvise(a, kBytes, MADV_NOHUGEPAGE);
     const long cold = touch_faults(static_cast<char*>(a), kBytes);
     munmap(a, kBytes);
-    if (cold < 2000) return 3;   // 2,048 pages (fewer only if the kernel used huge pages)
+    if (cold < 2000) { std::printf("only %ld faults on 8 MiB\n", cold); return 3; }   // 2,048 pages
 
     // With MCL_FUTURE the kernel populates new mappings when they are made: the writes then take no fault.
     const int err = lock_all();

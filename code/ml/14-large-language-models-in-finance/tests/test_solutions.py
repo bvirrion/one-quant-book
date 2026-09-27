@@ -4,6 +4,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_llm as m  # noqa: E402
 
@@ -20,6 +22,8 @@ def test_setup():
     assert (pct(acc), n, pct(ceiling), 2012 - n) == (66.0, 1462, 61.6, 550)
 
 
+# Printed digits that move with the CPU's floating-point kernels: skipped by CI (make test-fast).
+@pytest.mark.reference
 def test_contamination():
     c = {k: {p: (pct(a), pct(b)) for p, (a, b) in v.items()} for k, v in m.contamination().items()}
     assert c["clean"] == {"before both cut-offs": (69.7, 57.7), "between the cut-offs": (56.2, 56.0),
