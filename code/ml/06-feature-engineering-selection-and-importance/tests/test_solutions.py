@@ -3,6 +3,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_importance as m  # noqa: E402
@@ -13,6 +14,8 @@ def pct(x, d=2):
     return round(100 * float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_importances():
     imp = m.importances()
     assert (pct(imp["test_r2"]), pct(imp["truth_r2"])) == (2.67, 4.01)
@@ -30,12 +33,16 @@ def test_importances():
     assert (pct(imp["drop"][0]), pct(imp["drop"][4])) == (0.09, -0.02)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_twins():
     t = m.twins()
     assert (pct(t["all"]), pct(t["no_x1"]), pct(t["no_x1b"]), pct(t["no_both"])) == (2.67, 2.58, 2.68, 1.61)
     assert pct(t["all"] - t["no_both"]) == 1.05 and round((t["all"] - t["no_both"]) / t["all"], 1) == 0.4
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_stability():
     s = m.stability()
     assert list(s["lasso"]["chosen"]) == [0] and list(s["boosting"]["chosen"]) == [0, 1]
@@ -45,6 +52,8 @@ def test_stability():
     assert max(s["lasso"]["freq"][2:4].max(), s["boosting"]["freq"][2:4].max()) < 0.1
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_heavy_tail_and_exercises():
     h = m.heavy_tail()
     assert (pct(h["raw"]), pct(h["winsorised"]), pct(h["ranked"]), pct(h["truth"])) == (0.13, 1.27, 1.96, 2.17)
@@ -61,3 +70,15 @@ def test_heavy_tail_and_exercises():
             phi[i] += v[tuple(sorted(seen + [i]))] - v[tuple(sorted(seen))]
             seen.append(i)
     assert {i: x / 6 for i, x in phi.items()} == {1: 1.5, 2: 1.5, 3: 0.0}
+
+
+def test_small_runs():
+    # 100 trees and no importance study (drop-column refits, SHAP, permutations): the planted signal lives in
+    # features 0 to 3 (and 4, a near-copy of 0), and the split gain finds its three largest there.
+    from firm_gbdt import make
+
+    X, y, Xt, yt, ft = m.data()
+    fit = make(dict(m.PARAMS, n_estimators=100)).fit(X, y)
+    gain = fit.booster_.feature_importance("gain")
+    assert set(np.argsort(gain)[-3:]) <= {0, 1, 2, 3, 4} and np.corrcoef(X[:, 0], X[:, 4])[0, 1] > 0.9
+    assert m.r2(yt, ft) > 0

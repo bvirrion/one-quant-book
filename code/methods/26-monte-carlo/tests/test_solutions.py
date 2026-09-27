@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import qm_mc  # noqa: E402
@@ -15,6 +16,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_variance_table():
     tb = table(14, 32)
     f = tb["factor"]
@@ -26,6 +29,8 @@ def test_variance_table():
     assert round(math.sqrt(f["rqmc bridge + cv"]) / 10) * 10 == 190
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_error_vs_cost_slopes():
     rows = error_vs_cost()
     n = [row[0] for row in rows]
@@ -34,6 +39,8 @@ def test_error_vs_cost_slopes():
     assert all(-0.82 < v < -0.68 for v in s[2:]) and (n[0], n[-1]) == (64, 32768)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_orders_mlmc_is():
     o = orders()
     x = [row[0] for row in o]
@@ -52,6 +59,8 @@ def test_orders_mlmc_is():
     assert min(rows, key=lambda t: rows[t][1]) == 3.8 and round((rows[0.0][1] / rows[3.8][1]) ** 2, -2) == 1000
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert (r(1 / (1 - 0.81), 1), r(1 / (1 - 0.99**2), 1)) == (5.3, 50.3)
     z = digital_is()["zstar"]
@@ -71,9 +80,19 @@ def test_exercises():
     assert out == {80.0: (0.99953, 1071), 130.0: (0.99425, 87)}
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_multilevel_scheme_ablation():
     """WRITING section 9: halving the step halves Euler's weak error of the mean and Milstein's strong error, and
     dropping the Milstein term (the ablation, i.e. Euler) leaves strong order one half."""
     o = orders()
     for a, b in zip(o[3:], o[4:], strict=False):
         assert 1.9 < a[3] / b[3] < 2.1 and 1.7 < a[2] / b[2] < 2.1 and 1.3 < a[1] / b[1] < 1.5
+
+
+def test_small_runs():
+    # 256 paths and 4 replicates instead of 16,384 and 32: the control variate and the randomised quasi-Monte Carlo
+    # with the bridge both reduce the variance, and the price agrees with plain Monte Carlo.
+    t = table(m=8, reps=4)
+    assert t["factor"]["control variate"] > 1 and t["factor"]["rqmc bridge + cv"] > 1
+    assert abs(t["price"] - t["plain_est"]) < 5 * t["plain_se"]

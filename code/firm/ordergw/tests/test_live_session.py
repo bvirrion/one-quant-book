@@ -90,7 +90,9 @@ def test_session_cancel_on_disconnect_replay_and_drop_copy():
         hf.drop()
         time.sleep(0.3)
         assert g.worst_long() == 300                 # until we hear otherwise, the two orders may still fill
-        reps = hf.connect() or hf.read(2)
+        # the login acceptance and the replay may share one TCP read: take whatever connect() saw, then the rest
+        reps = hf.connect()
+        reps += hf.read(2 - len(reps))
         assert hf.s.logins == 2 and hf.s.next_seq == seen + 2
         assert sorted((type(r).__name__[-1], r.reason) for r in reps) == [("C", "D"), ("C", "D")]
         apply(g, reps)

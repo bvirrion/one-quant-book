@@ -4,9 +4,10 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from s1_residarb import YEAR, run, stability  # noqa: E402
+from s1_residarb import YEAR, panel, run, sharpe, stability  # noqa: E402
 
 
 def r(x, d=2):
@@ -20,6 +21,8 @@ def f(res):
             r(100 * res["passed"], 1), None if math.isnan(c) else r(c, 3))
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_main_table():
     assert f(run(0.0, "etf")) == (1.04, 0.07, 0.9, 12.0, 12.3, 347, 37, 3.47, 99.1, None)
     assert f(run(0.0, "pca")) == (1.3, -0.06, -0.5, 9.8, 7.2, 343, 39, 3.43, 99.0, None)
@@ -30,6 +33,8 @@ def test_main_table():
     assert r(100 * run(0.3, "pca")["explained"], 1) == 45.7
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_speed_filter_and_thresholds():
     assert (r(run(0.3, "etf", 1.25, 0.0)["sr_net"]), r(run(0.3, "pca", 1.25, 0.0)["sr_net"])) == (2.16, 3.04)
     got = [(r(run(0.3, "etf", 1.25, YEAR / tau)["sr_net"]), r(100 * run(0.3, "etf", 1.25, YEAR / tau)["passed"], 1))
@@ -41,6 +46,8 @@ def test_speed_filter_and_thresholds():
     assert (r(v["sr_net"]), r(v["sr_gross"])) == (1.78, 2.88)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_stability():
     st = stability()[1:]
     assert (r(100 * np.mean([x["explained"] for x in st]), 1), r(np.mean([x["v1"] for x in st]), 3),
@@ -55,3 +62,14 @@ def test_exercises():
     assert (r(100 * s_eq), r(-0.02 / s_eq)) == (2.29, -0.87)
     assert r(math.exp(-1 / 30), 4) == 0.9672
     assert r(2 * 0.37 * 0.0005 * 252 * 100, 1) == 9.3
+
+
+def test_small_runs():
+    # A 100-name, three-year universe instead of the full one: the panel's returns, industry returns and volumes line
+    # up day by day, and the Sharpe ratio annualises as the chapter does.
+    import numpy as np
+
+    P, R, ind, vol = panel(n=100, days=3 * YEAR)
+    assert R.shape == vol.shape and ind.shape == (R.shape[0], P.cfg.n_industries) and np.isfinite(ind).all()
+    x = np.r_[0.01, -0.005, 0.02, 0.0]
+    assert abs(sharpe(x) - x.mean() / x.std(ddof=1) * YEAR**0.5) < 1e-12 and sharpe(np.zeros(5)) == 0.0

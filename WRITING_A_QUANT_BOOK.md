@@ -988,6 +988,25 @@ outline budget or the difference explained.
     - *Ignore rules and kernels.* `.gitignore`'s `code/**/bin/` also swallowed Rust `src/bin/` sources,
       so it is now `code/**/cpp/bin/`. A page-fault count needs `MADV_NOHUGEPAGE`, because runners have
       transparent huge pages set to "always".
+    - *CI tests the code, not the book's digits (user ruling 2026-09-27, after a 75-minute microstructure
+      job).* Many "numbers gate" tests re-ran the full-size experiment behind each printed number: whole
+      simulated days, 10⁵ Monte Carlo paths, full training runs.
+      - In the 36 chapter directories that took a minute or more on CI, those tests are now `reference`
+        too. Each chapter gained a `test_small_runs` that calls the same functions at a reduced size, through
+        their size parameters, and asserts properties, never printed digits. Examples: the orders complete,
+        the attribution adds up, the tree fails to beat the panel's ceiling, a stricter fill model fills less.
+      - Where a function had no size parameter, one was added with the book's value as its default, keeping
+        every printed listing's line numbers: `mx_facts.day`, `rs_evbt.day`, `s1_residarb.panel`.
+      - A heavy result computed at import (`S = sensitivities()`, `P = problem()`) runs even when every test
+        is deselected. Make it a cached function called inside the tests.
+      - By-hand arithmetic tests stay unmarked.
+      - The rule for new chapters: every chapter directory's fast set runs in well under 20 s, and a
+        full-size test is `reference` from the start.
+    - *Runner limits.*
+      - `RLIMIT_MEMLOCK` is 8 MiB on stock Ubuntu. A test that calls `mlockall(MCL_FUTURE)` must check it,
+        and must check every later `mmap` for `MAP_FAILED`.
+      - A loopback network test must not assume where TCP splits messages. `connect() or read(2)`
+        dropped a message whenever the login reply and a replay arrived together.
   - *Shared simulator first.* Freezing `firm.exchsim` at the sync (MoldUDP64 feed, SoupBinTCP/OUCH-style
     order entry, `schema.json`, golden fixtures, `STATUS.md`) let Book 13 generate its codecs, Book 11
     run its venue playbook and Book 12 serve a model on the same venue while all were written at once.

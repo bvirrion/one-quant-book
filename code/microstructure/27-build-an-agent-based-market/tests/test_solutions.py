@@ -1,15 +1,20 @@
 """Numbers gate: every numerical answer printed in Book 10, chapter 27 (text and solutions)."""
+import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from mx_agents import FACTS, ablation, calibration, distance, maker_study, sign_curves, target  # noqa: E402
+from mx_agents import FACTS, SEEDS, ablation, calibration, distance, maker_study, run, sign_curves, target  # noqa: E402
 
 
 def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_calibration_named_result():
     t, c = target(), calibration()
     assert c["best"] == (1.2, 2.5, 0.05) and c["start"] == (0.9, 0.0, 0.0)
@@ -28,6 +33,8 @@ def test_calibration_named_result():
     assert min(s, key=s.get) == (1.2, 2.5, 0.05) and r(s[(1.2, 2.5, 0.1)]) == 10.4
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercise_7_five_facts():
     t, c = target(), calibration()
     five = FACTS[:5]
@@ -39,6 +46,8 @@ def test_exercise_7_five_facts():
     assert r(t["mean"]["depth"], 0) == 24 and r(t["mean"]["spread"], 2) == 1.04
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_ablation_table():
     a = ablation()
     want = {"runs": [(1.32, 0.79), (0.02, 0.29), (-0.63, 1.12), (-2.77, 0.15), (-0.35, 0.25), (-0.38, 0.19), (0.10, 0.06)],
@@ -55,6 +64,8 @@ def test_ablation_table():
     assert a["noise"]["facts"]["sign_acf1"] > 0.95
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_sign_curves_and_maker():
     s = sign_curves()
     assert (r(s["slope"], 2), s["implied"]) == (-1.15, -1.5)
@@ -63,3 +74,12 @@ def test_sign_curves_and_maker():
     got = [(r(m[k]["inventory_rms"]), r(m[k]["pnl"], 0), r(m[k]["pnl_sd"], 0), r(m[k]["spread"], 3)) for k in (0.0, 0.1, 0.3)]
     assert got == [(14.5, -116, 203, 1.031), (4.2, 448, 98, 1.023), (1.6, 545, 67, 1.024)]
     assert max(abs(x) for x in m[0.0]["path"][1]) >= 20
+
+
+def test_small_runs():
+    # Two sessions at the calibrated parameters instead of the grid search: every stylised fact is measured, and
+    # without the noise traders the order signs lock into long runs (the ablation's reading).
+    best = (1.2, 2.5, 0.05)
+    full, no_noise = run(best, SEEDS[0]), run(best, SEEDS[0], "noise")
+    assert set(full) >= set(FACTS) and all(math.isfinite(full[k]) for k in FACTS)
+    assert no_noise["sign_acf1"] > full["sign_acf1"] and no_noise["sign_acf1"] > 0.9

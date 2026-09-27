@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_baselines as b  # noqa: E402
 
@@ -16,6 +18,8 @@ def row(v):
             round(v["turnover"], 2))
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_table():
     rows, chosen = b.table()
     assert chosen == {"ridge": 1e4, "lasso": 1e-3, "elastic net": 1e-3, "PCR": 10, "PLS": 1, "ridge on splines": 1e4}
@@ -31,6 +35,8 @@ def test_table():
     assert rows["lasso"]["nonzero"] == 6
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_paths_and_crossing():
     p = b.paths()
     assert abs(p["lasso"][1][-1]) < 1e-6 and max(p["ridge"][1]) == p["ridge"][1][2]
@@ -40,6 +46,8 @@ def test_paths_and_crossing():
     assert (pct(m), pct(s)) == (-0.08, 2.56) and (2 * 2.56 / 0.08) ** 2 > 4000
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert (round(2.4 * 20 / 100, 2), round(2.4 / 2, 1)) == (0.48, 1.2)
     assert (round(1.6 / 2.5 * math.sqrt(12), 2), round(1.4 / 2.5 * math.sqrt(12), 2)) == (2.22, 1.94)
@@ -48,3 +56,15 @@ def test_exercises():
             round(r0["lasso"]["ls_sr_net"], 2)) == (3.68, 4.86, 4.24)
     assert (pct(r0["ridge"]["r2"]), pct(r0["boosted trees"]["r2"])) == (0.35, 0.57)
     assert round(r0["boosted trees"]["ls_sr"], 1) == 5.7
+
+
+def test_small_runs():
+    # A 100-name, 10-feature panel instead of the table's cross-validation: ridge shrinks the coefficients as its
+    # penalty grows, and the lasso sets some exactly to zero.
+    import numpy as np
+
+    P = b.data(n=100, k=10)
+    X, y = P.X.reshape(-1, P.X.shape[-1]), (P.r - P.r.mean(axis=1, keepdims=True)).reshape(-1)
+    norms = [float(np.linalg.norm(b.ridge(a).fit(X, y).coef_)) for a in (1.0, 1e3, 1e6)]
+    assert norms[0] > norms[1] > norms[2] > 0
+    assert (b.lasso(1e-3).fit(X, y).coef_ == 0).any()

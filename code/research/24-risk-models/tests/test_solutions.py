@@ -3,7 +3,10 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
+import rs_riskmodel as rm
 from rs_riskmodel import (
     WARM,
     YEAR,
@@ -28,6 +31,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exposed_book_and_models():
     s = summary()
     assert [tuple(r(v, k) for v, k in zip(s[m], (4, 4, 2), strict=True)) for m in ("full", "no momentum", "statistical")] == \
@@ -46,6 +51,8 @@ def test_exposed_book_and_models():
     assert r(fit_r2()) == 0.19
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_calibration():
     n = len(forecast(books()[0]["exposed"], fundamental())[0])
     lo, hi = bias_band(n)
@@ -68,3 +75,17 @@ def test_calibration():
 def test_exercises():
     assert r(math.sqrt(3.26**2 + (1.23 * 7.2) ** 2), 1) == 9.4 and r(9.4 / 3.26, 1) == 2.9
     assert r(math.sqrt(2 / 60), 2) == 0.18 and r(math.sqrt(2 / 2016), 3) == 0.031 and r(math.sqrt(0.75), 3) == 0.866
+
+
+def test_small_runs():
+    # The chapter's book-building steps on a small random cross-section (the synthetic market is the reference run):
+    # a long-short book is dollar-neutral, and neutralising it leaves no exposure to the factors, at gross 2.
+    rng = np.random.default_rng(0)
+    listed = rng.random(200) > 0.1
+    X = rng.standard_normal((200, 4))
+    w = rm._long_short(rng.standard_normal(200), listed, 20)
+    assert abs(w.sum()) < 1e-12 and (w > 0).sum() == (w < 0).sum() == 20
+    n = rm._neutral(w, X, listed)
+    assert np.abs(X[listed].T @ n[listed]).max() < 1e-9 and abs(np.abs(n).sum() - 2.0) < 1e-9 and (n[~listed] == 0).all()
+    z = rm._z(rng.standard_normal(200), listed, rng.random(200))
+    assert abs(np.std(z[listed]) - 1) < 1e-9 and (z[~listed] == 0).all()

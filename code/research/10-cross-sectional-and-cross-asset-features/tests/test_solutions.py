@@ -25,6 +25,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_size_quintiles():
     t = size_table().set_index(["weighting", "start", "freq"])
     w = [t.loc[("EW", y, "weekly")] for y in (1962, 1988, 2007)]
@@ -51,6 +53,8 @@ def test_links():
         assert (r(v["raw"], 3), r(v["ic_t"], 1), r(v["truth"], 3)) == want
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_mining():
     m = mining()
     assert (m["names"], m["pairs"], m["links"]) == (698, 486_506, 133)
@@ -59,6 +63,8 @@ def test_mining():
     assert (r(m["monthly_true_mean"], 3), r(m["monthly_sd"], 3)) == (0.052, 0.097)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_pair():
     c = ccf(0.5)
     assert (c["argmax"], c["centre"], r(c["llr"]), r(c["changes_per_s"])) == (0.15, 0.5, 1.17, 0.65)
@@ -77,9 +83,18 @@ def test_pair():
     assert r(t[2.0]["a_to_b"] - t[2.0]["own_b"]) == 0.14
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     x = np.array([[0.01, 0.02, 0.03, 0.04, 0.10]])
     loo = peer_relative(x, np.zeros(5, int))[0, 4]
     assert (r(100 * loo, 1), r(100 * (0.10 - x.mean()), 1)) == (7.5, 6.0)
     assert abs((0.10 - x.mean()) - 4 / 5 * loo) < 1e-12
     assert (r(0.1 * -6, 1), r(0.1 * -6 / 21, 3)) == (-0.6, -0.029)
+
+
+def test_small_runs():
+    # One pair of hour-long tapes instead of the panels and grids: with a half-second delay the leader shows in the
+    # lead-lag ratio, and the estimated lead is positive.
+    c = ccf(0.5)
+    assert c["llr"] > 1 and c["argmax"] > 0 and c["changes_per_s"] > 0

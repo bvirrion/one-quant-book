@@ -2,16 +2,29 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "firm" / "simlive"))
 from firm_simlive import as_fills, implementation_shortfall, parity
-from rs_simlive import alone_at_price, decomposition, effective_latency, model_calibration, steps, vanished_volume
+from rs_simlive import (
+    SEEDS,
+    alone_at_price,
+    decomposition,
+    effective_latency,
+    model_calibration,
+    session,
+    steps,
+    vanished_volume,
+)
 
 
 def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_decomposition():
     rows, mean = decomposition()
     assert (round(mean["live_lots"]), round(mean["sim_lots"])) == (597, 305)
@@ -23,6 +36,8 @@ def test_decomposition():
     assert all(x["live"] < min(x["sim"], x["chance"]) for x in rows)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_locating_and_calibration():
     assert round(100 * vanished_volume()) == 68
     a = alone_at_price()
@@ -33,9 +48,17 @@ def test_locating_and_calibration():
     assert (round(m["front"][0]), round(m["front"][1]), round(m["live"][0]), round(m["live"][1])) == (8886, 2207, 3582, -2587)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     live = as_fills([(10.2, 1, 50.00, 100), (14.0, -1, 50.02, 100)])
     sim = as_fills([(10.9, 1, 50.00, 100), (12.0, 1, 49.99, 100)])
     assert parity(live, sim, 1.0) == (0.5, 0.5)
     s = implementation_shortfall(1, 10_000, 20.00, as_fills([(0, 1, 20.04, 6_000)]), 20.30, 0.002)
     assert [round(s[k], 2) for k in ("execution", "opportunity", "fees", "total")] == [240.0, 1200.0, 12.0, 1452.0]
+
+
+def test_small_runs():
+    # One seed instead of six: the live tape carries the agent's own orders, and removing them leaves the others.
+    base, live, ex, _ = session(SEEDS[0])
+    assert len(live.own) > 0 and len(ex) < len(live.msgs) and len(base.msgs) > 0

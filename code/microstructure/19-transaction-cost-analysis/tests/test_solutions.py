@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_tca import DAYS, log, study  # noqa: E402
@@ -13,6 +14,8 @@ def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_log_and_benchmarks():
     rows = log()
     assert DAYS == 100 and len(rows) == 400
@@ -26,6 +29,8 @@ def test_log_and_benchmarks():
         assert tuple(r(b[k], 2) for k in ("arrival", "interval_vwap", "day_vwap", "close")) == want
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_pretrade_and_attribution():
     s = study()
     p = s["pretrade"]
@@ -41,6 +46,8 @@ def test_pretrade_and_attribution():
     assert [r(-x, 2) for x in a["rev"]] == [1.37, 3.51] and [r(-x, 2) for x in u["rev"]] == [0.07, 1.06]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_comparison_named_result():
     s = study()
     assert (r(s["true"][0], 2), r(s["true"][1], 2)) == (1.89, 0.25)
@@ -57,6 +64,8 @@ def test_comparison_named_result():
     assert (r(dp["adj"], 2), r(dp["lo"], 2), r(dp["hi"], 2)) == (2.32, 0.79, 3.85)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert r((800 * 0.02 + 800 * 0.03 + 200 * 0.10 + 800 * 0.003) / 1000 * 100, 2) == 6.24
     assert r(-0.5 + 1.04 * 10.0 * math.sqrt(0.1), 2) == 2.79
@@ -64,3 +73,16 @@ def test_exercises():
     lam = (s["urgent"]["total"] - s["patient"]["total"]) / (s["patient"]["sd"] ** 2 - s["urgent"]["sd"] ** 2)
     assert (r(s["patient"]["sd"] ** 2 - s["urgent"]["sd"] ** 2), r(lam, 2)) == (14.6, 0.13)
     assert np.isclose(5.98**2 - 4.60**2, 14.6, atol=0.01)
+
+
+def test_small_runs():
+    # Two simulated days instead of a hundred: each order is worked patiently and urgently on the same day (common
+    # random numbers), and the urgent version finishes no later.
+    rows = log(days=2)
+    assert len(rows) == 8 and all(0 < x["part"] < 1 and math.isfinite(x["cost"]) for x in rows)
+    pairs = {}
+    for x in rows:
+        pairs.setdefault((x["day"], x["order"]), {})[x["urgent"]] = x
+    for p in pairs.values():
+        assert p[True]["qty"] == p[False]["qty"] and p[True]["side"] == p[False]["side"]
+        assert p[True]["t_end"] <= p[False]["t_end"]

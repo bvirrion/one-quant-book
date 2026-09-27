@@ -31,8 +31,8 @@ POINTS = (0.001, 0.01, 0.1, 1.0, 10.0, 60.0)
 
 
 @functools.lru_cache(maxsize=2)
-def day(seed: int = 7):
-    return simulate(TapeConfig(seconds=23_400.0, u_shape=1.5, seed=seed, news_at=None))
+def day(seed: int = 7, seconds: float = 23_400.0):
+    return simulate(TapeConfig(seconds=seconds, u_shape=1.5, seed=seed, news_at=None))
 
 
 def _replay(tape):

@@ -1,8 +1,10 @@
 """Numbers gate: every numerical answer printed in Book 10, chapter 9 (text and solutions)."""
+import math
 import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_dark import START, compare, run, zhu  # noqa: E402
@@ -12,6 +14,8 @@ def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_strategies():
     c = compare()
     got = {s: (r(v["shortfall"][0]), r(v["shortfall"][1]), r(v["drift"][0]), r(v["drift"][1])) for s, v in c.items()}
@@ -26,6 +30,8 @@ def test_strategies():
     assert r(c["block"]["done"][0] - START, -1) == 1240.0
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_zhu():
     z = zhu()
     assert (r(100 * z["fill_informed"]), r(100 * z["fill_uninformed"])) == (6.3, 17.5)
@@ -33,6 +39,8 @@ def test_zhu():
         (0.51, -0.13, 0.0, 0.11)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     # 1: a midpoint cross between 20.00 and 20.02 saves a cent a share on each side
     assert (r(20.01 - 20.00, 2), r(10_000 * 0.01, 0)) == (0.01, 100.0)
@@ -49,3 +57,12 @@ def test_exercises():
     assert (r(sf.mean()), r(sf.std(ddof=1) / 4), r(np.mean([x["leakage"] for x in rs]))) == (7.0, 0.9, 0.0)
     assert r(np.mean([x["done"] for x in rs]) - START, -1) == 1020.0
     assert r(np.mean([x["drift"] for x in rs])) == 13.6
+
+
+def test_small_runs():
+    # One seed instead of sixteen: the lit-only order trades nothing in the dark, the three dark strategies do, and
+    # every strategy's shortfall is measured.
+    c = compare(seeds=(1,))
+    assert set(c) == {"lit", "dark", "dark_min", "block"} and c["lit"]["dark_share"][0] == 0
+    assert all(c[s]["dark_share"][0] > 0 for s in ("dark", "dark_min", "block"))
+    assert all(math.isfinite(v["shortfall"][0]) for v in c.values())

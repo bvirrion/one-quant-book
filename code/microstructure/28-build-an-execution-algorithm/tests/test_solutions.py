@@ -4,15 +4,18 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from mx_execalgo import SIZES, ab_study, stress  # noqa: E402
+from mx_execalgo import IS, KEYS, SIZES, TWAP, ab_study, run, stress  # noqa: E402
 
 
 def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_named_result():
     s = ab_study()
     assert s["n"] == 200
@@ -36,6 +39,8 @@ def test_named_result():
     assert r(1.25 - 0.70 * 2 - 0.69) == -0.84
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_stress():
     st = stress()
     h = st["halt"]
@@ -58,3 +63,13 @@ def test_exercises_1_2():
     assert round(tol) == 333 and min(d for d in range(0, 2000, 100) if int((d - tol) // 100) * 100 >= 100) == 500
     assert round(0.3 / 0.7 * 32_000) == 13_714 and round(0.3 / 0.7 * 32_000) - 8000 == 5714
     assert np.isclose(10_000 / 2, 5000)
+
+
+def test_small_runs():
+    # One order of 4,000 shares on one seed, the algorithm against TWAP, instead of the 200-order A/B test: both
+    # complete, the cost attribution adds up, and TWAP pays the spread and the fees that the passive algorithm earns.
+    a, t = run(IS(4000, 0.5), 1), run(TWAP(4000), 1)
+    for x in (a, t):
+        assert x["state"] == "done" and x["filled"] == 4000 and 0 < x["participation"] < 1
+        assert abs(sum(x["tca"][k] for k in KEYS[:-1]) - x["tca"]["total"]) < 1e-9
+    assert a["tca"]["spread"] < 0 < t["tca"]["spread"] and a["tca"]["fees"] < t["tca"]["fees"]

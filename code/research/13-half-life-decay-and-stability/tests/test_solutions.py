@@ -2,11 +2,13 @@
 import math
 import pathlib
 import sys
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
+import rs_decay
 from rs_decay import (
     BROKEN,
     CUT,
@@ -40,6 +42,8 @@ def test_decay_table():
     assert d["surprise"]["ic"][60] < 0.0 < d["surprise"]["ic"][40]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_stability_and_breaks():
     m = stability("momentum")
     assert (r(m["mean"]), r(m["sd"]), m["n"]) == (0.023, 0.247, 95)
@@ -58,6 +62,8 @@ def test_stability_and_breaks():
     assert r(c["supf_p"], 2) == 0.93 and c["cusum_first"] == -1
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_detection_power():
     assert detection(0.0) == (1.0, 0.5)
     assert detection(0.3) == (0.7, 0.3)
@@ -65,6 +71,8 @@ def test_detection_power():
     assert detection(1.0) == (0.1, 0.1)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_factors():
     f = factors().set_index(["factor", "period"])
     before = [f.loc[(k, "before")] for k in ("SMB", "HML", "Mom")]
@@ -77,6 +85,8 @@ def test_factors():
     assert before[0]["start"] == "1963-07" and after[0]["end"] == "2026-07"
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_power():
     mom_t = 0.023 / 0.247 * math.sqrt(60)
     p = power(0.023, 0.247)
@@ -97,6 +107,8 @@ def test_power():
     assert round(t90, 1) == 3.6
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert (r(-math.log(2) / math.log(0.98), 1), r(1 - 0.98, 2)) == (34.3, 0.02)
     assert round(100 * (1 - 0.37 / 0.85)) == 56
@@ -106,3 +118,10 @@ def test_exercises():
     t = 0.04 / (0.10 / math.sqrt(60))
     assert (r(t, 2), r(power(0.04, 0.10)["posterior"], 3)) == (3.10, 0.858)
     assert isinstance(MarketConfig(), MarketConfig) and np.isfinite(t)
+
+
+def test_small_runs():
+    # Two hundred names over three years instead of a thousand over ten: the monthly information coefficients of
+    # momentum are computed, finite and bounded.
+    ic = rs_decay.monthly_ic("momentum", cfg=replace(rs_decay.DEFAULT, n=200, days=3 * rs_decay.YEAR))
+    assert len(ic) > 0 and np.isfinite(ic).all() and np.abs(ic).max() <= 1

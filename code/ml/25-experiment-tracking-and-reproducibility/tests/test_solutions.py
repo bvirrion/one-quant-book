@@ -3,11 +3,14 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_track as m  # noqa: E402
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_study():
     s = m.summary()
     assert (s["runs"], s["trials logged"]) == (200, 200)
@@ -17,6 +20,8 @@ def test_study():
     assert round(min(v), 2) == -3.16
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_reproduction():
     r = m.reproduction()
     assert r["registry"] and r["audit intact"]
@@ -26,6 +31,18 @@ def test_reproduction():
     assert reg.as_of("xs-gbdt", "2026-03-10T08:00")["version"] == 1 and reg.as_of("xs-gbdt", "2026-03-01T08:00") is None
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_seed_spread():
     s = np.array(m.seed_spread())
     assert (round(s.min(), 2), round(s.max(), 2), round(s.mean(), 2), round(s.std(ddof=1), 2)) == (-0.2, 2.88, 1.03, 0.94)
+
+
+def test_small_runs():
+    # One training run instead of the 200-run study: the same parameters, seed, data snapshot and feature code give
+    # the same model dump bit for bit, and changing the snapshot changes it.
+    from firm_gbdt import DEFAULTS
+
+    p = dict(DEFAULTS, n_estimators=20)
+    a, b = m.train(p, 1, "2026-01", "v2"), m.train(p, 1, "2026-01", "v2")
+    assert a == b and m.train(p, 1, "2026-03", "v2") != a

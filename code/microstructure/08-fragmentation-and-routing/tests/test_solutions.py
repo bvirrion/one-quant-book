@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_frag import study  # noqa: E402, I001
@@ -14,6 +15,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_views_and_locks():
     s = study()
     na, a = s["no_arb"]["lc"], s["arb"]["lc"]
@@ -26,6 +29,8 @@ def test_views_and_locks():
     assert [r(100 * s["at_best"][v]) for v in "ABC"] == [37.74, 29.88, 32.38]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_consolidated_feed():
     s = study()
     assert r(100 * s["sip_live"], 4) == r(100 * s["sip_offline"], 4) == 0.0098
@@ -35,6 +40,8 @@ def test_consolidated_feed():
     assert (r(100 * s["trades_stale"], 1), r(100 * s["trades_stale_bg"], 2)) == (18.5, 0.02)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_information_shares():
     s = study()
     i, c, i20 = s["is"], s["is_close"], s["is_20"]
@@ -44,6 +51,8 @@ def test_information_shares():
     assert [r(x) for x in c["is_low"]] == [0.23, 0.37, 0.13] and [r(x) for x in c["is_high"]] == [0.44, 0.59, 0.28]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     top = np.dtype([("t", "f8"), ("bid", "i8"), ("bid_qty", "i8"), ("ask", "i8"), ("ask_qty", "i8")])
     q = {"V1": (1000, 300, 1002, 200), "V2": (1001, 500, 1003, 100), "V3": (1001, 50, 1002, 400),
@@ -67,3 +76,11 @@ def test_exercises():
     a_perp = np.array([0.3, 0.2])
     assert [r(x) for x in a_perp / a_perp.sum()] == [0.6, 0.4]
     assert abs(np.array([-0.2, 0.3]) @ a_perp) < 1e-12
+
+
+def test_small_runs():
+    # Ten minutes of the fragmented market instead of an hour: the consolidated quote moves, the arbitrageur
+    # trades, and every venue trades.
+    s = study(seconds=600.0)
+    assert s["nbbo_changes_per_s"] > 0 and s["arb_fills"] > 0 and {"arb", "no_arb"} <= set(s)
+    assert all(v > 0 for v in s["arb"]["volume"].values())

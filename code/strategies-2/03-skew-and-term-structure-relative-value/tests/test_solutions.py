@@ -3,21 +3,26 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from s2_volrv import books, bucket_sr, carry_link, fit, real, seeds, static, table, worst  # noqa: E402
+from s2_volrv import books, bucket_sr, carry_link, fit, real, seeds, static, table, worst, zscore  # noqa: E402
 
 
 def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_features():
     f = fit()
     assert (r(f["corr_skew"]), r(f["corr_slope"]), r(f["beta_skew"]), r(f["beta_slope"]), r(f["corr_raw_skew_level"]),
             r(f["corr_raw_slope_level"])) == (0.97, 0.92, -0.46, -0.2, -0.63, -0.83)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_books():
     t = table()
     got = {k: (r(v["sr"]), r(v["skewness"]), r(v["worst_sd"], 1), r(100 * v["share_up"], 0)) for k, v in t.items()}
@@ -29,6 +34,8 @@ def test_books():
     assert len(books()["skew raw"]["total"]) == 227
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_buckets_and_worst_month():
     b = bucket_sr()
     assert (r(b["skew raw"]["skew"]), r(b["skew residual"]["skew"]), r(b["calendar raw"]["slope"]),
@@ -40,6 +47,8 @@ def test_buckets_and_worst_month():
                     1470, 5.8, 2.0, 4.5, 15.2, 9.7, -119, -157, -289)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_seeds():
     s = seeds(8)
     assert {k: (r(np.mean(v)), r(min(v)), r(max(v))) for k, v in s.items()} == {
@@ -47,6 +56,8 @@ def test_seeds():
         "calendar residual": (0.38, -0.1, 0.75)}
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_real():
     x = real()
     s, k, rv, vn = x["slope"], x["skew"], x["rvx"], x["vxn"]
@@ -62,6 +73,8 @@ def test_real():
             r(float(vn["sd"]), 1), r(float(vn["half_life"]), 1)) == (5.2, 2.3, 15.7, 3.0, 2.3, 15.3)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_static_and_carry():
     st = static()
     assert {k: tuple(r(v[c], 1) for c in ("spot_time", "level", "total")) for k, v in st.items()} == {
@@ -70,6 +83,8 @@ def test_static_and_carry():
     assert (r(c["skew residual"]), r(c["calendar residual"])) == (0.25, 0.14)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercise_7_no_noise():
     t = table(0, 0.0)
     assert {k: (r(v["sr"]), r(v["worst_sd"], 1)) for k, v in t.items()} == {
@@ -77,6 +92,8 @@ def test_exercise_7_no_noise():
         "calendar residual": (-0.11, -2.1)}
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_small_answers():
     import math
     assert (100 - 10 * -2.3, r(0.4 / 20 * 100), r(math.log(0.5) / math.log(0.98), 1)) == (123.0, 2.0, 34.3)
@@ -84,3 +101,18 @@ def test_small_answers():
     from s2_volrv import market
     assert market()[1]["crashes"][0][0] - (1470 + 21) == 9
     assert r(100 * (math.exp(0.152 * math.sqrt(21 / 252)) - 1), 1) == 4.5    # the call's strike, 4.5% above spot
+
+
+def test_small_runs():
+    # One seed's books instead of the tables across seeds: the z-score is zero in its warm-up, clipped, and uses no
+    # future data; each book's P&L buckets are finite.
+    import numpy as np
+
+    x = np.random.default_rng(0).standard_normal(600)
+    z = zscore(x)
+    y = x.copy()
+    y[400:] += 10.0
+    assert (z[:252] == 0).all() and np.abs(z).max() <= 2.0 and np.array_equal(zscore(y)[:400], z[:400])
+    b = books(0)
+    assert set(b) == {"skew raw", "skew residual", "calendar raw", "calendar residual"}
+    assert all(np.isfinite(v).all() for book in b.values() for v in book.values())

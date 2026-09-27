@@ -3,6 +3,8 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_halts import CRASH_QTY, magnet_study, mechanisms_study  # noqa: E402
 
@@ -11,6 +13,8 @@ def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_mechanisms():
     s = mechanisms_study()
     got = [(r(s[k]["fall"]), r(s[k]["halted"], 0), round(s[k]["filled"]), r(s[k]["cost"])) for k in
@@ -20,6 +24,8 @@ def test_mechanisms():
         43.9, 41.1, 29.4, 23.2]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_magnet_named_result():
     m = magnet_study()
     both, band, none = m["band and anticipators"], m["band alone"], m["no band"]
@@ -36,3 +42,11 @@ def test_magnet_named_result():
 
 def test_exercise_1():
     assert (int(999_300 * 0.9985) // 100 * 100, -(-int(999_300 * 1.0015) // 100) * 100) == (997_800, 1_000_800)
+
+
+def test_small_runs():
+    # One crash instead of twenty per mechanism: without a mechanism nothing halts, the pauses do halt, and every
+    # mechanism leaves part of the crash order unfilled at worst.
+    s = mechanisms_study(seeds=(1,))
+    assert s["none"]["halted"] == 0.0 and max(s["velocity"]["halted"], s["market-wide"]["halted"]) > 0
+    assert all(0 < v["filled"] <= CRASH_QTY and v["fall"] > 0 for v in s.values())

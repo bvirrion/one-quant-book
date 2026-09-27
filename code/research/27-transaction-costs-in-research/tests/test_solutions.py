@@ -3,8 +3,11 @@ import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import numpy as np
+import rs_tcost
 from rs_tcost import AUMS, estimate, liquidity, netting, run, smoothing_curve
 
 
@@ -12,6 +15,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_estimation():
     for n, exp in ((500, (1.09, 0.24, 0.59, 0.07)), (5000, (0.71, 0.08, 0.48, 0.03)), (50000, (0.67, 0.03, 0.49, 0.01))):
         e = estimate(n)
@@ -19,6 +24,8 @@ def test_estimation():
     assert r(1e4 * 0.7 * 0.02 * math.sqrt(0.01), 0) == 14 and r(1e4 * 0.02 * math.sqrt(0.01 / 0.1), 0) == 63
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_books():
     n = run("naive", 1e9)
     assert (r(n["sr"]), r(n["sr_net"]), r(100 * n["cost"], 0), r(n["turnover"]), r(100 * n["vol"], 1)) == (2.56, -29.47, 1223, 5.33, 19.2)
@@ -30,6 +37,8 @@ def test_books():
     assert [r(run("naive", a, 50.0)["sr_net"]) for a in AUMS] == [1.78, 1.63, 1.15, -0.23]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_smoothing_and_netting():
     assert [r(v) for v in smoothing_curve("naive").values()] == [-29.47, -19.18, -10.62, -2.57, 0.1, 1.02, 1.15, 0.93, 0.69]
     assert [r(v) for v in smoothing_curve("cost-aware").values()] == [1.8, 2.43, 2.37, 2.17, 1.94, 1.71, 1.4, 1.15, 0.94]
@@ -43,8 +52,17 @@ def n_ret():
     return run("naive", 1e9)["ret"]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert r(1e4 * (2e-4 + 0.7 * 0.02 * math.sqrt(0.05)), 1) == 33.3
     assert r(1e4 * 0.491 / (5.33 * 252), 2) == 3.66 and r(100 * n_ret(), 1) == 49.1
     assert r((2**1.5 - 2) / 2, 2) == 0.41 and (r(math.sqrt(2)), r(2**1.5)) == (1.41, 2.83)
     assert r(np.median([x for d in liquidity().values() for x in d.values()]) / 1e6, 0) == 474
+
+
+def test_small_runs():
+    # 2,000 parent orders instead of the full sample: the fit recovers the square-root exponent that generated the
+    # costs, within its standard error.
+    e = estimate(n=2000)
+    assert abs(e["exponent"] - rs_tcost.EXPONENT) < 4 * e["se_exponent"] and e["eta"] > 0

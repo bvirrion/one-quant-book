@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_validation as v  # noqa: E402
@@ -13,6 +14,8 @@ def pct(x, d=2):
     return round(100 * float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_leaks_table():
     L = v.leaks()
     assert (pct(L["clean"]), pct(L["period_join"]), pct(L["target_encoding"])) == (-0.19, 1.27, 8.97)
@@ -22,6 +25,8 @@ def test_leaks_table():
     assert pct(L["selection_best"] - L["selection_median"]) == 0.13
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_selection_and_nested():
     s = v.selection()
     assert (pct(s["scores"].min()), pct(s["scores"].max()), pct(s["fresh_median"])) == (-0.60, -0.27, -0.19)
@@ -30,6 +35,8 @@ def test_selection_and_nested():
     assert (pct(n["flat_best"]), pct(n["nested"])) == (-0.62, -0.85)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_detectors():
     o = v.overlap_detectors()
     assert (o["shuffled"], o["purged"], round(o["adversarial_auc"], 2)) == (38080, 0, 0.71)
@@ -40,6 +47,8 @@ def test_detectors():
     assert pct(d["canary_period"][0]) == -0.44
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert round(0.30 + 1.16 * 0.10, 2) == 0.42
     t0 = np.arange(200)
@@ -52,3 +61,13 @@ def test_exercises():
     assert (round(x.mean(), 2), round(x.std(ddof=1) / math.sqrt(3), 3)) == (0.18, 0.017)
     p, f = v.announcement_effect(0.04)
     assert (pct(p), pct(f)) == (5.47, -0.14)
+
+
+def test_small_runs():
+    # The leak itself, on a small surprise array (the reference run scores models on the whole world): joining by the
+    # fiscal period shows each quarter's surprise one month before it is filed; joining by filing date does not.
+    rng = np.random.default_rng(0)
+    s = np.where(rng.random((12, 6)) < 0.4, rng.standard_normal((12, 6)), np.nan)
+    period, filing = v.surprise_known(s, "period"), v.surprise_known(s, "filing")
+    assert np.array_equal(filing[1:], period[:-1]) and not np.array_equal(filing, period)
+    assert np.allclose(v.xs(rng.standard_normal((5, 7))).mean(axis=1), 0)

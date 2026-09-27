@@ -3,6 +3,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_algos import (  # noqa: E402
@@ -20,6 +21,8 @@ def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_panel_and_forecasts():
     v = flow()
     (j, _), (j1, d1) = example_days()
@@ -34,6 +37,8 @@ def test_panel_and_forecasts():
         (13.7, 17.7), (13.3, 17.2), (14.6, 18.3), (12.7, 20.6)]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_vwap_named_result():
     s = vwap_study()
     hs, hd, ns, nd = s[("high", "static")], s[("high", "dynamic")], s[("normal", "static")], s[("normal", "dynamic")]
@@ -52,6 +57,8 @@ def test_vwap_named_result():
     assert min(x["done"] for k, x in s.items() if k[1] != "paired") == QTY
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_participation():
     p = pov_study()
     rows = [(p[k]["minutes"], p[k]["part"], p[k]["pace"], p[k]["induced"], p[k]["induced_se"], p[k]["cost"], p[k]["cost_se"])
@@ -62,6 +69,8 @@ def test_participation():
     assert all(p[k]["done"] == 1.0 for k in p)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_benchmarks():
     b = benchmark_study()
     got = [(r(x["bench"]), r(x["bench_sd"]), r(x["moved"]), r(x["impact"]), r(x["impact_se"]), r(x["arrival"]), r(x["arrival_se"]))
@@ -72,6 +81,8 @@ def test_benchmarks():
     assert (int(0.3 * QTY), min(b[n]["done"] for n in b)) == (4500, QTY)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_is_schedule_and_exercises():
     from firm_algos import decompose, shortfall
     assert r(100 * shortfall(QTY, 26, 4.0)[:13].sum() / QTY, 0) == 87
@@ -87,7 +98,17 @@ def test_is_schedule_and_exercises():
     assert (r(0.2 / 0.8 * 100), r(0.2 / 0.6 * 100)) == (25.0, 33.3)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercise_7_more_news():
     f = forecast_study(16, 0.2)
     assert (f["n_high"], r(100 * f["high_share"])) == (382, 10.1)
     assert (r(f["static curve"]["high"]), r(f["level + AR dynamic"]["high"])) == (20.0, 18.9)
+
+
+def test_small_runs():
+    # One seed of the participation study instead of eight (the VWAP panels need the 30-second forecast study):
+    # each child order completes, at a participation rate inside (0, 1).
+    p = pov_study(seeds=(1,))
+    assert set(p) == {("normal", "one"), ("normal", "two"), ("thin", "one"), ("thin", "two")}
+    assert all(x["done"] == 1.0 and 0 < x["part"] < 1 and x["minutes"] > 0 for x in p.values())

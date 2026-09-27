@@ -31,8 +31,8 @@ YEAR, START, W, K, LAM, COST, SHARE = 252, 2 * 252, 60, 15, 0.01, 0.0005, 0.3
 
 
 @functools.lru_cache(maxsize=3)
-def panel(share: float = SHARE):
-    P = simulate(MarketConfig(ou_share=share))
+def panel(share: float = SHARE, **size):
+    P = simulate(MarketConfig(ou_share=share, **size))
     R = np.where(P.listed, P.ret, np.nan)
     cap = np.where(P.listed, P.price * P.shares, 0.0)
     cprev = np.vstack([cap[:1], cap[:-1]])

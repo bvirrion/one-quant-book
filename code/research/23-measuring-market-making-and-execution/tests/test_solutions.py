@@ -2,14 +2,18 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from rs_markout import annual, curves, decomposition, execution, settle, tca_all
+from rs_markout import SEEDS, annual, curves, decomposition, execution, session, settle, tca_all
 
 
 def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_market_maker():
     for pull, exp in ((False, (8144, 18000, 45, 42, 0.43, -0.67, 0.19, -0.85)),
                       (True, (3309, 16391, 20, 40, 0.52, -0.53, 0.44, -0.81))):
@@ -44,6 +48,8 @@ def test_exercises_by_hand():
     assert (r(100 * 1.0), r(80 * (51 - 50.40) - 0.8)) == (100.0, 47.2) and r(8144 / 18000 * 100, 0) == 45
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_tca():
     rows, m, se = tca_all()
     got = {k: (r(m[k]), r(se[k])) for k in ("delay", "execution", "opportunity", "total", "drift", "paid", "vwap", "impact",
@@ -57,3 +63,10 @@ def test_tca():
     assert (q, r(e["sf"]["delay"] / q), r(e["sf"]["execution"] / q), r(e["sf"]["opportunity"] / q), r(e["sf"]["total"] / q),
             r(e["vwap"])) == (28700, 0.0, -7.83, -0.91, -8.69, -1.1)
     assert r(-7.83 - 0.91 + 0.05, 2) == -8.69
+
+
+def test_small_runs():
+    # One live session instead of twelve per arm: the market maker is filled, some fills meet informed orders, and
+    # every fill has a reference mid just before it.
+    s = session(SEEDS[0], False)
+    assert len(s["t"]) > 0 and 0 < s["informed"].mean() < 1 and (s["mid_before"] > 0).all()

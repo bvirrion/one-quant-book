@@ -2,6 +2,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_ticks import did_panel, priority_compare, tick_experiment  # noqa: E402, I001
 from firm_queuevalue import expected_time_to_fill, fill_probability, implicit_spread  # noqa: E402, I001
@@ -11,6 +13,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_grids():
     g = tick_experiment()
     assert [r(g[m]["spread_cents"]) for m in (1, 2, 5, 10)] == [1.07, 2.06, 5.03, 10.03]
@@ -30,6 +34,8 @@ def test_grids():
     assert r(g[5]["eff_half_cents"] / g[1]["eff_half_cents"], 1) == 4.5
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_queue_values():
     g = tick_experiment()
     front = [g[m]["by_orders"][0]["value"] for m in (1, 2, 5, 10)]
@@ -46,6 +52,8 @@ def test_queue_values():
     assert (r(bd[0]), r(bd[3]), r(bd[-1])) == (0.76, 0.44, 0.13)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_priority():
     p = priority_compare()
     f, q = p["fifo"], p["pro_rata"]
@@ -56,6 +64,8 @@ def test_priority():
     assert (r(f[-1]["t_fill"], 1), r(q[-1]["t_fill"], 1)) == (76.7, 4.3)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_did():
     d = did_panel()
     assert d["n_obs"] == 96
@@ -68,6 +78,8 @@ def test_did():
     assert (r(c["t1p0"], 1), r(c["t1p0"] + c["t0p1"] - c["t0p0"], 1)) == (2402.8, 1998.8)      # the figure's dashed line
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     # 1: relative tick of one cent at 4 and 400 dollars, in basis points
     assert (r(0.01 / 4 * 1e4, 1), r(0.01 / 400 * 1e4, 2)) == (25.0, 0.25)
@@ -80,3 +92,10 @@ def test_exercises():
     # 4: slot values
     front, back = 0.7 * (2.5 - 0.4), 0.06 * (2.5 - 0.9)
     assert (r(front), r(back, 3), r(front - back), r(5 * (front - back), 2)) == (1.47, 0.096, 1.37, 6.87)
+
+
+def test_small_runs():
+    # Two tick sizes on one ten-minute session instead of four sizes on four hours: a wider tick makes a longer
+    # queue at the best price.
+    g = tick_experiment(mults=(1, 5), seeds=(7,), seconds=600.0)
+    assert set(g) == {1, 5} and g[5]["orders_at_best"] > g[1]["orders_at_best"]

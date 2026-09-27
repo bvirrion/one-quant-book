@@ -2,6 +2,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_impact import counterfactual, panel, panel_fits, replay_pitfall, single_and_aggregate  # noqa: E402, I001
 from firm_impactfit import fit_power  # noqa: E402, I001
@@ -11,6 +13,8 @@ def r(x, d=2):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_single_and_aggregate():
     s = single_and_aggregate()
     assert (s["volume"], s["trades"]) == (763_900, 7639)
@@ -22,6 +26,8 @@ def test_single_and_aggregate():
     assert [r(x, 1) for x in a["dm"][1:6]] == [-3.1, -1.4, 0.2, 0.7, 3.1]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_metaorders():
     assert replay_pitfall()["diff"] == [0.0, 0.0, 0.0, 0.0]
     c = counterfactual()
@@ -32,6 +38,8 @@ def test_metaorders():
     assert r(100 * 24000 / 749_200, 1) == 3.2
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_panel():
     f = panel_fits()
     c, t, k = f["clean"], f["timed"], f["corrected"]
@@ -45,6 +53,8 @@ def test_panel():
     assert (len(p["impact"]), r(p["participation"].min() * 1e4, 1), r(p["participation"].max() * 100, 1)) == (2000, 1.0, 5.0)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     # 1: square-root law with Y = 0.8, sigma = 2%: 1% and 4% of the daily volume, in basis points
     assert (r(0.8 * 0.02 * 0.01**0.5 * 1e4, 0), r(0.8 * 0.02 * 0.04**0.5 * 1e4, 0)) == (16.0, 32.0)
@@ -54,3 +64,12 @@ def test_exercises():
     fa = fit_power(a["impact"], a["sigma"], a["participation"], clusters=a["stock"])
     fb = fit_power(b["impact"], b["sigma"], b["participation"], clusters=b["stock"])
     assert (r(fb["exponent"]), r(fa["exponent"]), r(fb["prefactor_sqrt"]), r(fa["prefactor_sqrt"])) == (0.28, 0.20, 0.81, 1.24)
+
+
+def test_small_runs():
+    # Fifteen minutes of tape and one seed of metaorders instead of the panels: the market trades, and a
+    # 24,000-share buy moves the price up, further than a 1,500-share one (same seed, same background flow).
+    s = single_and_aggregate(seconds=900.0)
+    assert s["trades"] > 0 and s["volume"] > 0 and {"lags", "all", "by_size"} <= set(s["response"])
+    c = counterfactual(sizes=(1500, 24_000), seeds=(1,))
+    assert c[24_000][0][0] > 0 and c[24_000][0][0] >= c[1500][0][0]

@@ -4,6 +4,7 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import hf_toxicity as h  # noqa: E402
@@ -13,6 +14,8 @@ def r(x, d=3):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_classes_and_periods():
     c = h.by_class()
     assert (r(c["informed"], 2), r(c["se_informed"], 2), r(c["uninformed"], 2), r(c["se_uninformed"], 2)) == (
@@ -23,6 +26,8 @@ def test_classes_and_periods():
             ("before", "during", "after")] == [(6.97, 34.7, 0.025), (17.89, 23.6, 0.059), (6.69, 32.3, 0.132)]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_score():
     q = h.fit_quality()
     assert [r(x) for x in q["coef"]] == [1.432, -0.029, -1.795, -0.072, 0.028] and q["n"] == 919
@@ -33,6 +38,8 @@ def test_score():
     assert r(h.fitted().score(np.array([2, 0.8, math.log1p(0.5), 0])), 2) == 0.09
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_responses():
     rs = h.responses()
     got = [(round(v["shares"]), r(100 * v["informed"], 1), r(v["markout"]), r(v["se"]), round(v["messages"]), r(v["pnl"], 2),
@@ -46,7 +53,18 @@ def test_responses():
     assert r(100 * (1 - 10733 / 19167), 0) == 44 and r(10733 / 6550 - 1, 2) == 0.64
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_hysteresis_and_exercises():
     y = h.hysteresis()
     assert (round(y["messages"]), round(y["shares"]), r(100 * y["informed"], 1), r(y["markout"])) == (716, 9767, 21.2, 0.102)
     assert r(0.32 * -0.95 + 0.68 * 0.55, 2) == 0.07 and r(0.2 * 10000 * 0.01, 2) == 20.0
+
+
+def test_small_runs():
+    # One calibration session instead of six: the base quoter's fills, their classes and mark-outs.
+    c = h.by_class(seeds=h.CAL_SEEDS[:1])
+    assert c["fills"] > 0 and 0 < c["share_informed"] < 1
+    assert c["informed"] < 0 < c["uninformed"]          # informed flow costs the quoter, the rest pays it
+    r, at_fill = h.run(h.CAL_SEEDS[0])
+    assert len(at_fill) == len(r.fills["qty"]) and np.isfinite(h._markouts(r)).all()

@@ -3,11 +3,15 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
+import rs_lobreplay as rl
 from rs_lobreplay import LATENCIES, bar_quoter_level3, impact_bound, see_or_act, tape, touch_grid
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_touch_grid():
     assert len(tape(31, 3600.0).msgs) == 129_303
     g = touch_grid()
@@ -23,6 +27,8 @@ def test_touch_grid():
     assert (round(impact_bound(g[("fifo", 0.0)])), round(impact_bound(g[("fifo", 5.0)]))) == (26, 9)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_bar_quoter_and_exercises():
     b = bar_quoter_level3()
     lots = np.mean([r["lots"] for r in b])
@@ -33,3 +39,12 @@ def test_bar_quoter_and_exercises():
     assert (round(s["see late"]["lots"]), round(s["see late"]["markout"], 3), round(s["see late"]["pnl"])) == (416, -0.132, -173)
     assert (600 - 400 * 600 / 800, 200 - 400 * 200 / 800) == (300.0, 100.0)
     assert 522 * 100 * 0.10 / 2 == 2610
+
+
+def test_small_runs():
+    # Five minutes of tape instead of the hour sessions: the optimistic front-of-queue fill model fills at least as
+    # much as FIFO on the same messages, and each replay is measured.
+    tp = tape(31, 300.0)
+    front, fifo = (rl._stats(rl.Replay(tp.msgs, rl.TouchQuoter(), m, entry_latency=0.0, data_latency=0.0).run(),
+                             tp.trades) for m in ("front", "fifo"))
+    assert front["lots"] >= fifo["lots"] > 0 and 0 <= fifo["share"] <= front["share"] <= 1

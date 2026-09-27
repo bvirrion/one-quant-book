@@ -5,11 +5,14 @@ import sys
 import tempfile
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_lobmodel as m  # noqa: E402
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_setup_and_data():
     c = m.CFG
     assert (len(c["train"]), len(c["valid"]), len(c["test"]), c["seconds"]) == (8, 3, 6, 1200.0)
@@ -23,6 +26,8 @@ def test_setup_and_data():
     assert s["tcn params"] == 12867 and s["parity"] == 0.0
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_measured_latencies_and_grid():
     t = m.measured()
     assert t["cpp forest branches"] < t["cpp forest loop"] < t["flat forest (Python and NumPy)"]
@@ -33,11 +38,15 @@ def test_measured_latencies_and_grid():
     assert (round(t["cpp forest loop"] / 1000, 1), round(t["TCN forward (PyTorch one window)"] / 1000)) == (1.1, 166)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_threshold_choice():
     s = m.summary()
     assert [round(x, 1) for x in s["threshold pnl"]] == [43.4, 53.9, 48.0, 50.1] and s["threshold"] == 0.1
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_latency_table():
     rows, base = m.latency_table()
     got = [(round(r["pnl"], 2), round(r["markout 1 s"], 3), r["positive sessions"]) for r in rows]
@@ -54,6 +63,8 @@ def test_latency_table():
     assert round(rows[1]["pnl"] / base["pnl"], 1) == 4.0
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_tracking_and_monitors():
     with tempfile.TemporaryDirectory() as d:
         rid, lineage, broken = m.tracking(d)
@@ -70,3 +81,16 @@ def test_tracking_and_monitors():
 def test_scaling_arithmetic():
     rate = np.mean([7620, 4351, 5539, 5747, 3974, 3373]) / 1200.0
     assert round(106 * rate / 2000, 2) == 0.23 and round(166 / 0.153, -2) == 1100 and round(0.106 * rate, 2) == 0.45
+
+
+def test_small_runs():
+    # The whole graph on a tiny configuration (two training sessions of five minutes, one epoch) instead of the
+    # three-minute reference run: every stage produces its output, and the flattened forest that the C++ and Rust
+    # servers load predicts exactly what LightGBM does.
+    import tempfile
+
+    cfg = dict(m.CFG, train=(1000, 1001), valid=(2000,), test=(3000,), seconds=300.0, epochs=1, thresholds=(0.1,),
+               latencies=(0, 10_000_000))
+    o, _ = m.lm.make_pipeline(tempfile.mkdtemp(), cfg).run()
+    assert {"train", "valid", "test", "cv", "fit", "tcn", "threshold"} <= set(o) and len(o["train"]["y"]) > 0
+    assert float(np.max(np.abs(o["fit"]["lightgbm"] - o["fit"]["flat"]))) == 0.0

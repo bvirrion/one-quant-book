@@ -1,15 +1,20 @@
 """Numbers gate: every numerical answer printed in Book 10, chapter 24 (text and solutions)."""
+import math
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
-from mx_mq import study  # noqa: E402
+from mx_mq import EVENT, MEASURES, session_day, study  # noqa: E402
 
 
 def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_named_result_and_table():
     s = study()
     q = s["quoted"]
@@ -34,7 +39,17 @@ def test_named_result_and_table():
     assert r(s["otr"]["means"][(True, False)] + s["otr"]["did"]["coef"], 1) < s["otr"]["means"][(True, False)]
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert r(900 / 250) == 3.6 and r(900 / 250 - 1.18) == 2.4
     low = study("low")["quoted"]
     assert (r(low["did"]["coef"], 2), r(low["did"]["se"], 2), r(low["truth"], 2)) == (1.11, 0.06, 0.94)
+
+
+def test_small_runs():
+    # One stock, one post-event day, with and without the order-to-trade cap (same seed): the day's measures are
+    # finite, and the cap cuts the messages per trade, which is what it is for.
+    with_rule, without = session_day(0, EVENT, True), session_day(0, EVENT, False)
+    assert set(with_rule) >= set(MEASURES) and all(math.isfinite(with_rule[k]) for k in MEASURES)
+    assert with_rule["otr"] < without["otr"]

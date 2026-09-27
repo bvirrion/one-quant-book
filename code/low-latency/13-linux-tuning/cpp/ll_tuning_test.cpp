@@ -2,6 +2,7 @@
 #include "ll_tuning.hpp"
 
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 #include <cstdio>
 
@@ -34,12 +35,25 @@ int main() {
     if (cold < 2000) { std::printf("only %ld faults on 8 MiB\n", cold); return 3; }   // 2,048 pages
 
     // With MCL_FUTURE the kernel populates new mappings when they are made: the writes then take no fault.
+    // Every later mapping then counts against RLIMIT_MEMLOCK (8 MiB on stock Ubuntu): with less than 64 MiB,
+    // the locked 8 MiB mapping would fail, so the lock test is skipped as when mlockall is refused.
+    rlimit lim{};
+    if (getrlimit(RLIMIT_MEMLOCK, &lim) == 0 && lim.rlim_cur != RLIM_INFINITY && lim.rlim_cur < (64u << 20)) {
+        std::printf("RLIMIT_MEMLOCK %llu KiB: lock test skipped; cold faults %ld\n",
+                    static_cast<unsigned long long>(lim.rlim_cur >> 10), cold);
+        return 0;
+    }
     const int err = lock_all();
     if (err != 0) {
         std::printf("mlockall failed (errno %d): lock test skipped; cold faults %ld\n", err, cold);
         return 0;
     }
     void* b = mmap(nullptr, kBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (b == MAP_FAILED) {
+        munlockall();
+        std::printf("mmap under mlockall failed: lock test skipped; cold faults %ld\n", cold);
+        return 0;
+    }
     const long locked = touch_faults(static_cast<char*>(b), kBytes);
     munmap(b, kBytes);
     munlockall();

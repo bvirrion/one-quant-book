@@ -26,10 +26,10 @@ SEEDS, DAY, WIDTH, LOT, MAX_LOTS = (17, 18, 19, 20), 23_400.0, 60.0, 100.0, 5
 
 
 @functools.lru_cache(maxsize=4)
-def day(seed: int):
-    tp = simulate(TapeConfig(seconds=DAY, news_at=None, u_shape=1.5, seed=seed))
+def day(seed: int, seconds: float = DAY):
+    tp = simulate(TapeConfig(seconds=seconds, news_at=None, u_shape=1.5, seed=seed))
     tr = tp.trades
-    return tp, time_bars(tr["t"], tr["price"].astype(float), tr["qty"].astype(float), WIDTH, 0.0, DAY)
+    return tp, time_bars(tr["t"], tr["price"].astype(float), tr["qty"].astype(float), WIDTH, 0.0, seconds)
 
 
 class Quoter(Strategy):

@@ -2,6 +2,8 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_facts import (  # noqa: E402
     cancel_rates,
@@ -34,6 +36,8 @@ def test_midas():
     assert (y[2012]["cancel_to_trade"], y[2026]["cancel_to_trade"], y[2026]["days"]) == (19.79, 16.62, 123)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_simulated_day():
     d = day()
     assert (len(d.msgs), len(d.trades)) == (715_054, 21_993)
@@ -51,6 +55,8 @@ def test_simulated_day():
     assert r((d.msgs["kind"] == b"X").sum() / len(d.trades), 1) == 15.5
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_intraday_and_spreads():
     p = intraday_mean()
     v = [x["volume"] for x in p]
@@ -62,6 +68,8 @@ def test_intraday_and_spreads():
     assert r(max(s for s, _ in tp["points"]), 2) == 1.08
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     # exercise 2: a spread of two ticks, volatility per trade 0.9 ticks: the ZI fit predicts 0.96 + 1.64 * 0.9
     assert r(0.96 + 1.64 * 0.9, 2) == 2.44
@@ -69,8 +77,18 @@ def test_exercises():
     assert round(1000 * midas_lifetimes()[("large", "cancel")][2]) == 540
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercise_7():
     e = lifetable(day(), event=b"E")
     assert [r(100 * x, 1) for x in e[3:]] == [1.8, 4.6, 12.4]
     m = midas_lifetimes()[("large", "trade")]
     assert [r(100 * x, 1) for x in m[3:]] == [3.4, 8.7, 15.0]
+
+
+def test_small_runs():
+    # Half an hour of the simulated day instead of six and a half hours: each measure of the book is computed.
+    d = day(seconds=1800.0)
+    c = cancel_rates(d)
+    assert len(c) == 6 and all(0 <= x < float("inf") for x in c)
+    assert 0 <= fleeting_share(d) <= 1 and relative_prices(d) and spread_profile(d)

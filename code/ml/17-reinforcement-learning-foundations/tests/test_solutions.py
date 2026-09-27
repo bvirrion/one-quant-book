@@ -3,12 +3,15 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 import ml_rl as m  # noqa: E402
 from firm_rlcore import liquidation_mdp, rollouts  # noqa: E402
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exact_problem():
     mm = m.mdp()
     assert mm.n_states == 242
@@ -21,6 +24,8 @@ def test_exact_problem():
     assert round(0.2 * sum(k * k for k in range(1, 10))) == 57
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_learning_curves():
     lc = {k: [round(float(x), 3) for x in v] for k, v in m.learning_curves().items()}
     assert (lc["Q-learning"][2], lc["Q-learning"][4]) == (1.408, 0.044)
@@ -30,12 +35,16 @@ def test_learning_curves():
     assert round(lc["Q-learning"][2], 2) == 1.41 and round(lc["SARSA"][2], 2) == 0.28
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_bandits():
     b = {k: (round(float(v[0][-1])), round(100 * v[1])) for k, v in m.bandits().items()}
     assert b == {"epsilon 0.1": (1727, 78), "epsilon 0.01": (2026, 65), "UCB, c = 1.41": (1325, 83),
                  "UCB, c = 1": (944, 87)}
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_off_policy():
     o = m.off_policy()
     assert (round(o["truth"], 2), round(o["behaviour"], 2)) == (2.77, 3.80)
@@ -44,6 +53,8 @@ def test_off_policy():
                  "DR": (-0.03, 0.29, 0.29)}
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_sim_to_real():
     s = {k: round(float(v), 2) for k, v in m.sim_to_real().items()}
     assert s == {"agent in simulator": 2.77, "desk in simulator": 3.66, "agent in market": 3.83,
@@ -52,6 +63,8 @@ def test_sim_to_real():
     assert round(s["agent in market"] - s["desk in market"], 1) == 0.6
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     assert round((2 * 5 * 2**0.5 / 0.3) ** 2, -2) == 2200
     assert round(-10 + 0.1 * (-3 - 5 + 10), 2) == -9.8 and round(-10 + 0.1 * (-3 - 8 + 10), 2) == -10.1
@@ -63,3 +76,12 @@ def test_exercises():
     t = liquidation_mdp(drain=0.1)
     V, pi = t.solve()
     assert (round(-V[t.start] / 10, 2), [int(pi[t.idx(0, 10, liq)]) for liq in (0, 1)]) == (3.01, [5, 3])
+
+
+def test_small_runs():
+    # The exact problem and a short bandit run instead of the learning curves: dynamic programming beats the desk's
+    # schedule, which beats TWAP, and UCB's regret stays finite and grows.
+    b = m.benchmarks()
+    assert b["optimal"] <= b["desk"] <= b["TWAP"]
+    out = m.bandits(n=500, seeds=2)
+    assert all(np.isfinite(reg).all() and reg[-1] >= reg[0] and 0 <= best <= 1 for reg, best in out.values())

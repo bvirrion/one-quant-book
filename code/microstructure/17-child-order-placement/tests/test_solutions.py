@@ -4,14 +4,18 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 from mx_place import (  # noqa: E402
     QTY,
+    Cross,
+    Post,
     calibration,
     dp_thresholds,
     market_stats,
     model_study,
+    run_policy,
     sim_study,
     urgent_study,
 )
@@ -21,6 +25,8 @@ def r(x, d=1):
     return round(float(x), d)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_market_and_calibration():
     s = market_stats()
     assert (r(100 * s["one_tick"]), r(s["queue"]), r(1 / s["moves"]), r(s["volume"], 0)) == (97.7, 14.6, 9.4, 137)
@@ -29,6 +35,8 @@ def test_market_and_calibration():
     assert (r(c.lam, 2), r(c.theta, 3), r(c.mu, 2), r(c.depth2)) == (0.99, 0.021, 0.69, 3.2)
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_policies_in_the_simulated_market():
     s = sim_study()
     assert s["n"] == 216
@@ -47,6 +55,8 @@ def test_policies_in_the_simulated_market():
     assert r(s["imbalance"]["cost"] - s["reprice"]["cost"], 2) == 0.03
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_plan_and_learning():
     m = model_study()
     assert (r(m["cross"][0], 2), r(m["join"][0], 2), r(m["plan"][0], 2), r(m["Q-learning"][0], 2)) == (0.66, -0.40, -0.40, -0.39)
@@ -56,6 +66,8 @@ def test_plan_and_learning():
     assert t[(1, 60.0)][0] == t[(8, 15.0)][0] == t[(8, 60.0)][0] == 1.0
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_urgent_lot():
     u = urgent_study()
     assert u["n"] == 1824
@@ -66,6 +78,8 @@ def test_urgent_lot():
     assert all(x[3] < 2 * x[4] for x in b)                                # crossing never significantly cheaper
 
 
+# Full-size run behind the book's printed numbers: make test-code / make reproduce; CI runs test_small_runs.
+@pytest.mark.reference
 def test_exercises():
     from firm_placement import _fresh, cross_cost, solve
     c = calibration()
@@ -78,3 +92,12 @@ def test_exercises():
         w = np.outer(f[1:41], f[1:41])
         return r(100 * float((w * p.cross[-1][1, 1:, 1:]).sum() / w.sum()))
     assert (share(c), share(dataclasses.replace(c, lam=c.lam / 2))) == (6.0, 18.6)
+
+
+def test_small_runs():
+    # Three slices on one seed instead of 24 sessions: crossing takes liquidity on every fill, joining the queue
+    # earns some passive fills, and every slice is measured.
+    cross, join = run_policy(Cross(), 1701, slices=3), run_policy(Post(0, False), 1701, slices=3)
+    assert len(cross) == len(join) == 3 and all(np.isfinite(x[1]) for x in cross + join)
+    assert all(x[2] == 0.0 for x in cross) and sum(x[2] for x in join) > 0
+    assert all(-1 <= x[0] <= 1 and 0 <= x[3] <= 1 for x in cross + join)
