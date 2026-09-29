@@ -1,0 +1,390 @@
+\chapter{Dataframes}\label{ch:pl:dataframes}
+
+Two researchers compute five-minute bars from the same trades and get different volumes. One library names a bar by its left
+edge and puts a trade stamped exactly on a boundary into the bar that starts there; the other names it by its right edge and
+puts the same trade into the bar that ends there; one of them drops the minutes in which nothing traded, the other does not.
+Both are right by their own conventions, and a signal that compares the two sets of bars finds a pattern that is nothing but the
+convention. The \omterm{def:pl:dataframes:dataframe}{dataframe} is the research platform's working language; its idioms --- bars, as-of joins, rolling windows,
+cross-sectional ranks, pivots --- are where its silent bugs live, and its engines differ enormously in what they cost. This chapter
+writes the idioms once with explicit conventions for three engines (\texttt{firm.marketdf}), checks that the engines agree, and
+runs one research pipeline over a month of quotes and trades eagerly, lazily and out of core.
+
+\section{The dataframe model}
+
+\begin{definition}[Dataframe]\label{def:pl:dataframes:dataframe}
+A \emph{dataframe}\index{dataframe} is a table of named, typed columns of equal length, with operations that act on whole columns
+and groups of rows: selection, filtering, computed columns, grouping and aggregation, joins, sorting, windows and reshaping.
+\end{definition}
+
+The three engines of the chapter implement the same model differently. pandas holds each column as a numpy array (or an Arrow
+array) with a row index attached, and executes each operation when it is called. Polars holds columns in Arrow's memory layout,
+has no row index, and can either execute each operation or build a plan and execute it later. DuckDB is a SQL engine: a query
+is a plan, executed when its result is asked for (chapter~5). The \omterm{def:pl:columnar-formats:layouts}{columnar layout} of chapter~3 underlies all three.
+
+\begin{definition}[Long format, wide format]\label{def:pl:dataframes:shape}
+A table in \emph{long format}\index{long format} has one row per observation and a column for each variable, including the keys
+(symbol, time, value). The same data in \emph{wide format}\index{wide format} have one row per value of one key and one column per
+value of another (a row per minute, a column per symbol).
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,cell/.style={draw,minimum width=1.05cm,minimum height=0.42cm,inner sep=1pt}]
+\foreach \r/\t/\s/\v in {0/09:31/AAA/10.1,1/09:31/BBB/20.4,2/09:32/AAA/10.2,3/09:32/BBB/20.3} {
+  \node[cell] at (0,-\r*0.42) {\t}; \node[cell] at (1.05,-\r*0.42) {\s}; \node[cell] at (2.1,-\r*0.42) {\v};}
+\foreach \x/\h in {0/time,1.05/symbol,2.1/close} {\node[cell,fill=omDef!15] at (\x,0.42) {\h};}
+\node[font=\scriptsize\itshape] at (1.05,1.05) {long: a row per observation};
+\draw[->,thick] (3.1,-0.4) -- node[above]{pivot} (4.6,-0.4);
+\draw[<-,thick] (3.1,-0.9) -- node[below]{melt} (4.6,-0.9);
+\foreach \r/\t/\a/\b in {0/09:31/10.1/20.4,1/09:32/10.2/20.3} {
+  \node[cell] at (5.6,-\r*0.42) {\t}; \node[cell] at (6.65,-\r*0.42) {\a}; \node[cell] at (7.7,-\r*0.42) {\b};}
+\foreach \x/\h in {5.6/time,6.65/AAA,7.7/BBB} {\node[cell,fill=omMeth!15] at (\x,0.42) {\h};}
+\node[font=\scriptsize\itshape] at (6.65,1.05) {wide: a row per minute, a column per symbol};
+\end{tikzpicture}
+
+\omcaption{The same closing prices in \omterm{def:pl:dataframes:shape}{long format} (keys as columns) and in \omterm{def:pl:dataframes:shape}{wide format} (one key as rows, the other as columns).
+Research code moves between the two: long for storage, joins and grouping; wide for cross-sectional arithmetic and
+matrices.}\label{fig:pl:dataframes:shape}
+\end{omfigure}
+
+Market data are stored long (chapter~4's partitions are long tables), and most transformations are clearer long: a rolling window
+is a window over the rows of one symbol, a cross-sectional rank a rank over the rows of one minute. The \omterm{def:pl:dataframes:shape}{wide format} serves the
+matrix operations of portfolio construction (One Quant Book~7, chapters~24--26), and the pivot between the two is where missing
+values appear: a minute in which one symbol did not trade is a missing cell in the wide table, never a row in the long one.
+
+\section{Eager and lazy evaluation}
+
+\begin{definition}[Eager evaluation, lazy evaluation]\label{def:pl:dataframes:eager}
+An engine with \emph{eager evaluation}\index{eager evaluation} executes each operation when it is called and materialises its full
+result. An engine with \emph{lazy evaluation}\index{lazy evaluation} records the operations as a plan and executes the plan only when
+a result is requested, which lets it see the whole computation before running any of it.
+\end{definition}
+
+\omterm{def:pl:dataframes:eager}{Eager evaluation} is easy to reason about and to debug step by step; every intermediate table exists, and every intermediate table
+costs memory. \omterm{def:pl:dataframes:eager}{Lazy evaluation} gives the engine the whole pipeline, which is what makes optimisation possible.
+
+\section{Query plans and optimisation}
+
+\begin{definition}[Query optimiser]\label{def:pl:dataframes:optimiser}
+A \emph{query optimiser}\index{query optimiser} rewrites a plan into an equivalent cheaper one before executing it: it pushes filters
+and projections toward the scans (so that fewer rows and columns are read, chapter~3), removes unused columns and operations, reorders
+joins and aggregations, and chooses algorithms.
+\end{definition}
+
+A lazy query for one symbol's prices on one day, written as a scan of every trade file followed by a filter and a selection, is
+optimised by Polars into a plan that reads one partition and four of six columns, and applies the filter while scanning
+(\cref{fig:pl:dataframes:plan}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,op/.style={draw,rounded corners=2pt,align=center,minimum width=4.4cm,minimum height=0.62cm,
+  inner sep=2pt},>=Stealth]
+\node[font=\small\bfseries] at (0,0.75) {as written};
+\node[op,fill=omMeth!12] (a1) at (0,0) {select \texttt{ts}, \texttt{price}};
+\node[op,fill=omMeth!12] (a2) at (0,-1.0) {filter symbol $=$ S007, date $=5$};
+\node[op,fill=omThm!12] (a3) at (0,-2.0) {scan all 20 date partitions\\ all 6 columns};
+\draw[->] (a3) -- (a2); \draw[->] (a2) -- (a1);
+\draw[->,very thick,gray] (2.6,-1.0) -- node[above,black]{optimiser} (4.2,-1.0);
+\node[font=\small\bfseries] at (6.8,0.75) {as executed};
+\node[op,fill=omMeth!12] (b1) at (6.8,0) {select \texttt{ts}, \texttt{price} (2 of 2)};
+\node[op,fill=omDef!12,minimum height=1.62cm] (b2) at (6.8,-1.5) {scan \texttt{date=5} only\\ project 4 of 6 columns\\
+  filter symbol $=$ S007 while scanning};
+\draw[->] (b2) -- (b1);
+\node[anchor=north,align=center,text width=4.6cm] at (6.8,-2.45) {partition pruning, projection and predicate pushdown};
+\end{tikzpicture}
+
+\omcaption{A narrow query as written and as Polars executes it (from the plan it prints). The filter on the partition column removes 19 of
+20 partitions before any file is opened; the projection keeps the two columns returned and the two the filter reads; the filter on the
+symbol runs inside the scan.}\label{fig:pl:dataframes:plan}
+\end{omfigure}
+
+The partition pruning (only \texttt{date=5} is scanned), the \omterm{def:pl:columnar-formats:pushdown}{projection pushdown} (four columns: the two asked for and the two the filter
+needs) and the \omterm{def:pl:columnar-formats:pushdown}{predicate pushdown} of chapter~3 are all the optimiser's work; an eager version of the same code would read the month and
+filter it in memory.
+
+\section{Out-of-core and streaming execution}
+
+\begin{definition}[Out-of-core processing, streaming execution]\label{def:pl:dataframes:outofcore}
+\emph{Out-of-core processing}\index{out-of-core processing} computes a result over data larger than memory by reading it in pieces
+from storage. \emph{Streaming execution}\index{streaming execution} is the engine-level form of it: the plan's operators pass batches
+to one another as they are produced, so that a scan, a filter and an aggregation hold one batch at a time, while operators that need
+all of their input (a global sort, some joins) buffer it.
+\end{definition}
+
+Chapter~8 wrote out-of-core loops by hand; a lazy engine with a streaming executor does the same for a whole plan. It cannot do it
+for every operator: an as-of join needs both sides sorted, and a sort needs all its input, so a plan containing them buffers at those
+points. The pipeline below has both, which is why streaming saves memory here but does not make it constant.
+
+\section{Idioms for market data}
+
+\begin{definition}[Window function]\label{def:pl:dataframes:window}
+A \emph{window function}\index{window function} computes, for each row, a value over a set of related rows --- the rows of the same
+group, ordered, possibly limited to a frame such as the last $n$ rows --- without collapsing the rows as an aggregation does:
+a rolling mean per symbol, a rank within a minute, the previous row's value (a lag).
+\end{definition}
+
+Five idioms cover most of research on market data, and each has a convention that must be stated rather than inherited.
+
+\begin{method}[Market-data idioms with their conventions]\label{met:pl:dataframes:idioms}
+\textbf{Bars}: state the width, the label (left or right edge), the closed side, and whether empty bars are dropped or filled (with
+the previous close and zero volume). \textbf{As-of joins}: state the key (time or sequence number, chapter~4), the group, and whether
+an equal time matches. \textbf{Rolling windows}: state the frame (rows or time), the group and the minimum number of observations.
+\textbf{Cross-sectional ranks}: state the tie rule. \textbf{Pivots}: state what a missing cell means.
+\end{method}
+
+\omcode{code/firm/marketdf/firm_marketdf.py}{54}{88}{Bars with explicit conventions in three engines: the bar index from the closed
+side by floor division (whatever the engine's integer division does with negative numbers), the label from the edge, then the same
+aggregation.}\label{lst:pl:dataframes:bars}
+
+\Cref{lst:pl:dataframes:bars} is the bars idiom in the three engines. Two details are the kind that breaks equivalence silently: the
+first and last price of a bar must be taken in time order with a tie-breaker (the feed's sequence number), and the index of a
+right-closed bar is $\lceil t/w \rceil - 1 = \lfloor (t-1)/w \rfloor$ for integer times, which each engine must compute with floor
+division --- DuckDB's integer division truncates toward zero, and the SQL version computes the floor explicitly. The acceptance tests
+compare the three engines on trades stamped to the whole second, so that boundaries and ties occur.
+
+\begin{example}[Two sets of bars]\label{ex:pl:dataframes:bars}
+On one symbol-day of synthetic trades (375 trades, stamped to the second as some vendors deliver them), five-minute bars labelled
+and closed on the left and on the right differ in volume in 4 of the 74 intervals: two trades fall exactly on a five-minute boundary,
+and each moves its volume, 600 shares in all, from one bar to the next. The two sets also carry labels five minutes apart for the same
+interval. Filling empty bars adds 4 bars to the 74, and the day's bar returns become 77 instead of 73: a return computed across a
+dropped bar spans ten minutes and is compared, in a rolling window, with five-minute returns.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (11.2,0) node[right]{time};
+\foreach \x/\l in {0.5/10:00,5.5/10:05,10.5/10:10} {\draw (\x,0.1) -- (\x,-0.1) node[below]{\l};}
+\fill[omThm] (5.5,0) circle (2.5pt);
+\node[omThm,above] at (5.5,0.1) {trade at 10:05:00};
+\draw[omDef,thick] (0.5,0.9) -- (5.4,0.9); \draw[omDef,line width=2pt] (5.6,0.9) -- (10.5,0.9);
+\fill[omDef] (0.5,0.9) circle (2pt); \draw[omDef,fill=white] (5.4,0.9) circle (2pt);
+\fill[omDef] (5.6,0.9) circle (2pt); \draw[omDef,fill=white] (10.5,0.9) circle (2pt);
+\node[omDef,above] at (3,0.95) {bar labelled 10:00}; \node[omDef,above] at (8,0.95) {bar labelled 10:05 (holds the trade)};
+\node[omDef,anchor=east,font=\scriptsize\bfseries] at (0.3,0.9) {left/left};
+\draw[omMeth,line width=2pt] (0.5,-0.9) -- (5.4,-0.9); \draw[omMeth,thick] (5.6,-0.9) -- (10.5,-0.9);
+\draw[omMeth,fill=white] (0.5,-0.9) circle (2pt); \fill[omMeth] (5.4,-0.9) circle (2pt);
+\draw[omMeth,fill=white] (5.6,-0.9) circle (2pt); \fill[omMeth] (10.5,-0.9) circle (2pt);
+\node[omMeth,below] at (3,-0.95) {bar labelled 10:05 (holds the trade)}; \node[omMeth,below] at (8,-0.95) {bar labelled 10:10};
+\node[omMeth,anchor=east,font=\scriptsize\bfseries] at (0.3,-0.9) {right/right};
+\end{tikzpicture}
+
+\omcaption{A trade stamped exactly 10:05:00 under two bar conventions. Closed on the left, it belongs to the bar $[10\!:\!05,
+10\!:\!10)$, labelled 10:05; closed on the right, to $(10\!:\!00, 10\!:\!05]$, also labelled 10:05 because that convention names bars by
+their right edge. Filled dots mark closed ends, open dots open ends; the thick bar holds the trade. The same label names two different
+intervals, and the trade's volume changes interval.}\label{fig:pl:dataframes:edge}
+\end{omfigure}
+
+\section{Joins, windows and ranks: where ties hide}
+
+Bars are the most visible convention; three others hide in the joins and windows. An as-of join on the timestamp matches each trade
+with the last quote at or before its time: when a trade and the quote change it caused share a timestamp, the inclusive join returns the
+quote after the trade. Chapter~4 found this on 223 of 17\,281 trades and made the join strict on the feed's sequence number;
+\texttt{firm\_marketdf.asof} takes \texttt{strict} as an argument in all three engines (pandas \texttt{allow\_exact\_matches}, Polars the
+same, DuckDB the inequality \texttt{>} instead of \texttt{>=}).
+
+A rolling window has a frame in rows or in time, and a minimum number of observations below which it returns nothing or a partial
+value: the idiom's rolling mean averages whatever rows exist, one at the start of each symbol, which must be known to the code that uses
+it. A cross-sectional rank has a tie rule, and engines differ in their default.
+
+\begin{example}[Tied returns]\label{ex:pl:dataframes:ties}
+In one minute, four symbols have returns $0.1$, $0.2$, $0.2$ and $0.3$ (in basis points). The average rule gives ranks 1,
+2.5, 2.5 and 4, the rank sum $10 = 4\cdot5/2$ whatever the ties. SQL's \texttt{rank()} gives 1, 2, 2, 4 (the minimum rule), which lowers
+the tied symbols' average rank; with $c$ rows tied at \texttt{rank()} $= r$, the average rank is $(2r + c - 1)/2 = (4 + 2 - 1)/2 = 2.5$,
+the expression the SQL of \cref{lst:pl:dataframes:sql} uses. Returns of prices on a tick grid tie often: in the smaller month of the
+tests, 10.8\% of the 222\,621 one-minute returns are exactly zero, and 6\,467 groups of tied returns occur in 7\,808 minutes.
+\end{example}
+
+\section{One pipeline, five ways}
+
+The chapter's research pipeline runs over the chapter-3 month of quotes (now 3 million, three thousand per symbol per day) and a
+month of 1.2 million trades, stored as date partitions of Parquet: one-minute bars, their log returns, the cross-sectional rank of
+each return within its minute, each symbol's average rank over the month; and, in parallel, every trade joined as of its prevailing
+quote and each symbol's mean effective spread in basis points. \Cref{lst:pl:dataframes:lazy} is the Polars version, a lazy plan
+that the three Polars modes share.
+
+\omcode{code/platforms/10-dataframes/python/pl_dataframes.py}{111}{124}{The pipeline as one Polars plan: bars, returns and ranks by
+window expressions, and the as-of join and effective spread; the same plan is collected eagerly, lazily or by the streaming
+engine.}\label{lst:pl:dataframes:lazy}
+
+\omcode{code/platforms/10-dataframes/python/pl_dataframes.py}{140}{161}{The same pipeline in DuckDB's SQL, over the Parquet files:
+bars by an ordered aggregate, returns by a lag, ranks by a window with the tie rule written out, and the as-of
+join.}\label{lst:pl:dataframes:sql}
+
+All five modes return the same fifty average ranks and fifty mean spreads to nine decimals. \Cref{fig:pl:dataframes:engines} measures
+them, each in its own process with one thread, memory counted as the process's high-water mark minus that of a process that only imports
+the libraries (155~MB). pandas, eager and with a row index, reads the whole month into memory and holds every intermediate table: it
+needs 895~MB more than the imports and 1.3~s. Polars eager holds the same tables in Arrow form: 769~MB. Lazily, it needs 654~MB, and
+with the streaming engine 614~MB; the as-of join and the sorts keep the saving modest. DuckDB, executing the SQL over the files with its
+own streaming operators, needs 317~MB, a third of pandas.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=10pt,ymin=0,ymax=1000,ylabel={extra memory (MB)},
+  xtick={0,1,2,3,4},xticklabels from table={figdata/platforms/10-dataframes/measured_engines.csv}{engine},
+  tick label style={font=\small},xticklabel style={text width=1.7cm,align=center},label style={font=\small},grid=major,grid style={gray!20},enlarge x limits=0.15,
+  nodes near coords,point meta=explicit symbolic,nodes near coords style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x expr=\coordindex,y=extra_mb,meta=seconds]{figdata/platforms/10-dataframes/measured_engines.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Memory beyond the imports (bars) and wall time in seconds (labels) of the same research pipeline over a month of quotes and
+trades, in five engine modes, each run in its own process with one thread. The five give identical answers. Measured on a laptop (Intel
+Core Ultra 7 155H) under WSL2, machine otherwise idle. Data: \texttt{bench\_dataframes.py}.}\label{fig:pl:dataframes:engines}
+\end{omfigure}
+
+\begin{remark}[Measuring memory of a child process]\label{rem:pl:dataframes:rss}
+The first version of the measurement read the child's peak resident set from \texttt{getrusage}, and every engine seemed to need about
+the same memory: on Linux, resource usage is preserved across \texttt{exec}, so the figure can include the memory of the process the child was started
+from. The high-water mark in
+\texttt{/proc/self/status} belongs to the process's own address space; it is what the chapter reports.
+\end{remark}
+
+\begin{dated}{2026-09}{Engine versions}\label{dat:pl:dataframes:versions}
+The chapter's measurements and plans use pandas 2.3.3, Polars 1.44.2, DuckDB 1.5.5 and PyArrow 25.0.1, the versions pinned in the series'
+requirements. Plans, defaults and memory use change between versions: the plan of \cref{fig:pl:dataframes:plan} is what this Polars
+version prints, and Polars falls back to its in-memory engine for operations not yet implemented in streaming.
+\end{dated}
+
+\section{Tutorial: bars, conventions and five engines}\label{tut:pl:dataframes:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Compute bars under stated conventions in three engines, see what the conventions change, and run one pipeline in five
+modes with identical answers. \textbf{End state:} \cref{ex:pl:dataframes:bars}, \cref{fig:pl:dataframes:engines} and the optimised plan
+of the chapter.
+\begin{tutsteps}
+\item \textbf{Idioms}: \texttt{firm\_marketdf.bars}, \texttt{asof}, \texttt{rolling\_mean}, \texttt{xs\_rank}, \texttt{to\_wide},
+\texttt{to\_long}; the acceptance tests check that the three engines agree.
+\item \textbf{Conventions}: \texttt{pl\_dataframes.conventions()} for the symbol-day of \cref{ex:pl:dataframes:bars}.
+\item \textbf{Plan}: \texttt{plan\_text()} prints the optimised lazy plan of a narrow query.
+\item \textbf{Pipeline}: \texttt{write\_month(**BIG)}, then \texttt{bench\_dataframes.py} runs the five modes, each in its own process,
+checks the answers and records time and memory.
+\end{tutsteps}
+\textbf{What to change next.} Replace the as-of join in the Polars plan by a join on the previous second and see what the streaming
+engine then saves; add a filled-bar option to the pipeline and measure how the average ranks change.
+\end{tutorial}
+
+\section{Build: market-data idioms}\label{bld:pl:dataframes:marketdf}
+
+\begin{build}
+\bfield{Purpose} The platform's shared implementation of the idioms every researcher rewrites: one contract, three engines, the
+conventions as arguments, the equivalence as tests. The backtest engine of chapter~11 and the feature code of the research environment
+(chapter~15) use it.
+\bfield{Interface} \texttt{ENGINES}; \texttt{bars(ticks, width, label, closed, fill, engine)}; \texttt{asof(left, right, by, on,
+engine, strict)}; \texttt{rolling\_mean(df, by, order, column, window, engine)}; \texttt{xs\_rank(df, time, column, engine)};
+\texttt{to\_wide}, \texttt{to\_long}.
+\bfield{Rules} Conventions are arguments with no hidden default beyond the documented one; every idiom has the same result in every
+engine, to the row; ties are broken by the sequence number; integer times are bucketed by floor division in every engine.
+\bfield{Acceptance tests} \texttt{code/firm/marketdf/tests/}: bars under four conventions equal across engines on second-stamped trades,
+with volume conserved; the conventions worked by hand on four trades; as-of joins (inclusive and strict), rolling means and ranks equal
+across engines; a pivot round trip.
+\bfield{Stretch} Time-based rolling windows; bars with volume-weighted prices; the idioms for Arrow tables without pandas.
+\end{build}
+
+\begin{omsources}
+\item H.~Wickham, ``Tidy data'', \emph{Journal of Statistical Software} 59(10), 2014.
+\item pandas documentation, \texttt{DataFrame.resample}; Polars user guide, ``Streaming''; DuckDB documentation, ``AsOf join''.
+\item Linux man-pages, \texttt{getrusage(2)}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:1}
+A trade is stamped 10:05:00 exactly. In which five-minute bar, and under which label, does it fall under each of the two conventions
+of \cref{fig:pl:dataframes:edge}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:2}
+Convert the long table of \cref{fig:pl:dataframes:shape} to wide and back. What does the wide table hold for a minute in which BBB did
+not trade?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:3}
+Which columns and partitions does the optimised plan of the narrow query read, and why four columns rather than two?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:4}
+Why is the index of a right-closed bar $\lfloor (t-1)/w \rfloor$ for integer $t$, and what goes wrong in an engine whose integer division
+truncates toward zero, for negative times?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:5}
+In \cref{ex:pl:dataframes:bars}, dropping the empty bars gives 73 returns and filling them 77. Which returns differ, and what does a
+20-bar rolling volatility of the dropped series overstate?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:6}
+Why does \omterm{def:pl:dataframes:outofcore}{streaming execution} save less memory on the chapter's pipeline than on a pipeline of scans, filters and aggregations?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:dataframes:7}
+\emph{Coding.} With \texttt{firm\_marketdf.bars}, compute one-minute bars of the chapter's month for one symbol in the three engines and
+under the four conventions of the acceptance tests. Do the engines agree, and does the total volume depend on the convention?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:dataframes:8}
+\emph{Find the flaw.} ``We resample trades to bars with the library default, compute returns with \texttt{pct\_change} on the bar table
+sorted by time, and rank them across symbols each minute.''
+\end{exercise}
+
+\section{Problem: Two Sets of Bars}
+
+\begin{problem}[{Weekend problem --- a month through five engines}]\label{pb:pl:dataframes:1}
+The chapter's month of quotes and trades, its bar conventions and the five engine modes of \cref{fig:pl:dataframes:engines}.
+
+\medskip\noindent\textbf{Part I --- Conventions.}
+\begin{enumerate}
+\item How many trades of the symbol-day fall exactly on a five-minute boundary, and why can that happen?
+\item How many of the 74 intervals differ in volume between the two conventions, and how many shares move?
+\item How far apart are the labels of the same interval under the two conventions?
+\item How many bars and returns does the day have with empty bars dropped, and with them filled?
+\item Which convention would you choose for a research store, and what must be written down?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Plans.}
+\begin{enumerate}[resume]
+\item What does an eager engine materialise that a lazy one need not?
+\item What three optimisations does the narrow query's plan show?
+\item Why is a lazy plan easier to optimise than eager code?
+\item Which operators of the pipeline cannot stream, and why?
+\item Why must the SQL compute floor division explicitly?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The five modes.}
+\begin{enumerate}[resume]
+\item What does the pipeline compute, and how are the five answers compared?
+\item How much memory beyond the imports does each mode need?
+\item Which mode is fastest, and which uses least memory?
+\item Why is pandas the most expensive in memory?
+\item Why did a first measurement show about the same memory for every engine?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the volume and return discrepancies of the conventions, and the time and memory of the pipeline in
+the five modes.
+\item Which engine would you use for a month, and which for five years of the same data?
+\item What would you standardise across a research team so that two researchers' bars agree?
+\item What does an equivalence test across engines protect against?
+\item In one sentence: what makes a \omterm{def:pl:dataframes:dataframe}{dataframe} pipeline trustworthy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:pl:dataframes:1}
+Your five-minute bars do not match a colleague's. What do you check?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:pl:dataframes:2}
+What is the difference between eager and lazy \omterm{def:pl:dataframes:dataframe}{dataframe} evaluation, and when does it matter?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:dataframes:3}
+How would you compute a cross-sectional rank of one-minute returns across 3\,000 symbols for a year?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:dataframes:4}
+Your pandas job runs out of memory on a month of trades. What do you change?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:pl:dataframes:5}
+Design a shared library of market-data transformations for a research team using several \omterm{def:pl:dataframes:dataframe}{dataframe} engines.
+\end{interviewq}

@@ -1,0 +1,367 @@
+\chapter{Programmable Hardware II: Trading Designs}\label{ch:nw:programmable-hardware-ii-trading-designs}
+
+The design of this chapter decides two clock cycles after the last byte of a price reaches it: \qty{12.8}{\nano\second} at 156.25~MHz,
+for the first order and for the ten-thousandth, whether the market is quiet or bursting. It has no cache to miss and no thread to wake,
+and the order it sends leaves as a template with three fields patched in. It also cannot do much: it compares one price with one
+threshold, for one instrument, and everything it knows about the world was written into its registers by software a moment before.
+That combination (very fast, very narrow, steered by software) is what firms mean by a \omterm{def:nw:programmable-hardware-ii-trading-designs:hybrid}{hybrid trading system}.
+
+This chapter builds a \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{hardware trigger} on the exchange simulator's feed, with its risk checks and its \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{order template}, in SystemVerilog
+on the toolkit of chapter~6, and checks it four ways: in Verilator, in Icarus, against a C++20 cycle model and against a Python model,
+order for order and cycle for cycle. It then puts the trigger in the firm's wire-to-wire path and asks what it buys.
+
+\section{Feed decoding in hardware}
+
+A software handler (One Quant Book~13, chapter~18) receives a whole datagram, then walks its messages. A hardware decoder walks the
+messages as the bytes arrive, eight a cycle, keeping only the state it needs between cycles: where it is in the packet's header, the
+length of the current message, how far into it it is, and the fields it has captured so far. In the simulator's feed, as in the
+exchange feed format it follows, an add-order message is 36 bytes with its price in the last four; the decoder therefore knows everything
+about an order the cycle its last byte arrives, while the rest of the packet (other messages, the frame's check sequence) may still be to
+come.
+
+\omcode{code/firm/hwtrade/hdl/hwt_trigger.sv}{47}{75}{The decoder's combinational logic: a byte-serial state machine unrolled over the
+beat's eight lanes. It captures the type, instrument, side, size and price, and at the message's last byte decides whether to
+fire.}\label{lst:nw:programmable-hardware-ii-trading-designs:parse}
+
+\begin{definition}[Hardware trigger, cut-through decision]\label{def:nw:programmable-hardware-ii-trading-designs:trigger}
+A \emph{hardware trigger}\index{hardware trigger} is logic on a network card that watches a market-data stream for a condition set in
+advance by software (a price crossing a threshold, a trade on a given instrument) and, when it occurs, starts an order without the
+host's involvement. A \emph{cut-through decision}\index{cut-through decision} is a decision taken as soon as the bytes it depends on
+have arrived, before the frame that carries them has ended or been checked.
+\end{definition}
+
+The unrolled state machine of \cref{lst:nw:programmable-hardware-ii-trading-designs:parse} is the simplest correct design, and it is
+slow in hardware: eight byte steps chained in one cycle make a long \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{critical path}. Faster decoders exploit the format: messages start at
+known offsets relative to their length prefixes, so dedicated logic can look for a message start in each lane at once, and fixed-layout
+messages can be matched by comparing whole words. That is the work of chapter~6's \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{timing closure}, and it is why production decoders are
+specific to one venue's format.
+
+\section{Book building in hardware}
+
+A trigger on single messages needs no book. A strategy that trades on the best bid or offer needs one, and a book in hardware is a
+different data structure from the ones of One Quant Book~13, chapter~19. Orders by reference need a hash table in \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAM} or external
+memory; price levels need an array indexed by the price's offset from a reference, with the best level found by a priority encoder over
+occupied levels; and every update must finish within the time between messages, or the design must queue them. Firms that build books
+in hardware keep only a few levels near the touch, for the few instruments that need them, and leave the rest to software.
+
+\section{Risk checks in cycles}
+
+A firm's hardware sends orders on behalf of a broker-dealer that must keep pre-trade controls ``under the direct and exclusive
+control'' of the broker (One Quant Book~11, chapter~27), controls that reject orders exceeding ``appropriate price or size parameters,
+on an order-by-order basis or over a short period of time''. In hardware those checks are comparisons and counters, and they cost a
+pipeline stage.
+
+\begin{definition}[Register map]\label{def:nw:programmable-hardware-ii-trading-designs:regmap}
+A \emph{register map}\index{register map} is the set of addresses at which a hardware design exposes its configuration and state to
+software (thresholds, limits, enable and kill bits, counters), read and written over the host's bus, and the document that defines
+them.
+\end{definition}
+
+\omcode{code/firm/hwtrade/hdl/hwt_trigger.sv}{108}{135}{The risk stage and the order template: a size limit, a kill bit and a token
+bucket, then the order's id, size and price patched in.}\label{lst:nw:programmable-hardware-ii-trading-designs:risk}
+
+\begin{proposition}[A token bucket's burst]\label{prop:nw:programmable-hardware-ii-trading-designs:bucket}
+A token bucket of capacity $B$ refilled with one token every $R$ cycles lets out at most $B + \lfloor t/R\rfloor$ orders in any interval
+of $t$ cycles. If software needs $t$ cycles to notice a runaway and set the kill bit, the hardware can send at most that many orders
+before it stops, and none after.
+\end{proposition}
+
+\begin{proof}
+The bucket holds at most $B$ tokens at the start of the interval and gains at most one every $R$ cycles; each order consumes one. The
+kill bit masks the output stage in the cycle it is set.
+\end{proof}
+
+The proposition is the requirement document of a hardware risk layer. At 156.25~MHz, with the chapter's bucket of 4 tokens refilled
+every 64 cycles, a software monitor that reacts in \qty{20}{\micro\second} lets out at most 52 orders; one that reacts in
+\qty{100}{\micro\second}, 248. The limits that matter in hardware are those that bind before software can act.
+
+\section{Order generation from templates}
+
+\begin{definition}[Order template]\label{def:nw:programmable-hardware-ii-trading-designs:template}
+An \emph{order template}\index{order template} is an order message prepared in advance, complete except for the fields that depend on
+the trigger (client order identifier, size, price), which the hardware patches in as it sends.
+\end{definition}
+
+\begin{definition}[TCP offload engine]\label{def:nw:programmable-hardware-ii-trading-designs:toe}
+A \emph{TCP offload engine}\index{TCP offload engine} implements the TCP protocol (sequence numbers, acknowledgements, retransmission)
+in a network card's hardware, so that the card can send and receive on a TCP connection without the host.
+\end{definition}
+
+Order entry runs over TCP (chapter~1), so a card that sends orders by itself must own the connection's state: its next sequence
+number, its acknowledgements, its retransmissions. A \omterm{def:nw:programmable-hardware-ii-trading-designs:toe}{TCP offload engine} does that; the \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{order template} then carries the TCP and IP
+headers too, with sequence number and checksums patched at send time. The software that owns the session (logon, heartbeats, the
+venue's session layer) shares the connection with the hardware through the same engine.
+
+\begin{dated}{2026-09}{A published hardware tick-to-trade figure}\label{dat:nw:programmable-hardware-ii-trading-designs:stac}
+In a STAC-T0 benchmark reported in June 2024, an FPGA system built on an AMD Alveo UL3524 card with a TCP and UDP core (an Exegy and AMD
+solution) was measured at a minimum of \qty{13.9}{\nano\second} for 507-byte frames and \qty{14.1}{\nano\second} for 68-byte frames, from
+``the last bit of inbound data needed to make a trading decision to the first bit of the simulated outbound order''. The definition
+excludes the time for the inbound bits to arrive, which the chapter's design, and any design, cannot avoid.
+\end{dated}
+
+\section{Hybrid designs: what stays in software and why}
+
+\begin{definition}[Hybrid trading system]\label{def:nw:programmable-hardware-ii-trading-designs:hybrid}
+A \emph{hybrid trading system}\index{hybrid trading system} splits a strategy between software, which computes its model, positions
+and parameters at its own pace, and hardware, which applies precomputed decisions to the market data at \omterm{def:nw:networking-for-trading:ser}{line rate}; software writes the
+hardware's registers and reads its counters and copies of what it sent.
+\end{definition}
+
+The split follows from what each side is good at. Hardware is fast and fixed: every feature costs logic, every change costs a build of
+hours and a verification of days, and it cannot hold much state. Software is slow and flexible: it can model, learn, net positions
+across venues and change within minutes. So software decides \emph{what} would be worth doing (``buy up to 700 at 100.02 or better if
+anyone offers'') and hardware decides \emph{when} (the cycle the offer arrives). Everything that needs history, many instruments or
+judgement stays in software; the one comparison that must happen first moves to the card.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (feed) at (0,0) {feed\\ (UDP)};
+\node[b,fill=omDef!18] (dec) at (2.5,0) {decode\\ (stage 1)};
+\node[b,fill=omThm!15] (risk) at (5.4,0) {risk: size,\\ bucket, kill\\ (stage 2)};
+\node[b,fill=omMeth!20] (tpl) at (8.3,0) {order\\ template\\ (stage 3)};
+\node[b,fill=gray!10] (out) at (11.0,0) {orders\\ (TCP offload)};
+\node[b,fill=omDef!8,minimum width=5.6cm] (sw) at (4.0,-2.4) {software on the host: model, positions, limits};
+\node[b,fill=gray!8] (regs) at (4.0,-1.25) {register map: thresholds, limits, kill, counters};
+\draw[->,thick] (feed) -- (dec);
+\draw[->,thick] (dec) -- node[above,font=\scriptsize]{trigger} (risk);
+\draw[->,thick] (risk) -- (tpl);
+\draw[->,thick] (tpl) -- (out);
+\draw[->,omThm] (sw) -- (regs);
+\draw[->,omThm] (regs.north -| risk.south) -- (risk.south);
+\draw[->,omThm] (regs.north -| dec.south) -- (dec.south);
+\draw[->,gray,dashed] (tpl.south) |- node[pos=0.25,right,font=\scriptsize]{copies of orders} (sw.east);
+\end{tikzpicture}
+
+\omcaption{The chapter's hybrid design. Three pipeline stages on the card decode the feed, check each candidate order and patch it into
+a template; software on the host writes the thresholds, limits and kill bit through the \omterm{def:nw:programmable-hardware-ii-trading-designs:regmap}{register map} and receives copies of everything
+the card sends.}\label{fig:nw:programmable-hardware-ii-trading-designs:hybrid}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,c/.style={draw,minimum height=0.55cm,minimum width=1.05cm,align=center,inner sep=1pt}]
+\foreach \i in {0,...,9} {\node at (1.1*\i,1.25) {\i};}
+\node[anchor=east] at (-0.7,1.25) {cycle};
+\foreach \i in {0,...,7} {\node[c,fill=omDef!15] at (1.1*\i,0.55) {beat \i};}
+\node[anchor=east] at (-0.7,0.55) {input};
+\node[c,fill=omDef!35] at (1.1*7,-0.15) {price};
+\node[anchor=east] at (-0.7,-0.15) {decode};
+\node[c,fill=omThm!25] at (1.1*8,-0.85) {risk};
+\node[anchor=east] at (-0.7,-0.85) {risk};
+\node[c,fill=omMeth!30] at (1.1*9,-1.55) {order};
+\node[anchor=east] at (-0.7,-1.55) {template};
+\end{tikzpicture}
+
+\omcaption{One packet with one add-order message (58 bytes: 20 of header, 2 of length, 36 of message) through the design, one beat of 8
+bytes a cycle. The price's last byte arrives in beat~7; the trigger is registered at the end of that cycle, the risk decision one cycle
+later, and the order in the cycle after: two cycles after the price, ten after the packet's first byte.}\label{fig:nw:programmable-hardware-ii-trading-designs:cycles}
+\end{omfigure}
+
+\section{Tutorial: a trigger on the simulator's feed, four ways}\label{tut:nw:programmable-hardware-ii-trading-designs:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run the trigger on two seconds of the exchange simulator's feed in Verilator, in Icarus, in a C++20 cycle model and in a
+Python model, check that all four send the same orders on the same cycles, and put the design in the wire-to-wire path.
+\textbf{End state:} \cref{tab:nw:programmable-hardware-ii-trading-designs:runs}, \cref{fig:nw:programmable-hardware-ii-trading-designs:race}
+and the green tests of \texttt{firm.hwtrade}.
+\begin{tutsteps}
+\item \textbf{The feed.} \texttt{make\_hwtrade\_fixture.py} runs One Quant Book~10's simulator for two seconds from the open (992 packets)
+  and stores them; \texttt{beats\_of} cuts each into beats with two idle cycles between packets (the day compressed: the bucket counts
+  cycles, not seconds).
+\item \textbf{Four models.} \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{CycleModel} and \texttt{cpp/firm\_hwtrade.hpp}
+  (\cref{lst:nw:programmable-hardware-ii-trading-designs:model}) run the same settings; the tests compare their outputs line for line.
+\item \textbf{The reference.} \texttt{triggers()} parses the same packets message by message in Python: every qualifying message must be
+  either an order or a reject.
+\item \textbf{The path.} \texttt{nw\_hwtrade.paths()} builds the hardware variant of \texttt{firm.wirepath} (the cage of chapter~2, the
+  card's transceivers, three cycles) next to chapter~5's software path, and \texttt{win\_probability} races each against a competitor;
+  \texttt{python fig\_hwtrade.py} writes the chart's data.
+\end{tutsteps}
+\textbf{What to change next.} Set the bucket to one token refilled every 10\,000 cycles and count the orders; move the kill bit to the
+cycle before the tenth order and check that exactly nine leave.
+\end{tutorial}
+
+\omcode{code/firm/hwtrade/cpp/firm_hwtrade.hpp}{20}{44}{The C++20 cycle model's clock edge: stage 3, then stage 2, then stage 1, each
+reading the registers the previous edge wrote, as the hardware does.}\label{lst:nw:programmable-hardware-ii-trading-designs:model}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrrr}
+\toprule
+Threshold (price $\times 10^4$) & Maximum size & Kill set at cycle & Orders & Rejects \\
+\midrule
+1\,000\,200 & 10\,000 & never & 108 & 5 \\
+1\,000\,300 & 10\,000 & never & 133 & 27 \\
+1\,000\,300 & 600 & never & 131 & 29 \\
+1\,000\,300 & 10\,000 & 3\,000 & 41 & 119 \\
+\bottomrule
+\end{tabular}
+\caption{The trigger on two seconds of the simulator's feed (instrument~1; sell-side add orders at or below the threshold), with a bucket
+of 4 tokens refilled every 64 cycles. Verilator, Icarus, the C++20 cycle model and the Python model give the same orders on the same
+cycles; orders and rejects add up to the qualifying messages the Python reference finds. Data: \texttt{firm.hwtrade}'s
+fixture.}\label{tab:nw:programmable-hardware-ii-trading-designs:runs}
+\end{table}
+
+The table shows each control at work. A lower threshold fires less often; the bucket rejects most of the extra triggers of the higher
+one, because they come in bursts; the size limit rejects two more; and the kill bit, set at cycle 3\,000, stops every later order. In
+the wire-to-wire path of chapter~5 (\cref{fig:nw:programmable-hardware-ii-trading-designs:race}), the hardware path is the cage's fibre,
+the card's transceivers (\qty{120}{\nano\second} each way, a model value) and three cycles: \qty{0.82}{\micro\second} at every quantile.
+The software path has a median of \qty{4.4}{\micro\second} and a 99th percentile of \qty{35}{\micro\second}. Against a competitor whose
+latency has a median of \qty{1}{\micro\second} (a lognormal of spread 0.3, a model), the hardware path wins 75\% of races and the software
+path one in ten thousand.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xmin=0,xmax=1,ymode=log,ymin=0.5,ymax=200,xlabel={quantile},ylabel={wire to wire (\unit{\micro\second}, log)},
+  ytick={1,10,100},yticklabels={1,10,100},legend columns=2,legend style={font=\footnotesize,at={(1.15,-0.32)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=q,y=software_us]{figdata/networks/07-programmable-hardware-ii-trading-designs/paths.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=q,y=hardware_us]{figdata/networks/07-programmable-hardware-ii-trading-designs/paths.csv};
+\legend{software path (chapter~5),hardware path}
+\nextgroupplot[xmode=log,xmin=250,xmax=12000,ymin=0,ymax=1.05,xlabel={competitor's median (ns, log)},ylabel={probability of winning},
+  xtick={300,1000,3000,10000},xticklabels={300,1\,000,3\,000,10\,000}]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=median_ns,y=software]{figdata/networks/07-programmable-hardware-ii-trading-designs/race.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=median_ns,y=hardware]{figdata/networks/07-programmable-hardware-ii-trading-designs/race.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Simulation: wire-to-wire latency of the software path of chapter~5 (Book~13's measured stages, the card and the cage) and of the
+hardware path (the cage, the card's transceivers at \qty{120}{\nano\second} each way, a model value, and three cycles at 156.25~MHz). Left:
+quantiles; the hardware path is a constant. Right: the probability of beating one competitor whose latency is lognormal with the given
+median and a spread of 0.3 (a model). Data: \texttt{fig\_hwtrade.py}.}\label{fig:nw:programmable-hardware-ii-trading-designs:race}
+\end{omfigure}
+
+\section{Build: the hardware trigger}\label{bld:nw:programmable-hardware-ii-trading-designs:hwtrade}
+
+\begin{build}
+\bfield{Purpose} A complete, tested \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{hardware trigger}: feed decoding, risk checks and an \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{order template}, with the three models that make
+it trustworthy, and a hardware variant of the firm's wire-to-wire path for chapter~29's plan.
+\bfield{Interface} \texttt{hdl/hwt\_trigger.sv} (parameters \texttt{LOC}, \texttt{BURST}, \texttt{REFILL}; registers \texttt{thresh},
+\texttt{max\_qty}, \texttt{kill}; outputs the order's id, size, price and a reject counter); \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbenches} \texttt{tb/hwt\_tb.cpp} and
+\texttt{tb/hwt\_tb.sv}; C++20 \texttt{firm::hwtrade::Model}; Python \texttt{firm\_hwtrade}: \texttt{beats\_of}, \texttt{write\_stim},
+\texttt{CycleModel}, \texttt{triggers}, \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{run\_verilator}, \texttt{run\_icarus},
+\texttt{parse\_output}, \texttt{wirepath\_stage}.
+\bfield{Rules} One order per qualifying message at most; nothing leaves while the kill bit is set; sizes above the limit are rejected, not
+clipped; the bucket never lends; the models agree with the HDL register for register.
+\bfield{Acceptance tests} \texttt{code/firm/hwtrade/}: the Python model reproduces the fixture's four settings, and every qualifying
+message is an order or a reject; Verilator and Icarus print the same orders as the Python model; the C++20 model reproduces the fixture;
+the size limit at its boundary; nothing after the kill bit; the bucket's rationing; two cycles from price to order.
+\bfield{Stretch} Keep the best offer of the instrument from add, execute and delete messages and fire on it; move the three checks into one
+cycle and measure the \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{critical path} it would need.
+\end{build}
+
+\begin{omsources}
+\item STAC, ``STAC-T0'' results with an Exegy and AMD FPGA solution (2024).
+\item 17 CFR 240.15c3-5 (the market access rule).
+\item Nasdaq, \emph{TotalView-ITCH 5.0} specification (Add Order layout); the simulator's \path{code/firm/exchsim/PROTOCOL.md}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:1}
+A packet carries one 36-byte add order behind the 20-byte header and the 2-byte length. In which beat is the price's last byte, and how many
+nanoseconds after the packet's first beat does the design emit the order at 156.25~MHz?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:2}
+With a bucket of 4 tokens refilled every 64 cycles at 156.25~MHz, what is the sustained maximum rate of orders?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:3}
+How many orders can the chapter's design send before a software monitor that reacts in \qty{50}{\micro\second} sets the kill bit?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:4}
+In \cref{tab:nw:programmable-hardware-ii-trading-designs:runs}, why does raising the threshold from 1\,000\,200 to 1\,000\,300 add 25 orders but
+22 rejects?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:5}
+Why does the design reject orders above the size limit instead of sending them at the limit?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:6}
+Name three decisions the chapter's strategy leaves in software, and why each would be hard in hardware.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:7}
+\emph{Coding.} With \texttt{firm.hwtrade.CycleModel}, set the bucket to 1 token refilled every 10\,000 cycles and count the orders at threshold
+1\,000\,300. Then set the kill bit one cycle before the tenth order of the unrestricted run and count again.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:8}
+\emph{Find the flaw.} ``Our hardware fires in 13 nanoseconds, so our wire-to-wire latency is 13 nanoseconds.''
+\end{exercise}
+
+\section{Problem: The Trigger That Must Not Fire Twice}
+
+\begin{problem}[{Weekend problem --- a hybrid path, a race and a runaway}]\label{pb:nw:programmable-hardware-ii-trading-designs:1}
+A firm moves the decision of a latency-sensitive strategy onto the chapter's \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{hardware trigger}. Use the chapter's numbers: the software path's
+wire-to-wire median \qty{4.39}{\micro\second} and 99th percentile \qty{35.3}{\micro\second}; the hardware path \qty{0.82}{\micro\second}
+(\qty{263}{\nano\second} of cage in, \qty{120}{\nano\second} of card in, three cycles at 156.25~MHz, \qty{120}{\nano\second} of card out,
+\qty{295}{\nano\second} of cage out); a competitor with a lognormal latency; a bucket of 4 tokens refilled every 64 cycles.
+
+\medskip\noindent\textbf{Part I --- The path.}
+\begin{enumerate}
+\item Add up the hardware path's stages.
+\item How much of it is the decision itself?
+\item What is the hardware path's 99th percentile, and why?
+\item By how much does the hardware path beat the software path at the median, and at the 99th percentile?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The race.}
+\begin{enumerate}[resume]
+\item Against a competitor with a median of \qty{1}{\micro\second}, what are the two paths' probabilities of winning (the chapter's
+  simulation)?
+\item And against one with a median of \qty{5}{\micro\second}?
+\item Which part of the hardware path would you shorten next, and what is left once the decision is gone?
+\item What does the race model leave out?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The runaway.}
+\begin{enumerate}[resume]
+\item A software monitor needs \qty{20}{\micro\second} to see a runaway and set the kill bit. How many orders can leave meanwhile?
+\item With a monitor on the card itself, reacting in 16 cycles?
+\item Why does the kill bit act on stage 3 rather than only on stage 2?
+\item What limits would you add to the card, and which should stay in the broker's layer?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the two paths' latencies, their probabilities of winning against a competitor with a median of
+  \qty{1}{\micro\second}, and the orders the bucket lets out before a \qty{20}{\micro\second} kill.
+\item Is the \qty{0.82}{\micro\second} path worth building for a strategy that races competitors at \qty{5}{\micro\second}?
+\item What does the firm give up by moving the decision into hardware?
+\item How often can the threshold change, and who changes it?
+\item Why must the software receive copies of every order the card sends?
+\item How would you test the design against a recorded day before it trades?
+\item What would a failure of the \omterm{def:nw:programmable-hardware-ii-trading-designs:regmap}{register map}'s write path do, and how would the design detect it?
+\item In one sentence: what does hardware decide, and what does software decide?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-ii-trading-designs:1}
+How does an FPGA parse a market-data feed while the packet is still arriving?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-ii-trading-designs:2}
+What risk checks would you put in hardware, and how do you prove they cannot be bypassed?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:nw:programmable-hardware-ii-trading-designs:3}
+What stays in software in a \omterm{def:nw:programmable-hardware-ii-trading-designs:hybrid}{hybrid trading system}, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-ii-trading-designs:4}
+How do you send an order over TCP from an FPGA?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-ii-trading-designs:5}
+How would you verify that the \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{hardware trigger} and its software model agree, and what would you do when they disagree?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:nw:programmable-hardware-ii-trading-designs:6}
+A vendor quotes 14 nanoseconds tick to trade. What questions do you ask?
+\end{interviewq}

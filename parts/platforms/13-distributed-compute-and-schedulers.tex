@@ -1,0 +1,362 @@
+\chapter{Distributed Compute and Schedulers}\label{ch:pl:distributed-compute-and-schedulers}
+
+A \omterm{def:pl:distributed-compute-and-schedulers:sweep}{parameter sweep} of ten thousand backtests was submitted at 18:00 on a Friday and finished at 13:47 on the Saturday. From 10:20 that morning,
+fewer than a tenth of the cluster's cores had been busy. Forty of the tasks were thirty times longer than the median, and they had
+been submitted last: the cluster reached them after twelve hours and then waited seven and a half for them. Nothing had failed; the scheduler had done
+exactly what it was told. This chapter is about what to tell it: how a sweep becomes a \omterm{def:pl:distributed-compute-and-schedulers:graph}{task graph}, how schedulers order the graph on a
+cluster, why the last few tasks decide when a sweep ends, and what caching, retries and backups cost and save.
+
+\section{Clusters and what they are for}
+
+\begin{definition}[Compute cluster, job scheduler]\label{def:pl:distributed-compute-and-schedulers:cluster}
+A \emph{compute cluster}\index{compute cluster} is a set of machines (nodes), each with cores, memory and sometimes accelerators, managed
+as one pool of capacity. A \emph{job scheduler}\index{job scheduler} decides which submitted work runs on which part of the pool and when,
+according to a policy, the resources each piece of work requests and the priorities of the users who submitted it.
+\end{definition}
+
+A research platform uses its cluster for work that is large, repetitive and mostly independent: \omterm{def:pl:distributed-compute-and-schedulers:sweep}{parameter sweeps}, walk-forward refits
+(Book~7, chapter~20), simulations over seeds (chapters~11 and~12), risk scenarios (chapters~18 and~20), model training (Book~12). Most of it
+is the easiest kind of parallel work there is.
+
+\begin{definition}[Embarrassingly parallel workload, parameter sweep]\label{def:pl:distributed-compute-and-schedulers:sweep}
+A workload is \emph{embarrassingly parallel}\index{embarrassingly parallel workload} when it splits into tasks that do not communicate
+while they run. A \emph{parameter sweep}\index{parameter sweep} is such a workload: the same computation, typically a backtest, run once
+for each point of a grid of parameters, data slices or seeds.
+\end{definition}
+
+\omterm{def:pl:distributed-compute-and-schedulers:sweep}{Embarrassingly parallel} does not mean embarrassingly easy to finish on time. The tasks of a sweep have unequal durations --- a longer
+lookback, a busier market, a slower data slice --- and the sweep ends only when its last task does.
+
+\begin{definition}[Makespan, straggler]\label{def:pl:distributed-compute-and-schedulers:makespan}
+The \emph{makespan}\index{makespan} of a set of tasks is the time from the start of the first to the end of the last. A
+\emph{straggler}\index{straggler} is a task that finishes long after most of its peers, because it is intrinsically long, because it runs
+on a slow or overloaded machine, or because it failed and was run again.
+\end{definition}
+
+\section{Schedulers and queues}
+
+The simplest scheduler keeps one queue and gives the next free core the task at its head: first in, first out. Graham (1969) analysed this
+\emph{list scheduling} and bounded it: whatever the order, the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} on $m$ identical cores is at most $2 - 1/m$ times the best possible,
+and taking the tasks longest first --- \emph{longest processing time}, LPT --- tightens the bound to $4/3 - 1/(3m)$. The bounds rest on a
+simple observation, which is also the chapter's measuring stick.
+
+\begin{proposition}[Lower bound on the makespan]\label{prop:pl:distributed-compute-and-schedulers:bound}
+No schedule of tasks with durations $d_i$ on $m$ cores finishes before $\max\bigl(\sum_i d_i / m,\ \max_i d_i,\ L\bigr)$, where $L$ is the
+longest chain of dependent tasks: the work must be done by $m$ cores, the longest task runs on one core, and a chain runs in sequence.
+\end{proposition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{279}{292}{The lower bound of \cref{prop:pl:distributed-compute-and-schedulers:bound}, with the
+longest chain computed over the task graph.}\label{lst:pl:distributed-compute-and-schedulers:bound}
+
+LPT needs to know which tasks are long. A scheduler does not know durations, only estimates --- from the parameters (a longer window, a
+longer history), from earlier runs of the same code, or from the user. The chapter's estimates are right to within a factor $e^{0.3z}$ with
+$z$ standard normal, a typical spread for a model of run time.
+
+\begin{definition}[Fair-share scheduling]\label{def:pl:distributed-compute-and-schedulers:fairshare}
+\emph{Fair-share scheduling}\index{fair-share scheduling} gives each user or team a target share of the cluster and orders the queue so that
+those using less than their share are served first; a team that submits ten thousand tasks does not lock out a team that submits five hundred
+an hour later.
+\end{definition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{109}{129}{Fair share in its simplest form: the next task comes from the team using the fewest
+cores per unit of its target.}\label{lst:pl:distributed-compute-and-schedulers:fairshare}
+
+\begin{dated}{2026-09}{Fair share in a production scheduler}\label{dat:pl:distributed-compute-and-schedulers:slurm}
+Slurm, a widely used open-source workload manager, computes a fair-share factor from normalised shares $S$ and normalised usage $U$
+(its ``Fair Tree'' algorithm, the default since Slurm 19.05): an association's level fair-share is $S/U$, above 1 when it is under-served,
+and users are ranked so that the children of a better-served account always rank below those of a worse-served one.
+\end{dated}
+
+\begin{definition}[Work stealing]\label{def:pl:distributed-compute-and-schedulers:stealing}
+\emph{Work stealing}\index{work stealing} is a decentralised scheduling policy: each worker keeps its own queue of tasks and takes from its
+head; a worker whose queue is empty takes a task from the far end of another worker's queue. Blumofe and Leiserson (1999) analysed it
+for multithreaded computations; it balances load without a central queue.
+\end{definition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{132}{154}{Work stealing: tasks dealt round robin to per-core deques, an idle core stealing
+from the fullest.}\label{lst:pl:distributed-compute-and-schedulers:stealing}
+
+\section{Task graphs}
+
+\begin{definition}[Task graph]\label{def:pl:distributed-compute-and-schedulers:graph}
+A \emph{task graph}\index{task graph} is a directed acyclic graph whose nodes are tasks, each with a resource request and an estimated
+duration, and whose edges say which task's output another task reads; a task is ready when all its predecessors have finished.
+\end{definition}
+
+A sweep is rarely a flat list. Its backtests read features; the features read cleaned data; the data were built once for many sweeps.
+Written as a graph, each shared stage is one task that many backtests depend on, and its output can be cached under the content key of
+Book~7's research workflow (chapter~29): the hash of its code, parameters and inputs. The next sweep over the same data finds the features
+in the cache and runs only the backtests.
+
+\section{Parameter sweeps and stragglers}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \i/\l in {0/{feature stage 1},1/{feature stage 2},2/{\dots},3/{feature stage 100}} {
+  \node[draw,rounded corners=2pt,fill=omMeth!15,minimum width=2.2cm] (f\i) at (\i*3,1.4) {\l};}
+\foreach \i in {0,1,3} {\foreach \j in {-1,0,1} {\draw[->] (f\i.south) -- ++(\j*0.8,-0.8);}}
+\foreach \i in {0,1,3} {\node[font=\tiny] at (\i*3,0.1) {100 backtests};}
+\node[draw,rounded corners=2pt,fill=gray!10,align=center,minimum width=10cm] (c) at (4.5,-0.6) {cluster: 24 nodes $\times$ 16 cores;
+one node four times slower; running work fails at 0.002 per core-hour};
+\end{tikzpicture}
+
+\omcaption{The chapter's \omterm{def:pl:distributed-compute-and-schedulers:graph}{task graph} and cluster. A hundred feature stages of twenty minutes each, each read by a hundred backtests; every
+backtest's duration drawn from the measured spread, forty of them thirty times the median in the flat sweep. The feature stages are cached
+by content key.}\label{fig:pl:distributed-compute-and-schedulers:graph}
+\end{omfigure}
+
+The chapter's cluster is simulated (\texttt{firm.jobgraph}); its tasks are not invented. Twenty-four small backtests of chapter~11 ---
+level-3 replays of five-minute \texttt{firm.tape} sessions --- were run on this laptop through the same scheduler interface, with one
+worker: their median was 0.089~seconds, the spread of their log durations 0.76, and the longest took 8.0 times the median. The simulated
+sweep keeps that spread and scales the median to fifteen minutes: 10\,000 backtests, forty of them thirty times the median (seven and a
+half hours, a long lookback on a long history) submitted last, as a sweep over a grid naturally submits its largest parameters. The work
+adds up to 3\,649 core-hours on 384 cores, a lower bound of 9.50~hours.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,xlabel={hours after submission},ylabel={busy cores (log scale)},xmin=0,xmax=21,
+  ymode=log,ymin=0.7,ymax=600,unbounded coords=jump,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=t_h,y=busy]{figdata/platforms/13-distributed-compute-and-schedulers/profile_fifo.csv};
+\addplot[color=omDef,thick,densely dashed,const plot] table[x=t_h,y=busy]{figdata/platforms/13-distributed-compute-and-schedulers/profile_lpt.csv};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:14,45) {first in, first out};
+\node[omDef,font=\scriptsize,anchor=north west,align=left] at (axis cs:10.6,330) {longest first, with backups:\\ends at 10.0};
+\draw[black,dotted] (axis cs:9.50,0.7) -- (axis cs:9.50,600) node[pos=0.3,right,font=\scriptsize]{lower bound};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Busy cores over time for the same sweep under two schedules, sampled every ten minutes, on a log scale. First in, first out keeps
+the cluster full for about nine hours, reaches the forty long tasks only after twelve, and runs them on an almost idle cluster until
+the last ends at 19.8~hours; longest first with speculative backups ends at 10.0~hours. Data: \texttt{fig\_jobgraph.py}.}\label{fig:pl:distributed-compute-and-schedulers:profile}
+\end{omfigure}
+
+\Cref{tab:pl:distributed-compute-and-schedulers:policies} is the sweep under each policy. First in, first out reaches the last of the forty long
+tasks only after twelve hours, and the sweep ends at 19.8~hours --- 475.0 node-hours of a cluster held for a job that needed 3\,649
+core-hours. Longest first starts the long tasks at once and ends at 11.8~hours.
+\omterm{def:pl:distributed-compute-and-schedulers:stealing}{Work stealing}, which balances load but does not reorder it, ends at 16.3.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+policy & \multicolumn{2}{c}{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} (hours)} & \multicolumn{2}{c}{node-hours} & backups \\
+ & plain & with backups & plain & with backups & \\
+\midrule
+first in, first out & 19.79 & 20.32 & 475.0 & 487.6 & 152 \\
+longest first & 11.80 & 10.02 & 283.3 & 240.4 & 105 \\
+\omterm{def:pl:distributed-compute-and-schedulers:stealing}{work stealing} & 16.33 & 16.40 & 391.9 & 393.5 & 145 \\
+longest first, no slow node & 10.32 & --- & 247.6 & --- & --- \\
+\midrule
+lower bound & \multicolumn{2}{c}{9.50} & & & \\
+\bottomrule
+\end{tabular}
+\caption{The 10\,000-task sweep on 384 cores under each policy, without and with speculative backups (a backup after 2.5 times the estimate),
+and longest first on a cluster without the slow node. Node-hours are the cluster's 24 nodes held for the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan}.}
+\label{tab:pl:distributed-compute-and-schedulers:policies}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,ybar,bar width=12pt,ylabel={makespan (hours)},ymin=0,ymax=26,
+  symbolic x coords={FIFO,LPT,work stealing},xtick=data,enlarge x limits=0.25,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2},nodes near coords,
+  nodes near coords style={font=\scriptsize,rotate=90,anchor=west,/pgf/number format/fixed,/pgf/number format/fixed zerofill,/pgf/number format/precision=2},point meta=y,ybar=4pt]
+\addplot[fill=omThm!45,draw=omThm] table[x=policy,y=plain]{figdata/platforms/13-distributed-compute-and-schedulers/makespans.csv};
+\addlegendentry{plain}
+\addplot[fill=omDef!45,draw=omDef] table[x=policy,y=backups]{figdata/platforms/13-distributed-compute-and-schedulers/makespans.csv};
+\addlegendentry{with backups}
+\draw[black,dashed] ({rel axis cs:0,0}|-{axis cs:FIFO,9.50}) -- ({rel axis cs:1,0}|-{axis cs:FIFO,9.50})
+  node[pos=0.335,below,font=\tiny]{lower bound 9.50};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{Makespan} of the sweep by policy, without and with speculative backups (after 2.5 times the estimate), against the lower bound.
+First in, first out (FIFO) and \omterm{def:pl:distributed-compute-and-schedulers:stealing}{work stealing} run the long tasks last; longest first (LPT) runs them first. Data:
+\texttt{fig\_jobgraph.py}.}\label{fig:pl:distributed-compute-and-schedulers:makespans}
+\end{omfigure}
+
+\begin{definition}[Speculative execution]\label{def:pl:distributed-compute-and-schedulers:spec}
+\emph{Speculative execution}\index{speculative execution} launches a second copy of a task that is running much longer than expected, on
+another machine; the first copy to finish is kept and the other is killed.
+\end{definition}
+
+Google's MapReduce paper named the problem and the cure: a \omterm{def:pl:distributed-compute-and-schedulers:makespan}{straggler} can be a machine with a bad disk whose read rate falls from 30 to
+1~MB/s, and when a job is close to completion the master schedules backup executions of the remaining in-progress tasks; their sort took
+44\% longer with backups disabled. The threshold matters. The chapter's backups start when a task has run 2.5 times its estimate: with
+estimates right to within $e^{0.3z}$, an honest task passes that point with probability 0.11\% ($z > 3.05$), so backups go mostly to tasks on
+the slow node. Longest first gains 1.8~hours from them; first in, first out loses 0.5, because its long tasks are late to start, not
+slow to run, and the backups only take cores; the wasted work --- killed copies, failed and retried attempts --- is 91 to 130
+core-hours, 2.5 to 3.6\% of the sweep.
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{206}{227}{Speculative execution in the simulator: a late task's backup goes to a free core on
+another node before the queue is served.}\label{lst:pl:distributed-compute-and-schedulers:spec}
+
+\begin{example}[The sweep that finished on Saturday]\label{ex:pl:distributed-compute-and-schedulers:sweep}
+Longest first with backups ends at 10.02~hours, 5.5\% above the lower bound of 9.50 hours. Without the slow node, but also without
+backups, it ends at 10.32: the backups recover more than the slow node costs, because they also rescue the tasks whose estimates were
+wrong and those that failed. First in, first out on the same cluster ends at 19.79~hours, twice as long, and holds 475 node-hours against
+240. The cluster had been almost idle for three and a half hours: from 16.3~hours after submission, fewer than a tenth of its cores were
+busy.
+\end{example}
+
+\section{Fair share between teams}
+
+A second team submits 500 backtests an hour after the first team's sweep. Under first in, first out they wait behind all 10\,000: half of them
+are done 8.28~hours after submission and the last 11.4~hours after. Under fair share with equal targets, every core that frees goes to the
+second team until it holds half the cluster: half its tasks are done in 0.59~hours and all in 2.64, while the first team's sweep ends at
+16.68~hours instead of 19.79 --- earlier, not later, because interleaving the second team's tasks changes where and when the first
+team's long tasks run, and that, not the extra 5\% of work, sets its end.
+
+\section{Caching, failure and cost}
+
+When every backtest recomputes its features (twenty minutes each), the sweep needs 6\,922 core-hours and 19.3~hours; written as a \omterm{def:pl:distributed-compute-and-schedulers:graph}{task graph}
+with a hundred feature stages it needs 3\,514 core-hours and 11.4~hours; the next sweep over the same data finds the hundred stages in the
+cache and needs 3\,475 core-hours and 10.3~hours. Failures cost what was lost: a failed attempt is retried from its start, so a failure of a
+seven-hour task costs up to seven hours, which is why long tasks write checkpoints (Book~12, chapter~23). The cost of a sweep is the capacity
+it holds: on a cluster rented by the node-hour, the difference between first in, first out and longest first with backups is 235 node-hours for
+the same answers.
+
+\section{Tutorial: a sweep on a simulated cluster}\label{tut:pl:distributed-compute-and-schedulers:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Calibrate a sweep on real backtests, schedule it under four policies on a simulated cluster, and measure what backups,
+fair share and caching change. \textbf{End state:} \cref{tab:pl:distributed-compute-and-schedulers:policies} and
+\cref{fig:pl:distributed-compute-and-schedulers:profile}.
+\begin{tutsteps}
+\item \textbf{Calibrate}: \texttt{bench\_jobgraph.py} runs 24 small backtests through \texttt{LocalExecutor} with one worker;
+\texttt{measured\_sigma()}.
+\item \textbf{Sweep}: \texttt{sweep(sigma)}, \texttt{cluster()}, \texttt{lower\_bound}.
+\item \textbf{Policies}: \texttt{policies(sigma)}; \texttt{profile(sigma)} for the busy-core curves.
+\item \textbf{Teams}: \texttt{fair\_share(sigma)}.
+\item \textbf{Caching}: \texttt{caching(sigma)} on the \omterm{def:pl:distributed-compute-and-schedulers:graph}{task graph}.
+\end{tutsteps}
+\textbf{What to change next.} Give the scheduler perfect estimates and see how close longest first comes to the bound; give it no estimates
+(every task the median) and see what remains of its advantage.
+\end{tutorial}
+
+\section{Build: the job graph}\label{bld:pl:distributed-compute-and-schedulers:jobgraph}
+
+\begin{build}
+\bfield{Purpose} A task-graph and scheduling library the platform uses to plan and run sweeps, and a simulator to choose policies before
+spending node-hours.
+\bfield{Interface} \texttt{Task}, \texttt{Cluster}, \texttt{simulate(tasks, cluster, policy, spec, cache) -> Schedule};
+\texttt{FIFO}, \texttt{LPT}, \texttt{FairShare}, \texttt{WorkStealing}; \texttt{lower\_bound}; \texttt{utilisation};
+\texttt{LocalExecutor}.
+\bfield{Rules} The scheduler sees estimates, never durations; a failed or preempted attempt is retried from its start; a backup runs on
+another node and the loser is killed and counted as waste; a cache hit takes no time; everything is seeded.
+\bfield{Acceptance tests} \texttt{code/firm/jobgraph/tests/}: Graham's example ($3,3,2,2,2$ on two cores: 7 against an optimum of 6); first
+in, first out against longest first; dependencies and the chain bound; fair share splitting cores; \omterm{def:pl:distributed-compute-and-schedulers:stealing}{work stealing} on an unbalanced deal;
+backups rescuing a slow node; retries; cache hits; the local executor's order.
+\bfield{Stretch} Memory classes and multi-core tasks with backfilling; preemptible (spot) capacity at a lower price; usage decaying over time in
+fair share.
+\end{build}
+
+\begin{omsources}
+\item R.~L. Graham, ``Bounds on multiprocessing timing anomalies'', \emph{SIAM Journal on Applied Mathematics} 17(2), 1969.
+\item J.~Dean and S.~Ghemawat, ``MapReduce: simplified data processing on large clusters'', OSDI 2004.
+\item J.~Dean and L.~A. Barroso, ``The tail at scale'', \emph{Communications of the ACM} 56(2), 2013.
+\item R.~D. Blumofe and C.~E. Leiserson, ``Scheduling multithreaded computations by work stealing'', \emph{Journal of the ACM} 46(5), 1999.
+\item Slurm documentation, ``Fair Tree Fairshare Algorithm''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:1}
+Five tasks of durations 3, 3, 2, 2, 2 run on two cores. What is the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} under longest first, and what is the best possible?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:2}
+The sweep's median task takes fifteen minutes. How long do the forty long tasks take on a normal node, and on the slow node?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:3}
+Why is the lower bound of the chapter's sweep the total work divided by the cores, and not the longest task?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:4}
+Why does the backup threshold of 2.5 times the estimate rarely fire for a healthy task, and what would a threshold of 1.5 do?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:5}
+Why does \omterm{def:pl:distributed-compute-and-schedulers:stealing}{work stealing} finish later than longest first, although no core is idle while work remains queued?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:6}
+Fair share lets the second team finish sooner. What does it do to the first team's end, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:distributed-compute-and-schedulers:7}
+\emph{Coding.} Run \texttt{policies} with the long tasks submitted first instead of last. What happens to first in, first out, and to
+longest first?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:distributed-compute-and-schedulers:8}
+\emph{Find the flaw.} ``The sweep ran all night on a cluster of 384 cores and used only 3\,649 core-hours, so the cluster is too big: we
+will halve it.''
+\end{exercise}
+
+\section{Problem: The Sweep That Finished on Saturday}
+
+\begin{problem}[{Weekend problem --- ten thousand backtests and a slow node}]\label{pb:pl:distributed-compute-and-schedulers:1}
+The chapter's sweep, cluster and policies.
+
+\medskip\noindent\textbf{Part I --- The workload.}
+\begin{enumerate}
+\item Why is a \omterm{def:pl:distributed-compute-and-schedulers:sweep}{parameter sweep} \omterm{def:pl:distributed-compute-and-schedulers:sweep}{embarrassingly parallel}?
+\item How was the spread of task durations obtained?
+\item What is the total work, and the lower bound on 384 cores?
+\item Where are the forty long tasks in the submission order, and why?
+\item What makes a task a \omterm{def:pl:distributed-compute-and-schedulers:makespan}{straggler} here, in three ways?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Policies.}
+\begin{enumerate}[resume]
+\item What does Graham's analysis guarantee for list scheduling and for longest first?
+\item What does longest first need that first in, first out does not?
+\item Why does \omterm{def:pl:distributed-compute-and-schedulers:stealing}{work stealing} not fix the long tasks?
+\item What does fair share change between two teams?
+\item When does \omterm{def:pl:distributed-compute-and-schedulers:spec}{speculative execution} help, and when does it waste?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The numbers.}
+\begin{enumerate}[resume]
+\item Give the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} of each policy with and without backups.
+\item How long was the cluster almost idle under first in, first out?
+\item How far from the lower bound is the best schedule, and why?
+\item What does fair share do for the second team's first half of tasks?
+\item What do the \omterm{def:pl:distributed-compute-and-schedulers:graph}{task graph} and the cache save?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} and node-hours of the sweep under each policy, the gain from \omterm{def:pl:distributed-compute-and-schedulers:spec}{speculative execution}, and
+the distance of the best schedule from the lower bound.
+\item What would you change in the platform's default scheduling of sweeps?
+\item What would you ask users to provide with each sweep?
+\item How would you decide the size of the cluster?
+\item In one sentence: what decides when a sweep ends?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:distributed-compute-and-schedulers:1}
+Your sweep's last 1\% of tasks takes as long as the first 99\%. What do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:distributed-compute-and-schedulers:2}
+What is \omterm{def:pl:distributed-compute-and-schedulers:spec}{speculative execution}, and when is it a bad idea?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:distributed-compute-and-schedulers:3}
+Two teams share a cluster; one submits huge sweeps. How do you keep the other productive?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:distributed-compute-and-schedulers:4}
+How would you structure ten thousand backtests that share expensive feature computations?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:distributed-compute-and-schedulers:5}
+Design the scheduling layer of a research platform's \omterm{def:pl:distributed-compute-and-schedulers:cluster}{compute cluster}.
+\end{interviewq}

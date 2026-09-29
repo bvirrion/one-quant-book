@@ -1,0 +1,304 @@
+\chapter{Real-Time Risk}\label{ch:pl:real-time-risk}
+
+Each of two desks was inside its limit all afternoon. Together they were short almost twice the firm's appetite in the same index, and
+nobody saw it until the \omterm{def:pl:the-platform-map:batch}{end-of-day batch}, because nothing added the desks up while they traded. Each desk's system answered the question
+it was asked --- am I inside my limit? --- and the question nobody's system was asked is the one that mattered. This chapter builds the
+aggregator that asks it on every fill and every market move: exposures added up the risk hierarchy incrementally, sensitivities cached and
+refreshed when the market moves, limits checked in the loop, and a what-if answer before a trade is sent.
+
+\section{What real-time means for risk}
+
+\begin{definition}[Real-time risk system]\label{def:pl:real-time-risk:system}
+A \emph{real-time risk system}\index{real-time risk system} computes the firm's exposures and limit usage continuously from the \omterm{def:pl:position-and-pnl-services:service}{position
+service}'s executions and the market's moves, fast enough that a breach is seen while the trading that causes it can still be stopped, and
+serves them with their timestamps.
+\end{definition}
+
+The end-of-day risk engine of Book~6 (chapter~29) revalues every position under hundreds of scenarios once a night; the pre-trade gate of
+Book~13 (chapter~22) checks one order in microseconds against limits it holds in memory. Real-time risk sits between them: seconds, not
+nanoseconds or hours, and the whole firm, not one order. Its numbers are coarser than the nightly engine's (sensitivities, not full
+revaluation) and its scope wider than the gate's (every desk at once). The timeliness of risk data is one of the principles of BCBS~239
+(Book~6, chapter~29): a figure available the next morning describes a risk that has already been taken.
+
+\section{Aggregation along the hierarchy}
+
+\begin{definition}[Exposure aggregation]\label{def:pl:real-time-risk:aggregation}
+\emph{Exposure aggregation}\index{exposure aggregation} adds trade-level exposures --- here delta-dollars in the index --- up the risk
+hierarchy (trade, book, desk, firm) so that every node carries the sum of its descendants and can be compared with its own limit.
+\end{definition}
+
+A desk's limit and the firm's are not a partition: the firm's appetite is usually less than the sum of its desks' limits, because desks are
+not expected to use their limits at the same time and in the same direction. That is exactly what they sometimes do. The chapter's
+hierarchy has one firm, two desks and a book each; the firm's appetite and each desk's limit are \$50~million of index delta, which
+\texttt{firm.riskctl}'s rule allows (a desk's limit never above the firm's).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum width=3.4cm,minimum height=0.9cm},>=Stealth]
+\node[box,fill=omThm!15] (f) at (0,0) {firm: limit \$50m\\ close $-\$90.8$m (breached)};
+\node[box,fill=omDef!12] (a) at (-3,-1.5) {desk A: limit \$50m\\ close $-\$47.6$m};
+\node[box,fill=omDef!12] (b) at (3,-1.5) {desk B: limit \$50m\\ close $-\$43.2$m};
+\node[box,fill=gray!10] (a1) at (-3,-3) {book: index puts\\ 21\,000 units, six lines};
+\node[box,fill=gray!10] (b1) at (3,-3) {book: index futures\\ 8\,800 short};
+\draw[->] (a1) -- (a); \draw[->] (b1) -- (b); \draw[->] (a) -- (f); \draw[->] (b) -- (f);
+\node[font=\scriptsize\itshape,align=left,anchor=west] at (5.0,-2.2) {each fill and tick adds\\ its difference upwards};
+\end{tikzpicture}
+
+\omcaption{The chapter's risk hierarchy at the close, with each node's limit and delta. Every node is inside its limit except the one no
+desk's system computes.}\label{fig:pl:real-time-risk:hierarchy}
+\end{omfigure}
+
+\section{Incremental updates}
+
+\begin{definition}[Incremental aggregation]\label{def:pl:real-time-risk:incremental}
+\emph{Incremental aggregation}\index{incremental aggregation} updates aggregates by adding only the change each event causes --- a fill's
+exposure, a trade's change after a market move --- to the node and its ancestors, instead of recomputing the tree from all trades.
+\end{definition}
+
+\begin{definition}[Sensitivity cache]\label{def:pl:real-time-risk:cache}
+A \emph{sensitivity cache}\index{sensitivity cache} keeps each trade's sensitivities (delta, gamma, vega) computed by the pricing library at
+one market snapshot, uses them to carry exposures forward as the market moves, and recomputes them when the market has moved more than a
+threshold since.
+\end{definition}
+
+The chapter's aggregator (\texttt{firm.rtrisk}) keeps, for each trade, the delta-dollars it currently contributes. A fill adds the new
+contribution minus the old to the trade's book and every ancestor. A market tick carries each cached delta forward with its gamma, $(\Delta +
+\Gamma\,\mathrm{d}S)\,q\,S$, and applies the differences; when the spot has moved more than 0.5\% since the cache was filled, every
+instrument is repriced by Book~5's library (\texttt{firm.pricing}, bump and reprice) and the differences are applied again. The aggregates are
+never rebuilt; the tests check that they always equal a rebuild.
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{50}{76}{The sensitivity cache: Greeks from the pricing library at one spot, stale beyond a
+threshold.}\label{lst:pl:real-time-risk:cache}
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{99}{134}{Incremental aggregation: a trade's contribution, its change added to every ancestor, and
+limits checked, on every fill and every tick.}\label{lst:pl:real-time-risk:aggregator}
+
+\begin{definition}[Risk snapshot]\label{def:pl:real-time-risk:snapshot}
+A \emph{risk snapshot}\index{risk snapshot} is the aggregator's state at one time: every node's exposure, the market time it reflects, the
+time and spot of the sensitivities it used and their age, and the limits breached.
+\end{definition}
+
+A snapshot that does not say how old its sensitivities are cannot be trusted; one that does can be used with judgement. At the close of the
+chapter's afternoon the cache was last refreshed 65 minutes earlier (3\,890~seconds): the spot had not moved 0.5\% since, so the carried
+deltas were within the threshold's accuracy.
+
+\section{Sensitivities, full revaluation and the gap}
+
+Carrying exposures with cached sensitivities is fast and approximate; full revaluation is exact and slow. The gap is measured by pricing
+desk A's options at the close both ways for moves from $-10\%$ to $+10\%$ (\cref{fig:pl:real-time-risk:gap}): the delta-gamma P\&L from
+sensitivities computed at the close against the change of the options' full values.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={move of the index (\%)},ylabel={error of the delta-gamma P\&L (\% of full)},xmin=-10,xmax=10,
+  ymin=0,ymax=25,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omDef,very thick] table[x=move_pct,y=error_pct]{figdata/platforms/18-real-time-risk/approximation.csv};
+\draw[omThm,dashed] (axis cs:-10,1) -- (axis cs:10,1) node[pos=0.5,above,font=\scriptsize]{1\%};
+\draw[black,dotted] (axis cs:3.5,0) -- (axis cs:3.5,25) node[pos=0.8,right,font=\scriptsize]{$+3.5\%$};
+\draw[black,dotted] (axis cs:-6.75,0) -- (axis cs:-6.75,25) node[pos=0.8,left,font=\scriptsize]{$-6.75\%$};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The error of the P\&L computed from cached delta and gamma, as a share of the full revaluation's, for desk A's 21\,000 index puts
+at the close, by the size of the index move. It is zero at $\pm1\%$ (where the Greeks' bumps were), below 1\% between $-6.75\%$ and $+3.5\%$,
+and grows fast on the upside, where the puts' convexity changes most. Data: \texttt{fig\_rtrisk.py}.}\label{fig:pl:real-time-risk:gap}
+\end{omfigure}
+
+Inside the range a real-time system meets in a day, the approximation is excellent: the error is exactly zero at $\pm 1\%$, because the library
+computed delta and gamma from bumps of $\pm 1\%$ and the quadratic passes through them, and stays under 1\% of the full revaluation from
+$-6.75\%$ to $+3.5\%$. Beyond, it fails fast --- 3.1\% at $+5\%$, 23.6\% at $+10\%$ --- which is why the cache is refreshed on moves far
+smaller than those, and why stress numbers come from full revaluation (Book~6, chapter~29), not from sensitivities.
+
+\section{Limits in the loop}
+
+\begin{definition}[What-if check]\label{def:pl:real-time-risk:whatif}
+A \emph{what-if check}\index{what-if check} computes what a proposed trade would do to the exposure of every node above its book, and which
+limits it would breach, before the trade is sent, without changing the aggregator's state.
+\end{definition}
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{144}{148}{The what-if check: the trade's contribution added to its ancestors on a copy, and the
+limits it would breach.}\label{lst:pl:real-time-risk:whatif}
+
+A \omterm{def:pl:real-time-risk:whatif}{what-if check} is the real-time system's contribution to pre-trade control: the gate of Book~13 checks an order against limits in
+microseconds, the what-if tells it whether the firm-level limit has room. At the close of the chapter's afternoon, desk~B asking to sell 400
+more futures would be told that its desk stays at $-\$45.2$~million, inside its limit, and the firm goes to $-\$92.8$~million, far outside.
+
+\section{Two desks, one index}
+
+The chapter's afternoon runs from 13:00 to 17:30 on an index starting at 5\,000, with seeded moves (20\% annual volatility and a drift of
+$-1.5\%$ over the afternoon; it closes at 4\,908.5). Desk~A buys index puts --- six listed lines, three strikes and two expiries, 1\,000 units
+at a time --- and desk~B sells index futures, 400 at a time, each at random moments, about every five minutes. Before each trade the desk
+checks its own exposure and trades only if it stays under 90\% of its limit. Executions go through the \omterm{def:pl:position-and-pnl-services:service}{position service} of chapter~17; the
+firm's aggregator adds everything up.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xlabel={time of day (hours)},ylabel={delta (\$ millions)},xmin=13,xmax=17.5,ymin=-100,ymax=5,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=3}]
+\addplot[color=omThm,very thick,const plot] table[x=hour,y=firm_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{firm}
+\addplot[color=omDef,thick,const plot] table[x=hour,y=desk_a_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{desk A (puts)}
+\addplot[color=omMeth,thick,dashed,const plot] table[x=hour,y=desk_b_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{desk B (futures)}
+\draw[black,thick] (axis cs:13,-50) -- (axis cs:17.5,-50) node[pos=0.72,below,font=\scriptsize]{every limit: $-\$50$ million};
+\draw[omThm,dotted,thick] (axis cs:14.397,-100) -- (axis cs:14.397,5) node[pos=0.93,right,font=\scriptsize]{firm breach 14:23:50};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Index delta of the firm and of each desk through the afternoon, in the aggregator. Neither desk goes beyond its limit --- desk~A's
+largest exposure is $-\$49.3$~million, desk~B's $-\$43.6$~million --- while the firm crosses its own at 14:23:50 and ends at $-\$90.8$~million.
+Data: \texttt{fig\_rtrisk.py}.}\label{fig:pl:real-time-risk:exposure}
+\end{omfigure}
+
+\begin{example}[Two desks, one index]\label{ex:pl:real-time-risk:desks}
+Both desks did what their systems allowed: desk~A made 21 trades and holds 21\,000 puts, desk~B made 22 and is short 8\,800 futures; neither
+exceeded its limit at any moment. The firm's limit was breached at 14:23:50, the aggregator's only alert of the afternoon; at the close the
+firm is $-\$90.8$~million of delta, 1.82 times its appetite (desk~A $-\$47.6$~million, desk~B $-\$43.2$~million). Without the aggregator, the
+\omterm{def:pl:the-platform-map:batch}{end-of-day batch} would have found it three hours after the breach. The cache was refreshed six times; the aggregator made 10\,570 updates.
+\end{example}
+
+\begin{remark}[Who acts on the alert]\label{rem:pl:real-time-risk:who}
+A firm-level breach belongs to no desk. The aggregator's alert has to reach someone with authority over both --- the risk manager who can
+block new risk-increasing orders through the gate, or reduce a desk's limit on the spot (chapter~16's \omterm{def:pl:signal-serving-and-parameter-management:store}{parameter store}, with its approvals) ---
+and the limit framework has to say in advance whose risk is cut first. A real-time number that nobody may act on is only a faster report.
+\end{remark}
+
+\section{Tutorial: two desks and an aggregator}\label{tut:pl:real-time-risk:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Aggregate two desks' exposures incrementally, find the firm-level breach the desks could not see, and measure the \omterm{def:pl:real-time-risk:cache}{sensitivity
+cache}'s approximation. \textbf{End state:} \cref{fig:pl:real-time-risk:exposure,fig:pl:real-time-risk:gap}.
+\begin{tutsteps}
+\item \textbf{The afternoon}: \texttt{pl\_rtrisk.afternoon()}: the index path, the desks' trades, the aggregator's alerts.
+\item \textbf{Snapshots}: \texttt{agg.snapshot(t)} at any time: exposures, cache age, breaches.
+\item \textbf{What-if}: \texttt{what\_if\_at\_close(r)}.
+\item \textbf{The gap}: \texttt{approximation\_error(r)} and \texttt{one\_percent\_move}.
+\end{tutsteps}
+\textbf{What to change next.} Lower the refresh threshold to 0.1\% and count the repricings; give desk~A calls instead of puts and see whether
+the firm still breaches.
+\end{tutorial}
+
+\section{Build: the real-time aggregator}\label{bld:pl:real-time-risk:rtrisk}
+
+\begin{build}
+\bfield{Purpose} The firm's exposures and limit usage, every node of the hierarchy, updated on every fill and tick, with what-if answers for
+proposed trades.
+\bfield{Interface} \texttt{Hierarchy}; \texttt{SensitivityCache(md, underlying, threshold)}; \texttt{Aggregator(hierarchy, cache,
+limits)} with \texttt{on\_fill}, \texttt{on\_tick}, \texttt{exposure}, \texttt{snapshot}, \texttt{what\_if}, \texttt{alerts};
+\texttt{Future}; \texttt{delta\_gamma\_pnl}, \texttt{full\_pnl}.
+\bfield{Rules} Aggregates are updated by differences, never rebuilt; sensitivities come from the pricing library and are refreshed beyond a
+threshold; every snapshot carries the age of its sensitivities; limits are checked on every update; a what-if never changes state.
+\bfield{Acceptance tests} \texttt{code/firm/rtrisk/tests/}: the hierarchy and the incremental sums against a rebuild; ticks inside the
+threshold (carried with gamma) and beyond it (repriced); limits, alerts and what-if; the delta-gamma P\&L against full revaluation for a small
+move.
+\bfield{Stretch} Vega and rates exposures on the same hierarchy; many underlyings with a correlation-aware firm number; the aggregator fed
+from the event log of chapter~24.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~5, chapters 4 and 28 (Greeks, the pricing library); One Quant Book~6, chapters 21 and 29 (sensitivities, the risk
+engine and its hierarchy, BCBS~239); One Quant Book~11, chapter~27, and Book~13, chapter~22 (limits and the pre-trade gate).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:1}
+A put with delta $-0.4$ on 1\,000 units of an index at 5\,000: what is its delta in dollars, and how many such trades fit under 90\% of a
+\$50~million limit?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:2}
+Why is the approximation error exactly zero at $\pm 1\%$ in \cref{fig:pl:real-time-risk:gap}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:3}
+What does the \omterm{def:pl:real-time-risk:whatif}{what-if check} tell desk~B at the close, and why can desk~B's own system not tell it that?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:4}
+Why does the error grow faster on the upside than on the downside for a book of long puts?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:5}
+The snapshot at the close used sensitivities 65 minutes old. When is that acceptable, and what would make it not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:6}
+Why is \omterm{def:pl:real-time-risk:incremental}{incremental aggregation} checked against a rebuild in the tests, and what defect would the check catch?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:real-time-risk:7}
+\emph{Coding.} Run \texttt{afternoon} with a refresh threshold of 0.1\% and of 2\%. How many repricings does each make, and does the firm's
+exposure at the close change?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:real-time-risk:8}
+\emph{Find the flaw.} ``Every desk has a limit and a pre-trade check, so the firm cannot exceed the sum of the desks' limits, and we have set
+that sum below the firm's appetite.''
+\end{exercise}
+
+\section{Problem: Two Desks, One Index}
+
+\begin{problem}[{Weekend problem --- a breach nobody's system could see}]\label{pb:pl:real-time-risk:1}
+The chapter's afternoon, desks and aggregator.
+
+\medskip\noindent\textbf{Part I --- The system.}
+\begin{enumerate}
+\item What does real-time mean here, compared with the nightly engine and the pre-trade gate?
+\item How are exposures aggregated, and why are desk limits not a partition of the firm's?
+\item What does an incremental update add, on a fill and on a tick?
+\item When is the cache refreshed, and by what?
+\item What does a snapshot carry?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The afternoon.}
+\begin{enumerate}[resume]
+\item What did each desk trade, and what did it check?
+\item What were the desks' largest exposures?
+\item When was the firm's limit breached?
+\item What was the firm's exposure at the close, as a multiple of its appetite?
+\item What does the \omterm{def:pl:real-time-risk:whatif}{what-if check} say at the close?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The approximation.}
+\begin{enumerate}[resume]
+\item How is the cache's P\&L compared with full revaluation?
+\item Between which moves is the error under 1\%?
+\item What is it at $+5\%$ and at $+10\%$?
+\item Why is it zero at $\pm1\%$?
+\item What follows for stress numbers?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the time at which the firm-level limit was breached while each desk stayed inside its own, the exposure at
+the close, and the size of the market move beyond which the cache's P\&L error exceeds one percent of full revaluation.
+\item Who should receive the alert, and what should they be able to do?
+\item How would you set the refresh threshold?
+\item What else would you aggregate in real time?
+\item In one sentence: why must risk be added up while it is taken?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:real-time-risk:1}
+Two desks are each inside their limits. How can the firm be outside its own?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:real-time-risk:2}
+How would you keep firm-wide exposures current as thousands of fills and ticks arrive per second?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:real-time-risk:3}
+When is a delta-gamma approximation of P\&L good enough, and when must you revalue?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:real-time-risk:4}
+What should a \omterm{def:pl:real-time-risk:snapshot}{risk snapshot} tell its reader besides the numbers?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:real-time-risk:5}
+Design a \omterm{def:pl:real-time-risk:system}{real-time risk system} for a multi-desk trading firm.
+\end{interviewq}

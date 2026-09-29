@@ -1,0 +1,353 @@
+\chapter{Native Extensions}\label{ch:pl:native-extensions}
+
+A researcher rewrote the inner step of a signal in C++ and called it from Python once per tick, a million times. It was slower
+than the Python function it replaced: 118 nanoseconds a call against 60. Called once on the whole array of a million values, the
+same C++ loop took 1.4 nanoseconds an element, more than twice as fast as the library routine it was meant to beat. Everything
+about a \omterm{def:pl:native-extensions:extension}{native extension} is decided at the boundary between the interpreter and the compiled code: how often it is crossed, what
+has to be converted on the way, and who owns the memory on each side. This chapter binds one kernel written in C++20 and in Rust into
+Python two ways, with pybind11 and through a C interface loaded with \texttt{ctypes}, passes numpy arrays across without copying them,
+and measures the boundary (\texttt{firm.natext}).
+
+\section{Why and when to leave Python}
+
+\begin{definition}[Native extension, language binding]\label{def:pl:native-extensions:extension}
+A \emph{native extension}\index{native extension} is compiled code (C, C++, Rust) loaded into the Python process and called like a
+Python function. A \emph{language binding}\index{language binding} is the layer that makes it callable: it converts arguments and
+results between the two languages' representations, reports errors across the boundary, and states who owns each piece of memory.
+\end{definition}
+
+Chapter~8 gave the order of preference: first \omterm{def:pl:python-at-scale:array}{array programming}, which is already compiled code written by someone else; then a
+\omterm{def:pl:native-extensions:extension}{native extension} for what arrays cannot express --- a loop whose state changes with each element (a book, a queue position, a state
+machine), a merge of two sorted sequences, a recursion with branches. The chapter's two kernels are one of each kind: an exponentially
+weighted average (which numpy can express as a filter, so the native version competes with a library) and an as-of lookup of sorted
+times by one merge pass (which numpy does with a binary search per element, $O(n \log m)$ instead of $O(n + m)$).
+
+\omcode{code/firm/natext/cpp/firm_natext.hpp}{9}{38}{The two kernels in C++20, free of Python: the average, one step of it, and the
+as-of lookup by one merge pass.}\label{lst:pl:native-extensions:kernels}
+
+\section{The boundary: calls, types and the interpreter lock}
+
+\begin{definition}[Foreign function interface, application binary interface]\label{def:pl:native-extensions:ffi}
+A \emph{foreign function interface}\index{foreign function interface} lets code in one language call functions compiled from another.
+It relies on an \emph{application binary interface}\index{application binary interface}: the machine-level convention (how arguments
+are passed in registers and on the stack, the layout of structures, the names of symbols) that the caller and the callee compiled
+separately both obey; the C convention is the one every language can speak.
+\end{definition}
+
+\begin{definition}[Boundary-crossing cost]\label{def:pl:native-extensions:crossing}
+The \emph{boundary-crossing cost}\index{boundary-crossing cost} of a native call is the fixed work done on each call, independently of
+the size of its data: finding the function, checking and converting each argument from a Python object, releasing and reacquiring the
+interpreter lock, converting the result back and handling errors.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box,fill=omDef!12] (py) at (0,0) {Python caller:\\objects, numpy arrays};
+\node[box,fill=omMeth!15] (pb) at (4.6,0.9) {pybind11 binding: checks\\type and layout, releases\\the lock};
+\node[box,fill=omThm!12] (ct) at (4.6,-0.9) {ctypes: passes pointers\\as declared, checks nothing\\(the wrapper must)};
+\node[box,fill=gray!10] (cpp) at (9.0,0.9) {C++20 kernel};
+\node[box,fill=gray!10] (rs) at (9.0,-0.9) {Rust kernel\\(C ABI, cdylib)};
+\draw[->] (py) -- (pb); \draw[->] (py) -- (ct); \draw[->] (pb) -- (cpp); \draw[->] (ct) -- (rs);
+\draw[dashed,omThm,rounded corners=3pt] (-1.6,-2.4) rectangle (10.4,-1.8);
+\node[omThm] at (4.4,-2.1) {one numpy buffer: read and written in place by both kernels, never copied};
+\end{tikzpicture}
+
+\omcaption{Two routes across the boundary. pybind11 generates a binding that checks each argument's type and memory layout and can
+release the interpreter lock while C++ runs; ctypes loads any library with a C interface and passes what it is told, so the Python
+wrapper must check. Both hand the kernel a pointer into the same numpy buffer.}\label{fig:pl:native-extensions:boundary}
+\end{omfigure}
+
+\Cref{fig:pl:native-extensions:calls} measures the crossing. A one-step function called a million times from a Python loop costs 60
+nanoseconds a call when it is a Python function, 118 through pybind11 and 337 through \texttt{ctypes}: each native call converts
+three Python floats to C doubles and one back, and \texttt{ctypes} does it dynamically, by the argument types declared at run time.
+The arithmetic, one multiplication and one addition, is less than a nanosecond. A native function called per element is slower than
+the Python it replaces, because the loop around it is still Python.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=4.4cm,xbar,bar width=9pt,xmin=0,xmax=480,xlabel={nanoseconds per call, loop included},y dir=reverse,
+  ytick={0,1,2},yticklabels from table={figdata/platforms/09-native-extensions/measured_calls.csv}{route},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},point meta=explicit,
+  nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=0},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=ns_per_call,y expr=\coordindex,meta=ns_per_call]{figdata/platforms/09-native-extensions/measured_calls.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost of calling a one-step function once per element from a Python loop, a million times: as a Python function, as C++
+through pybind11, and as Rust through \texttt{ctypes}. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, machine
+otherwise idle. Data: \texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:calls}
+\end{omfigure}
+
+\begin{proposition}[Move the loop, not the body]\label{prop:pl:native-extensions:loop}
+If a native call costs $c_0$ per crossing and $c_1$ per element, and the Python it replaces costs $p$ per element, then calling it
+once per element costs $n(c_0 + c_1)$ and is faster than Python only if $c_0 + c_1 < p$; calling it once on the whole array costs
+$c_0 + n c_1$, which is faster than Python for every $n > c_0/(p - c_1)$ and approaches $n c_1$.
+\end{proposition}
+
+\begin{proof}
+Sum the costs of the calls in each arrangement and compare with $np$.
+\end{proof}
+
+With $c_0 \approx 118$~ns and $p \approx 60$~ns, the first arrangement never wins; the second wins beyond a handful of elements. The
+interpreter lock is the other half of the boundary: while the kernel runs it touches no Python object, so the binding releases the
+lock (\cref{lst:pl:native-extensions:pybind}) and other Python threads run meanwhile (chapter~8's sort did the same).
+
+\section{Binding C++ with a header-only binder}
+
+pybind11 is a header-only C++ library: the binding is a C++ file that includes it, describes each function's arguments, and is compiled
+with the Python headers into a shared library that Python imports as a module. \texttt{firm.natext} compiles it on first use with the
+compiler of the series (\texttt{g++ -std=c++20 -O2 -shared -fPIC} with the include paths from \texttt{python3-config} and
+pybind11).
+
+\omcode{code/firm/natext/cpp/firm_natext_py.cpp}{11}{24}{The pybind11 binding of the average: a numpy array taken as a C-contiguous
+float64 buffer, a result array allocated once, and the interpreter lock released while C++ runs.}\label{lst:pl:native-extensions:pybind}
+
+\begin{definition}[Buffer protocol]\label{def:pl:native-extensions:buffer}
+The \emph{buffer protocol}\index{buffer protocol} is Python's interface by which an object exposes its underlying memory --- a pointer,
+the element type, the shape and the strides --- to other objects and to compiled code, so that they can read and write it without
+copying.
+\end{definition}
+
+A numpy array exposes its memory this way, and pybind11's \texttt{array\_t} reads it. The declaration decides what happens when the
+array is not what the kernel expects. With \texttt{forcecast}, pybind11 silently converts: a float32 array or a strided view is copied
+into a new contiguous float64 buffer, and a function that was meant to write into the caller's array writes into the copy instead. The
+chapter's binding declares \texttt{c\_style} without \texttt{forcecast} and marks its arguments \texttt{noconvert}, so both are refused
+with an error: a copy should be a decision, not a surprise.
+
+\section{Binding Rust through the C ABI}
+
+Rust has a binding generator for Python too; this series uses no external crates, so the chapter takes the route that needs none: a
+library of \texttt{extern \textquotedbl{}C\textquotedbl{}} functions compiled as a C-compatible dynamic library, loaded with Python's \texttt{ctypes}.
+
+\omcode{code/firm/natext/rust/src/lib.rs}{29}{40}{A Rust function with a C interface: raw pointers and a length in, a slice built from
+them under stated conditions, and the safe kernel called on the slices.}\label{lst:pl:native-extensions:rust}
+
+\begin{dated}{2026-09}{Rust's Python bindings}\label{dat:pl:native-extensions:pyo3}
+PyO3, described in its user guide as ``Rust bindings for Python, including tools for creating native Python extension modules''
+(consulted September 2026), generates the equivalent of pybind11's argument checks and conversions for Rust. It is an external crate,
+which the series does not build; the C interface of this chapter is what such a binding produces underneath. A \texttt{cdylib} is, in
+the Rust Reference's words, a dynamic system library used when compiling a library to be loaded from another language.
+\end{dated}
+
+\texttt{ctypes} is the other extreme from pybind11: it calls any C function with the arguments it is told to pass and checks nothing
+about the memory behind a pointer. The wrapper (\cref{lst:pl:native-extensions:ctypes}) declares each function's argument types once,
+checks that each array is C-contiguous and of the right type, and passes the pointers; without the check, a strided view would be read
+as if it were contiguous, silently.
+
+\omcode{code/firm/natext/firm_natext.py}{105}{131}{Loading the Rust library with \texttt{ctypes}: declared argument types, and a
+wrapper that checks what \texttt{ctypes} does not before passing pointers into numpy buffers.}\label{lst:pl:native-extensions:ctypes}
+
+\section{Zero-copy across the boundary}
+
+\begin{definition}[Zero-copy transfer]\label{def:pl:native-extensions:zerocopy}
+A \emph{zero-copy transfer} of data across a boundary\index{zero-copy transfer} hands the receiver a reference to the sender's memory
+(a pointer and a layout) instead of a copy, so that its cost does not depend on the size of the data; it requires the two sides to agree
+on the layout and on who may write and free the memory, and for how long.
+\end{definition}
+
+Both bindings are zero-copy for their inputs; \texttt{ewma\_into} is zero-copy for its output as well, writing into an array the
+caller allocated (a test checks that the array's address is unchanged). The ownership rules are what makes it safe: the kernel reads
+and writes only during the call, keeps no pointer afterwards, and never frees what Python allocated; Python keeps the arrays alive for
+the call's duration. Chapter~4's \omterm{def:pl:a-tick-store-on-open-formats:mmap}{memory-mapped files} extend the same idea to disk and to other processes, and Arrow's layout of
+chapter~3 to other libraries and languages.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xmode=log,ymode=log,xlabel={array length (log scale)},ylabel={ns per element (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x=n,y=ewma_numpy]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=square*,omMeth] table[x=n,y=ewma_cpp]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=n,y=ewma_rust]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=diamond*,gray] table[x=n,y=ewma_python]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\legend{numpy (filter),C++ (pybind11),Rust (ctypes),pure Python}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Time per element of the whole-array average against the array's length. For short arrays every route is dominated by its
+fixed cost per call ($c_0/n$); for long arrays the native loops settle at about 1.3 to 1.9~ns an element and numpy's filter at 3 to 3.6, while
+pure Python stays at hundreds. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, machine otherwise idle. Data:
+\texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:sweep}
+\end{omfigure}
+
+\Cref{fig:pl:native-extensions:sweep,fig:pl:native-extensions:asof} are the whole-array versions. For the average, both native routes
+beat numpy's filter at every length measured: the filter routine has a fixed cost of several microseconds, larger than pybind11's; at a
+million elements C++ takes 1.4 nanoseconds an element against numpy's 3.3. For the as-of lookup the algorithm matters more than the
+language: numpy's binary search per element costs more per element as the arrays grow, 21~ns at a million, while the merge pass stays at
+about 6, three times less. The \texttt{ctypes} route pays a larger fixed cost (the pointer conversions of the wrapper) and overtakes
+numpy only from about a thousand elements for the lookup.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,xmode=log,ymode=log,xlabel={array length (log scale)},ylabel={ns per element (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x=n,y=asof_numpy]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=square*,omMeth] table[x=n,y=asof_cpp]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=n,y=asof_rust]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\legend{numpy (binary search per element),C++ (merge),Rust (merge)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Time per element of the as-of lookup of $n$ sorted times in $n$ others. numpy's binary search costs more per element as the
+arrays grow; the native merge pass costs a constant few nanoseconds once the fixed cost is amortised. Measured on a laptop (Intel Core
+Ultra 7 155H) under WSL2, one thread, machine otherwise idle. Data: \texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:asof}
+\end{omfigure}
+
+\begin{method}[Writing a native kernel for the research platform]\label{met:pl:native-extensions:method}
+(1) Write the kernel in C++ or Rust with no knowledge of Python: pointers, lengths, plain types. (2) Test it alone in its own language.
+(3) Bind it once per array, never once per element: arrays in, arrays out, the loop inside. (4) Refuse layouts and types the kernel does
+not read in place, rather than copying silently. (5) Release the interpreter lock around the pure computation. (6) Test the binding
+against the Python reference on the same data, including empty and edge inputs.
+\end{method}
+
+\section{Tutorial: one kernel, four implementations}\label{tut:pl:native-extensions:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build the C++ and Rust kernels, bind them, show that four implementations agree, and measure the boundary.
+\textbf{End state:} \cref{fig:pl:native-extensions:calls,fig:pl:native-extensions:sweep,fig:pl:native-extensions:asof}.
+\begin{tutsteps}
+\item \textbf{Kernels}: read \cref{lst:pl:native-extensions:kernels}; compile and run \texttt{firm\_natext\_test.cpp}; run
+\texttt{cargo test} in \texttt{code/firm/natext/rust}.
+\item \textbf{Bind}: \texttt{firm\_natext.cpp\_module()} compiles and imports the pybind11 module;
+\texttt{rust\_library()} builds the \texttt{cdylib} and declares its functions to \texttt{ctypes}.
+\item \textbf{Agree}: the acceptance tests compare the four averages and the four lookups, on random and edge inputs.
+\item \textbf{Refuse}: pass a strided view and a float32 array to each binding and read the errors.
+\item \textbf{Measure}: \texttt{bench\_natext.py} (per-call cost and the size sweep).
+\end{tutsteps}
+\textbf{What to change next.} Add \texttt{forcecast} to the binding and watch \texttt{ewma\_into} write into a copy; call the Rust kernel
+from two Python threads through \texttt{ctypes} (which releases the lock around foreign calls) and measure the speed-up.
+\end{tutorial}
+
+\section{Build: native kernels for the research platform}\label{bld:pl:native-extensions:natext}
+
+\begin{build}
+\bfield{Purpose} The pattern and the build machinery every native kernel of the platform follows: the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s readers of
+chapter~4, the backtest engine's inner loops (chapter~11) and the payoff compiler's evaluation (chapter~19) can all be moved across the
+boundary this way.
+\bfield{Interface} \texttt{ewma\_python}, \texttt{ewma\_numpy}, \texttt{ewma\_cpp}, \texttt{ewma\_cpp\_into}, \texttt{ewma\_rust};
+\texttt{asof\_python}, \texttt{asof\_numpy}, \texttt{asof\_cpp}, \texttt{asof\_rust}; \texttt{step\_python}, \texttt{step\_cpp},
+\texttt{step\_rust}; \texttt{cpp\_module()}, \texttt{rust\_library()}. C++20 header \texttt{firm::natext} (\texttt{ewma},
+\texttt{ewma\_step}, \texttt{asof\_index}); Rust crate \texttt{natext\_rs} with \texttt{natext\_ewma}, \texttt{natext\_asof},
+\texttt{natext\_ewma\_step}.
+\bfield{Rules} Kernels know nothing of Python; one call per array; inputs read in place or refused; the lock released around the
+computation; no pointer kept after a call; builds are part of the tests and a missing toolchain fails them.
+\bfield{Acceptance tests} \texttt{code/firm/natext/tests/}, \texttt{cpp/firm\_natext\_test.cpp}, \texttt{rust/}: four averages and four
+lookups equal, edges included; three steps equal; output written in place; strided and wrongly typed arrays refused by both bindings.
+\bfield{Stretch} A kernel over the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s flat records (a structured buffer, chapter~4); a second-order filter in all four
+languages; the bindings compared under two threads.
+\end{build}
+
+\begin{omsources}
+\item pybind11 documentation, \emph{NumPy} (buffer protocol, \texttt{array\_t}, \texttt{c\_style}, \texttt{forcecast},
+\texttt{noconvert}).
+\item T.~Oliphant and C.~Banks, \emph{PEP 3118 -- Revising the buffer protocol} (Final).
+\item The Rust Reference, \emph{Linkage} (\texttt{cdylib}); PyO3 user guide.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:1}
+At 118~ns a call through pybind11 and 60~ns a step in Python, how long does a day of two hundred million steps take each way, called
+per element? And computed by one call at 1.4~ns an element?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:2}
+Why is the \texttt{ctypes} call slower than the pybind11 call, although both end in the same machine instructions?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:3}
+What does \texttt{forcecast} do with a float32 array passed to a function declared for float64, and why is that dangerous for
+\texttt{ewma\_into}?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:4}
+With \cref{prop:pl:native-extensions:loop}, $c_0 = 118$~ns, $c_1 = 1.4$~ns and $p = 60$~ns, from how many elements is one call on the
+whole array faster than the Python loop?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:5}
+Why does numpy's as-of lookup cost more per element as the arrays grow, and the merge pass not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:6}
+A kernel keeps a pointer to a numpy array between calls to reuse it. Describe how that goes wrong, and what the ownership rule forbids.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:native-extensions:7}
+\emph{Coding.} With the chapter's functions, compute the as-of lookup of 100\,000 random sorted times in 50\,000 others by all four
+implementations, and check that they agree, including a left time before the first right time and one after the last.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:native-extensions:8}
+\emph{Find the flaw.} ``Our C++ extension takes a list of Python floats, converts it to a \texttt{std::vector<double>}, computes, and
+returns a new list. It is faster than numpy on our benchmark of ten numbers, so we use it everywhere.''
+\end{exercise}
+
+\section{Problem: The Million Calls}
+
+\begin{problem}[{Weekend problem --- where to cross the boundary}]\label{pb:pl:native-extensions:1}
+The chapter's kernels, their four implementations, the two bindings and the measurements of \texttt{bench\_natext.py}.
+
+\medskip\noindent\textbf{Part I --- The crossing.}
+\begin{enumerate}
+\item What does a native call do besides the arithmetic?
+\item What are the measured costs per call of the three routes?
+\item Why is a per-element native call slower than the Python function it replaces?
+\item What does releasing the interpreter lock allow, and when is it safe?
+\item What is an \omterm{def:pl:native-extensions:ffi}{application binary interface}, and why is the C one the common ground?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The two bindings.}
+\begin{enumerate}[resume]
+\item What does pybind11 check that \texttt{ctypes} does not?
+\item What must the \texttt{ctypes} wrapper check itself?
+\item What happens to a strided view passed to each binding?
+\item Why is \texttt{forcecast} not used?
+\item What would PyO3 add to the Rust route?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Arrays.}
+\begin{enumerate}[resume]
+\item What are the costs per element of the whole-array average at a million elements, by route?
+\item Why do the native routes beat numpy's filter at every length measured?
+\item What are the costs per element of the as-of lookup at a million, by route?
+\item From what length does the Rust lookup beat numpy's?
+\item Which of the two kernels gains more from going native, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the per-call cost of each binding, the lengths above which each native version beats numpy, and the
+saving of moving the loop, not the body, across the boundary.
+\item How much time does a day of two hundred million steps save by moving the loop into C++?
+\item When is a \omterm{def:pl:native-extensions:extension}{native extension} not worth writing?
+\item What does the ownership rule require of the kernel and of the caller?
+\item In one sentence: where should the boundary between Python and native code be?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:native-extensions:1}
+You wrote a function in C++ to speed up a Python loop, and it got slower. What happened?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:native-extensions:2}
+How do you pass a numpy array to C++ or Rust without copying it, and what can go wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:native-extensions:3}
+Compare pybind11, ctypes and a Rust binding generator for exposing a numerical kernel to Python.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:native-extensions:4}
+Why should a \omterm{def:pl:native-extensions:extension}{native extension} release the interpreter lock, and what must it not do while it is released?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:pl:native-extensions:5}
+Design the native layer of a research platform: which kernels go native, how they are bound, built, tested and distributed.
+\end{interviewq}

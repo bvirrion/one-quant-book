@@ -1,0 +1,427 @@
+\chapter{Switches and Layer-1 Devices}\label{ch:nw:switches-and-layer-1-devices}
+
+A store-and-forward switch cannot send a 1\,518-byte frame on before it has received all of it: at
+\qty{10}{\giga\bit\per\second} that is \qty{1.2}{\micro\second} of waiting, whatever the switch does afterwards. A \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switch}
+sold to trading firms forwards between its ports in \qty{4}{\nano\second}, with less than 100 picoseconds of jitter, and in the
+words of its data sheet it does ``not buffer or queue data'': it never looks at the frame at all. Between the two sit the
+cut-through switches, which look only at the first bytes. Choosing among them, port by port, is most of what designing the
+network inside a trading cage means.
+
+This chapter follows a frame through each kind of device, then through the passive devices that let a firm watch its own
+traffic, and ends with three designs of the same small cage: the latency of each path, the devices each path crosses, and the
+single devices whose failure would cut a server off.
+
+\section{Store-and-forward against cut-through}
+
+\begin{definition}[Store-and-forward and cut-through switching]\label{def:nw:switches-and-layer-1-devices:modes}
+A switch using \emph{store-and-forward switching}\index{store-and-forward switching} receives a frame completely, checks its
+frame check sequence, and only then starts to send it on the output port. A switch using \emph{cut-through
+switching}\index{cut-through switching} starts to send a frame as soon as it has read the header fields it needs to choose the
+output port, while the rest of the frame is still arriving.
+\end{definition}
+
+\begin{proposition}[What a switch adds]\label{prop:nw:switches-and-layer-1-devices:add}
+Let a frame of $\ell_{\mathrm f}$ bytes arrive at $R_{\mathrm L}$ on a port whose output is idle and of the same rate, and let
+$\tau$ be the switch's internal decision and transfer time. A store-and-forward switch adds
+$8\ell_{\mathrm f}/R_{\mathrm L} + \tau$ to the frame's latency; a cut-through switch that reads the first $h$ bytes adds
+$8h/R_{\mathrm L} + \tau$, independent of the frame's length. If the output port is busy, or faster than the input (it would
+run out of bits in the middle of the frame), a cut-through switch must buffer the frame and falls back to store-and-forward for
+it.
+\end{proposition}
+
+\begin{proof}
+The last bit leaves the sender at $8\ell_{\mathrm f}/R_{\mathrm L}$ and reaches the far end one serialisation after the first
+bit left the last device. A store-and-forward switch emits its first bit $\tau$ after its last bit arrived, so the serialisation
+is paid twice, once into the switch and once out; a cut-through switch emits its first bit $\tau$ after the $h$-th byte arrived,
+and the two serialisations overlap. If the output is busy the bits must wait; if it is faster than the input it would send
+faster than the bits arrive, and a frame cannot pause in the middle, so the frame must first be stored.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,fr/.style={draw,minimum height=0.45cm,anchor=west,inner sep=0pt}]
+\node[anchor=east] at (-0.2,2.1) {in (both)};
+\node[fr,fill=omDef!20,minimum width=5.0cm] at (0,2.1) {frame arriving};
+\node[anchor=east] at (-0.2,1.2) {out, cut-through};
+\node[fr,fill=omMeth!25,minimum width=5.0cm] at (1.3,1.2) {frame leaving};
+\node[anchor=east] at (-0.2,0.3) {out, store-and-forward};
+\node[fr,fill=omThm!20,minimum width=5.0cm] at (5.8,0.3) {frame leaving};
+\draw[densely dashed,gray] (0.5,2.45) -- (0.5,-0.3);
+\draw[densely dashed,gray] (5.0,2.45) -- (5.0,-0.3);
+\draw[<->] (0.5,-0.25) -- node[below,font=\scriptsize]{header read, then $\tau$} (1.3,-0.25);
+\draw[<->] (5.0,-0.25) -- node[below,font=\scriptsize]{$\tau$} (5.8,-0.25);
+\draw[->] (0,-0.9) -- (11.4,-0.9) node[right]{time};
+\end{tikzpicture}
+
+\omcaption{The same frame through a cut-through and a store-and-forward switch. Both wait for the switch's internal time
+$\tau$; the cut-through switch starts after the header (left dashed line), the store-and-forward switch after the last bit
+(right dashed line), so it adds one whole serialisation of the frame.}\label{fig:nw:switches-and-layer-1-devices:modes}
+\end{omfigure}
+
+A store-and-forward switch drops a frame whose check sequence is wrong before it goes further; a cut-through switch has already
+sent most of it when it finds out, and can only mark the end of the frame as bad. That is the whole price of cut-through, and
+in a colocation cage, where links are short and errors rare, it is a price firms pay.
+
+\begin{example}[One order, three switches]\label{ex:nw:switches-and-layer-1-devices:order}
+A 100-byte order frame at \qty{10}{\giga\bit\per\second}. A store-and-forward switch with a \qty{500}{\nano\second} internal time
+(a model value, not a data sheet's) adds $80 + 500 = \qty{580}{\nano\second}$; a cut-through switch that reads 64 bytes adds
+\qty{51.2}{\nano\second} plus its internal time; a layer-1 device adds only its own few nanoseconds. For a 1\,518-byte frame
+the store-and-forward switch's toll rises to \qty{1\,714}{\nano\second}, the others' do not change
+(\cref{fig:nw:switches-and-layer-1-devices:curve}).
+\end{example}
+
+\section{Layer-1 devices: fan-out, multiplexing and patching}
+
+\begin{definition}[Layer-1 switch, fan-out, multiplexer]\label{def:nw:switches-and-layer-1-devices:l1}
+A \emph{layer-1 switch}\index{layer-1 switch} connects ports at the level of the electrical or optical signal: it regenerates
+the bits of one input on the outputs configured for it without decoding frames, so it neither reads addresses nor queues. A
+\emph{layer-1 fan-out}\index{layer-1 fan-out} is a configuration that copies one input to several outputs at once. A
+\emph{layer-1 multiplexer}\index{layer-1 multiplexer} merges the frames of several inputs onto one output; unlike a fan-out it must
+recognise frame boundaries and hold a frame that arrives while another is being sent.
+\end{definition}
+
+The fan-out is the natural device for market data: the venue's feed arrives once on the cross-connect and must reach every
+server that trades on it, all at the same time, with nothing to decide. The multiplexer is the natural device for orders: many
+servers, one order-entry handoff, and no routing decision beyond ``all to that port''. A multiplexer cannot be as fast as a fan-out,
+because two servers can send at once.
+
+\begin{proposition}[Contention at a multiplexer]\label{prop:nw:switches-and-layer-1-devices:mux}
+Two frames of serialisation time $s$ reach a multiplexer's output at times differing by $D$. If $|D| < s$ the later frame waits
+$s - |D|$; otherwise neither waits. If each server's response to a common event arrives with an independent normal delay of
+standard deviation $\sigma$, $D$ is normal with standard deviation $\sigma\sqrt2$ and the later of two orders waits with
+probability $\P(|D| < s) = 2\Phi\bigl(s/(\sigma\sqrt2)\bigr) - 1$.
+\end{proposition}
+
+\begin{proof}
+The output sends one frame at a time: the frame that arrives second starts when the first has finished, $s$ after the first
+started, or at its own arrival if that is later. The difference of two independent normal variables of variance $\sigma^2$ is
+normal with variance $2\sigma^2$.
+\end{proof}
+
+\begin{example}[Two servers, one handoff]\label{ex:nw:switches-and-layer-1-devices:two}
+A 100-byte order occupies \qty{96}{\nano\second} of line time at \qty{10}{\giga\bit\per\second}. If two of the firm's servers
+answer the same market event with delays of standard deviation \qty{50}{\nano\second}, the second order waits with probability
+$2\Phi(96/70.7) - 1 = 0.83$. The firm's own servers are competing with each other at the multiplexer at the moment that matters
+most, and the one whose response was faster by a few nanoseconds is the one that goes first.
+\end{example}
+
+The chapter's tutorial runs this race for two, four and eight servers (\cref{fig:nw:switches-and-layer-1-devices:mux}). With four
+servers answering within \qty{50}{\nano\second} of one another, an order waits \qty{93}{\nano\second} on average and the last one
+\qty{186}{\nano\second}, more than the multiplexer's own \qty{39}{\nano\second}; spread the answers over a microsecond and the average
+falls to \qty{6}{\nano\second}. The tighter a firm's servers are, the more they queue behind one another.
+
+\begin{dated}{2026-09}{Device latencies from data sheets}\label{dat:nw:switches-and-layer-1-devices:devices}
+Arista's 7130 Connect Series \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switches} forward between ports in \qty{4}{\nano\second} (\qty{6}{\nano\second} for the
+96-port model), with less than \qty{100}{\pico\second} of jitter and the same latency for one-to-many mirroring. Arista's MetaMux
+multiplexes several inputs onto one output in \qty{39}{\nano\second} on average (\qty{42}{\nano\second} on another hardware
+model); ``when multiple packets arrive at the multiplexer at the same time'' it queues them in input buffers, and without
+contention its latency varies by $\pm\qty{7}{\nano\second}$. Cisco's Nexus 3548-X cut-through switch quotes latencies ``as low as''
+\qty{250}{\nano\second}, \qty{200}{\nano\second} in its warp mode, and replicates one port to any number of others in its warp SPAN
+mode ``as low as'' \qty{50}{\nano\second}.
+\end{dated}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ymode=log,xmin=0,xmax=1600,ymin=2,ymax=4000,
+  xlabel={frame size (bytes)},ylabel={latency added (ns, log scale)},
+  ytick={3,10,30,100,300,1000,3000},yticklabels={3,10,30,100,300,1\,000,3\,000},
+  xtick={64,256,512,1024,1518},xticklabels={64,256,512,1\,024,1\,518},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=frame,y=store_forward]{figdata/networks/02-switches-and-layer-1-devices/forwarding.csv};
+\addplot[omMeth,very thick,mark=square*,mark size=1.4pt] table[x=frame,y=cut_through]{figdata/networks/02-switches-and-layer-1-devices/forwarding.csv};
+\addplot[omExo,very thick,mark=triangle*,mark size=1.8pt] table[x=frame,y=mux]{figdata/networks/02-switches-and-layer-1-devices/forwarding.csv};
+\addplot[omDef,very thick,mark=diamond*,mark size=1.8pt] table[x=frame,y=l1]{figdata/networks/02-switches-and-layer-1-devices/forwarding.csv};
+\legend{store-and-forward (model),cut-through,multiplexer,layer-1 switch}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Latency each device adds to a frame at \qty{10}{\giga\bit\per\second}, egress idle, by frame size. Only the
+store-and-forward switch grows with the frame (its internal time of \qty{500}{\nano\second} is a model value); the others use the
+data-sheet figures of \cref{dat:nw:switches-and-layer-1-devices:devices}. Data: \texttt{fig\_cage.py}.}\label{fig:nw:switches-and-layer-1-devices:curve}
+\end{omfigure}
+
+A \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switch} is also a patch panel under software control: any port can be connected to any other, or to several, by a
+configuration change instead of a technician moving a cable. Firms use that to move a server from one venue's line to another,
+to swap a failed device for a spare, or to copy a link to a capture device for an hour.
+
+\section{Taps and mirror ports}
+
+A firm that wants to know what it sent and received, and when, must copy its traffic without disturbing it.
+
+\begin{definition}[Network tap, port mirroring]\label{def:nw:switches-and-layer-1-devices:tap}
+A \emph{network tap}\index{network tap} is a device inserted in a link that copies its traffic to monitoring ports; a passive
+optical tap does it by splitting the light of each fibre, sending a fixed share (its split ratio) to the monitor, needs no power
+and adds only the length of its fibre. \emph{Port mirroring}\index{port mirroring} is a switch's copying of the traffic of some of
+its ports to another port, in software or in its forwarding hardware.
+\end{definition}
+
+A tap is on the link itself: it cannot drop, reorder or delay the copy relative to the original, and it keeps working when the
+switch does not. Its costs are the light it takes (a 50/50 split halves the power reaching the far end, which a long cross-connect
+may not afford) and a monitoring port for each direction. A mirror port is free, since the switch is already there, but it is a
+switch port like any other: mirroring both directions of a busy \qty{10}{\giga\bit\per\second} link sends up to
+\qty{20}{\giga\bit\per\second} to a \qty{10}{\giga\bit\per\second} port, which drops half of it when both directions are full, exactly in
+the bursts one wanted to see. Capture devices (chapter~5) therefore sit on taps, and on layer-1 mirror outputs, which copy at \omterm{def:nw:networking-for-trading:ser}{line
+rate}.
+
+\section{Designing the network inside one cage}
+
+\begin{definition}[Out-of-band management network, direct-attach cable]\label{def:nw:switches-and-layer-1-devices:oob}
+An \emph{out-of-band management network}\index{out-of-band management network} is a separate network, with its own switches and
+links, over which a firm administers its devices and servers, so that configuration, monitoring and remote access never share
+a port or a queue with trading traffic, and still work when the trading network does not. A \emph{direct-attach
+cable}\index{direct-attach cable} is a copper cable assembly with the transceivers built into its ends, used for short links
+within a rack.
+\end{definition}
+
+\begin{method}[Designing a trading cage's network]\label{met:nw:switches-and-layer-1-devices:design}
+\begin{enumerate}
+\item List the handoffs: each venue's market-data lines (A and B), its order-entry connections, and the firm's own links out.
+\item Give market data a replication device (a \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 fan-out}, or a cut-through switch where filtering by group matters), with
+  line A and line B on different devices so that one failure never silences both.
+\item Give orders a path that crosses as few devices as possible: a \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 multiplexer} or a cut-through switch per handoff, and a
+  second handoff on a second device.
+\item Tap every handoff, both directions, and bring the copies to the capture devices; put the time reference
+  (chapter~4) in the same cage.
+\item Keep management out of band.
+\item Check the design by removing every device and every cable in turn: each server must still receive at least one line and
+  reach at least one order handoff.
+\end{enumerate}
+\end{method}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=2pt},>=Stealth]
+\node[b,fill=gray!10] (A) at (0,2.4) {handoff A};
+\node[b,fill=gray!10] (B) at (0,1.2) {handoff B};
+\node[b,fill=gray!10] (O) at (0,-0.4) {order handoff 1};
+\node[b,fill=gray!10] (P) at (0,-1.6) {order handoff 2};
+\foreach \n/\y in {tA/2.4,tB/1.2,tO/-0.4,tP/-1.6} {\node[b,fill=omExo!15,minimum width=0.9cm] (\n) at (2.7,\y) {tap};}
+\node[b,fill=omDef!20] (la) at (5.2,2.4) {layer-1\\ fan-out};
+\node[b,fill=omDef!20] (lb) at (5.2,1.2) {layer-1\\ fan-out};
+\node[b,fill=omMeth!20] (m1) at (5.2,-0.4) {multiplexer};
+\node[b,fill=omMeth!20] (m2) at (5.2,-1.6) {multiplexer};
+\node[b,minimum height=1.6cm,minimum width=1.6cm] (s1) at (9.4,1.7) {server 1};
+\node[b,minimum height=1.6cm,minimum width=1.6cm] (s2) at (9.4,-0.9) {server 2};
+\node[b,fill=gray!8] (cap) at (2.7,-3.0) {capture and time reference};
+\foreach \a/\b in {A/tA,B/tB,O/tO,P/tP,tA/la,tB/lb,tO/m1,tP/m2} {\draw[thick] (\a) -- (\b);}
+\foreach \a in {la,lb} {\draw[->,omDef,thick] (\a.east) -- (s1.west); \draw[->,omDef,thick] (\a.east) -- (s2.west);}
+\foreach \a in {m1,m2} {\draw[<-,omMeth,thick] (\a.east) -- (s1.west); \draw[<-,omMeth,thick] (\a.east) -- (s2.west);}
+\draw[gray,dashed] (tP) -- (cap);
+\end{tikzpicture}
+
+\omcaption{The layer-1 design of the chapter's cage. Each venue line goes through a tap to its own fan-out, which copies it to
+both servers; each server's orders go through two multiplexers to two order-entry handoffs. Every handoff is tapped (one tap's
+copy drawn); management is out of band and not drawn. Removing any single device or cable leaves every server with a line and an
+order path.}\label{fig:nw:switches-and-layer-1-devices:cage}
+\end{omfigure}
+
+\Cref{tab:nw:switches-and-layer-1-devices:designs} compares three designs of the same cage, two servers and the same cables
+(30~metres of cross-connect to each handoff, 3~metres inside the cage), computed with \texttt{firm.cagenet}. The commodity design
+puts two store-and-forward switches in series; the cut-through design gives each line its own switch; the layer-1 design is
+\cref{fig:nw:switches-and-layer-1-devices:cage}.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrl}
+\toprule
+Design & Feed in (ns) & Order out (ns) & Sum (ns) & Single points \\
+\midrule
+Store-and-forward switches & 1\,439.8 & 1\,430.2 & 2\,870.0 & both switches, three cables \\
+Cut-through switches & 560.0 & 556.8 & 1\,116.7 & none \\
+Layer-1 devices & 262.8 & 294.6 & 557.3 & none \\
+\bottomrule
+\end{tabular}
+\caption{Three cage designs: latency from the first bit at the venue handoff to the last bit at the server for a 104-byte feed
+frame, and from the server to the order handoff for a 100-byte order, at \qty{10}{\giga\bit\per\second}, egress idle. Data:
+\texttt{nw\_cage.design\_table()} on \texttt{firm.cagenet}.}\label{tab:nw:switches-and-layer-1-devices:designs}
+\end{table}
+
+The layer-1 design's feed path is 263 nanoseconds, of which 176 are the 36 metres of fibre and 83 the frame's own
+serialisation: the devices add 4. Its order path is slower than its feed path by the multiplexer's 39 nanoseconds less the
+fan-out's 4, and slower still when two servers answer the same event. The next nanoseconds are no longer in the devices but in
+the cables and in the servers.
+
+\section{Tutorial: three cages}\label{tut:nw:switches-and-layer-1-devices:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Model a cage's network, compute its paths and single points of failure, and race orders through a multiplexer.
+\textbf{End state:} \cref{tab:nw:switches-and-layer-1-devices:designs} and \cref{fig:nw:switches-and-layer-1-devices:curve,fig:nw:switches-and-layer-1-devices:mux}.
+\begin{tutsteps}
+\item \textbf{Devices.} \texttt{nw\_cage.DEVICES} holds the data-sheet latencies and the one model value;
+  \texttt{forwarding\_curve()} evaluates \cref{prop:nw:switches-and-layer-1-devices:add} per frame size.
+\item \textbf{Cages.} \texttt{design(name)} builds each cage from \texttt{firm.cagenet} devices and cables; \texttt{Cage.path} finds the
+  route and \texttt{breakdown} splits its latency (\cref{lst:nw:switches-and-layer-1-devices:breakdown}).
+\item \textbf{Failures.} \texttt{Cage.single\_points(feeds, orders, servers)} removes each element in turn;
+  \texttt{design\_table()} writes the table.
+\item \textbf{Contention.} \texttt{mux\_contention(k, jitter)} races $k$ orders through one multiplexer over 20\,000 events
+  (\cref{lst:nw:switches-and-layer-1-devices:mux}); \texttt{python fig\_cage.py} writes the charts' data.
+\end{tutsteps}
+\textbf{What to change next.} Replace the cross-connects by 150~metres and see which term of the table dominates; give each server
+its own multiplexer input from a second network card and measure how contention changes when the firm's four fastest strategies
+share two multiplexers instead of one.
+\end{tutorial}
+
+\omcode{code/firm/cagenet/firm_cagenet.py}{91}{101}{A path's latency: one serialisation, the fibre, and what each device adds.}\label{lst:nw:switches-and-layer-1-devices:breakdown}
+
+\omcode{code/networks/02-switches-and-layer-1-devices/python/nw_cage.py}{77}{88}{Orders from $k$ servers through one multiplexer:
+each starts when it has arrived and the previous one has finished.}\label{lst:nw:switches-and-layer-1-devices:mux}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.2cm,xmode=log,xmin=20,xmax=2000,ymin=0,ymax=320,
+  xlabel={standard deviation of the servers' response delays (ns, log scale)},ylabel={mean wait of an order (ns)},
+  xtick={25,50,100,200,400,800,1600},xticklabels={25,50,100,200,400,800,1\,600},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=jitter_ns,y=k2]{figdata/networks/02-switches-and-layer-1-devices/mux.csv};
+\addplot[omMeth,very thick,mark=square*,mark size=1.4pt] table[x=jitter_ns,y=k4]{figdata/networks/02-switches-and-layer-1-devices/mux.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.8pt] table[x=jitter_ns,y=k8]{figdata/networks/02-switches-and-layer-1-devices/mux.csv};
+\legend{2 servers,4 servers,8 servers}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: $k$ servers each send one 100-byte order in answer to the same event through one
+\qty{10}{\giga\bit\per\second} multiplexer; mean queueing delay of an order against the spread of the servers' response times,
+20\,000 events. Tightly clustered answers queue behind one another. Data: \texttt{fig\_cage.py}
+(seeded).}\label{fig:nw:switches-and-layer-1-devices:mux}
+\end{omfigure}
+
+\section{Build: the cage network model}\label{bld:nw:switches-and-layer-1-devices:cagenet}
+
+\begin{build}
+\bfield{Purpose} The firm's cage as data: what is connected to what, with which device, over how much fibre, so that every path's
+latency and every single point of failure is computed rather than remembered. Chapter~5 taps it and chapter~29 prices it.
+\bfield{Interface} \texttt{firm\_cagenet}: \texttt{Device(name, kind, fabric\_ns)} with kinds \texttt{handoff}, \texttt{server},
+\texttt{l1}, \texttt{mux}, \texttt{cut-through}, \texttt{store-and-forward}, \texttt{tap}; \texttt{Cable(a, b, length\_m, n\_g)};
+\texttt{Cage(devices, cables)} with \texttt{path}, \texttt{latency\_ns}, \texttt{breakdown}, \texttt{single\_points(feeds, orders,
+servers)} and \texttt{untapped(handoffs)}.
+\bfield{Rules} Latency runs from the first bit at the source to the last bit at the destination; every device's toll comes from
+\texttt{firm.netsim.forward\_ns}; taps add only fibre; paths never cross a server or a handoff; an unknown device kind or a cable to
+an unknown device is an error.
+\bfield{Acceptance tests} \texttt{code/firm/cagenet/tests/}: the toll of each device kind on a one-device chain; that a path does not
+cross a server; single points of failure and untapped handoffs on a hand-built cage.
+\bfield{Stretch} Load: route the feeds of chapter~1 through the cage with \texttt{firm.netsim.egress} at every output and report the
+worst queue; a spares plan, listing for each single point the patch a \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switch} would make to route around it.
+\end{build}
+
+\begin{omsources}
+\item Arista, \emph{7130 Connect Series Layer 1 Switch Data Sheet}; Arista, \emph{7130 MetaMux} product page.
+\item Cisco, \emph{Nexus 3548-X, 3524-X, 3548-XL and 3524-XL Switches Data Sheet}.
+\item Garland Technology, ``Network TAP Split Ratios and Loss Budget'' (2014).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:switches-and-layer-1-devices:1}
+What does a store-and-forward switch with a \qty{300}{\nano\second} internal time add to a 512-byte frame at
+\qty{25}{\giga\bit\per\second}? And a cut-through switch reading 64 bytes, with the same internal time?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:switches-and-layer-1-devices:2}
+A cut-through switch receives a frame at \qty{10}{\giga\bit\per\second} for an output at \qty{25}{\giga\bit\per\second}, then one at
+25 for an output at 10. In which case can it cut through, and why?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:switches-and-layer-1-devices:3}
+Both directions of a link are mirrored to one port. The link carries \qty{6}{\giga\bit\per\second} each way at the busiest moment;
+the mirror port runs at \qty{10}{\giga\bit\per\second}. What share of the copy is lost at that moment?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:switches-and-layer-1-devices:4}
+Two servers answer an event with independent normal delays of standard deviation \qty{100}{\nano\second}; their 100-byte orders go
+through one \qty{10}{\giga\bit\per\second} multiplexer. What is the probability that the later order waits?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:switches-and-layer-1-devices:5}
+In the layer-1 design of \cref{tab:nw:switches-and-layer-1-devices:designs}, split the feed path's 262.8~ns into serialisation,
+fibre and devices. Which would you shorten first, and how?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:switches-and-layer-1-devices:6}
+Why does a fan-out need no buffer while a multiplexer does? What does that imply for their latency and jitter?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:switches-and-layer-1-devices:7}
+\emph{Coding.} Add a third order handoff and a third multiplexer to the layer-1 design, send server~1's orders through one and
+server~2's through the others, and recompute the mean wait of \cref{fig:nw:switches-and-layer-1-devices:mux} for four servers at
+\qty{50}{\nano\second} when the four split two and two across two multiplexers.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:switches-and-layer-1-devices:8}
+\emph{Find the flaw.} ``Line A and line B come into the same \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switch}, which fans each out to our servers. It is a single box,
+but \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switches} have no software to crash, so there is no single point of failure.''
+\end{exercise}
+
+\section{Problem: Three Designs for One Cage}
+
+\begin{problem}[{Weekend problem --- nanoseconds, failures and money}]\label{pb:nw:switches-and-layer-1-devices:1}
+A firm is choosing among the three designs of \cref{tab:nw:switches-and-layer-1-devices:designs} for a cage that trades on a signal
+from the venue's feed and answers with an order to the same venue. Suppose that the cut-through design costs 60\,000 a year more
+than the commodity design, and the layer-1 design 150\,000 a year more (currency units; the figures are the problem's, not market
+prices).
+
+\medskip\noindent\textbf{Part I --- The paths.}
+\begin{enumerate}
+\item What is each design's trigger path, from the first bit of the feed frame at the handoff to the last bit of the order at the
+  order handoff, counting feed in and order out?
+\item How much does the cut-through design save over the commodity one, and the layer-1 design over the cut-through one?
+\item In the commodity design, how much of the feed path is the two switches' serialisation?
+\item How long is the 36~metres of fibre of the layer-1 feed path, in nanoseconds?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Contention.}
+\begin{enumerate}[resume]
+\item Four of the firm's strategies share the layer-1 design's first multiplexer and answer an event within
+  \qty{50}{\nano\second} (standard deviation) of each other. What is the mean wait of an order (from the chapter's simulation)?
+\item And of the last of the four?
+\item Does the design still beat the cut-through design for the last order?
+\item How would you spread the four strategies?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Failures.}
+\begin{enumerate}[resume]
+\item List the commodity design's single points of failure.
+\item Why does the cut-through design have none although each line has only one switch?
+\item What must be true of the venue's order handoffs for the layer-1 design to have none?
+\item What happens to latency when one of the layer-1 design's fan-outs fails?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item What is the cost per nanosecond per year of moving from commodity to cut-through?
+\item And of moving from cut-through to layer-1?
+\item State the \emph{named result}: the trigger path of each design and the cost of each nanosecond saved.
+\item For which kind of strategy is the layer-1 step worth its price?
+\item What does a layer-1 design give up that a switch provides?
+\item Where do the next nanoseconds come from once the devices add only tens?
+\item Which checks from the method would you run before signing off the design?
+\item In one sentence: what is the fastest device in a cage?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:switches-and-layer-1-devices:1}
+What is the difference between store-and-forward and \omterm{def:nw:switches-and-layer-1-devices:modes}{cut-through switching}, and when does a cut-through switch store and forward?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:switches-and-layer-1-devices:2}
+What is a \omterm{def:nw:switches-and-layer-1-devices:l1}{layer-1 switch}, and what can it not do that an Ethernet switch can?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:switches-and-layer-1-devices:3}
+Why do firms put orders through a multiplexer rather than a fan-out, and what goes wrong when several servers send at once?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:switches-and-layer-1-devices:4}
+Tap or mirror port for latency measurement? Defend your choice.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, trader}]\label{iq:nw:switches-and-layer-1-devices:5}
+Design the network for a cage with two venue lines, one order handoff and four servers. Walk me through the failure cases.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:switches-and-layer-1-devices:6}
+Your cut-through switch shows higher latency at the open than at noon, for the same frames. Why?
+\end{interviewq}

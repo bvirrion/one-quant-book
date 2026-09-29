@@ -199,6 +199,27 @@ that uses them and never leave it.
 | $x_t, u_t, g_{t+1}, G_t, \pi(u\mid x), V^\pi, Q^\pi$ | RL state, action, reward, return, policy, value functions (B12 ch. 17–18; avoids $s_t$ spread and $a_t$ ask) |
 | units | prices in code as integers of 1/10,000 currency unit; time as integer ns since midnight; `\qty{}{\nano\second}`, `\micro\second`, `\giga\hertz`, `\byte` |
 
+## Books 14–16 additions (sync, 2026-09-28)
+
+All local unless stated; series symbols keep their meaning.
+
+| symbol | meaning |
+|---|---|
+| $c_0$ | speed of light in vacuum ($c$ stays the coupon rate); $n_g$ group index; $d_{\mathrm{geo}}$ geodesic distance, $L_{\mathrm{path}}$ path length, $\xi=L_{\mathrm{path}}/d_{\mathrm{geo}}$ route factor, $t_{\mathrm{floor}}$ one-way latency floor (B14 Part III) |
+| $R_{\mathrm L}$, $t_{\mathrm{ser}}=8\ell_{\mathrm f}/R_{\mathrm L}$ | line rate and serialisation delay (B14) |
+| $t_1..t_4$, $\vartheta$, $y_{\mathrm f}$, $\sigma_y(\tau)$ | PTP timestamps, clock offset, fractional frequency offset, Allan deviation (B14 ch. 4) |
+| $f_{\mathrm{clk}}, T_{\mathrm{clk}}$ | clock frequency and period (B14 ch. 6–7) |
+| $\gamma_{\mathrm{rain}}=k_{\mathrm{ITU}}R_{\mathrm{rain}}^{\alpha_{\mathrm{ITU}}}$, $r_F$, $k_e$ | rain attenuation, Fresnel radius, earth-radius factor (B14 ch. 14) |
+| $\mathcal A$; MTBF, MTTR, RTO, RPO upright | availability and service metrics (B14 ch. 15, 28) |
+| $n_{\mathrm{msg}}$, $b$, $\mathrm{CR}$, $f_{\mathrm{sel}}$ | message count, bytes per record, compression ratio (upright), query selectivity (B15) |
+| $I_a$, $\Pi$, $\beta_{\mathrm{mem}}$, $\Pi_{\mathrm{att}}$, $f_{\mathrm{par}}$, $n_w$ | arithmetic intensity, peak compute, memory bandwidth, attainable throughput, parallel fraction, workers (B15 ch. 13–14; $W$ stays Brownian motion) |
+| $C_{\max}$, $d_j$; $t^{\mathrm{sys}}$; SLO upright | makespan and task durations; system time next to Book 7's valid and knowledge times; service-level objective, error budget $1-\mathrm{SLO}$ (B15) |
+| $\mathrm{Rev}$, $\Pi$, $C^{\mathrm{fix}}$, $c^{\mathrm{var}}$, $\omega$ | revenue, operating profit, fixed costs, variable cost per unit, compensation ratio (B16; $\Pi$ is local in both B15 and B16 chapters and never shared) |
+| ROE, RWA, LE, $\mathrm{EC}_i$, RAROC, $h_K$ | capital measures; $h_K$ capital-charge or hurdle rate (bare $h$ stays the VaR horizon) (B16) |
+| $\mathrm{NAV}_t$, $\mathrm{AUM}_t$, $p_{\mathrm{mgmt}}$, $p_{\mathrm{perf}}$ | fund quantities and fee rates ($A_t$ stays the annuity) (B16) |
+| $\mathrm{DD}_t$, MDD, BS, HHI with shares $w_i$, $T_{\mathrm{ftt}}$, $T_{\mathrm{surv}}$ | drawdown, maximum drawdown, Brier score, Herfindahl–Hirschman index, time to first trade, survival horizon (B16) |
+| units | `\flop`, `\msg` declared in `onequant.sty`; `\giga\bit\per\second`, `\decibel`; ppm via `\num{}` |
+
 ## Gates
 
 `tools/gates.sh chapter <slug>/<NN-chapter>`, `make test-code CH=<slug>/<NN-chapter>`,

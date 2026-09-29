@@ -1,0 +1,334 @@
+\chapter{On-Chain Connectivity}\label{ch:nw:on-chain-connectivity}
+
+A transaction sent to a public node of a blockchain reaches the rest of the network by gossip, hop by hop, and is visible to everyone on the
+way; one sent to a \omterm{def:nw:on-chain-connectivity:engine}{block engine} in the region of the next block producer skips the gossip altogether. On a chain whose leaders change every
+few hundred milliseconds, and whose software gives each leader four consecutive slots, which region to send to is a scheduling question: the
+answer changes with the \omterm{def:nw:on-chain-connectivity:leader}{leader schedule}, and the schedule is published in advance.
+
+Book~3 described the actors of on-chain trading (nodes, validators, builders, relays, searchers). This chapter is about their network: how
+nodes peer and gossip, what propagation networks and private relays change, where the \omterm{def:nw:on-chain-connectivity:engine}{block engines} are, how a \omterm{def:nw:on-chain-connectivity:leader}{leader schedule} turns into a
+choice of endpoint, and what \omterm{def:nw:on-chain-connectivity:engine}{hosted node providers} sell. The documentation is cited and dated; the propagation is a labelled simulation on
+the book's map.
+
+\section{Running and peering nodes}
+
+\begin{definition}[Gossip protocol]\label{def:nw:on-chain-connectivity:gossip}
+A \emph{gossip protocol}\index{gossip protocol} spreads a message over a peer-to-peer network by having each node that receives it for the first
+time forward it (or announce it) to some or all of its peers, so that it reaches every node in a number of hops that grows with the logarithm of
+the network's size.
+\end{definition}
+
+A node joins a chain's network by connecting to peers found through the chain's discovery protocol; in this chapter's model they are chosen at
+random, with no regard to geography. Each hop costs the link's delay plus the node's validation of the message before it forwards it. The consequence was measured early:
+Decker and Wattenhofer found in 2013 that a Bitcoin block reached the median node after 6.5 seconds and that after 40 seconds 5\% of nodes still
+had not seen it. Smaller messages and faster validation shorten each hop, but not the structure: a transaction still reaches the far side of
+the world through a chain of hops between peers it did not choose.
+
+\begin{proposition}[Gossip time]\label{prop:nw:on-chain-connectivity:gossip}
+On a network whose nodes each forward to all their peers on first receipt, a message reaches every node at the length of its shortest path
+from the source, where a link's length is its delay plus the receiving node's processing; forwarding to a subset and announcing to the rest, who
+pull, lengthens the announced links by a round trip and can only delay arrival.
+\end{proposition}
+
+\begin{proof}
+Flooding explores every path in parallel, so each node receives the message first along its shortest path (Dijkstra's argument). Replacing some
+pushes by announcements adds a round trip to those links' lengths, and shortest paths cannot become shorter when lengths grow.
+\end{proof}
+
+\omcode{code/firm/chainnet/firm_chainnet.py}{54}{71}{Gossip as shortest paths: flooding, and square-root fan-out with announcements and pulls.}\label{lst:nw:on-chain-connectivity:spread}
+
+The model places 600 nodes evenly in the eight cities of \cref{dat:nw:on-chain-connectivity:engines}, joins each to eight random peers, and
+charges each link its fibre floor times 1.5 plus \qty{5}{\milli\second} of processing (assumptions). A transaction from a node in Tokyo reaches
+half the nodes after \qty{85.0}{\milli\second} and nine-tenths after \qty{99.5}{\milli\second} by flooding; with square-root fan-out, which
+saves bandwidth, after 113.9 and \qty{149.0}{\milli\second}. In the model the random graph offers paths close to the direct legs,
+so what gossip adds is its extra hops: three to eight of them, 15 to \qty{40}{\milli\second} of processing, against the engine's one
+millisecond (an assumption). The tails differ most: the last node has it after \qty{158.5}{\milli\second} by flooding and
+\qty{326.5}{\milli\second} with square-root fan-out.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmin=0,xmax=180,ymin=0,ymax=1.02,xlabel={time since the transaction left Tokyo (ms)},
+  ylabel={share of nodes reached},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick,const plot] table[x=ms,y=flood]{figdata/networks/21-on-chain-connectivity/propagation.csv};
+\addplot[omThm,thick,dashed,const plot] table[x=ms,y=sqrt]{figdata/networks/21-on-chain-connectivity/propagation.csv};
+\addplot[gray,densely dotted] coordinates {(0,0.5) (180,0.5)};
+\addplot[gray,densely dotted] coordinates {(0,0.9) (180,0.9)};
+\legend{flooding,square-root fan-out}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: the share of 600 nodes in eight cities, eight random peers each, that have a transaction sent from a node in Tokyo, against
+time. Flooding reaches half at \qty{85.0}{\milli\second} and nine-tenths at \qty{99.5}{\milli\second}; square-root fan-out at 113.9 and
+\qty{149.0}{\milli\second}. Data: \texttt{fig\_chain.py}, \texttt{firm\_chainnet.spread()}.}\label{fig:nw:on-chain-connectivity:propagation}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar,width=11cm,height=6.2cm,bar width=6pt,xmin=0,xmax=110,ytick=data,
+  yticklabels from table={figdata/networks/21-on-chain-connectivity/leaders.csv}{city},y dir=reverse,
+  xlabel={arrival at a leader in the city (ms), from Tokyo},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,legend columns=2},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[y expr=\coordindex,x=gossip]{figdata/networks/21-on-chain-connectivity/leaders.csv};
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=direct]{figdata/networks/21-on-chain-connectivity/leaders.csv};
+\legend{through gossip,through the nearest block engine}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: when a transaction sent from Tokyo reaches the next leader, by the leader's city: through the gossip graph from a public node
+in Tokyo (median over the city's nodes), and directly through the published \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest the leader. Gossip adds 14 to
+\qty{39}{\milli\second}. Data: \texttt{fig\_chain.py}, \texttt{nw\_chain.to\_leader()}.}\label{fig:nw:on-chain-connectivity:leaders}
+\end{omfigure}
+
+\section{Transaction propagation networks and private relays}
+
+\begin{definition}[Transaction propagation network]\label{def:nw:on-chain-connectivity:tpn}
+A \emph{transaction propagation network}\index{transaction propagation network} is a privately operated network of relays, peered with many nodes
+and validators of a chain, that carries transactions and blocks between them faster and with less variance than the chain's own gossip over the
+public internet.
+\end{definition}
+
+Two services change the path of a transaction. A propagation network, such as bloXroute's Blockchain Distribution Network, replaces random public
+hops with its own relays, which its documentation describes as reducing ``latency and variance'' in propagation. A private relay changes who sees
+the transaction: Flashbots Protect, on Ethereum, sends it to a private mempool where it is ``hidden from frontrunning and sandwich bots'' until a
+builder includes it. The first is a latency product; the second a visibility product; a searcher may need both (Book~3's private order flow).
+
+\section{Block-builder and block-engine endpoints by region}
+
+\begin{definition}[Block engine, hosted node provider]\label{def:nw:on-chain-connectivity:engine}
+A \emph{block engine}\index{block engine} is a service, run close to a chain's validators, that accepts transactions and bundles from traders and
+forwards them directly to the current or next block producer, often through an auction for inclusion. A \emph{hosted node provider}\index{hosted node
+provider} runs a chain's nodes and sells access to their RPC endpoints, with request limits per plan, so that a firm need not run its own.
+\end{definition}
+
+\begin{dated}{2026-09}{Block engines and relays, from their documentation}\label{dat:nw:on-chain-connectivity:engines}
+\begin{itemize}
+\item Jito (Solana): mainnet \omterm{def:nw:on-chain-connectivity:engine}{block engines} in Amsterdam, Dublin, Frankfurt, London, New York, Salt Lake City, Singapore and Tokyo, each with its own
+  endpoint; its \texttt{sendTransaction} forwards a transaction directly to the validator; bundles need a tip of at least 1\,000 lamports.
+\item Flashbots Protect (Ethereum): a private mempool hidden from frontrunning and sandwich bots, with refunds.
+\item bloXroute: a Blockchain Distribution Network of relays for Solana, BNB Chain, Base, Ethereum, Hyperliquid and other chains.
+\end{itemize}
+\end{dated}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=6mm,
+  nd/.style={circle,draw=omThm,fill=omThm!15,minimum size=5mm,inner sep=0pt},
+  box/.style={draw=omDef,fill=omDef!12,rounded corners,align=center,minimum height=8mm,inner sep=3pt}]
+\node[box] (firm) at (0,0) {firm\\(Tokyo)};
+\node[nd] (a) at (2.2,1.3) {}; \node[nd] (b) at (3.8,1.9) {}; \node[nd] (c) at (5.4,1.2) {};
+\node[nd] (d) at (7.0,1.8) {}; \node[nd] (e) at (4.6,0.3) {};
+\node[box] (lead) at (9.4,0) {next leader\\(Frankfurt)};
+\node[box] (eng) at (7.4,-1.3) {block engine\\(Frankfurt)};
+\draw[omThm,->] (firm) -- (a); \draw[omThm,->] (a) -- (b); \draw[omThm,->] (b) -- (c); \draw[omThm,->] (c) -- (d);
+\draw[omThm,->] (d) -- (lead); \draw[omThm!50,->] (a) -- (e); \draw[omThm!50,->] (e) -- (c);
+\draw[omDef,->,thick] (firm) |- (eng); \draw[omDef,->,thick] (eng) -- (lead);
+\node[text=omThm,font=\footnotesize] at (4.6,2.5) {public gossip: every hop sees it and adds its processing};
+\node[text=omDef,font=\footnotesize] at (2.9,-1.62) {firm's route to the engine; one short last hop};
+\end{tikzpicture}
+
+\omcaption{Two ways to the next leader: hand the transaction to a public node and let gossip carry it hop by hop, visible to every node; or send it
+over the firm's own route to the \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest the leader, which forwards it directly. Schematic.}\label{fig:nw:on-chain-connectivity:paths}
+\end{omfigure}
+
+A \omterm{def:nw:on-chain-connectivity:engine}{block engine} is a \omterm{def:nw:the-european-map:pop}{point of presence} (chapter~11) for the chain's producers. Sending to the engine nearest the producer puts the long-haul part of
+the path on the firm's own route and the last hop on the engine's short one, instead of on a dozen random public hops.
+
+\section{Validator proximity and the leader schedule}
+
+\begin{definition}[Leader schedule]\label{def:nw:on-chain-connectivity:leader}
+A \emph{leader schedule}\index{leader schedule} is a chain's published assignment of future block-production slots to validators, computed in
+advance for an epoch, which lets anyone know which validator will produce each coming block and, if its location is known, where to send
+transactions.
+\end{definition}
+
+\begin{dated}{2026-09}{Slots and leaders, from the chains' specifications and code}\label{dat:nw:on-chain-connectivity:chains}
+Ethereum's mainnet configuration sets 12-second slots. Solana computes its \omterm{def:nw:on-chain-connectivity:leader}{leader schedule} an epoch in advance; the Solana SDK's default target
+slot time is \qty{300}{\milli\second} (it defines 400 and shorter as well) and the effective target is changed dynamically, so clients must not assume
+the default; the Agave validator gives each leader four consecutive slots.
+\end{dated}
+
+With 12-second slots, geography matters for Ethereum only at the edges of a slot. With slots of a few hundred milliseconds and four in a row per
+leader, it matters for every transaction on Solana: the next leader's location is known in advance, and a transaction that reaches it after its
+four slots waits for the next leader, possibly on another continent.
+
+\omcode{code/networks/21-on-chain-connectivity/python/nw_chain.py}{36}{44}{Arrival at the next leader: through the gossip graph, and directly through
+the published engine nearest the leader.}\label{lst:nw:on-chain-connectivity:leader}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmin=0,xmax=150,ymin=0,ymax=1.05,xlabel={time left in the leader's window when the transaction is sent (ms)},
+  ylabel={share of leaders reached},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omThm,thick,const plot] table[x=deadline,y=gossip]{figdata/networks/21-on-chain-connectivity/timely.csv};
+\addplot[omDef,thick,const plot] table[x=deadline,y=direct]{figdata/networks/21-on-chain-connectivity/timely.csv};
+\legend{through gossip,leader-aware engine}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: the share of next leaders, placed in turn in each of the eight engine cities, reached in time from Tokyo, against the time left
+in the leader's window. Sending to the engine nearest the leader shifts the curve left by 14 to \qty{39}{\milli\second}. Data: \texttt{fig\_chain.py},
+\texttt{nw\_chain.timely\_rates()}.}\label{fig:nw:on-chain-connectivity:timely}
+\end{omfigure}
+
+Averaged over the eight leader cities and over a time left uniform between zero and \qty{150}{\milli\second}, the leader-aware chooser lands 61\% of
+transactions in time against 48\% through gossip; over \qty{300}{\milli\second}, 80.5\% against 74.0\%. For a leader in Frankfurt, the
+chapter's problem, the direct path takes \qty{69.5}{\milli\second} and gossip \qty{83.5}{\milli\second}.
+
+\section{Hosted node providers}
+
+Running a chain's nodes well is work: storage, bandwidth, upgrades and peering. Hosted
+providers sell their nodes' endpoints instead, by plan and request limit. For trading, the question is the one of chapters~16 to~18: where the
+provider's nodes are, whether they are the ones the firm's transactions should enter, and how their limits are governed (Book~3's rate limits). A
+provider's endpoint is a convenient place to read the chain and a poor place to race on it.
+
+\begin{method}[Getting a transaction to the next block]\label{met:nw:on-chain-connectivity:send}
+\begin{enumerate}
+\item Read the chain's slot time and \omterm{def:nw:on-chain-connectivity:leader}{leader schedule}; map the coming leaders to regions where their location is known or can be measured
+  (chapter~17's triangulation).
+\item Keep connections open to the \omterm{def:nw:on-chain-connectivity:engine}{block engines} or builders in every region the leaders use; choose per transaction the one nearest the next
+  leader with enough time left.
+\item Use a propagation network or private relay where visibility or variance matters more than the last milliseconds.
+\item Run your own nodes where you read state critical to trading; use hosted endpoints for the rest, within their limits.
+\item Measure landing rates per region and per leader; the schedule and the engines' locations change.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: gossip and the next leader}\label{tut:nw:on-chain-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Simulate gossip on a peer graph over the book's map, and compare it with sending to the \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest the next leader.
+\textbf{End state:} \cref{fig:nw:on-chain-connectivity:propagation,fig:nw:on-chain-connectivity:leaders,fig:nw:on-chain-connectivity:timely}.
+\begin{tutsteps}
+\item \textbf{Engines.} \texttt{firm\_chainnet.load\_engines} reads the dated regional endpoints.
+\item \textbf{Graph.} \texttt{Graph} places 600 nodes in the engines' cities with eight peers each; \texttt{spread} (\cref{lst:nw:on-chain-connectivity:spread})
+  gives each node's arrival time.
+\item \textbf{Leaders.} \texttt{nw\_chain.to\_leader} (\cref{lst:nw:on-chain-connectivity:leader}) compares gossip with the nearest engine;
+  \texttt{timely\_rates} and \texttt{mean\_timely} turn it into landing shares.
+\end{tutsteps}
+\textbf{What to change next.} Make the graph geography-aware (peers chosen among the nearest nodes) and see what gossip gains; add the engines'
+own queueing and tips.
+\end{tutorial}
+
+\section{Build: the chain network model}\label{bld:nw:on-chain-connectivity:chainnet}
+
+\begin{build}
+\bfield{Purpose} How transactions travel on a chain's network and where to send them: the on-chain rows of chapter~29's plan.
+\bfield{Interface} \texttt{firm\_chainnet}: \texttt{Graph}, \texttt{spread}, \texttt{reach\_time}, \texttt{Engine}, \texttt{load\_engines},
+\texttt{one\_way\_ms}, \texttt{choose\_engine}, \texttt{timely}.
+\bfield{Rules} Endpoints are dated rows with sources; link delays are the fibre floor times a stated \omterm{def:nw:the-north-american-map:factor}{route factor} plus stated processing; every result
+is labelled a simulation.
+\bfield{Acceptance tests} \texttt{code/firm/chainnet/tests/}: the engines' data, flooding on a line graph by hand, square-root fan-out never faster
+than flooding, and the chooser and deadline check.
+\bfield{Stretch} Read a live \omterm{def:nw:on-chain-connectivity:leader}{leader schedule} and validators' measured locations; model the engines' auctions.
+\end{build}
+
+\begin{omsources}
+\item C.~Decker and R.~Wattenhofer, ``Information propagation in the Bitcoin network'', IEEE P2P 2013.
+\item Ethereum consensus specifications (mainnet configuration); Anza documentation (leader rotation), Solana SDK and Agave source.
+\item Jito Labs, low-latency transaction send; Flashbots Protect; bloXroute documentation.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:1}
+How many milliseconds does a Solana leader hold the chain if it has four consecutive slots at the SDK's default target?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:2}
+What is the difference between a \omterm{def:nw:on-chain-connectivity:tpn}{transaction propagation network} and a private relay?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:3}
+Why does gossip reach a node in the sender's own city later than a direct message would?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:4}
+Using \cref{prop:nw:on-chain-connectivity:gossip}, why is square-root fan-out never faster than flooding, and why use it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:5}
+The next leader is in Singapore and your machine in Tokyo. Which engine do you use, and what does the model say you gain?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:6}
+Why does the choice of region matter little on a chain with 12-second slots?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:on-chain-connectivity:7}
+\emph{Coding.} With \texttt{firm.chainnet}, how much faster does flooding reach nine-tenths of the nodes if each node has 16 peers instead of 8?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:on-chain-connectivity:8}
+\emph{Find the flaw.} ``We send every transaction to the \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest our servers, so we always use the fastest path.''
+\end{exercise}
+
+\section{Problem: The Leader Is in Frankfurt}
+
+\begin{problem}[{Weekend problem --- gossip against the leader-aware engine}]\label{pb:nw:on-chain-connectivity:1}
+A firm in Tokyo sends transactions on a chain whose next leader is in Frankfurt. It can hand them to a public node in Tokyo and let gossip carry them,
+or send them to the \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest the leader. Use the chapter's network model.
+
+\medskip\noindent\textbf{Part I --- Gossip.}
+\begin{enumerate}
+\item How long does flooding take to reach half and nine-tenths of the nodes from Tokyo?
+\item And square-root fan-out?
+\item When does the transaction reach a leader in Frankfurt through gossip?
+\item Why is that longer than the direct path?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The engine.}
+\begin{enumerate}[resume]
+\item Which engine is nearest the leader, and when does the transaction reach the leader through it?
+\item What is the one-way fibre floor Tokyo--Frankfurt, and what \omterm{def:nw:the-north-american-map:factor}{route factor} does the model assume?
+\item How much of the direct path is the engine's own time?
+\item What does the engine see that gossip would have shown to everyone?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Landing rates.}
+\begin{enumerate}[resume]
+\item With the time left uniform between zero and \qty{150}{\milli\second}, what share of leaders over the eight cities does each method reach?
+\item And with up to \qty{300}{\milli\second}?
+\item Why does the gain shrink as the window grows?
+\item How would four consecutive slots per leader change the firm's planning?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the propagation time to half and nine-tenths of the network, and the gain in timely arrival from sending to the
+  \omterm{def:nw:on-chain-connectivity:engine}{block engine} nearest the next leader against a fixed region.
+\item Which inputs are documentation and which assumptions?
+\item What would a geography-aware peer graph change?
+\item Where should the firm's machines be for this chain?
+\item What does a propagation network add on top of the engine?
+\item How should the firm check that its model matches reality?
+\item Where does this go in chapter~29's plan?
+\item In one sentence: why is the region a scheduling question?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:on-chain-connectivity:1}
+How does a transaction propagate on a blockchain's peer-to-peer network, and why is it slow?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:on-chain-connectivity:2}
+What is a \omterm{def:nw:on-chain-connectivity:engine}{block engine}, and why are there several around the world?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:on-chain-connectivity:3}
+How would you use a chain's \omterm{def:nw:on-chain-connectivity:leader}{leader schedule} to route transactions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:on-chain-connectivity:4}
+When would you run your own node rather than use a hosted provider?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:on-chain-connectivity:5}
+Why might a trader send a transaction privately rather than to the public mempool?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:nw:on-chain-connectivity:6}
+Design the transaction-sending layer of a trading firm active on a fast chain with leaders on three continents.
+\end{interviewq}

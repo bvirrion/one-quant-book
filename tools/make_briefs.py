@@ -47,15 +47,23 @@ def main():
                     f.write(f"# {n}. {ch['title']} — brief and source ledger\n\n## Brief\n\n")
                     f.write(f"- **Hook.** {ch['hook']}\n")
                     f.write("- **Sections.** " + "; ".join(ch["sections"]) + ".\n")
-                    f.write("- **Defines.** " + ", ".join(ch["defines"]) + ".\n")
+                    f.write("- **Defines.** " + (", ".join(ch["defines"]) or "nothing (uses only)") + ".\n")
                     if ch.get("uses"):
                         f.write("- **Uses (defined earlier).** " + ", ".join(ch["uses"]) + ".\n")
                     if ch.get("strategies"):
                         f.write("- **Strategy files.** " + "; ".join(ch["strategies"]) + ".\n")
-                    f.write(f"- **Tutorial.** {ch['tutorial']}\n")
-                    f.write(f"- **Build.** {ch['build']}\n")
-                    f.write(f"- **Weekend problem.** {ch['problem']}\n")
-                    f.write("- **Facts to verify.** " + "; ".join(ch["facts"]) + ".\n\n")
+                    if ch.get("tutorial"):
+                        f.write(f"- **Tutorial.** {ch['tutorial']}\n")
+                    if ch.get("build"):
+                        f.write(f"- **Build.** {ch['build']}\n")
+                    if ch.get("problem"):
+                        f.write(f"- **Weekend problem.** {ch['problem']}\n")
+                    if ch.get("bank"):
+                        f.write(f"- **Question bank.** {ch['bank']}\n")
+                    f.write("- **Facts to verify.** " + "; ".join(ch.get("facts", [])) + ".\n")
+                    if ch.get("data"):
+                        f.write(f"- **Data.** {ch['data']}\n")
+                    f.write("\n")
                     f.write("## Ledger\n\n| id | claim | source | URL | accessed | evidence | used in |\n|---|---|---|---|---|---|---|\n\n## EXCLUDED\n\n")
             cfile = f"parts/{SLUG}/{slug}.tex"
             if not os.path.exists(cfile):

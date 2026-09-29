@@ -1,0 +1,333 @@
+\chapter{Futures Connectivity}\label{ch:nw:futures-connectivity}
+
+In January 2018 an order on Eurex entered the exchange through one of sixteen high-frequency gateways, and the path on
+which competing orders raced was 22 microseconds long ``with multiple µs variance''. Each gateway had its own queue and its
+own jitter, so a firm that opened sessions on many gateways and sent a copy down each could beat a faster firm with one. The
+exchange's own account is blunt: ``Latency jitter on parallel inbound paths had incentivised multiplicity to reduce latency.''
+Its answer was to change the gateways, and by September 2018 the competitive path was under two microseconds with
+nanosecond variance. The history of those changes is a history of what ``fair'' means at the microsecond.
+
+Book~1 introduced futures commission merchants and clearing members, Book~10 the order-entry session, Book~11 the kill
+switch and the pre-trade check, Book~13 the drop copy and the binary market data. This chapter is about how a firm connects
+to a futures exchange: the sessions and the gateways behind them, the fairness designs the exchanges adopted, the clearing
+firm's controls on the path, and the market data channels. The race between gateway designs is a labelled simulation built
+on the exchanges' published numbers.
+
+\section{Order-entry sessions and market-segment gateways}
+
+\begin{definition}[Market segment gateway]\label{def:nw:futures-connectivity:msgw}
+A \emph{market segment gateway}\index{market segment gateway} is an exchange's order-entry gateway dedicated to one market
+segment, a group of products matched on one engine instance, so that every order for those products enters through the same
+gateway and in one sequence, rather than through any of several general gateways that route to all segments.
+\end{definition}
+
+CME Group offers both models. A Convenience Gateway accepts orders for every market segment and routes them; a Market Segment
+Gateway connects to one segment, and the firm connects to each segment it trades, with one session identity shared across all
+of them and separate primary and backup addresses for each (\cref{dat:nw:futures-connectivity:gateways}). Deutsche Börse's T7
+has the same split: partition-specific gateways, for high-frequency sessions only, reach one partition; low-frequency gateways
+reach all partitions through them, 43 microseconds slower at the median; FIX gateways go through the low-frequency ones.
+
+A session is therefore a set of choices: which gateway type, which segments or partitions, what throttle, and how many. On
+T7 a high-frequency session is throttled to 150 transactions a second (``Full'') or 250 (``Ultra''), a participant may order up
+to 80 sessions, and the price list charges more for the seventh Full session than for the sixth
+(\cref{dat:nw:futures-connectivity:sessions}).
+
+\begin{dated}{2026-09}{High-frequency session types and fees on Eurex, from the June 2023 price list}\label{dat:nw:futures-connectivity:sessions}
+ETI High Frequency Full session, at most 150 transactions a second: EUR 260 a month for each of a trading member's first six
+sessions, EUR 520 from the seventh. Ultra session, at most 250 transactions a second: EUR 780 a month. Up to 80 sessions may be
+ordered (Deutsche Börse, 2021).
+\end{dated}
+
+A session planner turns a transaction rate into the cheapest mix: \texttt{firm\_gwmodel.plan\_sessions} carries 3\,000
+transactions a second on one partition with five Full sessions and nine Ultra ones, EUR 8\,320 a month, cheaper than twenty
+Full sessions (EUR 8\,840) because the Full price doubles from the seventh.
+
+\section{Gateway fairness and its history}
+
+\begin{definition}[Gateway fairness]\label{def:nw:futures-connectivity:fairness}
+\emph{Gateway fairness}\index{gateway fairness} is the property of an exchange's \omterm{def:nw:api-engineering-for-crypto-venues:path}{order-entry path} that competing messages reach
+the matching engine in the order in which they reached the exchange's network, with a variance small against the differences
+the exchange means to reward, so that no participant gains by sending the same order through several paths.
+\end{definition}
+
+\begin{dated}{2026-09}{Gateway designs and their fairness, from the exchanges' documentation}\label{dat:nw:futures-connectivity:gateways}
+\begin{itemize}
+\item Eurex T7: January 2018, 16 high-frequency gateways, competitive path of 22 µs ``with multiple µs variance''; September
+  2018, partition-specific gateways as a single point of entry, ``sub 2 µs with ns level variance''. Since 2021: FIFO
+  ``guaranteed from network card to matching engine in''; \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation} connections equal in length within ±2.5~ns.
+\item CME Globex: ``The MSGW ensures messages are processed in the order in which they arrive at the gateway''; 17 market
+  segments. Safeguards: a message split across packets, or received out of order, costs its session at least
+  \qty{3}{\micro\second} of extra processing, during which another session's complete message may overtake it.
+\end{itemize}
+\end{dated}
+
+The model reproduces the incentive. Ten firms react to the same event at the same instant. Under the parallel design, each
+copy of an order crosses the network to a gateway (\qty{20}{\micro\second}, jitter of \qty{1}{\micro\second}), waits behind that
+gateway's queue (two messages already there on average, and the race's own copies that arrived first,
+\qty{1.5}{\micro\second} each), and the firm's first copy to finish counts. Under the segment design every copy enters one
+gateway whose order is fixed at the network card, over connections equal to ±2.5~ns. All parameters are assumptions in the
+range the exchanges describe.
+
+\omcode{code/firm/gwmodel/firm_gwmodel.py}{46}{65}{One race under each design: the segment design orders by arrival at the card; the parallel one by queues.}\label{lst:nw:futures-connectivity:race}
+
+\begin{proposition}[Copies under the two designs]\label{prop:nw:futures-connectivity:copies}
+Under a design where every copy of a firm's order reaches one first-in first-out queue at the same instant, extra copies cannot
+change which firm is first. Under parallel queues with independent delays, the firm's arrival is the minimum of its copies'
+delays, which falls with every copy, so its chance of winning rises while the others keep one session.
+\end{proposition}
+
+\begin{proof}
+In one queue, the copies of an order arrive together and the first is served no earlier than a single copy would be; the rest
+only queue behind it. With independent paths, the minimum of $k+1$ delays is at most the minimum of $k$, and strictly smaller
+with positive probability when the delays are continuous.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmin=0.5,xmax=12.5,ymin=0,ymax=0.65,xtick={1,2,3,4,5,6,7,8,9,10,11,12},
+  xlabel={the firm's sessions (one copy each)},ylabel={probability of winning the race},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,legend columns=3},table/col sep=comma]
+\addplot[omThm,thick,mark=*,mark size=1.4pt] table[x=k,y=solo]{figdata/networks/23-futures-connectivity/wins.csv};
+\addplot[omMeth,thick,mark=square*,mark size=1.4pt] table[x=k,y=everyone]{figdata/networks/23-futures-connectivity/wins.csv};
+\addplot[omDef,thick,dashed,mark=triangle*,mark size=1.8pt] table[x=k,y=segment]{figdata/networks/23-futures-connectivity/wins.csv};
+\legend{parallel: the firm alone,parallel: everyone,segment gateway}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: the chance that a firm wins a ten-firm race against the number of sessions it sends a copy through. With
+parallel gateways and the others on one session, twelve sessions take it from 10.0\% to 59.7\%; if everyone does the same, back
+to one in ten; with a segment gateway, one in ten whatever it does. Data: \texttt{fig\_futures.py},
+\texttt{nw\_futures.curves()}.}\label{fig:nw:futures-connectivity:wins}
+\end{omfigure}
+
+Alone, a firm that sprays copies over twelve gateways wins 59.7\% of the races instead of 10.0\%. When everyone does it, the win
+rate returns to one in ten, and what remains is the load: a bystander message reaching a random gateway just after the race
+takes \qty{25.4}{\micro\second} when every firm sends one copy and \qty{35.8}{\micro\second} when every firm sends twelve, the
+``higher, less predictable latencies'' of the exchange's account. Under the segment design the firm wins 9.8\% of races with one
+session or twelve: the order is decided by nanoseconds of cable, and copies only load the gateway.
+
+The history reads as a sequence of such repairs. Parallel gateways with independent queues rewarded multiplicity; FIFO within a
+gateway and deterministic networks reduced the variance; a single entry point per partition removed the parallel paths; equal
+cables moved the tie-break to nanoseconds. Each repair closes one strategy and exposes the next margin. CME's safeguards, which
+its documentation calls a market integrity control, target messages split across packets: sending the start of a message before
+its end is ready is a way to arrive first, and a session that does it now waits at least three microseconds.
+
+\section{Drop copy and clearing-firm risk layers}
+
+\begin{definition}[Clearing-firm credit control]\label{def:nw:futures-connectivity:credit}
+A \emph{clearing-firm credit control}\index{clearing-firm credit control} is a limit that a clearing member sets, at the exchange
+or in its own system, on the exposure of an executing firm it guarantees, with actions the exchange takes when the limit is
+breached, such as blocking new orders or cancelling working ones.
+\end{definition}
+
+A futures firm trades under a clearing member's guarantee, and the clearing member controls it at the exchange. CME's Globex
+Credit Controls let clearing-firm risk administrators set exposure limits and maximum order sizes per executing firm and choose
+what happens on a breach: an e-mail, blocked orders, cancelled orders; for mass quotes the check applies only after execution.
+Unlike the broker's layer of chapter~22, this control sits inside the exchange, so it adds nothing to the firm's path; its cost
+is the limit itself, which can stop a strategy in the middle of a busy day.
+
+The drop copy is the firm's independent record of every execution and cancellation, from the exchange. With several sessions it
+covers them all, and reconciliation must be per session: an order identifier is unique within its session, not across them.
+\texttt{firm.gwmodel} splits the drop copy by session and runs Book~13's reconciler on each.
+
+\omcode{code/firm/gwmodel/firm_gwmodel.py}{118}{126}{Reconciling a multi-session firm: Book~13's reconciler per session, and sessions the firm does not know.}\label{lst:nw:futures-connectivity:reconcile}
+
+Multiplicity has a cost here too. Twelve copies of an immediate-or-cancel order produce up to twelve executions and cancellations
+to reconcile, and more than one copy may fill: a firm that sprays orders must size each copy as if all might execute, which is
+the worst-case accounting of Book~13's gateway.
+
+\section{Market data: channels, recovery and bandwidth}
+
+CME disseminates market data by channel, a channel per product group (the E-mini S\&P~500 futures on channel 310, their options
+on 311, interest rate futures on 312, NYMEX crude and refined futures on 382, among others), each on two UDP feeds, A and B,
+which the exchange strongly recommends processing both. A gap in the packet sequence numbers means that every book on the
+channel may be wrong; recovery is from snapshot loops, a TCP replay of missed packets or an instrument loop. The configuration
+file, not the channel guide, is authoritative for the addresses, and both change.
+
+Two feeds protect only if their losses are independent. With a loss probability of $10^{-5}$ per packet on each, independent
+losses lose a packet on both once in $10^{10}$; with a correlation of 0.5 between the two feeds' losses (a shared switch, a
+shared buffer), once in 200\,000 (\texttt{firm\_gwmodel.both\_lost}). The two feeds must reach the firm by separate paths, into
+separate switch ports, or the second one mostly duplicates the first's failures.
+
+\section{The session budget}
+
+A firm can compute what an extra session is worth. At 20\,000 races a month and EUR 0.50 for each race won (assumptions), the
+second session is worth EUR 840 a month under the parallel design and the twelfth EUR 180.5; against Eurex's fees, the last
+session that pays for itself is the sixth, where the price per session doubles.
+
+\omcode{code/networks/23-futures-connectivity/python/nw_futures.py}{34}{51}{The value of the k-th session and the last one whose value covers its fee.}\label{lst:nw:futures-connectivity:marginal}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[ybar,width=11cm,height=5.6cm,bar width=8pt,xmin=1.4,xmax=12.6,ymin=0,ymax=950,xtick={2,3,4,5,6,7,8,9,10,11,12},
+  xlabel={the firm's k-th session},ylabel={EUR a month},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,legend columns=2},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=value]{figdata/networks/23-futures-connectivity/marginal.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=fee]{figdata/networks/23-futures-connectivity/marginal.csv};
+\legend{value of the extra wins (simulation),session fee (dated schedule)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The monthly value of each extra session under the parallel design, 20\,000 races a month at EUR 0.50 a race won
+(simulation and assumptions), against the Full session's fee: EUR 260 up to the sixth, 520 from the seventh. The sixth is the last
+that pays. Data: \texttt{fig\_futures.py}, \texttt{nw\_futures.marginal()}.}\label{fig:nw:futures-connectivity:marginal}
+\end{omfigure}
+
+The fee schedule is part of the fairness design: a price that doubles from the seventh session makes the marginal copy cost more
+than it wins exactly where the curve flattens. Under a segment gateway the calculation is simpler: the second session wins nothing,
+and sessions are bought for throughput, segments and redundancy only.
+
+\begin{method}[Planning futures order entry]\label{met:nw:futures-connectivity:plan}
+\begin{enumerate}
+\item List the market segments or partitions the strategies trade; read the exchange's gateway model and its fairness design.
+\item Size sessions for throughput and failover: transactions a second per segment against the throttles, with backup addresses
+  tested in the exchange's failover windows.
+\item If the design is fair, do not buy copies; if it is not, value each extra session against its fee and against the load it
+  adds, and expect the exchange to change the design.
+\item Put the clearing member's limits and the drop copy in the plan; reconcile per session.
+\item Take both market data feeds by separate paths, and certify recovery before trading.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: racing through gateways}\label{tut:nw:futures-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Simulate a race under parallel and segment gateways, and price the sessions a firm would buy.
+\textbf{End state:} \cref{fig:nw:futures-connectivity:wins,fig:nw:futures-connectivity:marginal}.
+\begin{tutsteps}
+\item \textbf{Designs.} \texttt{firm\_gwmodel.Design} with the stated parameters; \texttt{race}
+  (\cref{lst:nw:futures-connectivity:race}) runs one event.
+\item \textbf{Win rates.} \texttt{win\_rate} over 20\,000 events for each number of sessions, the firm alone or everyone.
+\item \textbf{Budget.} \texttt{nw\_futures.marginal} and \texttt{last\_paying} (\cref{lst:nw:futures-connectivity:marginal})
+  against the dated fee schedule; \texttt{plan\_sessions} for throughput.
+\end{tutsteps}
+\textbf{What to change next.} Let each firm's reaction time vary, so that the fastest firm wins most races under a fair design, and
+measure how much multiplicity a slower firm needs to catch up under the parallel one.
+\end{tutorial}
+
+\section{Build: the gateway and session model}\label{bld:nw:futures-connectivity:gwmodel}
+
+\begin{build}
+\bfield{Purpose} Gateways, sessions and their prices for a futures desk: the futures rows of chapter~29's plan.
+\bfield{Interface} \texttt{firm\_gwmodel}: \texttt{Design}, \texttt{race}, \texttt{win\_rate}, \texttt{SessionType},
+\texttt{load\_sessions}, \texttt{session\_cost}, \texttt{plan\_sessions}, \texttt{both\_lost}, \texttt{reconcile\_sessions}.
+\bfield{Rules} Fees and limits are dated rows with sources; the race is a labelled simulation with stated parameters; Book~13's
+\texttt{firm.ordergw} is wrapped, not changed.
+\bfield{Acceptance tests} \texttt{code/firm/gwmodel/tests/}: fairness of the segment design, the gain from copies under the parallel
+one and the load they add, a queue by hand, the fee schedule and the planner, and a two-session reconciliation.
+\bfield{Stretch} Reaction-time differences between firms; exchange throttles on copies; ICE's gateways.
+\end{build}
+
+\begin{omsources}
+\item Deutsche Börse, \emph{T7 infrastructure and latency}, Open Day 2018; \emph{Insights into Trading System Dynamics}, 2021.
+\item CME Group Client Systems Wiki: iLink Architecture, Market Segment Gateway Safeguards, CME Globex Credit Controls, MDP 3.0
+  Recovery Services and Channel Guide.
+\item Eurex Circular 029/23 and its price list attachment.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:1}
+What do a Convenience Gateway and a Market Segment Gateway each connect a CME session to?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:2}
+What does ten Full sessions cost a month on Eurex's June 2023 schedule, and what do they carry?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:3}
+Why does the exchange recommend processing both the A and the B feeds?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:4}
+Using \cref{prop:nw:futures-connectivity:copies}, explain why the segment design's win rate stays at one in ten.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:5}
+Why does CME penalise a message split across two packets, and whose message benefits?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:6}
+A firm sends each IOC through four sessions. What must its risk system assume, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:futures-connectivity:7}
+\emph{Coding.} With \texttt{firm\_gwmodel.plan\_sessions}, what is the cheapest mix for 3\,000 transactions a second, and how
+much more would Full sessions alone cost?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:futures-connectivity:8}
+\emph{Find the flaw.} ``Our twelve sessions win us six races in ten; if the other firms copy us we will add more.''
+\end{exercise}
+
+\section{Problem: Twelve Sessions for One Order}
+
+\begin{problem}[{Weekend problem --- the value of multiplicity under two gateway designs}]\label{pb:nw:futures-connectivity:1}
+A firm is one of ten that race for the same events on a futures exchange. It can send a copy of each order through up to twelve
+sessions. Use the chapter's model and the dated fees.
+
+\medskip\noindent\textbf{Part I --- The parallel design.}
+\begin{enumerate}
+\item What is the firm's chance of winning with one session, and with twelve?
+\item What does the second session add, and the twelfth?
+\item What is the proposition behind the rising curve?
+\item Which assumptions of the model drive the size of the gain?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Everyone copies.}
+\begin{enumerate}[resume]
+\item What happens to the firm's chance when all ten firms send twelve copies?
+\item What happens to a bystander's latency?
+\item Why did the exchange care?
+\item What did it change, and in what order?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The segment design.}
+\begin{enumerate}[resume]
+\item What is the firm's chance with one session and with twelve?
+\item What decides the order now?
+\item What margin is left to compete on?
+\item Why do the CME safeguards exist?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the probability of winning with $k$ sessions under jittery gateways against a segment gateway,
+  and the session fee above which the extra sessions do not pay.
+\item What does the twelfth session's value say about Eurex's fee from the seventh?
+\item Which of the chapter's numbers are published and which assumed?
+\item What would the firm buy under each design?
+\item How would it check which design it faces?
+\item What does multiplicity cost in reconciliation and risk?
+\item Where does this go in chapter~29's plan?
+\item In one sentence: what does ``fair'' mean at the microsecond?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:futures-connectivity:1}
+What is a \omterm{def:nw:futures-connectivity:msgw}{market segment gateway}, and why would an exchange offer one?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:futures-connectivity:2}
+Why might sending the same order through several sessions win more races, and when does it stop working?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:futures-connectivity:3}
+How would you measure whether an exchange's gateways are fair?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:futures-connectivity:4}
+You lost packets on both the A and B feeds at the same moment. What do you suspect first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:futures-connectivity:5}
+Your clearing member's credit control blocked your orders at midday. What do you do now, and what do you change for tomorrow?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:nw:futures-connectivity:6}
+Design order entry for a firm trading five market segments on one exchange: sessions, gateways, failover, risk and reconciliation.
+\end{interviewq}

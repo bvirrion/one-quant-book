@@ -15,5 +15,8 @@ for tex in sorted(glob.glob("parts/**/*.tex", recursive=True)):
         path, a, b = m.group(1), int(m.group(2)), int(m.group(3))
         lines = open(path, encoding="utf8").read().splitlines()
         n += 1
+        if not 1 <= a <= b <= len(lines):  # report, never crash (check_omcode.py fails the build on it)
+            print(f"{path}:{a}-{b}\n   OUT OF RANGE: the file has {len(lines)} lines")
+            continue
         print(f"{path}:{a}-{b}\n   first: {lines[a - 1].strip()}\n   last:  {lines[b - 1].strip()}")
 print(f"{n} listings")

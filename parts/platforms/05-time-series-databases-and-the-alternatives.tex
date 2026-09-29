@@ -1,0 +1,424 @@
+\chapter{Time-Series Databases and the Alternatives}\label{ch:pl:time-series-databases-and-the-alternatives}
+
+Five engines answered the same five questions on the same month of quotes, and each answer was checked against the other four
+before anything was timed. The row store with an index found one symbol's last quote before noon in less than a tenth of a
+millisecond, nearly eighty times faster than the columnar engine, and took over three hundred milliseconds to average the
+spread of every symbol over the month, over forty times slower than the columnar engine. Neither result is a property of the product; both are
+properties of the question. This chapter looks at what the databases sold for time series promise, sorts market-data queries
+into a few shapes, explains why an engine is fast on some shapes and slow on others, and builds the benchmark
+(\texttt{firm.tsbench}) that a firm should run on its own data before it chooses.
+
+\section{What a time-series database promises}
+
+\begin{definition}[Time-series database]\label{def:pl:time-series-databases-and-the-alternatives:tsdb}
+A \emph{time-series database}\index{time-series database} is a database designed for records keyed by time that mostly arrive
+in time order and are mostly read by time ranges: it stores them partitioned and ordered by time, appends quickly, and offers
+time-specific operations (aggregation into time intervals, as-of joins, retention by age).
+\end{definition}
+
+The chapter-4 \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} has every one of those properties and is not a database product: it is files, an embedded engine and
+a few conventions. That is the first thing to understand about the category. What a \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} adds is packaging ---
+a server that ingests, compacts, retains and answers queries without the firm writing the pieces --- and, in the better ones,
+engineering of the same ideas: columnar storage, time partitions, \omterm{def:pl:columnar-formats:pushdown}{zone maps}, vectorised execution. The operations it names are
+the ones every market-data store needs.
+
+\begin{definition}[Time bucket, downsampling]\label{def:pl:time-series-databases-and-the-alternatives:bucket}
+A \emph{time bucket}\index{time bucket} is one of the equal, aligned intervals into which a time axis is cut (the minutes of a
+day); bucketing assigns each record to its interval. \emph{Downsampling}\index{downsampling} replaces the records of each bucket
+by a summary (the last value, the count, an open-high-low-close bar), storing or returning one row per bucket.
+\end{definition}
+
+One-minute bars are the standard example: One Quant Book~7's time bars (chapter~2) are downsampled ticks. A store that keeps
+tick history for months and minute bars for years downsamples as part of its \omterm{def:pl:capturing-and-storing-tick-data:tier}{retention policy} (chapter~2): the raw ticks age
+out, the buckets stay.
+
+\section{Query shapes of market data}
+
+Almost every query a research or trading platform sends to its market data is one of a handful of shapes, and each shape asks
+something different of the storage (\cref{fig:pl:time-series-databases-and-the-alternatives:shapes}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (10.6,0) node[below left]{time (a month)};
+\draw[->] (0,0) -- (0,4.1) node[left,align=right]{symbols};
+\fill[gray!10] (0.05,0.1) rectangle (10.25,3.8);
+\draw[gray!60,dashed] (0.05,0.1) rectangle (10.25,3.8);
+\foreach \y in {0.5,1.0,...,3.5} {\draw[gray!25] (0,\y) -- (10.3,\y);}
+\fill[omThm!70] (5.02,1.95) circle (2.2pt);
+\node[omThm,anchor=south east] at (4.95,2.08) {point};
+\fill[omDef!40] (5.3,1.9) rectangle (5.9,2.1);
+\node[omDef,anchor=south west] at (5.35,2.12) {range};
+\fill[omMeth!40] (6.5,1.4) rectangle (7.2,1.6);
+\foreach \x in {6.6,6.7,6.8,6.9,7.0,7.1} {\draw[omMeth] (\x,1.4) -- (\x,1.6);}
+\node[omMeth,anchor=north] at (6.85,1.38) {bars (buckets)};
+\fill[omProp!35] (3.2,0.2) rectangle (3.6,3.7);
+\node[omProp,anchor=south] at (3.4,3.72) {as-of join (one day, all symbols)};
+\node[anchor=south east,fill=gray!10,inner sep=1pt] at (10.2,0.15) {cross-section: every row (dashed box)};
+\end{tikzpicture}
+
+\omcaption{Five query shapes on a month of quotes (symbols by time): a point lookup (the last quote of one symbol before one
+time), a range scan (one symbol, one hour), \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{time buckets} (one symbol, one day, one row a minute), an as-of join (every trade of a
+day with its symbol's quote), and a cross-section (every row of the month, one number per symbol). Each touches a different
+region, and a different layout serves each.}\label{fig:pl:time-series-databases-and-the-alternatives:shapes}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{llll}
+\toprule
+shape & rows touched & what makes it fast & example \\
+\midrule
+point & one & an index or a sorted key & last quote before an order \\
+range & a contiguous slice & sort order, \omterm{def:pl:columnar-formats:pushdown}{zone maps} & one symbol's hour \\
+bars & a slice, summarised & sort order, vectorised aggregation & minute bars for a chart \\
+as-of join & two slices, merged & both sorted by time within symbol & trades with quotes \\
+cross-section & all & columns, vectorised scans & average spread by symbol \\
+\bottomrule
+\end{tabular}
+\caption{The five query shapes, the rows each touches, and what an engine needs to answer it quickly.}\label{tab:pl:time-series-databases-and-the-alternatives:shapes}
+\end{table}
+
+\section{In-process engines against servers}
+
+A database was once a server: a separate process, often on a separate machine, that clients sent queries to over a network.
+The analytical engines most research platforms now use are not.
+
+\begin{definition}[Embedded database]\label{def:pl:time-series-databases-and-the-alternatives:embedded}
+An \emph{embedded database}\index{embedded database} runs inside the process that queries it, as a library: no server, no
+network, no serialisation of results, and data shared with the host program's memory where the formats allow.
+\end{definition}
+
+SQLite, the most deployed database there is, is embedded and row-oriented; DuckDB is embedded and columnar; Polars is a dataframe
+library with a query optimiser, which makes it an embedded engine too. An embedded engine gives up what a server gives ---
+concurrent writers, access control, one copy of the data for many users --- and gains the round trips and the conversions it
+does not make (\cref{fig:pl:time-series-databases-and-the-alternatives:embedded}). For a researcher's queries on files in a
+\omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}, that is the right trade; for a service many teams write to, it is not (chapter~25).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,inner sep=3pt,align=center}]
+\draw[rounded corners=3pt,gray] (-0.3,-0.9) rectangle (4.1,1.0);
+\node[font=\scriptsize\itshape,anchor=south west] at (-0.3,1.0) {one process};
+\node[box,fill=omDef!12] (a) at (0.9,0) {research code};
+\node[box,fill=omMeth!15] (e) at (3.1,0) {engine\\(library)};
+\draw[<->] (a) -- (e);
+\node[box,fill=gray!10] (f) at (3.1,-1.9) {columnar files};
+\draw[->] (f) -- (e);
+\draw[rounded corners=3pt,gray] (5.0,-0.9) rectangle (7.0,1.0);
+\draw[rounded corners=3pt,gray] (9.6,-0.9) rectangle (12.0,1.0);
+\node[font=\scriptsize\itshape,anchor=south west] at (5.0,1.0) {client};
+\node[font=\scriptsize\itshape,anchor=south west] at (9.6,1.0) {server};
+\node[box,fill=omDef!12] (c) at (6.0,0) {research code};
+\node[box,fill=omMeth!15] (s) at (10.8,0) {database\\server};
+\draw[->] (c.north east) to[bend left=15] node[above]{query} (s.north west);
+\draw[->] (s.south west) to[bend left=15] node[below,align=center]{rows,\\ serialised} (c.south east);
+\node[box,fill=gray!10] (d) at (10.8,-1.9) {its own storage};
+\draw[->] (d) -- (s);
+\end{tikzpicture}
+
+\omcaption{An embedded engine (left) runs inside the program that queries it and reads the files directly; a database server
+(right) is another process, reached over a connection, which returns its results serialised. The server can serve many users
+and writers; the embedded engine skips the round trip and the conversion.}\label{fig:pl:time-series-databases-and-the-alternatives:embedded}
+\end{omfigure}
+
+The other difference between engines is how they execute a plan. A classic engine passes one row at a time from operator to
+operator, calling a function per row per operator. A columnar engine passes batches of values of one column.
+
+\begin{definition}[Vectorised query execution, late materialisation]\label{def:pl:time-series-databases-and-the-alternatives:vectorised}
+\emph{Vectorised query execution}\index{vectorised query execution} runs each operator of a query plan on a batch of values of a
+column at a time (a vector of a few thousand), so that the per-call overhead is paid per batch and the inner loops are tight
+loops over arrays. \emph{Late materialisation}\index{late materialisation} delays assembling result rows from columns until
+after the filters: operators pass positions of qualifying rows, and only the surviving rows' other columns are ever read.
+\end{definition}
+
+Both ideas come from the research line of the MonetDB/X100 engine (2005) and the column stores that followed; they are why a
+columnar engine scans a million rows in milliseconds. They are also why it is slower than an index on a point lookup: a
+vectorised scan of a sorted file still opens a file, reads a footer and decodes at least a block, where a B-tree walks three
+pages to one row.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,op/.style={draw,rounded corners=2pt,minimum width=1.9cm,minimum height=0.6cm,fill=omDef!10}]
+\node[op] (s1) at (0,2.4) {scan};
+\node[op] (f1) at (0,1.2) {filter};
+\node[op] (g1) at (0,0) {aggregate};
+\draw[->] (s1) -- node[right]{one row} (f1);
+\draw[->] (f1) -- node[right]{one row} (g1);
+\node[font=\scriptsize\itshape] at (0,3.1) {row at a time};
+\node[op,fill=omMeth!15] (s2) at (5.0,2.4) {scan};
+\node[op,fill=omMeth!15] (f2) at (5.0,1.2) {filter};
+\node[op,fill=omMeth!15] (g2) at (5.0,0) {aggregate};
+\draw[->] (s2) -- node[right]{2\,048 values of a column} (f2);
+\draw[->] (f2) -- node[right]{positions that pass} (g2);
+\node[font=\scriptsize\itshape] at (5.0,3.1) {vectorised};
+\end{tikzpicture}
+
+\omcaption{Row-at-a-time and vectorised execution of the same plan. The vectorised engine calls each operator once per batch of
+a column and passes positions instead of rows (\omterm{def:pl:time-series-databases-and-the-alternatives:vectorised}{late materialisation}), so the other columns of rows that fail the filter are never
+read.}\label{fig:pl:time-series-databases-and-the-alternatives:vector}
+\end{omfigure}
+
+\begin{proposition}[No engine wins every shape]\label{prop:pl:time-series-databases-and-the-alternatives:shapes}
+Let an engine answer a query in time $c_0 + c_r\,r$, where $r$ is the number of rows it must touch and $c_0$ the fixed cost of
+starting (opening files, planning, reading metadata). An indexed row store has a small $c_0$ and a large $c_r$; a vectorised
+columnar engine has a larger $c_0$ and a much smaller $c_r$. The row store is faster below $r^\star = (c_0^{\mathrm{col}} -
+c_0^{\mathrm{row}})/(c_r^{\mathrm{row}} - c_r^{\mathrm{col}})$ rows touched, the columnar engine above.
+\end{proposition}
+
+\begin{proof}
+Equate the two affine costs and solve for $r$; below the crossing the smaller intercept wins, above it the smaller slope.
+\end{proof}
+
+The model is crude --- a real engine's cost depends on layout, selectivity and cache --- but its prediction is what the benchmark
+finds: point lookups and short ranges on one side, cross-sections on the other.
+
+\section{A benchmark that means something}
+
+\begin{method}[Benchmarking engines on market data]\label{met:pl:time-series-databases-and-the-alternatives:bench}
+(1) Use the firm's own data and query shapes, not a vendor's demonstration. (2) Check that every engine returns the same answer
+to every query before timing any of them: a fast wrong answer is the commonest benchmark result. (3) Run the engines interleaved,
+every engine once per round, so that a drifting machine affects all alike. (4) Report the first run on a fresh engine (cold)
+apart from the median of the rest (warm), and the spread. (5) State the machine, the load and what was in the page cache.
+\end{method}
+
+\texttt{firm.tsbench} implements the method for five engines: DuckDB over the month's Parquet files, partitioned by date and
+sorted by symbol and time; Polars scanning the same files lazily; SQLite, embedded and row-oriented, with an index on symbol and
+time; pandas, eager and in memory; and a hand-written numpy engine on the arrays sorted by symbol and time with a per-symbol
+offset index. \Cref{lst:pl:time-series-databases-and-the-alternatives:duck} is one engine's five queries.
+
+\omcode{code/firm/tsbench/firm_tsbench.py}{76}{101}{The five query shapes as DuckDB answers them: a sorted lookup, a range, time
+buckets with the last mid of each minute, an as-of join and a cross-sectional average.}\label{lst:pl:time-series-databases-and-the-alternatives:duck}
+
+The data are the chapter-3 month of quotes (a million rows, fifty symbols, twenty days) and 40\,000 trades drawn from it, each
+one nanosecond after a quote. All five engines agree on all five answers: 1 row for the point lookup, 153 for the hour of
+S007, 359 one-minute bars for its day, 2\,000 trades joined, 50 average spreads.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6.4cm,ybar,bar width=5pt,ymode=log,log origin=infty,ymin=0.03,ymax=1000,
+  ylabel={median time (ms, log scale)},xtick={0,1,2,3,4},
+  xticklabels from table={figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv}{query},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},enlarge x limits=0.15,
+  legend columns=5,legend style={font=\footnotesize,at={(0.5,-0.18)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=duckdb]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omMeth!55,draw=omMeth] table[x=k,y=polars]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omThm!55,draw=omThm] table[x=k,y=sqlite]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omProp!55,draw=omProp] table[x=k,y=pandas]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=gray!55,draw=gray] table[x=k,y=numpy]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\legend{DuckDB,Polars,SQLite,pandas,numpy}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Median warm time of each query shape on each engine, seven interleaved rounds, answers checked equal first. Measured
+on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, files in the page cache, machine otherwise idle. Data:
+\texttt{bench\_tsbench.py}.}\label{fig:pl:time-series-databases-and-the-alternatives:times}
+\end{omfigure}
+
+\Cref{fig:pl:time-series-databases-and-the-alternatives:times} is the result, and the proposition's prediction holds. SQLite's
+index answers the point lookup in 0.05~ms and the hour in 0.3~ms, DuckDB takes 3.8 and 2.2~ms for the same two, dominated by
+opening and planning; on the cross-section the order reverses, SQLite needing 313~ms to read a million rows one at a time and
+DuckDB 7~ms. Polars sits near DuckDB, slower on the grouped shapes; pandas pays for scanning the whole in-memory table with a
+boolean mask on every query and is the slowest on four shapes of five. The hand-written numpy engine is the fastest on the
+range, the bars and the cross-section, and close to the fastest on the other two: knowing the layout (sorted, with an offset per
+symbol) beats any general engine, at the cost of writing and maintaining it for every query.
+
+\omcode{code/firm/tsbench/firm_tsbench.py}{255}{274}{Cold and warm timings: a fresh engine's first run of each query is the
+cold one; warm runs are interleaved, every engine once per query per round.}\label{lst:pl:time-series-databases-and-the-alternatives:bench}
+
+\begin{example}[The query mix decides]\label{ex:pl:time-series-databases-and-the-alternatives:mix}
+A workload of point lookups and cross-sections, a fraction $f$ of them cross-sections, costs $(1-f)\,t_{\mathrm{point}} +
+f\,t_{\mathrm{xsec}}$ per query on each engine. With the medians above, DuckDB and SQLite cost the same at $f = 1.2\%$: as soon as
+more than about one query in a hundred is a cross-section, the columnar engine is faster on the whole workload, although it
+loses nearly eighty to one on the lookups.
+\end{example}
+
+\section{A survey of the field}
+
+\begin{dated}{2026-09}{Time-series and analytical engines in use for market data}\label{dat:pl:time-series-databases-and-the-alternatives:survey}
+As described by their own documentation and licence files (consulted September 2026): \textbf{kdb+} (KX) is ``a high-performance
+cross-platform historical timeseries columnar database'', an in-memory compute engine and a realtime streaming processor with its
+own language, q; all use requires a licence (commercial, or a free community edition of its successor, KDB-X, with usage
+restrictions). \textbf{ClickHouse} is an open-source column-oriented database server for real-time analytical reports (Apache
+2.0). \textbf{QuestDB} is an open-source \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} with SQL over memory-mapped, time-partitioned columns and Parquet
+(Apache 2.0). \textbf{TimescaleDB} is a PostgreSQL extension for time-series analytics with a columnstore (Apache 2.0 outside
+parts under the Timescale Licence). \textbf{InfluxDB~3} is an open-source \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} built on Arrow, DataFusion and
+Parquet (MIT or Apache 2.0). \textbf{ArcticDB} (Man Group) is a serverless dataframe database for Python storing to object
+storage or LMDB (Business Source Licence 1.1, each version converting to Apache 2.0 after at most four years). \textbf{DuckDB}
+and \textbf{Polars} are embedded, under the MIT licence.
+\end{dated}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lp{2.7cm}p{3.3cm}p{4.3cm}}
+\toprule
+engine & deployment & storage & strength on market data \\
+\midrule
+kdb+ & server, in-memory & columnar, time-partitioned & tick capture and queries in one system \\
+ClickHouse & server & columnar & large scans and aggregations \\
+QuestDB & server & columnar, time-partitioned & ingestion and time-range SQL \\
+TimescaleDB & PostgreSQL extension & rows and a columnstore & relational data beside time series \\
+InfluxDB 3 & server & Arrow and Parquet & monitoring-style metrics \\
+ArcticDB & library, object store & versioned dataframes & dataframe research history \\
+DuckDB, Polars & library & files (Parquet, Arrow) & research on a \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} \\
+SQLite & library & rows, B-tree & small reference tables, lookups \\
+\bottomrule
+\end{tabular}
+\caption{The engines of the dated box, by deployment and storage, and the part of the market-data workload each is built for;
+the last column is this book's reading of their designs, not a benchmark.}\label{tab:pl:time-series-databases-and-the-alternatives:survey}
+\end{table}
+
+The choice follows from the query mix and from who writes. A firm whose market-data queries are research scans over history,
+written once a day by a compaction job, is served by files and an embedded engine; a firm that needs many concurrent writers and
+readers of live data with access control buys or builds a server; a firm whose researchers live in dataframes and want versioned
+datasets looks at a dataframe store. Whatever the choice, the benchmark of this chapter, on the firm's own shapes, decides between
+candidates.
+
+\section{Tutorial: five engines, one answer}\label{tut:pl:time-series-databases-and-the-alternatives:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Load one dataset into five engines, prove that they agree, and time them properly. \textbf{End state:}
+\cref{fig:pl:time-series-databases-and-the-alternatives:times} and the break-even mix of
+\cref{ex:pl:time-series-databases-and-the-alternatives:mix}.
+\begin{tutsteps}
+\item \textbf{Data}: \texttt{pl\_tsbench.dataset()}: the chapter-3 month of quotes and 40\,000 trades; \texttt{prepare()} writes
+them as Parquet partitioned by date and sorted by symbol and time.
+\item \textbf{Agree}: \texttt{answers()} builds the five engines and checks the five shapes; every check must be true.
+\item \textbf{Time}: \texttt{bench\_tsbench.py} runs \texttt{firm\_tsbench.bench}
+(\cref{lst:pl:time-series-databases-and-the-alternatives:bench}): cold runs, then seven interleaved rounds.
+\item \textbf{Decide}: compute the break-even share of cross-sections between the fastest lookup engine and the fastest scan
+engine.
+\end{tutsteps}
+\textbf{What to change next.} Drop SQLite's index and rerun the point lookup; add a sixth shape (the volume-weighted price of
+each symbol's trades on one day) to every engine and check they agree before timing it.
+\end{tutorial}
+
+\section{Build: the engine benchmark}\label{bld:pl:time-series-databases-and-the-alternatives:tsbench}
+
+\begin{build}
+\bfield{Purpose} The firm's standing benchmark for any engine proposed for market data: same data, same shapes, answers checked,
+timings interleaved.
+\bfield{Interface} \texttt{QUERIES}, \texttt{ENGINES}, \texttt{Params(symbol, date, t0, t1, point\_t)};
+\texttt{write\_dataset(quotes, trades, root)}; \texttt{make\_engine(name, quotes, trades, root)} with \texttt{run(query, params)}
+returning sorted, rounded rows; \texttt{check(engines, params)}; \texttt{bench(factory, params, rounds)} returning cold, median
+and spread per engine and query.
+\bfield{Rules} No timing before every engine agrees on every shape; rounds interleave engines; cold runs are fresh instances;
+results are compared after sorting and rounding to six decimals, never by eye.
+\bfield{Acceptance tests} \texttt{code/firm/tsbench/tests/}: all five engines agree on every shape on a small dataset; a planted
+wrong engine is caught by the check; the as-of join returns the quote one nanosecond before each trade; the benchmark returns a
+cold and a warm time for every engine and shape.
+\bfield{Stretch} A server engine behind the same interface; memory as well as time; the benchmark at several data sizes, to
+estimate each engine's $c_0$ and $c_r$.
+\end{build}
+
+\begin{omsources}
+\item P.~Boncz, M.~Zukowski and N.~Nes, ``MonetDB/X100: hyper-pipelining query execution'', \emph{CIDR}, 2005.
+\item D.~J.~Abadi, D.~S.~Myers, D.~J.~DeWitt and S.~R.~Madden, ``Materialization strategies in a column-oriented DBMS'',
+\emph{ICDE}, 2007.
+\item M.~Raasveldt and H.~Mühleisen, ``DuckDB: an embeddable analytical database'', \emph{SIGMOD}, 2019.
+\item The documentation and licence files of the engines in the dated box.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:1}
+From \cref{fig:pl:time-series-databases-and-the-alternatives:times}, by what factor is SQLite faster than DuckDB on the point
+lookup, and by what factor slower on the cross-section?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:2}
+Why does an index on (symbol, time) make the point lookup almost free, and why does it not help the cross-section?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:3}
+A session of 6.5 hours has how many one-minute buckets? The bars query returned 359 rows for S007's day: what happened to the
+others?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:4}
+Why are the engines interleaved within each round rather than each run seven times in a row?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:5}
+Explain, with \cref{prop:pl:time-series-databases-and-the-alternatives:shapes}, why DuckDB's point lookup (3.8~ms) is slower than
+its range query (2.2~ms), although the range returns 153 rows.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:6}
+Derive the break-even share of cross-sections of \cref{ex:pl:time-series-databases-and-the-alternatives:mix} from the measured
+medians.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:7}
+\emph{Coding.} Check all five engines on symbol S023, day 12 (the same windows, shifted to that day). Do they agree, and how many
+rows does each shape return?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:8}
+\emph{Find the flaw.} ``We compared the vendor's \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} with DuckDB on the vendor's demonstration query: one run of
+each, ours first. The vendor's was three times faster, so we are buying it.''
+\end{exercise}
+
+\section{Problem: The Right Tool for Each Question}
+
+\begin{problem}[{Weekend problem --- choosing an engine for the research platform}]\label{pb:pl:time-series-databases-and-the-alternatives:1}
+The chapter's month of quotes and trades, the five engines of \texttt{firm.tsbench} and the measured medians of
+\cref{fig:pl:time-series-databases-and-the-alternatives:times}.
+
+\medskip\noindent\textbf{Part I --- Shapes.}
+\begin{enumerate}
+\item Name the five query shapes and give a market-data question of each.
+\item Which shapes touch few rows, and which touch many?
+\item What layout serves the range and the bars shapes?
+\item What does a \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} add to the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} of chapter~4?
+\item What is \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{downsampling}, and where does it belong in a \omterm{def:pl:capturing-and-storing-tick-data:tier}{retention policy}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Engines.}
+\begin{enumerate}[resume]
+\item What distinguishes an embedded engine from a server, and what does each give up?
+\item What is vectorised execution, and why does it make scans fast?
+\item What is \omterm{def:pl:time-series-databases-and-the-alternatives:vectorised}{late materialisation}?
+\item Why is a B-tree lookup faster than a vectorised scan of a sorted file for one row?
+\item Which engine is fastest on each shape here, and which is slowest?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Measurement.}
+\begin{enumerate}[resume]
+\item How many rows does each shape return, and why check them before timing?
+\item What are SQLite's and DuckDB's medians on the point lookup and the cross-section?
+\item Why is the hand-written numpy engine fastest on four shapes, and why is it not the answer?
+\item What does the cold run measure that the warm median does not?
+\item What must be stated with the numbers for them to mean anything?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the fastest engine for each shape, and the query mix at which the columnar engine beats the
+row store.
+\item A research team's workload is 95\% cross-sections and bars, 5\% point lookups: which engine?
+\item A service answering last-quote lookups for an order router: which engine, and why not the research one?
+\item When is a \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database} server the right purchase?
+\item In one sentence: what decides which engine is fastest?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:time-series-databases-and-the-alternatives:1}
+What is a \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{time-series database}, and do you need one for \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data}?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:time-series-databases-and-the-alternatives:2}
+Why is a columnar engine fast at aggregations and slow at single-row lookups?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:time-series-databases-and-the-alternatives:3}
+How would you benchmark two databases for your market data so that the result means something?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:time-series-databases-and-the-alternatives:4}
+When would you use an embedded engine such as DuckDB rather than a database server?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:time-series-databases-and-the-alternatives:5}
+Your firm is asked to replace its proprietary tick database. How do you decide what to replace it with?
+\end{interviewq}

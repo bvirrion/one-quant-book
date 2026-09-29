@@ -1,0 +1,98 @@
+\section*{Chapter \ref{ch:iv:sql-and-data} --- SQL and Data}
+
+\begin{solution}{iq:iv:sql-and-data:1}
+The inner join returns 56 rows (the matched trades, accounts being unique), the left join 61 (every trade, with NULL desk for the
+five orphans); \texttt{SELECT * FROM trades t WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.account = t.account)} lists the five.
+A \texttt{NOT IN} would fail silently if the subquery could return a NULL.
+\iqlookfor{join semantics, the anti join, and the \texttt{NOT IN} trap.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:2}
+61, 59, 60\,100 and $60\,100/59 \approx 1\,018.64$: aggregates ignore NULLs, so the average is over the 59 known quantities. Treating
+NULL as zero would give $60\,100/61 \approx 985.25$, a different answer to a different question; say which one is meant.
+\iqlookfor{NULL semantics in aggregates, and the choice they force.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:3}
+Join trades to accounts, group by desk, and filter with \texttt{HAVING SUM(qty) > 20000}; on the chapter's data only the
+\texttt{delta1} desk qualifies, with 41\,000. \texttt{WHERE} runs before grouping, row by row, and cannot see an aggregate.
+\iqlookfor{the order of evaluation: rows, groups, then group filters.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:4}
+The key (symbol, timestamp) is not unique: one timestamp carries two quotes, which match each other and themselves, four rows
+instead of two, hence $81 + 2 = 83$. Any join of trades to quotes on that key will duplicate the trades there. Decide what the
+duplicate means (two updates in the same microsecond, a feed replay, a bad merge) and deduplicate or add a sequence number before
+joining.
+\iqlookfor{reading row counts as a data-quality test.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:5}
+\texttt{ROW\_NUMBER} numbers the trades of each symbol from the largest quantity down, breaking ties by time, and the outer query keeps
+numbers 1 and 2. \texttt{RANK} gives tied quantities the same rank, so a symbol with three trades tied for largest returns three rows
+(and skips rank 2); \texttt{DENSE\_RANK} does not skip. Say which the question wants; the chapter's result agrees with a pandas
+sort-and-head on the same data.
+\iqlookfor{window ranking functions and their tie behaviour.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:6}
+\Cref{lst:iv:sql-and-data:dd}: a running sum ordered by day, then the difference from its running maximum. Verify with a
+cumulative sum and cumulative maximum in pandas on the same table, as the chapter's test does (worst drawdowns $-8.9$ and $-32.3$),
+and on a hand-made three-day example whose answer is obvious.
+\iqlookfor{running aggregates, and an independent check.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:7}
+\texttt{px / LAG(px) OVER (PARTITION BY sym ORDER BY ts) - 1}. The first trade of each symbol has no predecessor, so \texttt{LAG}
+returns NULL and so does the return; keep it NULL rather than zero. Order by a sequence number if timestamps can tie.
+\iqlookfor{\texttt{LAG} with the right partition and the NULL at the start.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:8}
+Bucket as \texttt{(ts - ts \% 300) / 300} (portable integer division), then \texttt{SUM(px * qty) / SUM(qty)} per symbol and bucket.
+Exclude NULL quantities explicitly and report how many trades were excluded: a VWAP silently computed on a subset is wrong in a way
+nobody sees. The chapter's DuckDB, SQLite and pandas answers agree.
+\iqlookfor{bucketing without dialect traps, and explicit treatment of NULLs.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:9}
+Among the positive days, \texttt{day - ROW\_NUMBER()} is constant along a run of consecutive days and changes when a day is missing,
+so grouping by it groups runs; count per group and take the maximum per account: 10 and 7 on the chapter's data, which a loop over
+the days confirms. It assumes one row per account and day with no missing days in the calendar; with trading days, number the
+calendar first.
+\iqlookfor{the gaps-and-islands identity and its calendar assumption.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:10}
+Both attach the latest quote at or before each trade, per symbol. They disagree only on the trade two units after the duplicated
+timestamp: DuckDB's as-of join picks 100.40, the portable query with its insertion-order tie-breaker picks 100.45
+(\cref{ex:iv:sql-and-data:tie}). The data do not define which quote was in force; add the feed's sequence number and order by it.
+Also say whether a quote stamped at the trade's own time counts (\texttt{<=} or \texttt{<}).
+\iqlookfor{as-of semantics, ties and the equality case.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:11}
+It attached the first quote at or after each trade: the future. A signal built on it (say, the trade's price against the attached
+mid) predicts returns remarkably well, because it has seen them. Detect it from the output: the attached quote's timestamp is after the
+trade's for almost every row (56 of 61 on the chapter's data, 4 more at equal times), which a one-line check of \texttt{quote\_ts >
+ts} reveals; make that check part of the pipeline.
+\iqlookfor{recognising look-ahead and a mechanical check for it.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:12}
+For each state change, \texttt{LEAD(ts)} gives the next change of the same instrument; the rows whose state is \texttt{HALTED} give the
+halt intervals, from their time to the next change: $[100, 160)$ and $[400, 470)$ for one instrument, $[300, 360)$ for the other. It
+assumes that consecutive rows differ in state and that the table is complete: two consecutive \texttt{HALTED} rows would split one
+halt in two, and a halt still open at the end has a NULL end, which should be reported as open rather than dropped.
+\iqlookfor{\texttt{LEAD} for intervals and the data assumptions made explicit.}
+\end{solution}
+
+\begin{solution}{iq:iv:sql-and-data:13}
+Numpy: per symbol, \texttt{searchsorted} of the trade times in the quote times with \texttt{side='right'}, minus one
+(\cref{lst:iv:sql-and-data:numpy}). pandas: \texttt{merge\_asof} on \texttt{ts} with \texttt{by='sym'} and
+\texttt{direction='backward'}, both frames sorted by time. Polars: \texttt{join\_asof} on \texttt{ts} with \texttt{by='sym'} and
+\texttt{strategy='backward'}. Check by comparing all three with the SQL row by row on
+data that contain the hard cases (a trade before the first quote, a quote at the trade's time, duplicated timestamps); the
+chapter's test does this and finds agreement everywhere except at the tie, where the tie rule decides.
+\iqlookfor{three idioms for the same join, and a differential check on the hard cases.}
+\end{solution}

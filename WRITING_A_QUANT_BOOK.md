@@ -95,7 +95,7 @@ tools/                                termlink, gates, figure-page finder
 | 13 Low-Latency Software | `low-latency` | `ll` |
 | 14 Networks, Hardware, Infrastructure | `networks` | `nw` |
 | 15 Research, Data and Risk Platforms | `platforms` | `pl` |
-| 16 The Desk and the Firm | `firm` | `fm` |
+| 16 The Desk and the Firm | `desk` (not `firm`: `code/firm/` is the running project) | `fm` |
 | 17 The Industry | `industry` | `in` |
 | 18 The Interview Book | `interviews` | `iv` |
 
@@ -208,6 +208,17 @@ A chapter is ~13 pages all-in (≈ 9.5 body + 3.5 solutions).
 
 Chapters whose outline title starts "Build:" invert the ratio: lesson 3 pp,
 build 5 pp.
+
+**Book 18 (The Interview Book) anatomy** (user ruling 2026-09-28). New
+questions only; nothing is harvested from Books 1–17. A chapter is: the
+hook; a short method lesson (2–4 pp: the families of questions, the method
+for each, worked examples); **one bank of about 12–15 `interviewq`**, ramped
+★ → ★★★ and tagged with roles and firm type; `omsources`. No `Exercises`,
+weekend problem, tutorial or build sections (a coding chapter may keep a
+short tutorial). Process chapters (Part I) and the behavioural chapter may
+carry 8–12 questions; chapter 29 is six transcribed mock interviews with
+assessor commentary. Every numeric or coding answer is asserted by
+`test_solutions.py`. Budget ~8 pp a chapter all-in.
 
 ## 6. Rules per item
 
@@ -387,9 +398,11 @@ the script in `code/`) · normalisation · known failure modes · sources.
 ### 6.12 Interview questions and solutions
 
 - 5–8 `interviewq` per chapter, `iq:` label first, tagged with stars and with
-  roles (`trader, researcher, developer, mle, bank`). They test the chapter's
+  roles. They test the chapter's
   ideas in interview form — they are not recycled exercises. Never attributed
-  to a firm. Book 18 later harvests them by label.
+  to a firm. (Book 18 writes new questions of its own and does not harvest
+  these: user ruling, 2026-09-28.) Roles: `trader, researcher, developer, mle,
+  bank, risk`, nothing else.
 - **Solutions file**: opens with the family's `\section*{Chapter \ref{…} ---
   Title}` line; then `\begin{solution}{<key>}` for every `exo:`, the `pb:`,
   and every `iq:`, in order. Terse but complete: the decisive step and the
@@ -579,6 +592,29 @@ outline budget or the difference explained.
   compressed, and a note to the agent at that point recovers pages cheaply. The whole batch —
   Step 0, Phase A, sync, four books, verification — took about eleven hours of wall time.
 
+- **Books 14–16, written in parallel (2026-09-28), one agent per book, three at a time (user rule):**
+
+  | Book | Chapters | Pages | Outline | pp/chapter all-in | Figures | Listings | Dated | Ledger rows | Links |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 14 Networks, Hardware, Infrastructure | 29 | 349 | ~384 | 11.4 | 96 | 65 | 40 | 220 | 685 |
+  | 15 Research, Data and Risk Platforms | 30 | 367 | ~398 | 11.7 | 110 | 103 | 27 | 122 | 702 |
+  | 16 The Desk and the Firm | 30 | 347 | ~400 | 11.1 | 108 | 40 | 32 | 182 | 854 |
+
+  The batch lands 8–13 % under the outline, the closest of any batch. The ch. 10 checkpoints projected 350,
+  363 and 350 pages, so no depth note was needed. Chapters of 300–370 body lines printed at 9–10 body pages
+  (Book 16), and Book 14's last nine chapters ran at 9.7 pages all-in against 12.0 for its first twenty.
+  Web searches were far below the estimates (about 95, 94 and 22 against 380, 250 and 450): the agents
+  fetched primary URLs directly. The whole batch (Step 0, Phase A, sync, three books, and two send-backs for
+  per-figure checks and re-measurement) took about one day of wall time.
+
+- **Books 17–18, written in parallel (2026-09-29), one agent per book:** Book 17 (The Industry) 30 chapters,
+  339 pp (outline ~392, −13.5 %), 11.3 pp a chapter, 86 figures, 52 dated boxes, 293 ledger rows, 620 links;
+  Book 18 (The Interview Book, new shape) 29 chapters, 220 pp (~240, −8 %), 7.6 pp a chapter, 357 questions,
+  23 figures, 80 ledger rows. A question-bank chapter of ~12–14 questions with solutions of 12–15 lines prints at
+  ~7.5 pp; reaching the outline would have meant padding, so the agent stopped. Both books used ~20 and ~12 web
+  searches and a few hundred direct fetches. **The series totals 18 books, 524 chapters, 6,007 pages**
+  (outline ~7,070 before the Book 18 re-shape).
+
 ## 9. Known traps (add to this list as books are written)
 
 - **Confident specifics from memory.** Fee levels, regions, rule numbers,
@@ -694,8 +730,8 @@ outline budget or the difference explained.
   PDFs. Substitutes that worked: CFTC-hosted rule filings
   (`cftc.gov/filings/orgrules/…` + `pdftotext`), the CME client-systems wiki on
   atlassian.net, clearing-member and broker specification pages (logged as
-  secondary sources), and for sec.gov PDFs `curl -A "<name> <email>"` then
-  `pdftotext -layout`. A search engine's summary of a table can garble its
+  secondary sources), and for sec.gov PDFs the Internet Archive's copy then
+  `pdftotext -layout` (never put the user's e-mail in a user agent without their consent; see the Books 17–18 traps). A search engine's summary of a table can garble its
   columns (OPRA, chapter 24): take numbers from the document, not the summary.
 - **Units and instants.** Two review catches that no gate sees: notional
   turnover printed in billions that was in trillions (chapter 27), and a
@@ -1041,3 +1077,83 @@ outline budget or the difference explained.
   - *Earlier-book defects found:* Book 6 `firm.modelval.binomial_tail` overflows for n in the
     thousands; Book 7 `firm_abtest.msprt` warns on overflow for overwhelming statistics; the firm-name
     gate still fires on the ordinary word "Bitwise" at the start of a sentence.
+
+- **Books 14–16 batch traps (2026-09-28/29, three books in parallel):**
+  - *"Sampled" is not a figure check.* Book 14's agent reported its figures checked with chapters 1–20
+    only sampled; the one-by-one pass then found 22 defects in 72 figures that no gate sees. Book 15's pass
+    found 28 in 110. The defects: a microwave "earth bulge" measured from the wrong baseline, a packet path
+    through the wrong interfaces, a rain-fade factor of 740 described as "two orders of magnitude", captions
+    contradicting the plot (50 ms against 0.1–0.3 s), 21 log axes not labelled as log, legends on data,
+    clipped labels, and thousands printed with commas. Ask for "figures: N checked, K fixed" in
+    `PROGRESS.md` and read the count.
+  - *pgfplots' default thousands separator is a comma.* 157 tick labels over Books 1–16 printed `1,000`.
+    `onequant.sty` now sets `/pgf/number format/1000 sep={\,}` for every chart. Hand-typed numbers had the
+    same defect (1,853 of them, and math-mode `5{,}000`, in 9 books), replaced by `\,` with a script that
+    skipped TikZ and pgfplots lines. Detector:
+    `pdftotext -layout <pdf> - | grep -nE '(^|\s{2,})[0-9]{1,3},[0-9]{3}(\s{2,}|$)'`.
+  - *Measured data taken while other agents run is not final.* Book 15 re-measured its 17 CSVs at a load
+    below 1. Orderings and ratios moved: the best chunk size went from 10,000 to 100,000 events, a FIFO
+    makespan from 38.7 h to 19.8 h (a long task on the slow node), a risk grid's late finish from 07:12 to
+    06:51. Let the text say what the new measurement shows; never re-run until the old claim returns.
+  - *Chart CSVs:* a `%` in a label comments out the rest of the pgfplots row; `check_figdata.py` now rejects
+    `%` and an unpaired `$`. `restrict expr` cannot filter on a string column (it fails silently), so write
+    one CSV per series. A log x axis drops x = 0 silently, and a `ybar` on a log axis needs
+    `log origin=infty`.
+  - *PGF, again:* a `\node` inside a `ybar stacked` axis is drawn under the bars, so draw it after the axis
+    from coordinates set inside; `\draw` in an axis is drawn after the plots, over node labels; `\foreach`
+    with `axis cs` inside an axis fails ("illegal parameter"); grouped `xbar` tornados misalign (draw ranges
+    as thick error bars); `meta expr` prints pgf's internal fixed-point numbers, so use
+    `nodes near coords={\pgfmathprintnumber…}`; a table captioned with `\omcaption` is numbered as a figure.
+  - *Listings:* a micro sign in a listed file is fatal to pdfTeX (write `us`); lines longer than about 96
+    characters wrap; a stray `\omcode{}{0}{0}{}` appeared three times in drafted figures.
+  - *Names:* Book 16's outline slug `firm` would have put its code in `code/firm/`, the running project;
+    it became `desk`. `firm.recon` is Book 1's index-reconstitution predictor, not reconciliation. Read a
+    component before planning to build on it.
+  - *Build headers from the running interpreter:* `python3-config` on PATH may belong to another Python (CI's
+    system 3.12 against the pinned 3.10); `firm.natext` now uses `sysconfig.get_paths()["include"]`.
+  - *Primary sources resolve "contradictions".* Book 3's LME margin calls ($2.6bn, $7.05bn) and the FCA's
+    ($3.5bn, $5.1bn) are different measures (intra-day calls against total calls), both correct. Read both
+    documents before "fixing" a number.
+  - *Source access that worked:* CME's client wiki through Confluence's REST API when cmegroup.com timed
+    out; the Federal Register at `/documents/full_text/text/`; AWS per-region prices from
+    `b0.p.awsstatic.com` (gzip without a header hint); justice.gov through the Internet Archive; EDGAR
+    full-text search (`efts.sec.gov`) for fund prospectuses; Companies House filing PDFs. Search Federal
+    Register full texts in Python (about 1 MB; ugrep's long regexes hit complexity limits).
+  - *Modelling:* with common random numbers a same-seed Monte Carlo difference is deterministic, and a
+    standard-error tolerance only hides regressions; a trailing baseline absorbs a slow drift within its
+    window, so lag it; SQLite is serializable, so a lost update has to be shown as an application-level
+    read-then-write; a lexicon built from the planted phrases is precise by construction, so vary the
+    phrasing; Python rounds 140.55 to 140.5, so print from the test.
+
+- **Books 17–18 batch traps (2026-09-29):**
+  - *The user's e-mail never appears anywhere (user rule, 2026-09-29).* It must not be in the repository, in a
+    user agent or in any request. **If a source asks for the user's e-mail, do not use that source.** sec.gov,
+    bls.gov and dol.gov refuse scripts without a contact e-mail in the user agent. The earlier advice here to use
+    `curl -A "<name> <email>"` is withdrawn, and the one script that carried the address (Book 10 ch. 3,
+    `mx_fetch_midas.py`) no longer does.
+    Ruling on existing material (user, 2026-09-29): documents already cited from these agencies stay cited, and
+    their files may be fetched from mirrors that ask for nothing (the Internet Archive's `id_` copies), never from
+    the agencies' own sites.
+  - *Privacy at extraction.* Drop directors' and named executives' pay lines when parsing, not in the prose.
+    Suppress pay cells with fewer than ten filings **and** fewer than three employers: without the second rule one
+    asset manager would have been published alone.
+  - *Writing from memory reproduces the series.* Book 18's first drafts contained two near-copies of Book 2
+    questions. An 8-word-shingle originality test against every question, exercise, problem, solution and example
+    of the other books (805 against 14,597 texts) found them. Check examples too, not only questions.
+  - *Shell heredocs:* an unquoted `<<EOF` deletes `$…$` math from TeX pushed through it; always use `<<'EOF'`.
+  - *Sanitizers on this WSL2 kernel:* ThreadSanitizer can die at start-up (an "unexpected memory mapping", or a
+    silent SIGSEGV). Rerun under `setarch -R`.
+  - *pgfplots:* `legend cell align` defaults to centre; `area legend` must come after `ybar` or each entry draws
+    two small bars; on a log axis a bar of value 1 has no height without `log origin=infty`; `ybar interval` needs
+    a closing row; `xbar` with `nodes near coords` needs `anchor=west`. At 130 dpi thin coloured legend lines look
+    black: zoom to 300 dpi before "fixing" them.
+  - *A listing range can stay in bounds and show the wrong code* when a shared module grows (Book 17 ch. 16 moved
+    six lines). `make test-code` checks bounds only; run `tools/omcode_ends.py` after every code edit.
+  - *Sources contradict themselves.* BLS's May 2025 industry file says wages at or above $239,200 are top-coded,
+    yet it prints percentiles above that value. Say so in the text rather than choosing one.
+  - *ruff B905:* `zip()` needs `strict=`. *grep here is ugrep*: use `/usr/bin/grep -a` for PCRE and logs.
+  - *Appending to `tools/firm_names.txt` re-opens every earlier book.* Books 14–18 added *CME Group*, *Nasdaq* and
+    *Cboe*. Ten earlier chapters (Books 1, 2, 9, 10 and 14) then failed the firm-name gate, because they named
+    those firms and their ledgers did not. Fixing them turned up a real error: Book 10 said Hasbrouck and Saar
+    studied "a Nasdaq trading platform", but their data are Nasdaq-listed stocks on the Island ECN, which Nasdaq
+    did not then own. After appending names, run `make gates` over the whole series, not only your own book.

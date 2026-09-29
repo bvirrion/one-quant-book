@@ -1,0 +1,360 @@
+\chapter{Capturing and Monitoring the Network}\label{ch:nw:capturing-and-monitoring-the-network}
+
+In this chapter's simulated cage the strategy's own log adds up, at the median, to \qty{1.5}{\micro\second} between decoding a
+packet and handing the order it caused to the network card. The capture taken at the cage's taps says that the order's frame left
+the order handoff \qty{4.4}{\micro\second} after the triggering packet's first byte reached the market-data handoff. The difference is
+the part of the path the program cannot see: the fibre and the layer-1 devices, the card's receive path into memory, and its
+transmit path out. At the 99th percentile the capture says \qty{38}{\micro\second}, and no log written by the program could have
+said which part of the path owns it.
+
+This chapter is about the firm watching its own traffic from the outside. It copies every frame at the handoffs (chapter~2's taps),
+timestamps it against the clocks of chapter~4, stores it, and answers from the capture alone the questions the firm asks every
+day: how long did we take, what did we lose, when did the port fill.
+
+\section{Taps, capture appliances and capture files}
+
+\begin{definition}[Packet capture, capture appliance]\label{def:nw:capturing-and-monitoring-the-network:capture}
+A \emph{packet capture}\index{packet capture} is a record of the frames that crossed a point of a network, each with the time it
+crossed. A \emph{capture appliance}\index{capture appliance} is a dedicated device that receives copies of traffic from taps,
+timestamps each frame against a disciplined clock, and writes the frames to storage at the \omterm{def:nw:networking-for-trading:ser}{line rate} of its inputs without losing
+any.
+\end{definition}
+
+\begin{definition}[Packet capture file, timestamp trailer]\label{def:nw:capturing-and-monitoring-the-network:trailer}
+A \emph{packet capture file}\index{packet capture file} stores a capture as a sequence of records, each a timestamp, a length and the
+frame's bytes; the libpcap format and its successor pcapng are the common ones, with nanosecond timestamps in their newer variants.
+A \emph{timestamp trailer}\index{timestamp trailer} is a block of bytes that a tapping or switching device appends to the end of a
+copied frame, carrying the time at which the device saw the frame and where it saw it (device and port), so that the timestamp
+travels with the frame to wherever it is stored.
+\end{definition}
+
+The timestamp that matters is the one taken where the frame crossed the tap, not the one the storage server writes when the copy
+reaches it: between the two lie an aggregation switch, a queue and the server's own card. A trailer fixes that. It is taken on the
+wire, in the frame's first bytes, and it rides the copy through any later aggregation; the storage server keeps it and can ignore its
+own time. \Cref{dat:nw:capturing-and-monitoring-the-network:trailers} describes one vendor's published layout; the book's
+\texttt{firm.wirecap} uses a 16-byte trailer of its own in the same spirit.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (A) at (0,1.6) {handoff A};
+\node[b,fill=gray!10] (B) at (0,0.5) {handoff B};
+\node[b,fill=gray!10] (O) at (0,-0.6) {order handoff};
+\foreach \n/\y in {tA/1.6,tB/0.5,tO/-0.6} {\node[b,fill=omExo!15] (\n) at (2.5,\y) {tap};}
+\node[b,fill=omDef!15,minimum height=1.2cm] (cage) at (6.2,0.5) {cage devices\\ and servers};
+\node[b,fill=omMeth!20,minimum height=1.0cm,minimum width=2.4cm] (agg) at (3.9,-2.6) {timestamping\\ aggregation};
+\node[b,fill=omThm!12,minimum height=1.0cm] (app) at (9.6,-2.6) {capture appliance:\\ storage, analysis};
+\node[b,fill=gray!8] (gm) at (9.6,-0.9) {grandmaster\\ (chapter~4)};
+\foreach \a/\b in {A/tA,B/tB,O/tO} {\draw[thick] (\a) -- (\b);}
+\foreach \a in {tA,tB,tO} {\draw[thick] (\a.east) -- (cage.west);}
+\foreach \a/\x in {tA/3.3,tB/3.55,tO/3.8} {\draw[->,gray,dashed] (\a.south) -- ++(0,-0.25) -| (\x,-2.1);}
+\draw[->,thick] (agg) -- node[above,font=\scriptsize]{copies with trailers} (app);
+\draw[->,gray] (gm) -- node[right,font=\scriptsize]{time} (app);
+\draw[->,gray] (gm.west) -| (4.8,-2.1);
+\end{tikzpicture}
+
+\omcaption{Watching a cage from outside. Taps on every handoff copy both directions; a timestamping device appends a trailer to each copy
+(time, device, port) against the grandmaster's time and aggregates the copies; the \omterm{def:nw:capturing-and-monitoring-the-network:capture}{capture appliance} stores and analyses them. No
+program in the cage is involved.}\label{fig:nw:capturing-and-monitoring-the-network:taps}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.8cm,align=center,inner sep=1pt}]
+\node[f,fill=omDef!12,minimum width=4.2cm] (fr) at (0,0) {original frame (as on the wire)};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (d) at (fr.east) {device\\ 2 bytes};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (p) at (d.east) {port\\ 2 bytes};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (fl) at (p.east) {flags\\ 4 bytes};
+\node[f,fill=omThm!20,minimum width=1.5cm,anchor=west] (s) at (fl.east) {seconds\\ 4 bytes};
+\node[f,fill=omThm!20,minimum width=1.7cm,anchor=west] (n) at (s.east) {nanoseconds\\ 4 bytes};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (d.south west) -- (n.south east)
+  node[midway,below=5pt] {16-byte trailer appended by the tapping device (the book's layout)};
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:nw:capturing-and-monitoring-the-network:trailer}{timestamp trailer} of \texttt{firm.wirecap}: the device and port that saw the frame and the full UTC time in seconds and
+nanoseconds, appended after the frame. Vendors' trailers carry the same information in their own layouts.}\label{fig:nw:capturing-and-monitoring-the-network:trailer}
+\end{omfigure}
+
+\begin{dated}{2026-09}{A published trailer}\label{dat:nw:capturing-and-monitoring-the-network:trailers}
+Arista documents that its 7130 devices insert a self-contained 16-byte timestamp header at the end of each copied \omterm{def:nw:networking-for-trading:frame}{Ethernet frame},
+recompute its check sequence, and carry 64 bits of seconds and nanoseconds, so that ``full UTC time'' needs no keyframes; the header
+names the device and port, and a flag says whether the original frame's check sequence was valid. Timestamps are taken ``on the first
+byte of a packet on the ingress port'', with the front-panel delay removed, and the document gives $\pm$75~picoseconds of accuracy
+when the device is synchronised by a pulse per second. Other devices overwrite a field of the frame with a shorter timestamp and send
+periodic keyframes to relate it to UTC.
+\end{dated}
+
+\omcode{code/firm/wirecap/firm_wirecap.py}{75}{92}{Writing and reading a nanosecond pcap file: a 24-byte file header, then per frame a
+16-byte record header and the bytes.}\label{lst:nw:capturing-and-monitoring-the-network:pcap}
+
+\section{Measuring wire-to-wire latency}
+
+Wire-to-wire latency (One Quant Book~13, chapter~1) is measured on the wire: from the first byte of a market-data frame at the firm's
+handoff to the first byte of the order it caused at the order handoff. From a capture it is a subtraction, once each order has been
+paired with its cause.
+
+\begin{definition}[Trigger packet]\label{def:nw:capturing-and-monitoring-the-network:trigger}
+The \emph{trigger packet}\index{trigger packet} of an order is the market-data packet whose content caused the firm to send it. Its
+capture time is the start of the order's wire-to-wire latency.
+\end{definition}
+
+The pairing is the hard part. A capture sees two streams of packets, and nothing on the wire says which packet caused which order.
+The naive rule, ``the latest packet with a triggering message before the order'', works when triggers are rare and the firm is fast;
+it fails exactly when latency is worth measuring, in bursts, when several triggers precede an order by less than the firm's own latency.
+The reliable rule is to carry the cause in the order: the firm puts the \omterm{def:nw:capturing-and-monitoring-the-network:trigger}{trigger packet}'s sequence number (or a hash of it) into a field
+of the order it sends, usually its client order identifier, and the capture reads it back.
+
+\begin{method}[Wire-to-wire from a capture]\label{met:nw:capturing-and-monitoring-the-network:w2w}
+\begin{enumerate}
+\item Tap both market-data lines and the order handoff; timestamp all three against the same clock, on the wire.
+\item For each market-data packet keep the time of the first copy seen on either line: the strategy acted on whichever arrived first.
+\item Have the strategy carry the trigger's sequence number in every order; for each order, subtract its trigger's time from its own.
+\item Report the distribution, not the mean, and break it down against a budget of the path's stages, so that a slow percentile can be
+  charged to a stage.
+\end{enumerate}
+\end{method}
+
+The chapter's tutorial runs this method on a simulated second: 99\,055 market-data packets on two lines, each copy lost independently
+with probability 0.2\%, and a strategy that answers 30\% of the packets carrying a trade message with an order, 9\,558 orders in all. The
+orders' timing is drawn from \texttt{firm.wirepath}, the extension of One Quant Book~13's tick-to-trade path to the wire
+(\cref{fig:nw:capturing-and-monitoring-the-network:budget}). The capture recovers every order's latency exactly by the sequence carried
+in the order; the naive rule pairs 47\% of them with the wrong packet.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar=0pt,width=11.5cm,height=6.6cm,bar width=5pt,xmode=log,xmin=20,xmax=60000,
+  ytick=data,yticklabels from table={figdata/networks/05-capturing-and-monitoring-the-network/budget.csv}{stage},
+  y dir=reverse,xlabel={nanoseconds (log scale)},tick label style={font=\small},label style={font=\small},
+  xtick={100,1000,10000},xticklabels={100,1\,000,10\,000},
+  grid=major,grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=p50_ns]{figdata/networks/05-capturing-and-monitoring-the-network/budget.csv};
+\addplot[fill=omThm!40,draw=omThm] table[y expr=\coordindex,x=p99_ns]{figdata/networks/05-capturing-and-monitoring-the-network/budget.csv};
+\legend{median,99th percentile}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The wire-to-wire budget of \texttt{firm.wirepath}: the layer-1 cage of chapter~2 (network in and out), the card's receive and
+transmit paths (model values), and the six in-process stages measured by One Quant Book~13 on a laptop (Intel Core Ultra 7 155H, WSL2).
+The last bar is their composition, a simulation. Data: \texttt{fig\_capture.py}.}\label{fig:nw:capturing-and-monitoring-the-network:budget}
+\end{omfigure}
+
+The budget says where the time goes. At the median the card's two passes (\qty{0.8}{\micro\second} each, model values) and the ring
+between the feed handler and the strategy (\qty{0.76}{\micro\second}, measured) are the largest stages; the fibre and devices of the cage
+together are \qty{0.56}{\micro\second}. At the 99th percentile the ring owns it, at \qty{32}{\micro\second}: on the laptop that measured it,
+a consumer that sleeps or is descheduled wakes late. Composed, the stages give a wire-to-wire median of \qty{4.4}{\micro\second} and a 99th
+percentile of \qty{35}{\micro\second}; the capture of the simulated session measures \qty{4.4}{\micro\second} and \qty{38}{\micro\second}, the
+difference being the sample.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.0cm,xmode=log,xmin=2,xmax=100,ymin=0,ymax=0.16,
+  xlabel={wire-to-wire latency from the capture (\unit{\micro\second}, log scale)},ylabel={share of orders},
+  ytick={0,0.05,0.1,0.15},yticklabels={0,0.05,0.10,0.15},
+  xtick={2,5,10,20,50,100},xticklabels={2,5,10,20,50,100},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[ybar,bar width=3pt,fill=omDef!55,draw=omDef] table[x=mid_us,y=share]{figdata/networks/05-capturing-and-monitoring-the-network/w2w_hist.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: wire-to-wire latency of 9\,558 orders measured from the capture of one simulated second, by the trigger sequence
+each order carries (bins of equal width in log scale). The distribution has the long right tail of its slowest stage. Data:
+\texttt{fig\_capture.py}.}\label{fig:nw:capturing-and-monitoring-the-network:hist}
+\end{omfigure}
+
+\omcode{code/networks/05-capturing-and-monitoring-the-network/python/nw_capture.py}{74}{95}{Reading the capture: each frame's time
+from its trailer, the first copy of each market-data packet on either line, and the trigger sequence of each
+order.}\label{lst:nw:capturing-and-monitoring-the-network:analyse}
+
+\section{Detecting gaps, drops and microbursts from a capture}
+
+The same capture answers the questions the feed handler of One Quant Book~13 answers from inside, and some it cannot. A gap is a
+sequence number missing from a line; a gap on both lines is a message the firm never had, and the capture shows whether it was lost
+before the handoff (missing at the tap) or after it (present at the tap, missing in the handler's counters). In the simulated second,
+line~A shows 158 gaps and line~B 198, and no message is missing from both: the handler recovered everything from the other line. Bursts
+come from the same timestamps: the busiest 100 microseconds of line~A carried \qty{1.24}{\giga\bit\per\second}, nine times its mean of
+\qty{0.14}{\giga\bit\per\second}, the same shape as chapter~1's feeds at a smaller scale.
+
+A capture is the firm's evidence as well as its instrument. It shows what the firm actually sent and when, which is what a venue, a
+client or a regulator asks about after an incident; European rules ask firms to identify the exact point at which each timestamp is
+applied, and a tap on the handoff is the one point that no software change can move.
+
+\section{Monitoring in production: counters, telemetry and alarms}
+
+\begin{definition}[Streaming telemetry]\label{def:nw:capturing-and-monitoring-the-network:telemetry}
+\emph{Streaming telemetry}\index{streaming telemetry} is the continuous export by network devices of their counters and state
+(per-port traffic, discards, queue occupancy, optical levels, clock state) to a collector, pushed at a chosen interval or on change,
+instead of polled by the collector.
+\end{definition}
+
+A capture is detailed and expensive: it stores every frame, and a busy cage fills disks in hours. Monitoring runs continuously on
+summaries: every device's counters, streamed every second or on change; every server's socket and ring drops; every handler's gap and
+staleness counters; every clock's offset. The alarms that matter in a trading network are few and specific:
+\begin{itemize}
+\item \textbf{discards on an \omterm{def:nw:networking-for-trading:egress}{egress queue}}, which only \omterm{def:nw:networking-for-trading:burst}{microbursts} produce on an underused link (chapter~1);
+\item \textbf{gaps on one line} persisting, a line degrading while the other hides it;
+\item \textbf{gaps on both lines}, a common cause, and any snapshot recovery;
+\item \textbf{a clock out of lock or in \omterm{def:nw:time-synchronisation:holdover}{holdover}}, and offsets approaching the budget (chapter~4);
+\item \textbf{wire-to-wire percentiles} drifting from the baseline, computed from the capture every minute.
+\end{itemize}
+Each alarm names a place on the path, and the capture of the minutes around it is kept for the investigation.
+
+\section{Tutorial: a second of the cage, from the taps}\label{tut:nw:capturing-and-monitoring-the-network:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Capture a simulated second at the cage's taps, write it as a pcap file, and measure from it alone what the firm's
+programs cannot see. \textbf{End state:} \cref{fig:nw:capturing-and-monitoring-the-network:budget,fig:nw:capturing-and-monitoring-the-network:hist},
+the pairing error of the naive rule, and the gap and burst counts quoted in the text.
+\begin{tutsteps}
+\item \textbf{The budget.} \texttt{nw\_capture.stages()} takes the cage of chapter~2, the card's model stages and Book~13's measured stages;
+  \texttt{budget\_rows()} composes them with \texttt{firm.wirepath}.
+\item \textbf{The session.} \texttt{session()} builds the feed's frames on both lines with independent losses, the orders with their
+  trigger sequence, and appends a trailer to each copy.
+\item \textbf{The file.} \texttt{firm.wirecap.write\_pcap(path, records)} writes it (\cref{lst:nw:capturing-and-monitoring-the-network:pcap});
+  any tool that reads nanosecond pcap files opens it.
+\item \textbf{The analysis.} \texttt{analyse(read\_pcap(path))} pairs orders with their triggers, counts gaps per line and messages lost on
+  both, and finds the busiest window (\cref{lst:nw:capturing-and-monitoring-the-network:analyse}); \texttt{python fig\_capture.py} writes the
+  charts' data.
+\end{tutsteps}
+\textbf{What to change next.} Raise the loss to 5\% per line and count the messages lost on both; make the strategy four times faster and
+measure how the naive rule's error changes.
+\end{tutorial}
+
+\section{Build: capture tools and the wire-to-wire path}\label{bld:nw:capturing-and-monitoring-the-network:wirecap}
+
+\begin{build}
+\bfield{Purpose} Two components: \texttt{firm.wirecap}, the firm's capture toolkit, and \texttt{firm.wirepath}, the tick-to-trade path of
+One Quant Book~13 extended to the wire, which chapters~7 and~29 use for their latency tables.
+\bfield{Interface} \texttt{firm\_wirecap}: \texttt{udp\_frame}, \texttt{tcp\_frame}, \texttt{add\_trailer}, \texttt{strip\_trailer},
+\texttt{write\_pcap}, \texttt{read\_pcap}, \texttt{write\_pcapng}, \texttt{read\_pcapng}, \texttt{parse}, \texttt{mold}, \texttt{ORDER},
+\texttt{match\_orders}, \texttt{match\_nearest}, \texttt{gaps}, \texttt{bursts}; C++20 reader \texttt{cpp/firm\_wirecap.hpp}.
+\texttt{firm\_wirepath}: \texttt{Stage(name, p50, p99, kind)}, \texttt{book13\_software()}, \texttt{wire\_stages(cage, \dots)},
+\texttt{card\_stages}, \texttt{hardware\_stage(cycles, mhz)}, \texttt{compose}, \texttt{report}, composing with \texttt{firm.latbudget}.
+\bfield{Rules} Timestamps are integers of nanoseconds since midnight UTC; the trailer's time wins over any storage time; the IPv4 checksum is
+correct; an order is paired only by the sequence it carries; Book~13's measurements are read, never copied or changed.
+\bfield{Acceptance tests} \texttt{code/firm/wirecap/tests/}: frames parse back, checksums hold, trailers round-trip, pcap and pcapng
+round-trip, a wrong magic is refused, matching, gaps and bursts on hand-made data, and the shared fixture read identically in Python and
+C++. \texttt{code/firm/wirepath/tests/}: the lognormal fit hits its median and 99th percentile, Book~13's stages are read, a cage's path
+gives the network stage, and the report's rows.
+\bfield{Stretch} Per-port burst detection with the switch's buffer as the threshold; a capture-based order-book rebuild compared, message by
+message, with the handler's.
+\end{build}
+
+\begin{omsources}
+\item \texttt{pcap-savefile(5)} (tcpdump/libpcap); IETF, \emph{PCAP Now Generic (pcapng) Capture File Format},
+draft-ietf-opsawg-pcapng-04.
+\item Arista, \emph{An Overview of Arista Ethernet Capture Timestamps}; OpenConfig, \emph{gNMI specification}.
+\item Commission Delegated Regulation (EU) 2017/574 (RTS~25), article 4.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:1}
+A nanosecond pcap record header gives 34\,200 seconds and 1\,500\,000\,321 nanoseconds. Is that a valid record, and what time of day
+should the reader report?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:2}
+A \omterm{def:nw:capturing-and-monitoring-the-network:trigger}{trigger packet} reaches the tap on line~A at 09:30:00.000\,012\,345 and on line~B \qty{3}{\micro\second} later; the order leaves at
+09:30:00.000\,016\,771. What is the wire-to-wire latency? If the copy on line~A had been lost, from which copy would you measure, and
+what would change?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:3}
+A 10~Gb/s link is tapped in both directions and written to disk with trailers; each frame is stored with a 16-byte record header and
+its 16-byte trailer. At a sustained \qty{4}{\giga\bit\per\second} each way with 200-byte frames, how many bytes a second go to disk?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:4}
+Why does the naive pairing rule fail more often the more frequent the triggers are and the slower the firm is?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:5}
+Line~A shows 158 gaps and line~B 198 in the tutorial's second, and none is on both. With 0.2\% independent loss per copy and 99\,055
+packets, how many packets would you expect to be lost on both lines?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:6}
+In \cref{fig:nw:capturing-and-monitoring-the-network:budget}, which stage would you attack first to cut the median, and which to cut the 99th
+percentile? What would each cost?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:7}
+\emph{Coding.} Make every stage of \texttt{firm.wirepath} four times faster except the network's, run the session again and measure the naive
+rule's pairing error. Explain the direction of the change.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:8}
+\emph{Find the flaw.} ``We measure our wire-to-wire latency by timestamping the market-data packet in the handler with the card's hardware
+timestamp and the order with the card's transmit timestamp. That is as good as a tap.''
+\end{exercise}
+
+\section{Problem: The Two Microseconds Nobody Logged}
+
+\begin{problem}[{Weekend problem --- a latency budget read from the taps}]\label{pb:nw:capturing-and-monitoring-the-network:1}
+A firm's strategy logs its in-process time and reports a median of \qty{1.5}{\micro\second}. The capture at the taps (the chapter's
+simulated second) reports a wire-to-wire median of \qty{4.4}{\micro\second} and a 99th percentile of \qty{38}{\micro\second}. Use the stage
+medians and 99th percentiles of \cref{fig:nw:capturing-and-monitoring-the-network:budget}: network in 263 and out 295~ns; card receive 798
+(p99 1\,997) and transmit 801 (p99 2\,000); the six software stages 437, 756, 158, 97, 47 and 33~ns at the median.
+
+\medskip\noindent\textbf{Part I --- Medians.}
+\begin{enumerate}
+\item What is the sum of the software stages' medians?
+\item What is the sum of every stage's median?
+\item Why is the sum of medians not the median of the sum?
+\item How much of the wire-to-wire median lies outside the program?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The tail.}
+\begin{enumerate}[resume]
+\item The ring's 99th percentile is \qty{31.9}{\micro\second}. What share of the wire-to-wire 99th percentile is that?
+\item Why can a single slow stage own the tail?
+\item What did Book~13 find the ring's tail to be on the laptop?
+\item What would a production host change?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The capture.}
+\begin{enumerate}[resume]
+\item Why is the tap's timestamp the right start for the latency, rather than the card's?
+\item The naive rule mispaired 47\% of the orders. What would the 99th percentile have looked like with it?
+\item What field would you use to carry the trigger in the order?
+\item Which alarm would have told the firm that its tail had moved?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the wire-to-wire median and 99th percentile, the part outside the program, and the stage that owns the
+  tail.
+\item If the cards' paths were halved, how much would the median fall?
+\item If the ring's tail were removed entirely, which stage would own the 99th percentile?
+\item What would you need to measure the cards' stages instead of assuming them?
+\item Why does the capture belong to the firm's evidence as well as its tools?
+\item How much disk does an hour of this capture take, at the tutorial's rates?
+\item What would you keep for a month, and what for a day?
+\item In one sentence: what does a tap see that a log does not?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:capturing-and-monitoring-the-network:1}
+How do you measure wire-to-wire latency? What do you need that a program's own logs do not give you?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:capturing-and-monitoring-the-network:2}
+Where should a capture's timestamp be taken, and why does it matter?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:capturing-and-monitoring-the-network:3}
+How do you pair each order with the market-data packet that caused it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:capturing-and-monitoring-the-network:4}
+Which network alarms would you set for a trading cage, and why those?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:capturing-and-monitoring-the-network:5}
+Your wire-to-wire 99th percentile doubled overnight; nothing was deployed. How do you find out why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:capturing-and-monitoring-the-network:6}
+What would you use a capture for besides latency?
+\end{interviewq}

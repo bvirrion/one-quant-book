@@ -1,0 +1,368 @@
+\chapter{Post-Trade Systems}\label{ch:pl:post-trade-systems}
+
+On 28 May 2024 most US securities trades began to settle one business day after the trade date instead of two. The rule that made the change
+also required brokers to have agreements or policies aimed at completing allocations, confirmations and \omterm{def:pl:post-trade-systems:confirmation}{affirmations} by the end of the trade
+date, and the industry's
+plan moved the \omterm{def:pl:post-trade-systems:confirmation}{affirmation} cut-off of the central matching service from 11:30~a.m.\ on the day after the trade to 9:00~p.m.\ on the trade date
+itself. For the operations team that fixes a trade whose confirmation does not agree with the firm's booking, the time available went from a
+working day to an evening. This chapter builds the systems that decide how many trades need fixing --- matching, \omterm{def:pl:post-trade-systems:ssi}{settlement instructions},
+\omterm{def:pl:post-trade-systems:recon}{reconciliation} --- and measures what the shorter cycle does to the ones that remain.
+
+\section{From booked trade to settled trade}
+
+Chapter~\ref{ch:pl:trade-capture-and-booking} ended with a booked trade in the canonical model. Between booking and settlement (Book~1,
+chapter~5) the trade must be agreed with the counterparty, instructed to the agents who move the securities and cash, settled, and then checked
+against what the custodian actually holds. Every step compares two records of the same thing, and every comparison that fails is a piece of
+manual work with a deadline.
+
+\begin{definition}[Trade confirmation, affirmation]\label{def:pl:post-trade-systems:confirmation}
+A \emph{trade confirmation}\index{trade confirmation} is the executing party's statement of a trade's terms --- security, side, quantity, price,
+trade and settlement dates, accounts --- sent to its counterparty. \emph{Affirmation}\index{affirmation} is the counterparty's (for an
+institutional trade, the investment manager's or its custodian's) agreement that the confirmation is right, after which the trade can be
+settled without further intervention.
+\end{definition}
+
+\begin{definition}[Settlement instruction, standard settlement instruction]\label{def:pl:post-trade-systems:ssi}
+A \emph{settlement instruction}\index{settlement instruction} tells a settlement agent to deliver or receive a security against payment, with
+the quantity, amount, settlement date and both parties' accounts. A \emph{standard settlement instruction}\index{standard settlement
+instruction} (SSI) is the account details a counterparty uses for a given market, kept once as reference data so that each trade's
+instruction is generated rather than typed.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=4mm,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=10mm,text width=20mm},
+  chk/.style={draw=omThm,fill=omThm!8,rounded corners=2pt,align=center,minimum height=10mm,text width=20mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (b) {booked trade\\(ch.~21)};
+\node[chk,right=of b] (m) {match with the\\confirmation};
+\node[box,right=of m] (a) {affirm\\(cut-off)};
+\node[box,right=of a] (i) {instruct\\(SSI table)};
+\node[box,right=of i] (s) {settle\\(DVP at the CSD)};
+\node[chk,below=9mm of s,text width=26mm] (r) {reconcile with\\the custodian};
+\node[chk,below=9mm of m,text width=34mm] (q) {break queue: classify,\\assign, fix, age};
+\draw[arr] (b) -- (m); \draw[arr] (m) -- (a); \draw[arr] (a) -- (i); \draw[arr] (i) -- (s); \draw[arr] (s) -- (r);
+\draw[arr,omThm] (m) -- node[left,font=\scriptsize]{mismatch} (q);
+\draw[arr,omThm] (r) -- node[above,font=\scriptsize]{difference} (q);
+\draw[arr,omThm,dashed] (q.east) to[bend right=12] node[below right,font=\scriptsize,pos=0.35]{fixed} (a.south);
+\end{tikzpicture}
+
+\omcaption{The post-trade pipeline of this chapter: each booked trade is matched with the counterparty's confirmation, affirmed before the
+cut-off, instructed from the SSI table and settled delivery versus payment; positions are then reconciled with the custodian. Every mismatch or
+difference (red) becomes a break in one queue, where it is classified, owned, fixed and aged.}\label{fig:pl:post-trade-systems:pipeline}
+\end{omfigure}
+
+The chapter's week is a model, and every number in it comes from the model: 500 institutional equity trades a day, executed by eight brokers for
+five funds, each trade booked in the firm's canonical model. The brokers' confirmations carry discrepancies planted at stated rates: a wrong
+price for 1\% of trades, a wrong settlement date for 1\%, a wrong account for 1.5\%, a wrong quantity for 0.5\%, and no confirmation at all
+for 1\%. Three of the eight brokers also round the average price to four decimals, which is not an error at all.
+
+\section{Confirmation and affirmation}
+
+\begin{definition}[Confirmation matching, matching tolerance]\label{def:pl:post-trade-systems:matching}
+\emph{Confirmation matching}\index{confirmation matching} pairs each booked trade with a confirmation that agrees on key fields (security,
+side, counterparty, trade date, account holder) and then compares the other fields; a \emph{matching tolerance}\index{matching tolerance} is
+the largest difference in a compared field that still counts as agreement. A pair within every tolerance is matched; a pair outside some is a
+partial match, reported with the fields that differ; a trade with no candidate is unmatched.
+\end{definition}
+
+\omcode{code/firm/posttrade/firm_posttrade.py}{43}{65}{Confirmation matching: candidates by key, the best candidate by fewest differing fields,
+and a partial match reported with its score and the fields that differ.}\label{lst:pl:post-trade-systems:match}
+
+The key fields must be exact, because they decide which record is compared with which; the tolerances apply to what is compared. Quantities,
+dates and accounts have no tolerance: a trade for 9\,500 shares is not a trade for 9\,400. The price is the one field where a tolerance makes
+sense, because the firm and the broker compute an average price over many fills and may carry it to different precision.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11.5cm,height=5.6cm,xlabel={price tolerance (\$ per share, log scale)},ylabel={matched automatically (\%)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  ymin=55,ymax=104,ytick={60,70,80,90,100},xmin=5e-8,xmax=0.1]
+\addplot[omDef,thick,mark=*] table[x=tolerance,y=rate_pct]{figdata/platforms/22-post-trade-systems/match_rate.csv};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:1e-7,60.4) {60.4};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:1e-6,61.0) {61.0};
+\node[omDef,font=\scriptsize,anchor=south east] at (axis cs:1e-5,67.6) {67.6};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:1e-3,95.8) {95.8};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:5e-2,96.8) {96.8};
+\draw[omThm,dashed] (axis cs:5e-5,55) -- (axis cs:5e-5,100) node[pos=0.15,right,font=\scriptsize,align=left]{half a unit in\\the fourth decimal};
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Share of Monday's 500 trades matched automatically against the price tolerance. Below \$0.00005 the three brokers that round the
+average price to four decimals break on almost every trade (60.4\% matched at \$0.0000001); from \$0.00005 to \$0.01 only the planted
+discrepancies remain (95.8\%); at \$0.05 five wrong prices are accepted as matches (96.8\%). Data:
+\texttt{fig\_posttrade.py}.}\label{fig:pl:post-trade-systems:tolerance}
+\end{omfigure}
+
+\Cref{fig:pl:post-trade-systems:tolerance} shows the two ways to get a tolerance wrong. Too tight, and the rounding convention of three brokers
+becomes 177 breaks on Monday that nobody needs to fix: a strict match rate of 60.4\%. Too loose, and a wrong price of a few cents is matched, and
+the error is found --- if at all --- when the cash does not agree. Between the two lies a plateau from half a unit in the fourth decimal to a
+cent, where the match rate is 95.8\% and every remaining break is a real one. The right tolerance is the plateau's lower end, derived from the
+precision each counterparty is known to use, and recorded per counterparty in reference data rather than chosen globally.
+
+\section{Settlement instructions}
+
+Once affirmed, each trade becomes an instruction: for Monday's first trade, a sale of 9\,400 shares at \$97.586941, a \emph{deliver versus
+payment} of \$917\,317.25 on the settlement date, from the fund's custody account to the broker's agent and account taken from the SSI table.
+Nothing in the instruction is typed; every field comes from the canonical trade or from reference data. That is the point of the SSI table: a
+wrong account on one confirmation is a break on one trade, but a wrong account in the SSI table is a fail on every trade with that
+counterparty in that market until someone notices, so SSI changes go through the same approval as the parameter changes of
+chapter~\ref{ch:pl:signal-serving-and-parameter-management} --- proposed, checked by a second person, effective from a stated date, never
+edited in place.
+
+In the model, wrong accounts are the most common discrepancy: 43 of the week's 138 breaks, against 32 missing confirmations, 27 wrong
+settlement dates, 26 wrong prices and 10 wrong quantities (\cref{fig:pl:post-trade-systems:kinds}). They are also the kind a firm can remove at
+the source, by maintaining SSIs once and sharing them with its counterparties instead of letting each side key them.
+
+\section{Reconciliation and breaks}
+
+\begin{definition}[Reconciliation, reconciliation break]\label{def:pl:post-trade-systems:recon}
+\emph{Reconciliation}\index{reconciliation} is the periodic comparison of two records that should agree --- the firm's positions or cash
+against a custodian's or prime broker's statement, the firm's trades against a clearing broker's --- item by item. A \emph{reconciliation
+break}\index{reconciliation break} is an item on which they differ: present on one side only, or present on both with different values.
+\end{definition}
+
+\omcode{code/firm/posttrade/firm_posttrade.py}{106}{120}{Reconciliation by key, with one-to-many groups: a custodian's block position is
+compared with the sum of the firm's allocations to it.}\label{lst:pl:post-trade-systems:recon}
+
+The difficulty of \omterm{def:pl:post-trade-systems:recon}{reconciliation} is rarely the comparison; it is the keys. The custodian may report one position where the firm holds five
+allocations (a one-to-many group), a cash movement may be the sum of a day's trades (an aggregate), and identifiers may differ between the two
+sides, so the reference data of chapter~\ref{ch:pl:reference-data-and-symbology-services} decides whether a difference is real. A break then
+needs three more things before it is useful: a kind (missing on one side, a quantity difference), an owner, and an age.
+
+\begin{definition}[Break ageing]\label{def:pl:post-trade-systems:ageing}
+\emph{Break ageing}\index{break ageing} is the classification of open breaks by the time since they were opened, in buckets (under a day, one
+to three days, three to seven, more), reported daily with the owner of each break; the old buckets are where risk hides, because a break that
+survives several \omterm{def:pl:post-trade-systems:recon}{reconciliations} is one that nobody understands.
+\end{definition}
+
+\section{Operating under a short settlement cycle}
+
+The model's operations team is three people. Breaks are worked largest value first, each taking a random time whose average depends on the kind
+(30~minutes for a settlement date, 45 for a price or a quantity, an hour for an account, an hour and a half to chase a missing confirmation). The
+window is where the two cycles differ. Under T+2 the model gives the team the next working day, 08:00 to 17:00, before a trade can no longer be
+settled on time; under T+1 it gives the evening of the trade date, 17:00 to the 21:00 \omterm{def:pl:post-trade-systems:confirmation}{affirmation} cut-off. These windows are the model's
+choices, set on the cut-offs quoted in the hook; a real team also works during the trading day, which helps both cycles equally.
+
+\omcode{code/platforms/22-post-trade-systems/python/pl_posttrade.py}{93}{109}{The team works the breaks largest value first; a break that
+cannot be finished inside the window fails to settle.}\label{lst:pl:post-trade-systems:resolve}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrrrrr}
+\toprule
+cycle & breaks & fixed & failed & value failed & recon breaks & aged 1--3 days & aged 3--7 days\\
+\midrule
+T+2 & 138 & 128 & 10 & \$2.74m & 4 & 4 & 0\\
+T+1 & 138 & 91 & 47 & \$19.17m & 24 & 12 & 5\\
+\bottomrule
+\end{tabular}
+\caption{The same week of 2\,500 trades and 138 breaks under the two cycles, with three people in operations. \omterm{def:pl:post-trade-systems:recon}{Reconciliation} with the custodian
+on Friday evening covers the trades due to settle by Friday; under T+1, 7 of the 24 breaks are under a day old.}
+\label{tab:pl:post-trade-systems:cycles}
+\end{table}
+
+The breaks are the same under both cycles --- they come from the confirmations, not the calendar --- but the work they need does not fit in the
+evening. The week's breaks need about 26 hours of work a day on average; the next working day gives three people 27 hours, the evening 12. Under
+T+2 ten trades fail in the week, \$2.74~million of value; under T+1 forty-seven fail, \$19.17~million, and the Friday \omterm{def:pl:post-trade-systems:recon}{reconciliation} finds six
+times as many position breaks (\cref{tab:pl:post-trade-systems:cycles}). A failed trade is not lost --- it settles later --- but the fund does
+not have the securities or the cash it expected, the \omterm{def:pl:position-and-pnl-services:service}{position service} of chapter~\ref{ch:pl:position-and-pnl-services} must carry settled and
+unsettled positions separately, and some markets charge for the fail: Book~2, chapter~5, describes the fails charge in the Treasury market.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ybar,bar width=9pt,ylabel={trades},symbolic x coords={account,missing,settle_date,price,qty},
+  xticklabels={wrong\\account,missing,wrong\\settlement date,wrong\\price,wrong\\quantity},xtick=data,
+  xticklabel style={align=center},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,ymin=0,ymax=52,
+  nodes near coords,every node near coord/.append style={font=\scriptsize},
+  legend style={font=\small,at={(0.5,1.03)},anchor=south,legend columns=3,draw=none,
+    /tikz/every even column/.append style={column sep=4mm}}]
+\addplot[fill=omDef!35,draw=omDef] table[x=kind,y=breaks]{figdata/platforms/22-post-trade-systems/kinds.csv};
+\addplot[fill=omThm!25,draw=omThm] table[x=kind,y=failed_t2]{figdata/platforms/22-post-trade-systems/kinds.csv};
+\addplot[fill=omThm!70,draw=omThm] table[x=kind,y=failed_t1]{figdata/platforms/22-post-trade-systems/kinds.csv};
+\legend{breaks in the week,failed under T+2,failed under T+1}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The week's 138 breaks by kind, and the trades that failed to settle under each cycle. Wrong accounts and missing confirmations are
+the most frequent and the slowest to fix, and together make 36 of the 47 fails under T+1. Data: \texttt{fig\_posttrade.py}.}
+\label{fig:pl:post-trade-systems:kinds}
+\end{omfigure}
+
+There are two ways back to the fails of the longer cycle, and \cref{fig:pl:post-trade-systems:staffing} compares them. The first is people:
+with seven in operations instead of three the evening absorbs the work, and the week's fails fall to 11. The second is fewer breaks: halving
+the rate of wrong accounts and missing confirmations --- SSIs maintained once and shared, allocations sent to the broker as soon as they are
+decided --- brings the fails to 13 with the same three people. The second is cheaper and it lasts, which is why the move to T+1 was prepared
+as much in reference data and allocation workflows as in staffing.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={people in operations},ylabel={trades failed in the week (T+1)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=2.6,xmax=8.6,ymin=0,ymax=52,xtick={3,4,5,6,7,8}]
+\addplot[omThm,thick,mark=*] table[x=staff,y=failed]{figdata/platforms/22-post-trade-systems/staffing.csv};
+\addplot[omDef,thick,mark=square*] table[x=staff,y=failed_half_errors]{figdata/platforms/22-post-trade-systems/staffing.csv};
+\draw[gray,dashed] (axis cs:2.6,10) -- (axis cs:8.6,10) node[pos=0.97,below left,font=\scriptsize]{T+2, three people: 10};
+\node[font=\scriptsize,anchor=north east,align=right] at (axis cs:8.5,50) {\textcolor{omThm}{$\bullet$ the model's error rates}\\
+  \textcolor{omDef}{$\blacksquare$ wrong accounts and missing confirmations halved}};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Trades failed in the week under T+1 against the size of the operations team, at the model's error rates (red) and with the
+wrong accounts and missing confirmations halved (blue). Seven people bring the fails to 11; halving the two commonest errors brings them to 13
+with three. Data: \texttt{fig\_posttrade.py}.}\label{fig:pl:post-trade-systems:staffing}
+\end{omfigure}
+
+The general lesson is the one of chapter~\ref{ch:pl:trade-capture-and-booking}: post-trade cost is set upstream. Every break the pipeline
+creates is paid for by a person against a deadline, and a shorter cycle shortens the deadline without changing the number of breaks. The
+measure to watch is the share of trades that go from booking to settlement untouched --- the straight-through rate --- by counterparty and by
+kind of break, together with the age of what is left.
+
+\begin{dated}{2026-09}{The US move to T+1}\label{dat:pl:post-trade-systems:t1}
+SEC Release 34-96930 (2023) amended Rule 15c6-1 to shorten the standard settlement cycle for most broker-dealer transactions from T+2 to T+1,
+with a compliance date of 28 May 2024, the day after a Federal holiday. New Rule 15c6-2 requires brokers to have agreements or policies aimed
+at completing allocations, confirmations and \omterm{def:pl:post-trade-systems:confirmation}{affirmations} as soon as technologically practicable and no later than the end of the trade date;
+new Rule 17Ad-27 requires clearing agencies that provide a central matching service to facilitate \omterm{def:pl:trade-capture-and-booking:stp}{straight-through processing} and report on it
+each year. The release cites the industry's T+1 Report, which moved the \omterm{def:pl:post-trade-systems:confirmation}{affirmation} cut-off from 11:30~a.m.\ ET on the day after the trade to
+9:00~p.m.\ ET on the trade date.
+\end{dated}
+
+\section{Tutorial: a week of confirmations under two cycles}\label{tut:pl:post-trade-systems:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Match a week of trades with planted discrepancies, instruct, reconcile and age the breaks, then replay the week under T+1.
+\textbf{End state:} \cref{fig:pl:post-trade-systems:tolerance} and \cref{tab:pl:post-trade-systems:cycles}.
+\begin{tutsteps}
+\item \textbf{Trades and confirmations}: \texttt{pl\_posttrade.trades(0, 1)} and \texttt{confirms(ours)}; count the planted kinds.
+\item \textbf{Matching}: \texttt{match\_rates(tols=\dots)} over tolerances from $10^{-7}$ to $0.05$.
+\item \textbf{Instructions}: build an \texttt{SSITable} for the eight brokers and generate the instruction of every matched trade.
+\item \textbf{Breaks and fixes}: \texttt{week(\textquotedbl T+2\textquotedbl)} and \texttt{week(\textquotedbl T+1\textquotedbl)}.
+\item \textbf{\omterm{def:pl:post-trade-systems:recon}{Reconciliation}}: \texttt{custodian\_recon(cycle)}, the breaks and their ageing.
+\end{tutsteps}
+\textbf{What to change next.} Add a cash \omterm{def:pl:post-trade-systems:recon}{reconciliation} (the day's net payments per fund against the custodian's cash statement) with
+aggregate matching; let the team work part of the trading day and see whether T+1 still needs more people.
+\end{tutorial}
+
+\section{Build: post-trade}\label{bld:pl:post-trade-systems:posttrade}
+
+\begin{build}
+\bfield{Purpose} Agree every trade with its counterparty, instruct it, and prove afterwards that the books agree with the custodian, with every
+exception in one queue.
+\bfield{Interface} \texttt{match}, \texttt{match\_rate}, \texttt{MatchResult}, \texttt{SSITable.instruction}, \texttt{reconcile} (with
+\texttt{groups}), \texttt{Break}, \texttt{classify}, \texttt{age}.
+\bfield{Rules} Keys exact, tolerances per field and recorded; instructions generated from SSIs, never typed; SSI changes approved and dated;
+every break has a kind, an owner and an opening time; ageing reported daily.
+\bfield{Acceptance tests} \texttt{code/firm/posttrade/tests/}: matched, partial and unmatched trades on both sides; the best candidate chosen
+among several; an instruction from the SSI table and a missing SSI; one-to-many \omterm{def:pl:post-trade-systems:recon}{reconciliation} and the ageing buckets.
+\bfield{Stretch} Cash and trade \omterm{def:pl:post-trade-systems:recon}{reconciliation} with aggregate matching; an \omterm{def:pl:post-trade-systems:confirmation}{affirmation} workflow with cut-off times and escalation; a
+straight-through rate report by counterparty.
+\end{build}
+
+\begin{omsources}
+\item US Securities and Exchange Commission, \emph{Shortening the Securities Transaction Settlement Cycle}, Release No.~34-96930, 2023.
+\item One Quant Book~1, chapter~5 (settlement, the settlement cycle, fails, delivery versus payment); Book~2, chapter~5 (the fails charge);
+Book~16, chapter~4 (the custodian).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:post-trade-systems:1}
+Why are the key fields matched exactly and only the other fields with a tolerance?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:post-trade-systems:2}
+A broker rounds prices to four decimals. What is the smallest price tolerance at which its correct confirmations always match?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:post-trade-systems:3}
+Under T+1, how many of the week's breaks were fixed, and what share of the breaks failed?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:post-trade-systems:4}
+Why is a wrong account in the SSI table worse than a wrong account on one confirmation?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:post-trade-systems:5}
+The custodian reports one position of 3\,000 shares where the firm holds allocations of 1\,000 and 2\,000 to two funds under the same account.
+How does the \omterm{def:pl:post-trade-systems:recon}{reconciliation} avoid three breaks?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:post-trade-systems:6}
+Why does the Friday \omterm{def:pl:post-trade-systems:recon}{reconciliation} find only 4 position breaks under T+2 when 10 trades failed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:post-trade-systems:7}
+\emph{Coding.} Rerun \texttt{week(\textquotedbl T+1\textquotedbl, staff=s)} for $s$ from 3 to 8 and find the smallest team that fails no more
+trades than T+2 with three people.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:post-trade-systems:8}
+\emph{Find the flaw.} \textquotedbl{}Our match rate went from 95.8\% to 96.8\% this month after we widened the price tolerance to five cents:
+operations is doing better.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: One Evening Instead of a Day}
+
+\begin{problem}[{Weekend problem --- one evening instead of two days}]\label{pb:pl:post-trade-systems:1}
+The chapter's week: 500 trades a day, eight brokers, five funds, planted discrepancies, three people in operations.
+
+\medskip\noindent\textbf{Part I --- Agreeing the trade.}
+\begin{enumerate}
+\item What is compared between a booked trade and a confirmation, and what must be exact?
+\item What does \omterm{def:pl:post-trade-systems:confirmation}{affirmation} add to matching?
+\item Why do three brokers produce breaks at a tight tolerance, and how many trades match at \$0.0000001?
+\item Where is the plateau of the match rate, and what is the rate there?
+\item What happens at a tolerance of five cents?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Instructing and reconciling.}
+\begin{enumerate}[resume]
+\item What does the \omterm{def:pl:post-trade-systems:ssi}{settlement instruction} of Monday's first trade contain, and where does each field come from?
+\item How should SSI changes be controlled?
+\item What makes \omterm{def:pl:post-trade-systems:recon}{reconciliation} hard in practice?
+\item What does a break need beyond the difference itself?
+\item Why are the old ageing buckets the ones to watch?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The two cycles.}
+\begin{enumerate}[resume]
+\item What window does the model give the team under each cycle, and why?
+\item How much work do the breaks need per day, and how much does each window give?
+\item How many trades fail under each cycle, and for how much value?
+\item Which kinds of break fail most under T+1?
+\item What does the Friday \omterm{def:pl:post-trade-systems:recon}{reconciliation} find under each cycle?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the share of trades matched automatically at each tolerance, the breaks remaining at the \omterm{def:pl:post-trade-systems:confirmation}{affirmation}
+cut-off under a two-day and a one-day cycle, and the fails that follow.
+\item How many people does T+1 need to fail no more trades than T+2 with three?
+\item What does halving wrong accounts and missing confirmations achieve?
+\item Which of the two would you fund, and why?
+\item In one sentence: what does a shorter settlement cycle change?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:post-trade-systems:1}
+What is a \omterm{def:pl:post-trade-systems:recon}{reconciliation break}, and what would you put in a break report?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:post-trade-systems:2}
+How do you choose the tolerances of a confirmation-matching engine?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:post-trade-systems:3}
+Your custodian reports positions by account and your books hold them by fund and strategy. Design the \omterm{def:pl:post-trade-systems:recon}{reconciliation}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:post-trade-systems:4}
+The market moves to a one-day settlement cycle. What changes in your post-trade systems and team?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:post-trade-systems:5}
+Design the post-trade platform of a firm that trades equities with thirty brokers for a hundred funds.
+\end{interviewq}

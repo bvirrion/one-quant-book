@@ -1,0 +1,384 @@
+\chapter{Testing and Continuous Delivery}\label{ch:pl:testing-and-continuous-delivery}
+
+In the last days of July 2012 a broker-dealer deployed new order-routing code to its eight routing servers, in stages. The new code reused a
+flag that had once switched on a function retired years before and never deleted. A technician did not copy the new code to one of the eight
+servers; no second person reviewed the deployment, and no written procedure required one. On 1 August orders carrying the reused flag reached
+the eighth server, woke the retired function, and in forty-five minutes the firm sent millions of orders and lost more than \$460 million. Book~11
+reads the episode for its missing risk limits; this chapter reads it for its deployment. Every piece of it --- the untested old code, the
+reused flag, the partial deployment, the missing check --- is something a test pipeline and a deployment procedure exist to catch.
+
+\section{The test pyramid for trading code}
+
+\begin{definition}[Unit, integration and end-to-end tests]\label{def:pl:testing-and-continuous-delivery:tests}
+A \emph{unit test}\index{unit test} checks one function or class in isolation, in milliseconds. An \emph{integration test}\index{integration
+test} checks several components working together --- a pricer with its market data, a strategy with the simulator --- in seconds. An
+\emph{end-to-end test}\index{end-to-end test} runs a whole flow as production would --- orders from a strategy through the gateway to a
+simulated venue and back to the \omterm{def:pl:position-and-pnl-services:service}{position service} --- in minutes.
+\end{definition}
+
+\begin{definition}[Test pyramid]\label{def:pl:testing-and-continuous-delivery:pyramid}
+The \emph{test pyramid}\index{test pyramid} is the rule that a code base should have many \omterm{def:pl:testing-and-continuous-delivery:tests}{unit tests}, fewer \omterm{def:pl:testing-and-continuous-delivery:tests}{integration tests} and few
+\omterm{def:pl:testing-and-continuous-delivery:tests}{end-to-end tests}, because each level up is slower, more fragile and less precise about what broke; it became widely known through Mike Cohn's
+2009 book \emph{Succeeding with Agile}.
+\end{definition}
+
+Trading code adds levels of its own. Book~13, chapter~25, describes property-based, differential and fuzz tests, performance regression gates
+and exchange certification for the low-latency path; chapter~\ref{ch:pl:simulation-production-parity}'s \omterm{def:pl:simulation-production-parity:harness}{parity harness} is an \omterm{def:pl:testing-and-continuous-delivery:tests}{integration test}
+between the simulator and the production adapter; Book~6's model validation is a review, not a test, but it produces the reference values tests
+use. This chapter adds the test a pricing library needs most, and the controls that decide what reaches production.
+
+\section{Golden files for pricers}
+
+\begin{definition}[Golden-file test]\label{def:pl:testing-and-continuous-delivery:golden}
+A \emph{golden-file test}\index{golden-file test} compares a program's outputs with reviewed values stored with the code --- the golden
+file --- each with a tolerance and the provenance of the value; any difference beyond the tolerance fails the test, and changing a golden value
+is itself a reviewed change.
+\end{definition}
+
+A pricing library's outputs are numbers without an independent oracle for most products: a closed form covers the simplest, and Book~5's
+reference pricers cover some more. What a golden file adds is memory: the value the library gave yesterday, reviewed then, against which
+today's build is compared. The JPMorgan task force report on the 2012 losses in the Chief Investment Office found that the new VaR model ran
+through spreadsheets filled by copying and pasting, and that one of them divided by the sum of two rates instead of their average, which
+likely muted volatility by a factor of two. A golden value for the VaR of a reference portfolio, reviewed once, would have moved when the
+model changed.
+
+The chapter's portfolio has sixty instruments priced by Book~5's library: twenty European options (analytic engine), ten American puts
+(finite differences), twenty Asian calls (Monte Carlo, 20\,000 paths) and ten down-and-out calls (closed form). The tolerance is the engine's
+own error times a factor $k$: a relative $10^{-10}$ for the closed forms, $k$ times the gap between the 200-point and the 400-point grid for
+the PDE, $k$ times the Monte Carlo standard error --- estimated from eight independent seeds --- for Monte Carlo.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=4.6cm,xbar,bar width=10pt,xmin=1e-10,xmax=30,xtick={1e-10,1e-8,1e-6,1e-4,1e-2,1},y dir=reverse,
+  ytick=data,yticklabels={European (analytic),American (PDE),Asian (Monte Carlo),down-and-out (closed form)},
+  xlabel={mean error unit per instrument (price units, log scale)},grid=major,grid style={gray!20},tick label style={font=\small},
+  label style={font=\small},table/col sep=comma,log origin=infty,nodes near coords,point meta=rawx,
+  every node near coord/.append style={font=\scriptsize,anchor=west,/pgf/number format/sci,/pgf/number format/precision=2}]
+\addplot[fill=omDef!40,draw=omDef] table[y expr=\coordindex,x=mean_error_unit]
+  {figdata/platforms/27-testing-and-continuous-delivery/errors.csv};
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{The error unit behind each golden value, averaged by product: a relative $10^{-10}$ of prices near 12--15 for the closed forms, the
+0.0019 gap between two PDE grids for American puts near 11, and the 0.053 Monte Carlo standard error of Asian calls near 8. The tolerance is
+$k$ times this unit, so one $k$ means eight orders of magnitude between products. Data: \texttt{fig\_goldtest.py}.}
+\label{fig:pl:testing-and-continuous-delivery:errors}
+\end{omfigure}
+
+\omcode{code/platforms/27-testing-and-continuous-delivery/python/pl_goldtest.py}{74}{82}{Each golden value's tolerance from its engine's
+own error: Monte Carlo spread across seeds, grid convergence for the PDE, a relative epsilon for closed forms.}
+\label{lst:pl:testing-and-continuous-delivery:tol}
+
+\omcode{code/firm/goldtest/firm_goldtest.py}{80}{93}{The comparison: every result against its golden value and tolerance, with a missing value
+on either side a failure, and the failures counted by product.}\label{lst:pl:testing-and-continuous-delivery:compare}
+
+Five builds are then compared with the golden file. Each plants one change in the library's behaviour.
+
+\omcode{code/platforms/27-testing-and-continuous-delivery/python/pl_goldtest.py}{103}{118}{The five planted builds: a new Monte Carlo seed, an
+ACT/360 day count, a sign error in the rate of puts, an Asian average that drops its last fixing, and a finer PDE grid.}
+\label{lst:pl:testing-and-continuous-delivery:builds}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={tolerance factor $k$ (Monte Carlo standard errors)},ylabel={share},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0.8,xmax=6.2,ymin=0,ymax=1.08,xtick={1,2,3,4,5,6}]
+\addplot[omThm,thick,mark=*] table[x=k,y=asian_fix]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[black,thick,mark=square*] table[x=k,y=noise_run]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[omDef,thick,dashed,mark=triangle*] table[x=k,y=noise_instrument]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[gray,thin] table[x=k,y=noise_theory]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\node[omThm,font=\scriptsize,anchor=south west] at (axis cs:4.2,0.62) {Asian-fixing bug detected};
+\node[font=\scriptsize,anchor=north west] at (axis cs:1.05,0.8) {$\blacksquare$ runs failed (noise)};
+\node[omDef,font=\scriptsize,anchor=north west] at (axis cs:1.05,0.68) {$\blacktriangle$ Asian calls flagged};
+\node[gray,font=\scriptsize,anchor=north east] at (axis cs:2.3,0.12) {theory};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The Monte Carlo tolerance trade-off. With the seed free to change, noise alone flags each Asian call with the probability that two
+estimates differ by more than $k$ standard errors (theory in grey) and fails every run for $k\le 2$; the Asian-fixing bug, which only the Monte
+Carlo instruments see, is caught on all twenty at $k\le2$ but on 9 of 20 at $k=5$, where noise still fails 2.5\% of runs. Data:
+\texttt{fig\_goldtest.py}.}\label{fig:pl:testing-and-continuous-delivery:tolerance}
+\end{omfigure}
+
+The two large regressions are caught at every tolerance: the sign error changes all twenty puts by hundreds of error units and more, and the day
+count changes every European, American and barrier price by far more than its tolerance. The trouble is Monte Carlo
+(\cref{fig:pl:testing-and-continuous-delivery:tolerance}). With the seed free to change, the golden test faces two estimates of the same price
+and must tolerate their difference. At $k=2$ noise alone flags 18\% of the Asian calls and fails every one of forty runs; at $k=5$ it fails 2.5\%
+of runs, but the Asian-fixing bug --- a small change, two to ten standard errors --- is caught on only 9 of the 20 Asian calls, and the day
+count's effect on them, never more than two standard errors, on none. With a false alarm costing \$1\,000 of investigation and a missed single-product
+regression \$500\,000 --- the model's assumptions --- the cheapest tolerance is $k\le2$, a test that fails on every run. No tolerance works.
+
+The fix is not a tolerance but a seed. Book~5's Monte Carlo engine draws its random numbers from a seed fixed per instrument; if the build
+pins it, today's Monte Carlo price is a deterministic function of the code, the same random numbers give the same price to the last digit,
+and the Monte Carlo instruments can be compared at a closed form's tolerance. Pinned, the golden test catches the Asian-fixing bug on all 20
+instruments and the day count on all 60. A new seed then fails the test like any other change --- which it is --- and is released as an
+approved update of the golden values. The same holds for the finer PDE grid: it moves each American put by exactly one error unit, passes
+every $k\ge1$, and should reach production as a reviewed golden update with the new grid in its provenance, not as a silent pass.
+
+\section{Continuous integration}
+
+\begin{definition}[Continuous integration, deployment pipeline]\label{def:pl:testing-and-continuous-delivery:ci}
+\emph{Continuous integration}\index{continuous integration} merges every change into the main line at least daily, and builds and tests the
+merged code automatically on each merge. A \emph{deployment pipeline}\index{deployment pipeline} is the automated sequence of stages ---
+build, \omterm{def:pl:testing-and-continuous-delivery:tests}{unit tests}, integration and golden tests, \omterm{def:pl:testing-and-continuous-delivery:tests}{end-to-end tests}, deployment --- that every change passes through, in order, stopping at the
+first failure.
+\end{definition}
+
+\begin{definition}[Continuous delivery]\label{def:pl:testing-and-continuous-delivery:cd}
+\emph{Continuous delivery}\index{continuous delivery} keeps the main line releasable at all times, so that any change that passes the
+pipeline can be deployed to production by a decision rather than a project.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=5mm,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=11mm,text width=19mm},
+  gate/.style={draw=omThm,fill=omThm!8,rounded corners=2pt,align=center,minimum height=11mm,text width=19mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[st] (b) {build};
+\node[st,right=of b] (u) {unit tests\\0.02~s};
+\node[st,right=of u] (g) {golden tests\\0.33~s};
+\node[st,right=of g] (e) {end to end\\1.62~s};
+\node[gate,right=of e] (c) {every host\\consistent?};
+\node[st,right=of c] (sw) {switch\\traffic};
+\foreach \a/\b in {b/u,u/g,g/e,e/c,c/sw} \draw[arr] (\a) -- (\b);
+\draw[arr,omThm] (c.south) -- ++(0,-6mm) -| node[pos=0.25,below,font=\scriptsize]{no: refuse, stay on blue} (b.south);
+\end{tikzpicture}
+
+\omcaption{The chapter's \omterm{def:pl:testing-and-continuous-delivery:ci}{deployment pipeline}, with the measured duration of each test tier on the sixty-instrument portfolio (otherwise idle machine;
+\texttt{bench\_goldtest.py}). Each stage runs only if the one before passed; the last check before the traffic switch is the consistency of
+every host with the release.}\label{fig:pl:testing-and-continuous-delivery:pipeline}
+\end{omfigure}
+
+The pipeline's order is the pyramid's: cheap tests first, so that most failures are found in seconds. On the chapter's portfolio, the unit tier
+(put--call parity on a thousand options) takes 0.02~seconds, the golden tier (the sixty instruments against their pinned values) 0.33 and the
+end-to-end tier (the portfolio revalued in five scenarios) 1.62, measured on an otherwise idle machine. The golden file is small enough to run on every
+merge; a firm's real one, with thousands of instruments, runs in the nightly integration build and on every change to the library.
+
+\section{Release trains and change control}
+
+\begin{definition}[Release train]\label{def:pl:testing-and-continuous-delivery:train}
+A \emph{release train}\index{release train} deploys, at fixed times, everything that has passed the pipeline since the previous departure; a
+change that misses a train waits for the next.
+\end{definition}
+
+\begin{definition}[Change control]\label{def:pl:testing-and-continuous-delivery:change}
+\emph{Change control}\index{change control} is the procedure every production change follows --- recorded, reviewed, approved by someone
+other than its author, deployed by a stated method, verified --- so that the firm can say for any change who made it, who approved it and
+when.
+\end{definition}
+
+The train's cadence sets a trade-off (\cref{tab:pl:testing-and-continuous-delivery:trains}). Over a model year of 533 changes, deploying each
+change as it passes the pipeline gives no wait and one change per deployment; a daily train makes changes wait half a day on average and ships
+1.8 at a time; a weekly train, 3.5 days and 10.3 changes; a fortnightly one, 7 days and 20.5. The batch matters when a deployment goes wrong:
+finding the bad change among ten takes about four bisection steps, among twenty about five, and each step is a \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{rollback}, a redeployment and a
+wait for the symptom. Trading firms usually settle between the two: small changes often for research and analytics, trains with a change
+window for the order path, where RTS~6 requires a clearly delineated methodology to develop and test a system before its deployment or
+substantial update, in an environment separated from production.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+cadence & mean wait (days) & changes per deployment & bisection steps\\
+\midrule
+each change at once & 0.00 & 1.00 & 0.00\\
+daily train & 0.51 & 1.83 & 1.16\\
+weekly train & 3.46 & 10.25 & 3.93\\
+fortnightly train & 6.99 & 20.50 & 4.86\\
+\bottomrule
+\end{tabular}
+\caption{A model year of 533 changes (ten a week) under four release cadences: the mean wait from passing the pipeline to production, the
+changes per deployment, and the bisection steps needed, on average per change, to find a bad change in its deployment.}
+\label{tab:pl:testing-and-continuous-delivery:trains}
+\end{table}
+
+\section{Deploying and rolling back}
+
+\begin{definition}[Blue--green deployment, rollback]\label{def:pl:testing-and-continuous-delivery:bluegreen}
+A \emph{blue--green deployment}\index{blue--green deployment} installs a release on a second, idle set of hosts (green) while the current set
+(blue) serves, then switches traffic to green at once; switching back is the \emph{rollback}\index{rollback}, the return to the previous
+release, which a blue--green deployment makes a switch rather than a reinstallation.
+\end{definition}
+
+The hook's deployment failed in the step between installation and switch: seven hosts ran the new release, one ran the old, and nothing
+compared them. A deployment check is simple to write. Each host reports the hash of the build it runs and of its configuration, and the release
+is refused --- the traffic switch does not happen --- unless every host reports the release's hashes. Run on the hook's eight servers, it names
+the eighth before the market opens.
+
+\omcode{code/firm/goldtest/firm_goldtest.py}{137}{145}{The deployment consistency check: each host's build and configuration hashes against
+the release's; any mismatch refuses the release.}\label{lst:pl:testing-and-continuous-delivery:check}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  host/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum width=13mm,minimum height=9mm,align=center,font=\scriptsize},
+  bad/.style={draw=omThm,fill=omThm!15,rounded corners=2pt,minimum width=13mm,minimum height=9mm,align=center,font=\scriptsize},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\foreach \i in {1,...,7} \node[host] (h\i) at (1.55*\i-1.55,0) {router\i\\8430046e};
+\node[bad] (h8) at (1.55*7,0) {router8\\0290313a};
+\node[draw=black,rounded corners=2pt,align=center,text width=44mm] (c) at (5.4,-2.1) {release 8430046e: check every host};
+\foreach \i in {1,...,8} \draw[arr,gray] (h\i.south) -- (c.north);
+\node[omThm,font=\scriptsize,align=left,anchor=west] at (8.3,-2.1) {refused: router8 runs\\another build};
+\node[font=\scriptsize,anchor=south] at (5.4,0.6) {build hashes reported by the eight hosts (first 8 characters)};
+\end{tikzpicture}
+
+\omcaption{The consistency check on the hook's deployment, re-enacted: seven routers report the new build's hash, the eighth the old one, and
+the release is refused before any order reaches the eighth. The same check on configuration hashes catches \omterm{def:pl:signal-serving-and-parameter-management:drift}{configuration drift}
+(chapter~\ref{ch:pl:signal-serving-and-parameter-management}).}\label{fig:pl:testing-and-continuous-delivery:hosts}
+\end{omfigure}
+
+The order also lists what else was missing: the retired code was still present and callable, and the flag it had once used was given a new
+meaning. Both are testing failures in this chapter's sense. Dead code should be deleted, not left behind a flag; a flag should never be
+reused, since an old host or an old message will still give it the old meaning; and a \omterm{def:pl:signal-serving-and-parameter-management:flag}{feature flag}
+(chapter~\ref{ch:pl:signal-serving-and-parameter-management}) switched on by a release is a deployment of its own, with its own staged
+rollout and its own check that every host agrees on what it means.
+
+\begin{dated}{2026-09}{The rules on testing and deployment}\label{dat:pl:testing-and-continuous-delivery:rules}
+The SEC's order of 16 October 2013 in the matter of Knight Capital Americas LLC (Release 34-70694) found that new code repurposed a flag that
+had activated a retired function still present on the servers; that a technician did not copy the new code to one of eight servers; that no
+second technician reviewed the deployment and no written procedure required it; and that orders routed over forty-five minutes on 1 August
+2012 cost the firm more than \$460 million. In the European Union, Commission Delegated Regulation (EU) 2017/589 (RTS~6) requires an
+investment firm to establish clearly delineated methodologies to develop and test an algorithmic trading system before its deployment or
+substantial update, ensuring among other things that it does not behave in an unintended manner, and to test in an environment separated
+from production (articles 5 and 7).
+\end{dated}
+
+\section{Tutorial: seven of eight servers}\label{tut:pl:testing-and-continuous-delivery:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Freeze a pricing library's golden values, measure what each tolerance detects and falsely flags, and refuse a partial
+deployment. \textbf{End state:} \cref{fig:pl:testing-and-continuous-delivery:tolerance,tab:pl:testing-and-continuous-delivery:trains}.
+\begin{tutsteps}
+\item \textbf{Portfolio}: \texttt{pl\_goldtest.portfolio()}; the error unit of each instrument with \texttt{errors}.
+\item \textbf{Builds}: \texttt{experiment()}, the five planted builds and forty noise builds.
+\item \textbf{Tolerance}: \texttt{rates(ex, k)} for each $k$, then with \texttt{pinned=True}; \texttt{expected\_cost(ex, k)}.
+\item \textbf{Pipeline}: \texttt{bench\_goldtest.py} for the stage times; \texttt{trains()} for the cadences.
+\item \textbf{Deployment}: \texttt{eight\_servers()} and \texttt{firm\_goldtest.consistency}.
+\end{tutsteps}
+\textbf{What to change next.} Store the golden file on disk with \texttt{GoldenStore.save} and require an approval for the grid refinement;
+add a check that no two releases give one flag two meanings.
+\end{tutorial}
+
+\section{Build: golden tests and deployment checks}\label{bld:pl:testing-and-continuous-delivery:goldtest}
+
+\begin{build}
+\bfield{Purpose} Know, for every build of the pricing library, which values moved and by how much, and never let a release reach a host set
+that does not all run it.
+\bfield{Interface} \texttt{Golden}, \texttt{GoldenStore} (\texttt{put}, \texttt{get}, \texttt{propose}, \texttt{approve}, \texttt{save},
+\texttt{load}), \texttt{compare}, \texttt{run\_tiers}, \texttt{release\_train}, \texttt{host\_state}, \texttt{consistency}.
+\bfield{Rules} Tolerances derived from engine error, not chosen; Monte Carlo seeds pinned in the build; golden updates proposed with a reason
+and approved by someone else; tiers in pyramid order, stopping at the first failure; no release switched on until every host matches it.
+\bfield{Acceptance tests} \texttt{code/firm/goldtest/tests/}: comparison with a failure, a missing value and a pass; approval by another
+person and persistence; tiers stopping at a failure; release-train waits, batches and bisection; consistency with a stale build and a drifted
+configuration.
+\bfield{Stretch} A change-impact report by risk factor; golden values of risk (Greeks, VaR) as well as prices; blue--green switching in the
+simulator.
+\end{build}
+
+\begin{omsources}
+\item US Securities and Exchange Commission, \emph{In the Matter of Knight Capital Americas LLC}, Release No.~34-70694, 16 October 2013.
+\item \emph{Report of JPMorgan Chase \& Co.\ Management Task Force Regarding 2012 CIO Losses}, 16 January 2013.
+\item M.~Fowler, \emph{TestPyramid}, 2012 (on M.~Cohn, \emph{Succeeding with Agile}, 2009).
+\item Commission Delegated Regulation (EU) 2017/589 (RTS~6), articles 5 and 7.
+\item One Quant Book~5, chapter~28 (reference pricers); Book~11, chapter~27 (risk controls); Book~13, chapter~25 (testing low-latency code).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:1}
+Why is the tolerance of a closed-form price a relative $10^{-10}$ and not zero?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:2}
+With the seed free, what share of Asian calls does noise alone flag at $k=3$, and what does theory predict?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:3}
+A weekly train carries ten changes and one is bad. About how many bisection steps does it take to find it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:4}
+Why does the finer PDE grid pass the golden test for every $k\ge1$, and why should it still be approved?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:5}
+Why can the day count's effect on the Asian calls not be seen with the seed free, and how is it seen with the seed pinned?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:6}
+What would a \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{blue--green deployment} have changed on the hook's morning, and what would it not have changed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:testing-and-continuous-delivery:7}
+\emph{Coding.} Double the Monte Carlo paths of the portfolio and rerun \texttt{rates(ex, 5)}. What happens to the Asian-fixing detection and
+why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:testing-and-continuous-delivery:8}
+\emph{Find the flaw.} \textquotedbl{}The golden test failed again on Monte Carlo noise, so we widened every tolerance to ten standard
+errors.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: Seven of Eight Servers}
+
+\begin{problem}[{Weekend problem --- seven of eight servers}]\label{pb:pl:testing-and-continuous-delivery:1}
+The chapter's portfolio, builds, pipeline, trains and eight routers.
+
+\medskip\noindent\textbf{Part I --- Tests.}
+\begin{enumerate}
+\item What does each level of the pyramid test, and why are there fewer tests at each level up?
+\item What does a golden file hold for each value?
+\item How is each engine's tolerance derived?
+\item What did the JPMorgan task force report find in the VaR spreadsheets?
+\item Which builds change which instruments?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Tolerance.}
+\begin{enumerate}[resume]
+\item Which regressions are caught at every tolerance, and why?
+\item What does noise alone do at $k=2$ and at $k=5$?
+\item What share of the Asian-fixing bug is caught at each $k$?
+\item Which $k$ minimises the model's expected cost, and what is wrong with it?
+\item What does pinning the seed change?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Delivery.}
+\begin{enumerate}[resume]
+\item How long does each tier of the pipeline take?
+\item What do the four release cadences give?
+\item What does \omterm{def:pl:testing-and-continuous-delivery:change}{change control} record?
+\item What does RTS~6 require before a trading algorithm is deployed?
+\item What is a \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{rollback} in a \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{blue--green deployment}?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the detection rate of each planted regression and the false-alarm rate of Monte Carlo noise at each
+tolerance, the tolerance that minimises expected cost, and the consistency check that would have refused the partial deployment.
+\item What four things went wrong in the hook's deployment, in this chapter's terms?
+\item Which one would the consistency check have caught, and which would testing have caught?
+\item What would you require of every release of the order path?
+\item In one sentence: what is a deployment?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:testing-and-continuous-delivery:1}
+What is the \omterm{def:pl:testing-and-continuous-delivery:pyramid}{test pyramid}, and why is it a pyramid?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:testing-and-continuous-delivery:2}
+How do you regression-test a Monte Carlo pricer?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:testing-and-continuous-delivery:3}
+A release reached seven of eight servers. How would your deployment process have stopped it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:testing-and-continuous-delivery:4}
+Would you deploy trading code continuously or on a \omterm{def:pl:testing-and-continuous-delivery:train}{release train}? Why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:testing-and-continuous-delivery:5}
+Design the test and release process of a firm's pricing library and order path.
+\end{interviewq}

@@ -1,0 +1,499 @@
+\chapter{The Platform Map}\label{ch:pl:the-platform-map}
+
+At 07:40 the overnight risk report, the P\&L and a researcher's backtest disagree about one position. Three teams spend the
+morning finding out why. The vendor's corporate-action file, which normally lands at 19:30, came at 21:30 the night before; the
+risk batch, which starts at 21:00 by the clock, had already read the old security master and the positions built on it; the P\&L
+job, which starts when its inputs are ready, read the new ones twenty minutes later. Every system did what it was built to do.
+What was missing was a picture, kept as data and checked by a program, of which system reads what, from whom, and when. This
+chapter draws that picture for the miniature firm built across the series, and turns it into a tool (\texttt{firm.platmap})
+that answers the questions the three teams spent their morning on: what a late file reaches, which job reads an input before it
+is complete, and how late each input may arrive before the morning's reports miss their deadline.
+
+\section{The systems of a trading firm}
+
+A trading firm is a chain of systems that turn market data and decisions into positions, and positions into money that has
+been counted, checked and reported. Books~1 to 14 of this series built most of the links one at a time: the exchange simulator
+and its feed (Book~10), the feed handler, order gateway and risk gate (Book~13), the backtesters and the research workflow
+(Book~7), the pricing library (Book~5), the risk engine (Book~6), the machine-learning platform (Book~12). This book is about
+the platforms that connect them, and it starts with the map.
+
+\begin{definition}[Front-to-back flow]\label{def:pl:the-platform-map:ftb}
+The \emph{front-to-back flow}\index{front-to-back flow} of a trading firm is the path that a trade and the data about it take
+through the firm's systems: market and reference data; the decision and the order; the execution; the position and its P\&L;
+the risk it adds; its booking, confirmation, settlement and reconciliation; and the controls and reports that close the day.
+\end{definition}
+
+The industry names the stretches of that path after the teams that historically ran them: the front, middle and back office,
+which One Quant Book~16 (chapter~13) defines as organisational units. This book cares about the systems, whoever runs them.
+\Cref{fig:pl:the-platform-map:layers} shows the miniature firm's eighteen systems in eight layers, and the direction in which
+the day's data move through them.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,
+  sys/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.55cm,inner sep=2pt,align=center},
+  ext/.style={sys,fill=gray!12},
+  lay/.style={font=\scriptsize\itshape,anchor=east,text=gray!70!black}]
+\foreach \y/\name in {0/external,-1/data,-2/trading,-3/positions,-4/risk,-5/post-trade,-6/control}
+  {\node[lay] at (-0.2,\y) {\name};}
+\node[ext] (ex) at (1.5,0) {exchanges};
+\node[ext] (dv) at (4.4,0) {data vendor};
+\node[ext] (cb) at (8.8,0) {clearing broker};
+\node[sys] (tc) at (1.0,-1) {tick capture};
+\node[sys] (ts) at (2.9,-1) {tick store};
+\node[sys] (rd) at (5.0,-1) {reference data};
+\node[sys] (ss) at (7.3,-1) {snapshot service};
+\node[sys] (og) at (1.9,-2) {strategies and gateway};
+\node[sys] (ps) at (1.9,-3) {position service};
+\node[sys] (pn) at (4.2,-3) {P\&L service};
+\node[sys] (pl) at (4.2,-4) {pricing library};
+\node[sys] (rg) at (6.8,-4) {risk grid};
+\node[sys] (tcap) at (1.9,-5) {trade capture};
+\node[sys] (rc) at (8.8,-5) {reconciliation};
+\node[sys] (pc) at (1.9,-6) {product control};
+\node[sys] (sv) at (3.9,-6) {surveillance};
+\node[sys] (rr) at (6.8,-6) {regulatory reporting};
+\node[sys,fill=omMeth!12,minimum height=2.4cm,text width=1.5cm] (rp) at (10.9,-2.7) {research platform};
+\draw[->] (ex) -- (tc);
+\draw[->] (tc) -- (ts);
+\draw[->] (dv) -- (rd);
+\draw[->] (og) -- (ps);
+\draw[->] (ps) -- (pn);
+\draw[->] (pl) -- (pn);
+\draw[->] (pl) -- (rg);
+\draw[->] (ps) -- (tcap);
+\draw[->] (cb) -- (rc);
+\draw[->] (ts.south) |- (rp.north west |- 0,-1.55);
+\draw (rd.south) -- (rd.south |- 0,-1.55);
+\draw[->] (ss.south) -- (ss.south |- rg.north);
+\end{tikzpicture}
+
+\omcaption{The miniature firm's systems by layer, from the venues at the top to the controls at the bottom; the research platform
+reads the tick store and the reference data beside the trading path. Arrows show the main direction of the day's data; the full
+set of flows is the map's data (\texttt{pl\_platmap}), not the drawing.}\label{fig:pl:the-platform-map:layers}
+\end{omfigure}
+
+Read from the top, the layers are the order in which a trade's data are born. Market data and reference data exist before any
+decision; the order gateway sends orders that the venue fills; the position service keeps what the fills add up to; the P\&L
+service values it with the pricing library's marks; the risk grid revalues it under scenarios; trade capture books it and
+post-trade systems confirm, settle and reconcile it; product control, surveillance and regulatory reporting check and report
+all of the above. A research platform sits to the side: it reads the same tick store and reference data to build the next
+strategy, and its outputs come back as parameters and models that the trading layer loads (chapter~16).
+
+\begin{example}[The miniature firm in numbers]\label{ex:pl:the-platform-map:numbers}
+The map of the miniature firm (\texttt{pl\_platmap}) has 18 systems, 22 datasets and 15 end-of-day jobs. Seven datasets
+arrive from outside: the day's fills, the day's market-data capture, the official closing prices, a market-data snapshot of
+curves and volatilities, the vendor's reference-data and corporate-action files, and the clearing broker's statement. Every
+other dataset is produced by exactly one job from others.
+\end{example}
+
+\section{Data flows and their clocks}
+
+The difficulty of a platform is not the number of systems but the number of clocks. Market data and fills arrive continuously
+during the session; the official closing prices come some minutes after the close; vendor files come in the evening at times
+the vendor does not guarantee; the clearing broker's statement comes when the clearing house has finished its own day. Each job
+of the end-of-day chain runs on one of two kinds of clock: it starts when its inputs are ready, or it starts at a time on the
+wall.
+
+\begin{definition}[Data-flow map]\label{def:pl:the-platform-map:map}
+A \emph{data-flow map}\index{data-flow map} is a description, kept as data, of a firm's systems, the datasets each one holds,
+and the jobs that read datasets and write others, each job with its duration and its clock (dependency-driven or scheduled at a
+fixed time), each dataset with its \omterm{def:pl:the-platform-map:sor}{system of record} and, for external inputs, its arrival time.
+\end{definition}
+
+Because it is data, a map can be checked (every dataset has one owner, the jobs form no cycle), traversed (what does this file
+reach?) and simulated (when will each report be ready tonight?). A diagram drawn once for a presentation does none of these, and
+is out of date by the next release.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (12.5,0) node[right]{time};
+\foreach \x/\t in {0/09:30,3.63/16:00,5.58/19:30,6.70/21:30,9.77/03:00,12.0/07:00}
+  {\draw (\x,0.08) -- (\x,-0.08) node[below]{\t};}
+\fill[omDef!25] (0,0.3) rectangle (3.63,0.75); \node at (1.8,0.525) {stream: ticks, fills};
+\fill[omMeth!25] (3.67,0.3) rectangle (10.28,0.75); \node at (7.0,0.525) {end-of-day batch};
+\fill[omThm!20] (6.93,0.95) rectangle (10.28,1.4); \node at (8.6,1.175) {overnight research};
+\draw[omThm,thick] (12.0,0.2) -- (12.0,1.6) node[above]{reports due};
+\draw[->,thick] (3.63,1.55) node[above]{close} -- (3.63,0.8);
+\draw[->] (5.58,1.55) node[above]{vendor files} -- (5.58,0.8);
+\draw[->] (6.70,2.15) node[above]{clearing statement} -- (6.70,0.8);
+\end{tikzpicture}
+
+\omcaption{The clocks of a trading day. Ticks and fills stream during the session; the \omterm{def:pl:the-platform-map:batch}{end-of-day batch} starts at the close and
+waits for files whose arrival times it does not control; overnight research runs after the batch has produced its inputs; the
+morning reports are due at 07:00. Times are the miniature firm's nominal ones.}\label{fig:pl:the-platform-map:clocks}
+\end{omfigure}
+
+\Cref{lst:pl:the-platform-map:jobs} is the end-of-day chain of the miniature firm as the map records it: each job with its
+inputs, outputs and duration in minutes. The risk batch takes an optional fixed start; everything else starts on its inputs.
+
+\omcode{code/platforms/01-the-platform-map/python/pl_platmap.py}{61}{81}{The end-of-day jobs of the miniature firm: inputs,
+outputs, duration in minutes and, for the risk batch, an optional fixed start.}\label{lst:pl:the-platform-map:jobs}
+
+\section{Systems of record and golden sources}
+
+A number exists in several places at once: the closing price of a stock is in the exchange's feed, in the tick store, in the
+pricing library's snapshot, in the P\&L service's marks and in every spreadsheet that copied it. When two of those copies
+differ, the firm needs a rule that says which one is right.
+
+\begin{definition}[System of record, golden source]\label{def:pl:the-platform-map:sor}
+The \emph{system of record}\index{system of record} of a dataset is the one system whose copy is authoritative: corrections are
+made there and nowhere else, and every other copy is derived from it. A \emph{golden source}\index{golden source} is a system of
+record that the firm designates for a kind of data used across many systems (instruments, counterparties, closing marks), so
+that every consumer reads from it or from a copy that the map shows to be derived from it.
+\end{definition}
+
+\begin{proposition}[One owner, one answer]\label{prop:pl:the-platform-map:oneowner}
+If every dataset has exactly one \omterm{def:pl:the-platform-map:sor}{system of record}, every copy is derived through the map from that system, and two reports read
+the same version of a dataset, then they agree about it.
+\end{proposition}
+
+\begin{proof}
+Each report's value of the dataset is a function of the version it read, applied along the map's derivations; the same version
+through the same derivations gives the same value. A disagreement therefore requires two systems of record (two versions that
+are not derived from one another), a copy made outside the map (a derivation nobody declared), or two versions read at
+different times.
+\end{proof}
+
+The proof is short because the proposition is almost a definition, and its value is in the three ways it can fail. The first
+two are structural and a program can find them in the map; the third is about time, and the rest of this chapter is about it.
+\Cref{lst:pl:the-platform-map:validate} is the structural check. On the map as first drawn it finds that two systems claim the
+marks, the pricing library and product control.
+
+\begin{example}[Two claims on the marks]\label{ex:pl:the-platform-map:marks}
+The pricing library computes the end-of-day marks from the closing prices and the curve and volatility snapshot; product
+control independently verifies them against broker quotes and consensus data (One Quant Book~6, chapter~27). Both call their
+output ``the marks''. They are two datasets: the marks, owned by the pricing library, and the verified marks with their
+adjustments, owned by product control. The map's fix is to name the second dataset and make its dependence on the first
+explicit; the check then passes, and a disagreement between the two becomes a number product control reports rather than a
+discovery.
+\end{example}
+
+\omcode{code/firm/platmap/firm_platmap.py}{85}{107}{Structural checks: one system of record per dataset, known names, one
+producer per dataset, and no cycle.}\label{lst:pl:the-platform-map:validate}
+
+\begin{dated}{2026-09}{How far banks are from one owner per number}\label{dat:pl:the-platform-map:bcbs}
+The Basel Committee's principles for effective risk data aggregation and risk reporting (BCBS~239, published on 9 January 2013)
+ask banks to generate accurate, complete and timely risk data from a data architecture that supports it. In its progress
+report of 28 November 2023 (consulted September 2026), the Committee found that of the 31 global systemically important banks
+it assessed, only two were fully compliant with all the principles.
+\end{dated}
+
+\section{Batch and stream}
+
+\begin{definition}[Batch processing, stream processing, end-of-day batch]\label{def:pl:the-platform-map:batch}
+\emph{Batch processing}\index{batch processing} runs a job on a complete, bounded dataset (a day of fills, a vendor file) and
+produces its output once. \emph{Stream processing}\index{stream processing} runs a job continuously on an unbounded sequence
+of events, updating its output as each event arrives. The \emph{end-of-day batch}\index{end-of-day batch} is the set of batch
+jobs that run after the close to produce the day's official positions, marks, P\&L, risk and reports.
+\end{definition}
+
+A trading firm runs both, often for the same quantity. The position service of chapter~17 keeps positions as a stream during
+the day, from each fill as it arrives, because traders and the risk gate need them now; the end-of-day positions job recomputes
+them as a batch from the complete day, the clearing statement and the security master, because the books are closed on those.
+The two must agree, and when they do not the difference is a break (chapter~22).
+
+In a batch chain the questions are about time: when will each output be ready, which job decides when the chain ends, and how
+late may each input be. With unlimited machines (chapter~13 removes that assumption), two passes over the map answer them.
+
+\begin{method}[Forward and backward passes]\label{met:pl:the-platform-map:passes}
+Order the jobs so that every job comes after the producers of its inputs.
+\emph{Forward:} for each job, its start is the latest ready time of its inputs (or its fixed start), its end is start plus
+duration, and its outputs are ready at its end; external inputs are ready at their arrival times.
+\emph{Backward:} for each job in reverse order, its latest end is the earliest of its own deadline and the latest starts of the
+jobs that read its outputs; its latest start is that minus its duration. The \emph{slack} of a job is its latest start minus its
+scheduled start. The latest safe arrival of an external input is the earliest latest start among the jobs that read it.
+\end{method}
+
+\begin{proposition}[The dependency-driven schedule is the earliest]\label{prop:pl:the-platform-map:earliest}
+With unlimited capacity and fixed durations, the forward pass of a map whose jobs all start on their inputs gives each job the
+earliest start any schedule can give it, and the chain ends at the end of its longest chain of jobs: the chain that ends last,
+traced back through the input that was ready last at each step.
+\end{proposition}
+
+\begin{proof}
+By induction in dependency order. A job cannot start before all its inputs are ready; if each input is ready as early as
+possible (the induction hypothesis, or its arrival time for an external input), the job starts as early as possible by
+starting at the latest of those times. Following the last-ready input back from the job that ends last gives a chain of jobs
+with no gap between one's end and the next's start, whose total is the end time.
+\end{proof}
+
+\Cref{lst:pl:the-platform-map:passes} is both passes. The forward pass also records every read of an input that was not yet
+complete when the job started, which is only possible for a job with a fixed start: that is the check the hook needed.
+
+\omcode{code/firm/platmap/firm_platmap.py}{185}{219}{The forward pass (start on the last input, or at the fixed time), the stale
+reads it implies, and the backward pass of latest starts.}\label{lst:pl:the-platform-map:passes}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=8.2cm,xbar stacked,bar width=6pt,xmin=0,xmax=16,
+  xtick={0,2,4,6,8,10,12,14,16},xticklabels={16:00,18:00,20:00,22:00,00:00,02:00,04:00,06:00,08:00},
+  ytick={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14},yticklabels from table={figdata/platforms/01-the-platform-map/gantt_nominal.csv}{job},
+  tick label style={font=\scriptsize},ymin=-0.7,ymax=14.7,grid=major,grid style={gray!20},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.12)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[draw=none,fill=none,forget plot] table[x=start,y=k]{figdata/platforms/01-the-platform-map/gantt_nominal.csv};
+\addplot[fill=omDef!45,draw=omDef] table[x=other,y=k]{figdata/platforms/01-the-platform-map/gantt_nominal.csv};
+\addplot[fill=omThm!55,draw=omThm] table[x=chain,y=k]{figdata/platforms/01-the-platform-map/gantt_nominal.csv};
+\draw[omThm,thick,dashed] (axis cs:15,-0.7) -- (axis cs:15,14.7) node[pos=0.97,left,font=\scriptsize]{07:00 deadline};
+\legend{job,longest chain}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The miniature firm's \omterm{def:pl:the-platform-map:batch}{end-of-day batch} on a nominal night, every job started on its inputs. The longest chain (red)
+runs from the corporate-action file through the golden copy of the reference data, the research features and the overnight
+backtests, and ends at 03:55; the dashed line is the 07:00 deadline. Data: \texttt{fig\_platmap.py}.}\label{fig:pl:the-platform-map:gantt}
+\end{omfigure}
+
+On a nominal night (\cref{fig:pl:the-platform-map:gantt}) the chain ends at 03:55, 185 minutes before its deadline. Its longest
+chain is not the risk batch, which is the longest job (six hours, from 20:15 to 02:15), but the research branch: the golden copy
+waits for the 19:30 corporate-action file, the features wait for the golden copy, and six hours of backtests follow. A firm that
+bought more machines for the risk grid would not move the end of the night by a minute. \Cref{tab:pl:the-platform-map:latest}
+turns the backward pass into the question operations actually ask the vendor: how late can your file be?
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+input & arrives & latest safe arrival & margin (min) \\
+\midrule
+fills, capture & 16:05 & 00:40, 22:25 & 515, 380 \\
+closing prices & 16:20 & 00:40 & 500 \\
+curve and volatility snapshot & 16:45 & 00:20 & 455 \\
+vendor reference data & 18:00 & 22:35 & 275 \\
+vendor corporate actions & 19:30 & 22:35 & 185 \\
+clearing statement & 21:30 & 05:50 & 500 \\
+\bottomrule
+\end{tabular}
+\caption{Arrival and latest safe arrival of each external input for every morning report to be ready by 07:00, from the
+backward pass on the nominal map. The corporate-action file has the smallest margin. Data: \texttt{pl\_platmap.latest\_arrivals}.}\label{tab:pl:the-platform-map:latest}
+\end{table}
+
+\section{Reading a platform map}
+
+Two more questions complete the reading. The first is structural: what does an input reach?
+
+\begin{definition}[Blast radius]\label{def:pl:the-platform-map:blast}
+The \emph{blast radius}\index{blast radius} of a dataset is the set of datasets derived from it, directly or through other
+jobs: everything that is wrong if it is wrong and late if it is late.
+\end{definition}
+
+On the miniature firm's map the day's fills, the vendor
+reference file and the corporate-action file each reach nine of the fifteen derived datasets; the clearing statement reaches
+two (the reconciliation breaks and the signed P\&L); the market-data capture reaches four. A wrong corporate action is as
+dangerous as a wrong fill, and much less watched: fills are reconciled with the venue's drop copy (Book~13, chapter~21) within
+seconds, while a corporate action is checked, if at all, when a report looks odd.
+
+The second question is about time, and it is the hook's. A job that starts on a fixed clock time reads whatever version of its
+inputs exists at that moment. If an input's producer runs late, the job reads the previous version without an error, and its
+output silently disagrees with outputs computed from the new one.
+
+\begin{proposition}[When a fixed start reads stale data]\label{prop:pl:the-platform-map:stale}
+A job with fixed start $s$ reads a complete version of input $x$ if and only if $x$ is ready by $s$. If $x$ is the output of a
+chain of dependency-driven jobs of total duration $D_x$ that starts on an external input arriving at time $a$, the job reads
+stale data exactly when $a > s - D_x$.
+\end{proposition}
+
+\begin{proof}
+The first part is the definition of the forward pass. For the second, the forward pass gives $x$ the ready time $a + D_x$ when
+$a$ is the last input of the chain, and the read is stale exactly when $a + D_x > s$.
+\end{proof}
+
+The risk batch of the hook starts at 21:00 ($s = 300$ minutes after the close). Its inputs include the positions, ready 45
+minutes after the corporate-action file arrives (25 minutes of golden copy, 20 of positions), so it reads stale positions as soon
+as the file arrives after 20:15. On a nominal night the file comes at 19:30, 45 minutes of margin, and nobody notices the fixed
+start. On the night of the hook it came at 21:30: the golden copy was ready at 21:55, the positions at 22:15, and the risk batch
+had been running on the old versions since 21:00 (\cref{fig:pl:the-platform-map:hook}). The P\&L job, dependency-driven, read
+the new ones at 22:15. The three teams' morning was the price of one fixed start.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=4.4cm,xbar stacked,bar width=8pt,xmin=4,xmax=12,
+  xtick={4,5,6,7,8,9,10,11,12},xticklabels={20:00,21:00,22:00,23:00,00:00,01:00,02:00,03:00,04:00},
+  ytick={0,1,2,3},yticklabels from table={figdata/platforms/01-the-platform-map/gantt_hook.csv}{job},
+  tick label style={font=\scriptsize},ymin=-0.6,ymax=3.6,grid=major,grid style={gray!20},table/col sep=comma]
+\addplot[draw=none,fill=none,forget plot] table[x=start,y=k]{figdata/platforms/01-the-platform-map/gantt_hook.csv};
+\addplot[fill=omDef!45,draw=omDef] table[x=dur,y=k]{figdata/platforms/01-the-platform-map/gantt_hook.csv};
+\draw[omThm,thick,dashed] (axis cs:5.9167,-0.6) -- (axis cs:5.9167,3.6);
+\draw[omThm,thick,dashed] (axis cs:6.25,-0.6) -- (axis cs:6.25,3.6);
+\node[font=\scriptsize,omThm,anchor=west] at (axis cs:6.35,1.55) {security master ready 21:55, positions 22:15};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The night of the hook: the corporate-action file arrives at 21:30. The risk batch, started by the clock at 21:00, has
+already read the security master and the positions (their new versions are ready at the dashed lines); the P\&L job, started on
+its inputs, reads the new ones. Data: \texttt{fig\_platmap.py} (\texttt{firm\_platmap.stale\_reads}).}\label{fig:pl:the-platform-map:hook}
+\end{omfigure}
+
+The fix is not to move the fixed start to 22:00, which only moves the threshold; it is to make the risk batch start on its
+inputs. Dependency-driven, on the night of the hook it starts at 22:15 and ends at 04:15, well inside the deadline, and the map
+reports no stale read. Fixed starts exist for good reasons (a machine is free only after 21:00; a vendor file has no completion
+signal), and where one is kept, the map's check turns the silent disagreement into a failed precondition: the job refuses to
+start on an incomplete input, or starts and marks its output as built on a stale version.
+
+\begin{remark}[What the map does not know]\label{rem:pl:the-platform-map:limits}
+The passes assume fixed durations and unlimited machines. Durations vary from night to night, jobs share a cluster, and a job
+can fail and be rerun; chapter~13 adds queues and failures, and chapter~20 sizes the risk batch itself. The map also knows only
+the flows someone declared: a spreadsheet that copies the marks at 18:00 is invisible to it, which is why the map is enforced by
+making systems read their inputs through it (chapters~6, 7 and~16) rather than drawn beside them.
+\end{remark}
+
+\section{Tutorial: the miniature firm as a map}\label{tut:pl:the-platform-map:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Describe the miniature firm as data, check it, schedule a night, and find the hook's defect by program.
+\textbf{End state:} \cref{fig:pl:the-platform-map:gantt,fig:pl:the-platform-map:hook}, \cref{tab:pl:the-platform-map:latest}
+and the \omterm{def:pl:the-platform-map:blast}{blast radius} of every input.
+\begin{tutsteps}
+\item \textbf{Declare.} Read \texttt{pl\_platmap}: systems by layer, datasets with their \omterm{def:pl:the-platform-map:sor}{system of record} and, for external
+inputs, their arrival times, and the jobs of \cref{lst:pl:the-platform-map:jobs}.
+\item \textbf{Validate.} \texttt{draft().validate()} reports that the marks have two systems of record; \texttt{firm().validate()}
+reports nothing.
+\item \textbf{Schedule.} \texttt{firm().schedule()} and \texttt{longest\_chain()} give \cref{fig:pl:the-platform-map:gantt}:
+the chain golden copy, features, backtests, ending at 03:55. \texttt{slack(900)} and \texttt{latest\_arrivals} give
+\cref{tab:pl:the-platform-map:latest}.
+\item \textbf{Replay the hook.} \texttt{firm(risk\_start=300).stale\_reads(HOOK\_NIGHT)} returns the two stale reads of the risk
+batch; \texttt{firm().stale\_reads(HOOK\_NIGHT)} returns none.
+\item \textbf{\omterm{def:pl:the-platform-map:blast}{Blast radius}.} \texttt{firm().blast\_radius()} and \texttt{downstream} of the corporate-action file.
+\end{tutsteps}
+\textbf{What to change next.} Give the backtests a deadline of 06:00 and find the new latest arrival of the corporate-action file;
+add a margin-forecast job that reads the positions and the clearing statement and must be ready by 06:00, and see which input's
+latest arrival it moves.
+\end{tutorial}
+
+\section{Build: the platform map}\label{bld:pl:the-platform-map:platmap}
+
+\begin{build}
+\bfield{Purpose} The firm's map of systems, datasets and jobs as data, with the checks and the time questions every later
+chapter uses: the tick store (chapter~4) and the reference data (chapter~6) declare their outputs in it, the data-quality rules
+of chapter~7 and the observability of chapter~28 attach to its datasets, and the scheduler of chapter~13 runs its jobs.
+\bfield{Interface} \texttt{System(name, layer, owner)}, \texttt{Dataset(name, system, cadence, ready)}, \texttt{Job(name,
+inputs, outputs, duration, start, deadline)}; \texttt{PlatformMap(systems, datasets, jobs)} with \texttt{validate},
+\texttt{producer}, \texttt{downstream}, \texttt{upstream}, \texttt{schedule}, \texttt{ready\_times}, \texttt{stale\_reads},
+\texttt{latest\_starts}, \texttt{slack}, \texttt{longest\_chain}, \texttt{blast\_radius}; times in minutes after the close.
+\bfield{Rules} One \omterm{def:pl:the-platform-map:sor}{system of record} per dataset and one producer per derived dataset; no cycles; a fixed-start job is allowed
+but every read before its input is ready is reported; the map is the only place a flow is declared.
+\bfield{Acceptance tests} \texttt{code/firm/platmap/tests/}: the forward pass and the longest chain on a small map, and how a
+late input moves both; the backward pass and slack by hand; a stale read found and absent; two systems of record, an unknown
+system, an orphan dataset and a cycle reported; closures and \omterm{def:pl:the-platform-map:blast}{blast radius}.
+\bfield{Stretch} Durations as distributions and the probability of meeting the deadline by simulation; versions of datasets
+and the version each job read; a map generated from the systems' own declarations rather than written by hand.
+\end{build}
+
+\begin{omsources}
+\item Basel Committee on Banking Supervision, \emph{Principles for effective risk data aggregation and risk reporting}
+(BCBS~239), January 2013, and \emph{Progress in adopting the Principles}, November 2023.
+\item T.~Akidau et al., ``The dataflow model'', \emph{Proceedings of the VLDB Endowment} 8(12), 2015 (batch as a special case
+of stream processing).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-platform-map:1}
+The P\&L job reads the positions (ready at 20:15), the marks (17:05) and the security master (19:55), and takes 25 minutes.
+When does it start and end on a nominal night, and which input decides?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-platform-map:2}
+The vendor's reference-data file arrives at 22:50 instead of 18:00. Using \cref{tab:pl:the-platform-map:latest}, which report is
+late, and by how many minutes?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-platform-map:3}
+Why does the clearing statement have the smallest \omterm{def:pl:the-platform-map:blast}{blast radius} of the seven inputs, and does a small \omterm{def:pl:the-platform-map:blast}{blast radius} mean the
+input needs less checking?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-platform-map:4}
+To finish earlier, the risk team moves the risk batch's fixed start from 21:00 to 20:30. Up to what arrival time of the
+corporate-action file does it read complete inputs, and what margin does that leave on a nominal night?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-platform-map:5}
+Product control's independently verified marks differ from the pricing library's by a few basis points on some positions.
+Explain why these are two datasets rather than two copies of one, and which of the two the P\&L sign-off should read.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-platform-map:6}
+During the day the position service keeps positions as a stream; after the close a batch job recomputes them. Give two reasons
+the two can differ at 17:00, and say which one the books are closed on.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-platform-map:7}
+\emph{Coding.} Add a job \texttt{margin forecast} that reads the positions and the clearing statement, takes 60 minutes and must
+be ready by 06:00. What is its latest start, does it change any other job's latest start, and what is the clearing statement's
+new latest safe arrival?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-platform-map:8}
+\emph{Find the flaw.} ``The overnight batch is too close to its deadline. We will double the risk grid's machines, which halves
+the risk batch to three hours, and the whole batch will end three hours earlier.''
+\end{exercise}
+
+\section{Problem: The Morning the Numbers Disagreed}
+
+\begin{problem}[{Weekend problem --- a late file and a fixed start}]\label{pb:pl:the-platform-map:1}
+The miniature firm's map (\texttt{pl\_platmap}), its nominal night and the night the corporate-action file arrived at 21:30.
+
+\medskip\noindent\textbf{Part I --- The nominal night.}
+\begin{enumerate}
+\item When do the golden copy, the positions and the risk batch start and end, with every job started on its inputs?
+\item Which job ends last, and when?
+\item What is the longest chain, and why is the risk batch, the longest job, not on it?
+\item How many minutes of slack does the batch have before 07:00?
+\item What is the risk batch's slack?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- How late can the files be?}
+\begin{enumerate}[resume]
+\item What is the latest safe arrival of the vendor's corporate-action file, and which job sets it?
+\item What is the latest safe arrival of the market-data capture, and why is it earlier than that of the fills?
+\item Which input has the largest margin between its nominal and its latest safe arrival?
+\item How many datasets does the corporate-action file reach?
+\item Which datasets does a wrong clearing statement reach?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The night of the hook.}
+\begin{enumerate}[resume]
+\item The file arrives at 21:30. When are the security master and the positions ready?
+\item The risk batch starts at 21:00 by the clock. Which of its inputs does it read stale?
+\item When does the P\&L job run, and which versions does it read?
+\item Up to what arrival time of the file would the fixed-start risk batch have read complete inputs?
+\item Started on its inputs, when would the risk batch have run on that night, and would it have met the deadline?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the end and slack of the nominal night, the latest safe arrival of the corporate-action
+file, and the arrival time beyond which the fixed-start risk batch reads stale data.
+\item Why did the disagreement produce no error in any system?
+\item Which of the three failure modes of \cref{prop:pl:the-platform-map:oneowner} occurred?
+\item Give two ways to keep a fixed start without the silent disagreement.
+\item In one sentence: what does a platform map give that a system diagram does not?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, risk}]\label{iq:pl:the-platform-map:1}
+What is a \omterm{def:pl:the-platform-map:sor}{system of record}, and why does a firm need one per dataset?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:the-platform-map:2}
+When would you compute positions as a stream and when as a batch?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:pl:the-platform-map:3}
+The morning risk report and the P\&L disagree on one position. How do you find out why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:the-platform-map:4}
+Should a batch job start at a fixed time or when its inputs are ready? What goes wrong with each?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:the-platform-map:5}
+How would you find out how late a vendor file can arrive before the morning reports are late?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk}]\label{iq:pl:the-platform-map:6}
+You join a firm with no diagram of its systems. How do you build a map that stays correct, and what do you check first?
+\end{interviewq}

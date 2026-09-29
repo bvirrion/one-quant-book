@@ -1,0 +1,520 @@
+\chapter{Networking for Trading}\label{ch:nw:networking-for-trading}
+
+The operator of the consolidated U.S. options feed tells its subscribers how much network to buy, and it does not quote an
+average. For July 2026 it projected 4.403 gigabits in the busiest 100 milliseconds and 0.501 gigabits in the busiest 10
+milliseconds, per copy of the feed: \qty{44}{\giga\bit\per\second} over the longer window, \qty{50}{\giga\bit\per\second}
+over the shorter, twice that for a subscriber that takes both redundant copies. Its own statistics say the same thing from the
+other side: the busiest millisecond of July 2026 carried messages at five times the rate of the busiest second. A network
+sized for the average of a trading day loses packets in its busiest milliseconds, and those are the milliseconds a trading firm
+is paid to see.
+
+This chapter opens the book's first part, the network between a venue and the firm's servers. It prices a byte on the wire,
+shows how one packet reaches many subscribers, explains why market data travels in datagrams and orders in streams, and ends
+where most losses begin: at a switch port that receives more than it can send.
+
+\section{The Ethernet frame and what a byte costs on the wire}
+
+\begin{definition}[Network interface card, Ethernet frame]\label{def:nw:networking-for-trading:frame}
+A \emph{network interface card}\index{network interface card} (NIC) is the device that connects a computer to a network link:
+it turns the bits on the wire into data in the host's memory and back. An \emph{Ethernet frame}\index{Ethernet frame} is the
+unit an Ethernet link carries: a destination and a source address (6 bytes each), a type (2 bytes), a payload of 46 to 1\,500
+bytes and a frame check sequence (4 bytes), from 64 to 1\,518 bytes in all without a VLAN tag. On the wire each frame is
+preceded by 8 bytes of preamble and start delimiter and followed by at least 12 bytes of idle inter-frame gap.
+\end{definition}
+
+\begin{definition}[Line rate, serialisation delay, maximum transmission unit]\label{def:nw:networking-for-trading:ser}
+The \emph{line rate}\index{line rate} $R_{\mathrm L}$ of a link is the rate at which it clocks bits onto the medium (1, 10, 25
+or \qty{100}{\giga\bit\per\second}). The \emph{serialisation delay}\index{serialisation delay} of a frame is the time the link
+takes to put it on the wire. The \emph{maximum transmission unit}\index{maximum transmission unit} (MTU) is the largest payload
+a link carries in one frame, 1\,500 bytes for standard Ethernet.
+\end{definition}
+
+\begin{proposition}[What a frame costs]\label{prop:nw:networking-for-trading:ser}
+A frame of $\ell_{\mathrm f}$ bytes occupies $\ell_{\mathrm f} + 20$ bytes of line time, so its \omterm{def:nw:networking-for-trading:ser}{serialisation delay} is
+\[
+  t_{\mathrm{ser}} = \frac{8\,(\ell_{\mathrm f} + 20)}{R_{\mathrm L}},
+\]
+and a link carries at most $R_{\mathrm L} / (8(\ell_{\mathrm f}+20))$ frames a second. Every device that must receive a whole
+frame before it sends it on pays $t_{\mathrm{ser}}$ once more.
+\end{proposition}
+
+\begin{proof}
+The preamble, start delimiter and inter-frame gap are 20 bytes of line time that belong to each frame and to no other; a link
+sends one bit every $1/R_{\mathrm L}$. A store-and-forward device (chapter~2) starts to transmit only once the last bit has
+arrived, a delay of one serialisation at the incoming rate.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.95cm,minimum width=1.32cm,text width=1.2cm,
+  align=center,inner sep=1pt}]
+\foreach \i/\n/\b/\c in {0/{preamble\\+ SFD}/8/gray!15, 1/Ethernet\\header/14/omDef!15, 2/IPv4\\header/20/omDef!15,
+  3/UDP\\header/8/omDef!15, 4/{Mold-\\UDP64}/20/omMeth!18, 5/length/2/omMeth!18, 6/add\\order/36/omThm!25,
+  7/FCS/4/omDef!15, 8/{gap}/12/gray!15}
+  {\node[f,fill=\c,anchor=south west] at (1.35*\i,0) {\n}; \node[font=\scriptsize] at (1.35*\i+0.66,-0.25) {\b\ bytes};}
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (1.35,-0.5) -- (10.8,-0.5)
+  node[midway,below=4pt,font=\scriptsize] {Ethernet frame: 104 bytes (64 minimum, 1\,518 maximum)};
+\draw[decorate,decoration={brace,amplitude=4pt}] (0,1.05) -- (12.15,1.05)
+  node[midway,above=4pt,font=\scriptsize] {line time: 124 bytes $=$ \qty{99.2}{\nano\second} at \qty{10}{\giga\bit\per\second},
+  \qty{39.7}{\nano\second} at \qty{25}{\giga\bit\per\second}};
+\end{tikzpicture}
+
+\omcaption{One add-order message on the wire, in the simulator's feed format (a MoldUDP64 packet in a UDP datagram in an
+\omterm{def:nw:networking-for-trading:frame}{Ethernet frame}). The 36 bytes the strategy reads are 29\% of the line time the frame occupies. Boxes are not to scale; byte
+counts from \cref{prop:nw:networking-for-trading:ser} and the formats' headers.}\label{fig:nw:networking-for-trading:frame}
+\end{omfigure}
+
+\begin{example}[One add order]\label{ex:nw:networking-for-trading:mold}
+The exchange simulator of One Quant Book~10 publishes its feed as MoldUDP64 packets: a 20-byte header (session, sequence
+number, message count), then each message behind a 2-byte length. An add-order message is 36 bytes, so a packet carrying one
+is 58 bytes of UDP payload; with 8 bytes of UDP header, 20 of IPv4 header and 18 of Ethernet header and check sequence the
+frame is 104 bytes and occupies 124 bytes of line time (\cref{fig:nw:networking-for-trading:frame}): \qty{99.2}{\nano\second}
+at \qty{10}{\giga\bit\per\second}, \qty{39.7}{\nano\second} at 25. A venue that packs eight such messages in one packet
+spends the 66 bytes of fixed overhead once for eight messages instead of eight times.
+\end{example}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrrr}
+\toprule
+Frame (bytes) & \qty{1}{\giga\bit\per\second} & \qty{10}{\giga\bit\per\second} & \qty{25}{\giga\bit\per\second} &
+\qty{100}{\giga\bit\per\second} \\
+\midrule
+64 & 672.0 & 67.2 & 26.9 & 6.7 \\
+128 & 1\,184.0 & 118.4 & 47.4 & 11.8 \\
+256 & 2\,208.0 & 220.8 & 88.3 & 22.1 \\
+512 & 4\,256.0 & 425.6 & 170.2 & 42.6 \\
+1\,024 & 8\,352.0 & 835.2 & 334.1 & 83.5 \\
+1\,518 & 12\,304.0 & 1\,230.4 & 492.2 & 123.0 \\
+\bottomrule
+\end{tabular}
+\caption{\omterm{def:nw:networking-for-trading:ser}{Serialisation delay} in nanoseconds by frame size and \omterm{def:nw:networking-for-trading:ser}{line rate} (\cref{prop:nw:networking-for-trading:ser}, preamble
+and inter-frame gap included). Computed by \texttt{nw\_wire.frame\_table}.}\label{tab:nw:networking-for-trading:ser}
+\end{table}
+
+\Cref{tab:nw:networking-for-trading:ser} is the first latency table of this book and the one most often forgotten. A
+full-size frame at \qty{10}{\giga\bit\per\second} takes \qty{1.23}{\micro\second} to serialise, half of the
+\qty{2.5}{\micro\second} that an engineer of a large market maker gave in a public talk as a very good wire-to-wire time for a
+whole software trading system (One Quant Book~13, chapter~1). Moving from 10 to \qty{25}{\giga\bit\per\second} saves 60\% of
+every serialisation, a reason to buy the faster port even when the slower one would carry the traffic.
+Serialisation is also why small frames matter: an order is rarely larger than a hundred bytes, and a switch that forwards it
+only once it has all of it pays for all of it.
+
+\begin{remark}[Bits in flight]\label{rem:nw:networking-for-trading:flight}
+Light in standard single-mode fibre travels a metre in about \qty{4.88}{\nano\second} (group index 1.462, chapter~10).
+A 1\,518-byte frame at \qty{10}{\giga\bit\per\second} is therefore 252~metres long in the fibre, longer than any cable in a
+data-centre hall: its first bit reaches the far end long before its last bit has left. Distance and serialisation are separate
+terms of a latency budget, and at the scale of a building serialisation usually wins.
+\end{remark}
+
+\omcode{code/firm/netsim/firm_netsim.py}{36}{50}{Frame arithmetic in \texttt{firm.netsim}: the smallest frame is padded to 64
+bytes, and every frame pays 20 bytes of preamble and gap.}\label{lst:nw:networking-for-trading:frame}
+
+\section{IP multicast: groups, membership and snooping}
+
+A venue sends the same market data to hundreds of subscribers. Sending one copy to each over its own connection would make
+the last subscriber wait for all the others (chapter~12 studies a venue that did exactly that); sending one copy that the
+network replicates makes them all equal to within the replication.
+
+\begin{definition}[Multicast group, IGMP]\label{def:nw:networking-for-trading:group}
+A \emph{multicast group}\index{multicast group} is an IPv4 address between 224.0.0.0 and 239.255.255.255 that names a set of
+receivers rather than one host: a datagram sent to it is delivered to every member. The \emph{Internet Group Management
+Protocol}\index{Internet Group Management Protocol} (IGMP) is the protocol by which a host tells its neighbouring routers
+which groups it wants to receive, and, in version~3, from which sources.
+\end{definition}
+
+A venue's feed is usually spread over many groups, one per channel or partition of instruments, so that a subscriber
+receives only the groups it needs (chapter~22 sizes the options feeds this way). A group must also be delivered on the
+Ethernet segment, and Ethernet addresses are 48 bits: a group address is mapped to the Ethernet address
+\texttt{01:00:5e} followed by the low 23 bits of the group, so the upper 5 of the 28 bits that distinguish groups are lost and
+32 groups share each Ethernet address. A card filtering on Ethernet addresses may therefore let through groups the host never
+joined, and the kernel discards them after having paid for them.
+
+\begin{definition}[IGMP snooping]\label{def:nw:networking-for-trading:snooping}
+\emph{IGMP snooping}\index{IGMP snooping} is a switch's practice of reading the IGMP membership reports that cross it and
+forwarding each group's traffic only to the ports on which a member has reported, instead of flooding every multicast frame
+to every port.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.65cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[b,fill=gray!10] (v) at (0,0) {venue feed\\ groups A, B};
+\node[b,fill=omDef!15,minimum width=1.9cm,minimum height=3.6cm] (s) at (3.6,0) {switch\\ (IGMP\\ snooping)};
+\foreach \y/\t/\g in {1.35/{server 1: joined A}/{A}, 0.45/{server 2: joined A and B}/{A, B}, -0.45/{server 3: joined B}/{B},
+  -1.35/{server 4: joined nothing}/{nothing}}
+  {\node[b,minimum width=4.1cm,anchor=west] (h) at (7.4,\y) {\t};
+   \draw[->,thick] (s.east|-h.west) -- node[above,font=\scriptsize]{sends \g} (h.west);}
+\draw[->,thick] (v) -- node[above,font=\scriptsize]{A and B} (s.west|-v.east);
+\end{tikzpicture}
+
+\omcaption{\omterm{def:nw:networking-for-trading:snooping}{IGMP snooping}. The switch learns from the servers' membership reports which ports want which group and replicates
+each group only to them; server~4 receives nothing. Without snooping, all four ports would carry both groups, and servers that
+joined nothing would still spend their cards' and kernels' time discarding them.}\label{fig:nw:networking-for-trading:snoop}
+\end{omfigure}
+
+\begin{example}[Two groups, one Ethernet address]\label{ex:nw:networking-for-trading:mac}
+Group 239.255.1.2 maps to \texttt{01:00:5e:7f:01:02}: the low 23 bits of 255.1.2 are 127.1.2 once the top bit of 255 is
+dropped. Group 224.127.1.2 maps to the same address. A server that joined only the first receives, from any switch or card
+that filters by Ethernet address alone, the traffic of the second as well. Venues allocate their groups with this in mind, and
+a firm that runs its own internal multicast (chapter~27's ticker plant) should too.
+\end{example}
+
+\section{Datagrams against streams}
+
+Two transport protocols carry almost everything in a trading network. UDP sends datagrams: each is delivered whole or not at
+all, with no ordering and no retransmission, and one datagram sent to a group reaches every member. TCP carries a byte
+stream between two endpoints: it numbers the bytes, acknowledges them, retransmits what is lost and delivers everything in
+order.
+
+Market data travels in UDP multicast because only multicast sends one copy to all, and because a feed must not slow down
+for its slowest subscriber: TCP's flow control would do exactly that. The price is that loss is the application's problem. The
+venue sends every packet on two independent lines (One Quant Book~10, chapter~26), numbers them, and runs retransmission and
+snapshot services; the firm's handler arbitrates and recovers (One Quant Book~13, chapters~16 and~18). Orders travel over TCP
+because an order must arrive exactly once, in order with the firm's other orders, and because the venue must know which
+connection sent it: the session layer of the order-entry protocol builds on those guarantees.
+
+\begin{definition}[Head-of-line blocking]\label{def:nw:networking-for-trading:hol}
+\emph{Head-of-line blocking}\index{head-of-line blocking} is the delay imposed on every item in an ordered queue by one item at
+its head that cannot proceed. In TCP, a lost segment holds back every later byte of the stream, already received or not, until
+its retransmission arrives.
+\end{definition}
+
+\omterm{def:nw:networking-for-trading:hol}{Head-of-line blocking} is the cost of TCP's ordering. A cancel sent a microsecond after a lost new-order message waits for the
+new order's retransmission, which comes after at least a round trip and usually after a timer: on a clean colocation link loss
+is rare, and when it happens the whole session stalls. Ordering is also a feature: the venue must never see the cancel before
+the order it cancels.
+
+\begin{definition}[Nagle's algorithm]\label{def:nw:networking-for-trading:nagle}
+\emph{Nagle's algorithm}\index{Nagle's algorithm} is TCP's rule that a sender holds new data back, instead of sending it in a
+small segment, while any data it has already sent remains unacknowledged. It saves bandwidth when a program writes many small
+pieces, and was designed for interactive terminals.
+\end{definition}
+
+\begin{proposition}[Nagle meets the delayed acknowledgement]\label{prop:nw:networking-for-trading:nagle}
+Let a sender write a small order and, before it is acknowledged, a second small order, on a connection with \omterm{def:nw:networking-for-trading:nagle}{Nagle's algorithm}
+enabled, to a receiver that delays its acknowledgements (TCP allows up to half a second). The second order leaves only when
+the first is acknowledged: after the receiver's delayed-acknowledgement timer, or a round trip if the receiver has data of its
+own to send. Disabling \omterm{def:nw:networking-for-trading:nagle}{Nagle's algorithm} (the socket option \texttt{TCP\_NODELAY}) removes the wait.
+\end{proposition}
+
+\begin{proof}
+By the rule, the second write is held while the first segment is unacknowledged. The receiver sends its acknowledgement when
+its timer fires, when it has a second full segment to acknowledge (it has not: one small segment arrived), or with its own data.
+\end{proof}
+
+\begin{method}[An order-entry socket]\label{met:nw:networking-for-trading:socket}
+\begin{enumerate}
+\item Set \texttt{TCP\_NODELAY} on every order-entry and drop-copy connection.
+\item Write each message with one call, so that one message is one segment and nothing waits for a later write.
+\item Where the venue's session protocol acknowledges at the application level, acknowledge promptly at the TCP level too
+  (Linux's \texttt{TCP\_QUICKACK} is not permanent and must be set again after reads).
+\item Keep the connection up (the session layer's heartbeats) and pre-warmed: a new TCP connection costs a round trip before
+  its first byte, and chapter~20 adds a TLS handshake on top for crypto venues.
+\end{enumerate}
+\end{method}
+
+\section{Congestion: egress queues, incast and microbursts}
+
+A switch forwards each frame to an output port. If frames destined to one port arrive faster than the port's \omterm{def:nw:networking-for-trading:ser}{line rate}, they
+wait.
+
+\begin{definition}[Egress queue, oversubscription ratio]\label{def:nw:networking-for-trading:egress}
+An \emph{egress queue}\index{egress queue} is the buffer in which a switch holds frames waiting to be sent on an output port;
+when it is full, arriving frames are dropped (tail drop). The \emph{oversubscription ratio}\index{oversubscription ratio} of a
+port is the sum of the \omterm{def:nw:networking-for-trading:ser}{line rates} that can send to it divided by its own \omterm{def:nw:networking-for-trading:ser}{line rate}.
+\end{definition}
+
+\begin{definition}[Incast, microburst]\label{def:nw:networking-for-trading:burst}
+\emph{Incast}\index{incast} is the congestion that arises when many senders transmit to one receiver at the same moment. A
+\emph{microburst}\index{microburst} is a period of microseconds to milliseconds during which the traffic offered to a port
+exceeds its \omterm{def:nw:networking-for-trading:ser}{line rate}, while its average over any interval a monitoring tool reports (a second, a minute) stays well below
+it.
+\end{definition}
+
+A feed that uses half of a port on average can overflow it for a millisecond, and a trading network is built to make this
+happen: every venue's feed, and every partition of every feed, reacts to the same market events at the same time.
+
+\begin{proposition}[The fluid bound]\label{prop:nw:networking-for-trading:fluid}
+Let $n$ inputs send at rates $r_1, \dots, r_n$ to a port of \omterm{def:nw:networking-for-trading:ser}{line rate} $R_{\mathrm L}$ during a burst of length $D$, starting
+from an empty queue. At the end of the burst the queue holds
+\[
+  B = \Bigl(\textstyle\sum_i r_i - R_{\mathrm L}\Bigr)^{+} D / 8 \text{ bytes},
+\]
+and the last byte of the burst leaves $8B/R_{\mathrm L}$ after it arrived. Tail drop loses nothing if and only if the buffer
+available to the port is at least $B$; otherwise it loses $B$ minus the buffer, in whole frames.
+\end{proposition}
+
+\begin{proof}
+During the burst the queue grows at the difference of the rates when it is positive and stays empty otherwise; the port then
+drains it at $R_{\mathrm L}$. The discrete version, frame by frame, is the loop of \cref{lst:nw:networking-for-trading:egress},
+which reduces to the fluid formula when frames are small against $B$.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xmode=log,xmin=0.7,xmax=1400,ymin=0,ymax=380,
+  xtick={1,10,100,1000},xticklabels={1~ms,10~ms,100~ms,1~s},
+  xlabel={averaging window (log scale)},ylabel={peak rate (million messages / s)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omExo,very thick,mark=*,mark size=1.6pt] table[x=window_ms,y=2024_01]{figdata/networks/01-networking-for-trading/opra.csv};
+\addplot[omMeth,very thick,mark=square*,mark size=1.6pt] table[x=window_ms,y=2025_03]{figdata/networks/01-networking-for-trading/opra.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=2pt] table[x=window_ms,y=2026_07]{figdata/networks/01-networking-for-trading/opra.csv};
+\legend{January 2024,March 2025,July 2026}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The consolidated U.S. options feed's busiest window of each length, as a rate: the peak count of messages in one
+second, 100~ms, 10~ms and 1~ms divided by the window. The shorter the window, the higher the rate; in July 2026 the busiest
+millisecond ran at 5.5 times the busiest second. Data: OPRA, \emph{Key Operating Metrics} (August 2026), transcribed in
+\texttt{data/networks/opra\_metrics.csv}.}\label{fig:nw:networking-for-trading:opra}
+\end{omfigure}
+
+\Cref{fig:nw:networking-for-trading:opra} is the published version of the \omterm{def:nw:networking-for-trading:burst}{microburst}: the same feed, in the same month, is
+63.9 million messages a second or 350 million a second depending on the window one reads it through. The operator's capacity
+notice, which subscribers use to size their links, is written in 10-millisecond peaks for that reason
+(\cref{dat:nw:networking-for-trading:opra}); a switch port does not average over 10 milliseconds, it queues frame by frame.
+
+\begin{dated}{2026-09}{How much network the options feed needs}\label{dat:nw:networking-for-trading:opra}
+SIAC's capacity projection for OPRA effective July 2026 gives, for one copy of the feed, 13.575 million messages, 4.403
+gigabits and 1.564 million packets in the busiest 100 milliseconds, and 1.562 million messages, 0.501 gigabits and 169\,000
+packets in the busiest 10 milliseconds. That is \qty{44.0}{\giga\bit\per\second} and \qty{50.1}{\giga\bit\per\second}; about 352
+bytes and 8.7 messages per packet over the 100-millisecond window. Subscribers taking both redundant copies double the
+bandwidth, and the notice asks for 10\% more for retransmissions. The notice states the 10-millisecond interval ``reflects system
+utilization during bursts of traffic''.
+\end{dated}
+
+To see the mechanism rather than its footprint, the chapter's tutorial simulates eight feeds into one
+\qty{10}{\giga\bit\per\second} port with \texttt{firm.netsim}. Each feed averages 400\,000 packets a second in clusters (a
+market event produces a run of messages), one to thirty add-order messages a packet; the eight together offer about
+\qty{5.2}{\giga\bit\per\second}, half the port. In one version every feed's clusters are independent. In the other, 30\% of
+each feed's packets come in clusters triggered by common events, 400 a second, that hit all eight feeds at once, as a macro
+release or a large trade in an index future does.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.7cm},width=6.6cm,height=5.2cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xmode=log,ymode=log,xmin=0.7,xmax=14000,ymin=3,ymax=300,xlabel={window (\unit{\micro\second}, log)},
+  ylabel={peak rate (\unit{\giga\bit\per\second}, log)},xtick={1,10,100,1000,10000},
+  xticklabels={1,10,100,1\,000,10\,000},ytick={5,10,20,50,100,200},yticklabels={5,10,20,50,100,200}]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=window_us,y=independent]{figdata/networks/01-networking-for-trading/peak.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=window_us,y=common]{figdata/networks/01-networking-for-trading/peak.csv};
+\addplot[gray,dashed,domain=0.7:14000] {10};
+\nextgroupplot[xmode=log,xmin=8,xmax=6000,ymin=0,ymax=26,xlabel={egress buffer (KB, log)},ylabel={frames lost (\%)},
+  xtick={10,100,1000},xticklabels={10,100,1\,000},
+  legend columns=2,legend style={font=\footnotesize,at={(-0.2,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omDef,thick,dashed,mark=o,mark size=1.4pt] table[x=buffer_kb,y=f4_independent]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omThm,thick,dashed,mark=square,mark size=1.4pt] table[x=buffer_kb,y=f4_common]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=buffer_kb,y=f8_independent]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=buffer_kb,y=f8_common]{figdata/networks/01-networking-for-trading/fanin.csv};
+\legend{4 feeds independent,4 feeds with common events,8 feeds independent,8 feeds with common events}
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Simulation: feeds into one \qty{10}{\giga\bit\per\second} egress port. Left: the busiest window of each length for eight
+feeds (dashed: the \omterm{def:nw:networking-for-trading:ser}{line rate}); independent bursts stay under it at 100~\unit{\micro\second} and beyond, common events push it
+past \qty{60}{\giga\bit\per\second}. Right: frames lost to tail drop by buffer size, 50~ms of traffic. The same average load
+needs about 30~KB of buffer when bursts are independent and about a megabyte when they are common. Data:
+\texttt{fig\_bursts.py} on \texttt{firm.netsim} (seeded, deterministic).}\label{fig:nw:networking-for-trading:fanin}
+\end{omfigure}
+
+The two versions have the same average load, and the difference is all in the correlation
+(\cref{fig:nw:networking-for-trading:fanin}). With independent bursts the busiest 100 microseconds carry
+\qty{9.1}{\giga\bit\per\second}, and the buffer that would have lost nothing, the largest backlog of the run, is 21 to 31~KB
+over twenty seeds. With common events the busiest 100 microseconds carry \qty{68}{\giga\bit\per\second}, and that buffer is
+between 0.44 and 2.4~MB over the same twenty seeds, 1.1~MB on average. Removing the common events is the ablation: the
+megabyte is caused by the correlation, not by the load. A port's traffic statistics averaged over a second show half a link in
+both cases.
+
+\begin{dated}{2026-09}{A low-latency switch's buffer}\label{dat:nw:networking-for-trading:buffer}
+Cisco's data sheet for the Nexus 3548-X, a 48-port \qty{10}{\giga\bit\per\second} switch sold for low latency, gives its
+buffer as ``6 MB shared among 16 ports; 18 MB total'' and latencies ``as low as'' \qty{250}{\nano\second} in normal mode and
+\qty{200}{\nano\second} in its warp mode. A port whose fifteen neighbours are also busy can count on about a sixteenth of its
+6~MB block, 375~KB.
+\end{dated}
+
+Read against the simulation, the box says that a port which can borrow the whole shared block survives the common-event
+bursts of \cref{fig:nw:networking-for-trading:fanin}, and a port that gets only its sixteenth does not: at 500~KB of buffer the
+eight feeds with common events still lose 2.6\% of their frames. The events that fill every port at once are the events that
+leave each port with only its share. The remedies are a faster egress port (the eight feeds' common bursts reach
+\qty{16}{\giga\bit\per\second} over a millisecond, within a \qty{25}{\giga\bit\per\second} port), fewer feeds per port, or a
+switch whose buffer is dedicated rather than shared; chapter~2 adds the devices that do not queue at all.
+
+\section{Tutorial: microbursts from frames to drops}\label{tut:nw:networking-for-trading:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Price frames on the wire, read the published burst curve, and simulate a fan-in port until it drops.
+\textbf{End state:} \cref{tab:nw:networking-for-trading:ser}, \cref{fig:nw:networking-for-trading:opra,fig:nw:networking-for-trading:fanin},
+and the zero-loss buffers quoted in the text.
+\begin{tutsteps}
+\item \textbf{Frames.} \texttt{nw\_wire.frame\_table()} and \texttt{mold\_example()} reproduce the table and
+  \cref{ex:nw:networking-for-trading:mold} from \cref{lst:nw:networking-for-trading:frame}.
+\item \textbf{The published curve.} \texttt{opra\_curve()} turns the operator's peak counts into rates; \texttt{opra\_capacity()}
+  turns the capacity notice into gigabits a second and bytes a packet.
+\item \textbf{Traffic.} \texttt{feed()} draws one feed's packets from \texttt{firm.netsim.bursty\_arrivals}, and
+  \texttt{fanin\_traffic()} merges eight of them, with or without common events (\cref{lst:nw:networking-for-trading:feed}).
+\item \textbf{The port.} \texttt{firm.netsim.egress} runs the tail-drop queue (\cref{lst:nw:networking-for-trading:egress});
+  \texttt{fanin()} sweeps the buffer, \texttt{zero\_loss\_buffer()} runs twenty seeds with an unbounded buffer and returns each
+  run's largest backlog. \texttt{python fig\_bursts.py} writes the charts' data.
+\end{tutsteps}
+\textbf{What to change next.} Vary the share of packets that come with common events from 0 to 0.5 and plot the zero-loss
+buffer against it; replace the \qty{10}{\giga\bit\per\second} port by a \qty{25}{\giga\bit\per\second} one and find the smallest
+buffer that loses nothing.
+\end{tutorial}
+
+\omcode{code/networks/01-networking-for-trading/python/nw_wire.py}{62}{77}{One feed and a fan-in of eight: the common event
+times are drawn once and shared by every feed.}\label{lst:nw:networking-for-trading:feed}
+
+\omcode{code/firm/netsim/firm_netsim.py}{119}{140}{The egress queue: the backlog drains at the line rate between arrivals, and a
+frame that does not fit is dropped whole.}\label{lst:nw:networking-for-trading:egress}
+
+\section{Build: the network model}\label{bld:nw:networking-for-trading:netsim}
+
+\begin{build}
+\bfield{Purpose} A packet-level model of the firm's network that every later chapter of Parts~I and~II uses: frames, links,
+queues, switches and multicast, with exact byte accounting and seeded traffic.
+\bfield{Interface} \texttt{firm\_netsim}: constants for every header; \texttt{frame\_bytes}, \texttt{mold\_payload},
+\texttt{wire\_bytes}, \texttt{ser\_ns}, \texttt{prop\_ns}; \texttt{mcast\_mac}; \texttt{peak\_rate(t, bytes, window)};
+\texttt{event\_times}, \texttt{bursty\_arrivals}; \texttt{egress(t, frames, gbps, buffer)} returning departures, drops and
+backlogs; \texttt{forward\_ns(frame, gbps, mode, fabric\_ns)} for store-and-forward, cut-through and layer-1 devices;
+\texttt{replicate(groups, members, ports, snooping)}; \texttt{merge}. C++20 twin of the \omterm{def:nw:networking-for-trading:egress}{egress queue},
+\texttt{cpp/firm\_netsim.hpp}.
+\bfield{Rules} Integer nanoseconds and bytes; every frame pays 20 bytes of preamble and gap; frames shorter than 64 bytes are
+padded; tail drop drops whole frames; a queue is FIFO; every random draw is seeded; the C++ queue reproduces the Python one to
+the nanosecond.
+\bfield{Acceptance tests} \texttt{code/firm/netsim/tests/}: frame sizes of known packets (64, 104, 1\,518 bytes); RFC~1112
+address mapping and its 32-to-1 overlap; the peak-rate window on a hand-made stream; FIFO order, conservation of frames and
+the buffer bound of the \omterm{def:nw:networking-for-trading:egress}{egress queue}; ten frames arriving together leave after ten serialisations; the fixture shared with the
+C++ test.
+\bfield{Stretch} Priority queues (strict priority for orders over market data on a shared uplink); a shared-buffer switch in
+which ports borrow from a common pool under a dynamic threshold, to reproduce \cref{dat:nw:networking-for-trading:buffer}'s
+arithmetic in simulation.
+\end{build}
+
+\begin{omsources}
+\item OPRA, \emph{Key Operating Metrics of U.S. Options Securities Information Processor} (August 2026); SIAC, \emph{Revised
+OPRA Capacity Projections} (15 September 2025).
+\item G.~Fairhurst, ``Ethernet Frame Calculations'' (University of Aberdeen); UNH InterOperability Laboratory, \emph{10
+Gigabit Ethernet} MAC tutorial.
+\item RFC~768 (UDP), RFC~791 (IPv4), RFC~9293 (TCP), RFC~896 (Nagle), RFC~1122 (host requirements), RFC~1112 and RFC~5771
+(multicast addressing), RFC~3376 (IGMPv3), RFC~4541 (snooping); Linux \texttt{tcp(7)}.
+\item Cisco, \emph{Nexus 3548-X, 3524-X, 3548-XL and 3524-XL Switches Data Sheet}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:1}
+What is the \omterm{def:nw:networking-for-trading:ser}{serialisation delay} of a 256-byte frame at \qty{25}{\giga\bit\per\second}, and how many 64-byte frames can a
+\qty{10}{\giga\bit\per\second} link carry in one second?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:2}
+To which Ethernet address is the \omterm{def:nw:networking-for-trading:group}{multicast group} 233.54.12.111 mapped? Give another group in 224.0.0.0/4 that shares it.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:3}
+From \cref{dat:nw:networking-for-trading:opra}, what bandwidth must a firm taking both copies of the feed, with the
+retransmission allowance, provision for the 10-millisecond peak, and how many \qty{25}{\giga\bit\per\second} links is that?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:4}
+A gateway writes a new order and, forty microseconds later, a cancel of another order on the same TCP connection, without
+\texttt{TCP\_NODELAY}. The venue acknowledges data only with its own messages or after its delayed-acknowledgement timer. What
+can happen to the cancel, and why is the order of the two never at risk?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:5}
+Four inputs send at \qty{6}{\giga\bit\per\second} each for 50 microseconds to a \qty{10}{\giga\bit\per\second} port with an empty
+queue. How many bytes are queued at the end of the burst, and how long does the last byte wait?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:6}
+In \cref{fig:nw:networking-for-trading:opra}, compute the ratio of the busiest millisecond's rate to the busiest second's rate
+in January 2024 and in July 2026. What changed, and what does it mean for a link sized in 2024?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:networking-for-trading:7}
+\emph{Coding.} With \texttt{nw\_wire.zero\_loss\_buffer}, compute the mean zero-loss buffer over twenty seeds when 10\% and when
+50\% of the packets come with common events. How does the buffer scale with the share?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:networking-for-trading:8}
+\emph{Find the flaw.} ``Our market-data port averages \qty{3}{\giga\bit\per\second} on a \qty{10}{\giga\bit\per\second} link and
+its one-minute peak is \qty{4.2}{\giga\bit\per\second}. We have more than half the link spare; the packet loss our handler
+reports must be in the server.''
+\end{exercise}
+
+\section{Problem: The Open That Did Not Fit}
+
+\begin{problem}[{Weekend problem --- eight feeds, one port and a shared buffer}]\label{pb:nw:networking-for-trading:1}
+A firm's market-data switch sends eight venue feeds to one strategy server over one \qty{10}{\giga\bit\per\second} port. Each
+feed averages \qty{0.6}{\giga\bit\per\second}; at a market-wide event all eight burst together at \qty{2.5}{\giga\bit\per\second}
+each for one millisecond. Frames average 200 bytes. The switch is the one of \cref{dat:nw:networking-for-trading:buffer}; during
+such an event every port of the block is busy, so the port gets its sixteenth of the shared 6~MB.
+
+\medskip\noindent\textbf{Part I --- Averages.}
+\begin{enumerate}
+\item What is the port's average load and utilisation?
+\item How many frames a second does it carry on average (preamble and gap included)?
+\item What is the offered rate during the event, and the utilisation?
+\item Why does the port's one-minute counter never show the event?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The queue.}
+\begin{enumerate}[resume]
+\item How many bytes are queued at the end of the burst, with an unlimited buffer?
+\item How many frames is that?
+\item How long does the last byte of the burst wait in the queue?
+\item After the burst the feeds return to their averages. How long does the queue take to drain?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The buffer.}
+\begin{enumerate}[resume]
+\item What buffer would lose nothing?
+\item How much buffer does the port actually get during the event?
+\item How many bytes and how many frames are dropped?
+\item What share of the burst's frames is that?
+\item Would the whole 6~MB block have been enough?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the minimum buffer for zero loss, and the frames dropped at the port's share.
+\item How long would the burst have to last for the whole 6~MB block to overflow?
+\item Would a \qty{25}{\giga\bit\per\second} port queue at all during the event?
+\item The firm takes both copies of each feed on separate ports of the same block. Does that help?
+\item Which switch counter shows the loss, and which handler counter?
+\item How do the handler's recovery paths (One Quant Book~13, chapter~18) cope with the loss?
+\item In one sentence: why is the event that fills one port the event that fills all of them?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:networking-for-trading:1}
+What is \omterm{def:nw:networking-for-trading:ser}{serialisation delay}? Why does going from 10 to \qty{25}{\giga\bit\per\second} matter for an order that fits in one small
+frame?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer, trader}]\label{iq:nw:networking-for-trading:2}
+Why is market data sent over UDP multicast and orders over TCP?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:networking-for-trading:3}
+Explain \omterm{def:nw:networking-for-trading:nagle}{Nagle's algorithm} and the delayed acknowledgement. What do you set on an order-entry socket, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:networking-for-trading:4}
+The feed handler reports gaps on both lines at the open, but the server's card shows no drops. Where do you look?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:networking-for-trading:5}
+What does \omterm{def:nw:networking-for-trading:snooping}{IGMP snooping} do, and what happens in a trading network without it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:nw:networking-for-trading:6}
+How would you size the buffer of a switch port that receives several market-data feeds?
+\end{interviewq}

@@ -34,7 +34,7 @@ figdata:
 
 # make gates                 -> every written book
 # make gates BOOK=markets-2   -> one book
-BOOK ?= markets-1 markets-2 markets-3 methods derivatives rates-credit-risk research strategies-1 strategies-2 microstructure hft ml low-latency
+BOOK ?= markets-1 markets-2 markets-3 methods derivatives rates-credit-risk research strategies-1 strategies-2 microstructure hft ml low-latency networks platforms desk industry interviews
 gates:
 	for b in $(BOOK); do tools/gates.sh book $$b || exit 1; done
 

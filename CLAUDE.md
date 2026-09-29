@@ -10,7 +10,10 @@ eighteen English-only LaTeX books covering quantitative finance end to end
 HFT, machine learning, low-latency software, networks, platforms, the firm,
 the industry, interviews).
 
-**Status (2026-09-26): Books 1–13 are written; Books 14–18 are outline only.**
+**Status (2026-09-29): all eighteen books are written.** Books 14–16 were written
+2026-09-28/29 in one parallel batch of three, one agent per book (user rule for Books 14–18: at most three
+books at a time, batches {14, 15, 16} then {17, 18}, both done 2026-09-28/29; `sources/BATCH_BOOKS_14-16.md`, `sources/BATCH_BOOKS_17-18.md`).
+Book 16's slug is `desk`, not `firm` (`code/firm/` is the running project).
 Books 1–9 are committed (7–9, written 2026-09-24/25 in the main session with no
 subagents per the user's ruling, in 2322893). **Books 10–13 were written 2026-09-25/26 in
 one parallel batch, one agent per book** (committed as PP-114) (`sources/BATCH_BOOKS_10-13.md`;
@@ -35,6 +38,11 @@ book (`sources/BATCH_BOOKS_3-6.md`; series definition map
 | 11 Market Making and HFT | `one_quant_book_11_hft.tex` | `hft` / `hf` | 29 | 330 | 68 | 59 | 19 | 118 | 361 |
 | 12 Machine Learning for Markets | `one_quant_book_12_ml.tex` | `ml` / `ml` | 29 | 348 | 58 | 87 | 3 | 168 | 1,000 |
 | 13 Low-Latency Software | `one_quant_book_13_low_latency.tex` | `low-latency` / `ll` | 26 | 314 | 72 | 80 | 13 | 120 | 606 |
+| 14 Networks, Hardware, Infrastructure | `one_quant_book_14_networks.tex` | `networks` / `nw` | 29 | 349 | 96 | 65 | 40 | 220 | 685 |
+| 15 Research, Data and Risk Platforms | `one_quant_book_15_platforms.tex` | `platforms` / `pl` | 30 | 367 | 110 | 103 | 27 | 122 | 702 |
+| 16 The Desk and the Firm | `one_quant_book_16_desk.tex` | `desk` / `fm` | 30 | 347 | 108 | 40 | 32 | 182 | 854 |
+| 17 The Industry: Firms, Roles and Careers | `one_quant_book_17_industry.tex` | `industry` / `in` | 30 | 339 | 86 | 38 | 52 | 293 | 620 |
+| 18 The Interview Book | `one_quant_book_18_interviews.tex` | `interviews` / `iv` | 29 | 220 | 23 | 55 | 6 | 80 | 56 |
 
 Books 1–6: gates 0 errors / 0 undefined / 0 overfull, `make gates` green (the
 series-wide "defined twice" check: 1,646 terms, none twice), `make test-code`
@@ -59,7 +67,20 @@ C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
 `styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
 code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas; since the Books 10–13 batch also scipy, scikit-learn, LightGBM, statsmodels and PyTorch CPU — user ruling 2026-09-25).
 Versions are pinned in `requirements.txt`, which `make venv` installs. To add a library, install it, run the tests, then re-freeze with `python3 -m pip --python .venv/bin/python freeze`.
-CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `make test-fast`, which skips the tests marked `reference`. Those tests either reproduce the book's exact printed numbers with a full-size run (the heavy chapters), or assert digits that move with the processor's floating-point kernels. Every chapter keeps a small `test_small_runs` or other unmarked test that CI runs (user ruling 2026-09-27: CI tests the code, not the book's digits). A `v*` tag also publishes a GitHub release with all thirteen PDFs, each versioned and under its plain name (job `release`, after `code` and `book` pass); a manual run never releases. Chart regeneration is not in CI: `make reproduce` runs everything, `reference` tests and figdata included, on the machine that wrote the book.
+CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `make test-fast`, which skips the tests marked `reference`. Those tests either reproduce the book's exact printed numbers with a full-size run (the heavy chapters), or assert digits that move with the processor's floating-point kernels. Every chapter keeps a small `test_small_runs` or other unmarked test that CI runs (user ruling 2026-09-27: CI tests the code, not the book's digits). A `v*` tag also publishes a GitHub release with all eighteen PDFs, each versioned and under its plain name (job `release`, after `code` and `book` pass); a manual run never releases. Chart regeneration is not in CI: `make reproduce` runs everything, `reference` tests and figdata included, on the machine that wrote the book.
+Books 14–16 alone (each checked by the main session): 0/0/0, `tools/gates.sh book` green (3,383 definitions
+over 16 books, none twice), per-book `make test-code` green (Book 14: 122 chapter + 102 firm tests, C++20 twins,
+a Rust crate, SystemVerilog under Verilator 4.038 and Icarus 11, which `make venv` does not install: `apt install
+verilator iverilog python3-dev`; Book 15: 128 + 165, DuckDB/Polars/Arrow/pybind11 in the venv, a C++20 and Rust
+tick-store reader, 17 measured charts re-measured on a quiet machine; Book 16: 156 + 94), figdata reproduced with
+no diff, and every figure checked on its own page. Since 2026-09-29 `onequant.sty` prints pgfplots thousands
+with a thin space, and 1,853 hand-typed comma thousands in Books 2, 3, 6, 8–12 and 16 became `\,`.
+Books 17–18 alone (each checked by the main session): 0/0/0, `tools/gates.sh book` green (3,540 definitions over
+18 books, none twice), per-book `make test-code` green (Book 17: 139 chapter + 99 firm tests; public data only as
+small derived tables in `data/industry/` with `LICENSES.md`, firm-level only, pay cells with fewer than ten filings or
+three employers suppressed, no individual's pay; Book 18: 357 new questions in 29 chapters, a lesson plus one bank of
+at most 14 per chapter, no exercises or weekend problems (user ruling), 331 Python tests incl. an originality gate
+against Books 1–17, C++20 ×4, Rust, SQL on DuckDB and SQLite).
 Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 ## Commands
@@ -97,5 +118,8 @@ OQB_BOOK=2 .venv/bin/python tools/figcrop.py "Figure 23.4." out.png   # then REA
 - A model's memory is not a source: every checkable external fact goes
   through the source ledger; volatile facts live in `dated` boxes.
 - A practice is attributed to a named firm only with a citable public source.
+- The user's e-mail address never appears in the repository, a user agent or a request. If a source asks for
+  it, do not use that source (user rule, 2026-09-29). Documents already cited from such a site (SEC, BLS, DOL)
+  stay cited; their files may be fetched only from mirrors that ask for nothing, such as the Internet Archive.
 - No code is printed unless it is included from a tested file.
 - Every title starts "One Quant Book N — ".

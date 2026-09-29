@@ -1,0 +1,179 @@
+\chapter{Concurrency, Operating Systems and Networks}\label{ch:iv:concurrency-operating-systems-and-networks}
+
+Two threads each add one to a shared counter a million times; the program prints a number well below two million. The
+candidate is asked for the smallest value it could print, which is not what anyone expects, and then for three ways to make it
+print two million, ranked by what each costs on a hot path. Systems questions at trading firms follow the path of a message
+through a machine: threads and the memory they share, the kernel and its system calls, virtual memory and caches, and the
+network stack that delivers the packet. The engineering is One Quant Book~13's (chapters 3, 11 to~13) and Book~14's; this
+chapter is the interview.
+
+\section{Atomics, locks and memory ordering}
+
+Two threads that access the same memory, at least one writing, without synchronisation, have a data race; in C++ and Rust that
+is undefined behaviour (One Quant Book~13, chapter~9), and ThreadSanitizer reports it. The classic lost update comes from
+\texttt{++counter} being a load, an add and a store: two threads can load the same value and both store its successor. Under the
+simplest model of an interleaving (each thread's steps in order, one global order of memory operations: sequential
+consistency) the outcomes can be enumerated exhaustively, which is the interview's method for small programs.
+
+\begin{proposition}[How low can the counter go?]\label{prop:iv:concurrency-operating-systems-and-networks:counter}
+If two threads each perform $n \ge 2$ increments by a separate load and store, the final value under sequential consistency is
+at least 2 and at most $2n$, and 2 is reached. For $n = 1$ it is 1 or 2.
+\end{proposition}
+
+\begin{proof}
+Every store writes a loaded value plus one, so once a thread has stored, the counter is at least 1 forever. The final value is the
+last store, which is some thread's last increment; for $n \ge 2$ that increment's load comes after the same thread's first store, so
+it reads at least 1 and stores at least 2. To reach 2: thread A loads 0; thread B runs $n - 1$ increments; A stores 1; B loads 1; A
+runs its remaining $n - 1$ increments; B stores 2. The chapter's code enumerates every interleaving for $n \le 4$ and finds every
+value from 2 to $2n$.
+\end{proof}
+
+Fixes, from cheapest to dearest on a hot path: give each thread its own counter and sum at the end (no sharing at all); an atomic
+\texttt{fetch\_add} (a locked instruction on one cache line that bounces between cores under contention); a mutex around the
+increment (a system call when contended). Memory ordering (One Quant Book~13, chapter~11) decides what else becomes visible with an
+atomic operation: \texttt{relaxed} guarantees only atomicity, \texttt{release}/\texttt{acquire} make writes before a release visible
+after the matching acquire (the message-passing pattern), and \texttt{seq\_cst} adds a single total order, needed for patterns
+such as store buffering, where each thread writes one flag and reads the other's.
+
+\omcode{code/interviews/25-concurrency-operating-systems-and-networks/cpp/iv_spsc.hpp}{10}{33}{A single-producer
+single-consumer queue: the release store of the index publishes the element; the two indices live on separate cache
+lines.}\label{lst:iv:concurrency-operating-systems-and-networks:spsc}
+
+\section{Processes, threads, scheduling and system calls}
+
+A system call crosses from user to kernel mode and back; a context switch saves one thread's registers and restores another's,
+and pollutes caches and translation tables. Both cost far more than a function call, which is why latency-critical threads are
+pinned to isolated cores, poll instead of sleeping (busy polling), and avoid the kernel on the data path (kernel bypass, One Quant
+Book~13, chapter~13). A mutex that is uncontended is a couple of atomic instructions; contended, it sleeps in the kernel; a spinlock
+never sleeps and suits very short critical sections on dedicated cores only.
+
+\section{Memory: virtual memory, page faults, caches and false sharing}
+
+Virtual addresses are translated through a radix tree of page tables: with 48-bit addresses, 4 KiB pages and 8-byte entries, each
+level resolves 9 bits and four levels plus a 12-bit offset cover the address. The translation lookaside buffer caches
+translations; its reach is its entry count times the page size, so huge pages (2 MiB) multiply it by 512. The first touch of a page
+faults (One Quant Book~13, chapter~6), which is why trading processes pre-fault their memory at start-up. Caches move 64-byte lines;
+two threads writing different variables in the same line make it bounce between cores (false sharing), which padding each hot
+variable to its own line removes.
+
+\section{Networks: what happens when a packet arrives}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>={Stealth},
+  box/.style={draw=omDef,rounded corners=2pt,fill=omDef!6,minimum height=0.75cm,text width=2.35cm,align=center,inner sep=2pt},
+  byp/.style={draw=omThm,rounded corners=2pt,fill=omThm!8,minimum height=0.75cm,text width=2.35cm,align=center,inner sep=2pt}]
+\node[box] (nic) at (0,0) {NIC receives frame, DMA into a ring};
+\node[box] (irq) at (3.1,1.3) {interrupt, then NAPI polling};
+\node[box] (stk) at (6.2,1.3) {IP and UDP processing};
+\node[box] (sock) at (9.3,1.3) {socket buffer};
+\node[box] (app) at (12.7,0) {application};
+\node[box] (sys) at (9.3,-0.05) {\texttt{recvmsg}: system call, copy};
+\node[byp] (ring) at (6.2,-1.35) {user-space ring, polled by the application};
+\draw[->,thick,omDef] (nic) -- (irq);
+\draw[->,thick,omDef] (irq) -- (stk);
+\draw[->,thick,omDef] (stk) -- (sock);
+\draw[->,thick,omDef] (sock) -- (sys);
+\draw[->,thick,omDef] (sys) -- (app);
+\draw[->,thick,omThm] (nic) -- (ring);
+\draw[->,thick,omThm] (ring) -- (app);
+\node[font=\scriptsize,omDef,anchor=south] at (6.2,1.8) {kernel path};
+\node[font=\scriptsize,omThm,anchor=north] at (6.2,-1.85) {kernel bypass};
+\end{tikzpicture}
+
+\omcaption{A received packet's two routes to the application. Through the kernel: the network card writes the frame into memory by
+DMA, an interrupt starts the driver's polling, the stack processes the headers and queues the data on the socket, and a system call
+copies it out. With kernel bypass the card's ring is mapped into the application, which polls it: no interrupt, no system call, no
+copy.}\label{fig:iv:concurrency-operating-systems-and-networks:packet}
+\end{omfigure}
+
+TCP gives a reliable ordered byte stream with congestion control and retransmission; UDP gives datagrams that may be lost, duplicated
+or reordered, with no head-of-line blocking. Market data is multicast over UDP (One Quant Book~13, chapter~16), because one sender
+reaches many receivers and a lost packet should not delay the next; receivers detect gaps with sequence numbers and recover from a
+second line or a retransmission service. Order entry uses TCP, because every message must arrive in order and a lost order must not
+go unnoticed.
+
+\section{Worked answers}
+
+\begin{example}[Little's law and a ring buffer]\label{ex:iv:concurrency-operating-systems-and-networks:little}
+\emph{``A decoding stage receives 200\,000 messages a second and each spends 15 microseconds in it on average. How many are
+inside the stage at once? During a burst the feed delivers a million messages a second for a while and the stage still
+drains 200\,000; how long can the burst last before a ring buffer of 1\,024 slots overflows?''} Little's law: the average
+number in a stable system is the arrival rate times the time in the system, $200\,000 \times 15 \times 10^{-6} = 3$
+messages. In the burst the queue grows at $10^6 - 2 \times 10^5 = 800\,000$ messages a second, so 1\,024 slots last
+$1\,024/800\,000 = 1.28$ milliseconds. Then the design questions the numbers raise: feeds burst for longer than that at the
+open, so either the buffer grows (at 64 bytes a slot, a million slots is 64 megabytes, which no longer fits in cache), or the
+stage gets faster, or it sheds work by conflating updates, and the answer should say which the business can accept.
+\end{example}
+
+\section{Question bank}
+
+\omcode{code/interviews/25-concurrency-operating-systems-and-networks/cpp/snippets/race_counter.cpp}{1}{15}{Two threads, one
+counter.}\label{lst:iv:concurrency-operating-systems-and-networks:race}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:concurrency-operating-systems-and-networks:1}
+Why does \cref{lst:iv:concurrency-operating-systems-and-networks:race} usually print less than two million? What does the C++
+standard say about the program?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:concurrency-operating-systems-and-networks:2}
+When would you use a spinlock rather than a mutex?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:concurrency-operating-systems-and-networks:3}
+What is a context switch, what does it cost beyond the switch itself, and how do trading systems avoid them on the hot path?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer, trader} \iqfirm{any}]\label{iq:iv:concurrency-operating-systems-and-networks:4}
+Why do venues usually publish market data by UDP multicast but take orders on TCP sessions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:concurrency-operating-systems-and-networks:5}
+In the model where each increment is a separate load and store, what is the smallest value the program of
+\cref{lst:iv:concurrency-operating-systems-and-networks:race} could print? Describe the interleaving.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:concurrency-operating-systems-and-networks:6}
+Thread 1 writes \texttt{x = 1} then reads \texttt{y}; thread 2 writes \texttt{y = 1} then reads \texttt{x}; both start at 0. Can both
+threads read 0? Answer under sequential consistency, on x86, and with C++ relaxed atomics, and say how to forbid it.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:concurrency-operating-systems-and-networks:7}
+A producer writes a message then sets a flag; a consumer waits for the flag then reads the message. Which memory orderings make
+this correct, and which outcome do they forbid?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:concurrency-operating-systems-and-networks:8}
+Two threads each update their own \texttt{int64\_t} counter in an array of eight counters, and the program is slower than with one
+thread. Why, and what is the fix?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:concurrency-operating-systems-and-networks:9}
+With 48-bit virtual addresses, 4 KiB pages and 8-byte page-table entries, how many levels of page table are there? A TLB has 1\,536
+entries: how much memory does it cover using 4 KiB pages, and using 2 MiB huge pages?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:concurrency-operating-systems-and-networks:10}
+Write a lock-free single-producer single-consumer queue and justify every memory ordering in it.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:concurrency-operating-systems-and-networks:11}
+What happens, step by step, between a UDP packet arriving at the network card and the application having its payload? Which steps
+does kernel bypass remove?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, trader} \iqfirm{crypto firm}]\label{iq:iv:concurrency-operating-systems-and-networks:12}
+A multicast feed carries sequence numbers. Write the receiver's gap detector, allowing for late and duplicated packets, and say
+what the receiver does when a gap stays open.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer} \iqfirm{any}]\label{iq:iv:concurrency-operating-systems-and-networks:13}
+Thread A locks the order book then the risk state; thread B locks the risk state then the order book. What can happen, and give
+two ways to prevent it.
+\end{interviewq}
+
+\begin{omsources}
+\item M.~Herlihy and N.~Shavit, \emph{The Art of Multiprocessor Programming}, revised reprint, 2012.
+\item J.~Postel, RFC 768, \emph{User Datagram Protocol}, 1980; W.~Eddy (ed.), RFC 9293, \emph{Transmission Control Protocol (TCP)},
+2022.
+\item ISO/IEC 14882:2020, [intro.races] and [atomics.order]; One Quant Book~13, chapters 3, 6, 9, 11--13 and~16.
+\end{omsources}

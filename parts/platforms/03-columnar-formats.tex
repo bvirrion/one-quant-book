@@ -1,0 +1,432 @@
+\chapter{Columnar Formats}\label{ch:pl:columnar-formats}
+
+A researcher asks for one symbol's quotes over one hour of one day, from a month of quotes for fifty symbols stored in one
+file of 19.5~MB. The query reads 17.0~MB of it. The same quotes written in time order, or sorted by symbol and then time, in
+\omterm{def:pl:columnar-formats:rowgroup}{row groups} of 8\,192 rows, answer the same query by reading 0.39 or 0.36~MB. Nothing about the data changed, only where its
+bytes sit and what the file says about them. This chapter explains the two open columnar formats that most of the industry's
+research data now passes through --- one for memory, one for disk --- well enough to predict such numbers, builds a small
+columnar file format from scratch (\texttt{firm.colfile}) to see every byte, and measures what layout a market-data file
+should have.
+
+\section{Rows against columns}
+
+\begin{definition}[Row-oriented and columnar layout]\label{def:pl:columnar-formats:layouts}
+In a \emph{row-oriented layout}\index{row-oriented layout} the fields of each record are stored next to each other, record
+after record. In a \emph{columnar layout}\index{columnar layout} the values of each field are stored next to each other, field
+after field, so that the $i$-th record is the $i$-th value of every column.
+\end{definition}
+
+The normalised records of chapter~2 are row-oriented: 56 bytes a message, each message whole. A \omterm{def:pl:columnar-formats:layouts}{columnar layout} is the
+structure of arrays of One Quant Book~13, chapter~14, applied to storage: one array per field.
+\Cref{fig:pl:columnar-formats:layouts} shows the same four quotes both ways.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\tiny,cell/.style={draw,minimum width=0.78cm,minimum height=0.42cm,inner sep=0.5pt}]
+\foreach \f/\c [count=\j from 0] in {sym/omDef,ts/omMeth,bid/omThm,ask/omProp} {
+  \foreach \r in {0,1,2,3} {
+    \node[cell,fill=\c!22] at (\j*0.78+\r*3.3,1.3) {\f$_\r$};
+    \node[cell,fill=\c!22] at (\r*0.78+\j*3.3,0) {\f$_\r$};
+  }
+}
+\node[anchor=east,font=\scriptsize] at (-0.4,1.3) {rows};
+\node[anchor=east,font=\scriptsize] at (-0.4,0) {columns};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (6.21,-0.3) -- (9.33,-0.3) node[midway,below=4pt,font=\scriptsize]{a query on \texttt{bid} reads one run};
+\end{tikzpicture}
+
+\omcaption{The same four quotes in a \omterm{def:pl:columnar-formats:layouts}{row-oriented layout} (top: each record whole) and a \omterm{def:pl:columnar-formats:layouts}{columnar layout} (bottom: each field
+whole). A query that needs one field of every record reads a contiguous run in the \omterm{def:pl:columnar-formats:layouts}{columnar layout} and every record in the row
+layout.}\label{fig:pl:columnar-formats:layouts}
+\end{omfigure}
+
+\begin{proposition}[What a scan reads]\label{prop:pl:columnar-formats:scan}
+A query that needs $k$ of the $m$ fixed-width fields of every record, of widths $w_1,\dots,w_m$, reads
+$n\sum_{i=1}^m w_i$ bytes from a \omterm{def:pl:columnar-formats:layouts}{row-oriented layout} and $n\sum_{i\in K} w_i$ from a columnar one, where $K$ is the set of
+fields it needs.
+\end{proposition}
+
+\begin{proof}
+In the row layout the needed fields are interleaved with the others at every record, and storage is read in blocks far larger
+than a field, so every byte is read. In the \omterm{def:pl:columnar-formats:layouts}{columnar layout} the needed columns are contiguous and the others are never touched.
+\end{proof}
+
+Two more advantages come from the same place. A column holds values of one type and often of one kind --- a timestamp that
+increases, a symbol that repeats, a price that moves by a tick --- so it compresses far better than a row of mixed fields
+(chapter~2 measured it). And an array of one type is what vector instructions (One Quant Book~13, chapter~14) and array
+programming (chapter~8) want. The price is paid on writes and on reads of whole records: appending one record touches every
+column, which is why the intraday store of chapter~4 appends rows and the historical store holds columns.
+
+\section{The in-memory columnar standard: buffers, validity, dictionaries}
+
+The open in-memory columnar standard (Apache Arrow) fixes how a column sits in memory, so that two libraries, or two
+processes, can share it without converting it: the zero-copy exchanges of chapters~4 and~9 rely on it. A column (an
+\emph{array}) is a few contiguous buffers, recommended to be aligned and padded to 64 bytes.
+
+\begin{definition}[Validity bitmap]\label{def:pl:columnar-formats:validity}
+The \emph{validity bitmap}\index{validity bitmap} of a column is a buffer holding one bit per value, set when the value is
+present and clear when it is null, numbered from the least significant bit of each byte; a column with no null may omit it.
+\end{definition}
+
+A fixed-width column is its \omterm{def:pl:columnar-formats:validity}{validity bitmap} and one buffer of values. A string column adds an offsets buffer of $n+1$ integers:
+value $i$ is the bytes between offsets $i$ and $i+1$ of a data buffer. A dictionary-encoded column is an integer column of
+indices into a separate column of distinct values. \Cref{fig:pl:columnar-formats:buffers} lists the buffers of the first
+1\,000 rows of three columns of the chapter's quotes.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,buf/.style={draw,rounded corners=1pt,minimum height=0.5cm,inner sep=2pt,align=center}]
+\node[anchor=east] at (-0.2,1.5) {\texttt{ts} (int64)};
+\node[buf,fill=gray!10,text width=2.3cm] at (1.45,1.5) {validity: none};
+\node[buf,fill=omDef!18,text width=5.2cm] at (5.2,1.5) {values: 1\,000 $\times$ 8 = 8\,000 bytes};
+\node[anchor=east] at (-0.2,0.6) {\texttt{condition} (string)};
+\node[buf,fill=omThm!15,text width=2.3cm] at (1.45,0.6) {validity: 125 bytes};
+\node[buf,fill=omMeth!18,text width=2.6cm] at (3.9,0.6) {offsets: 1\,001 $\times$ 4};
+\node[buf,fill=omDef!18,text width=1.9cm] at (6.7,0.6) {data: 49 bytes};
+\node[anchor=west] at (7.85,0.6) {951 nulls};
+\node[anchor=east] at (-0.2,-0.3) {\texttt{symbol} (dictionary)};
+\node[buf,fill=omMeth!18,text width=2.3cm] at (1.45,-0.3) {indices: 4\,000 bytes};
+\node[buf,fill=omDef!18,text width=3.3cm] at (4.35,-0.3) {dictionary: 50 strings};
+\end{tikzpicture}
+
+\omcaption{Buffers of the first 1\,000 rows of three columns of the chapter's quotes in the in-memory columnar format: an integer
+column with no null needs no \omterm{def:pl:columnar-formats:validity}{validity bitmap}; a nullable string column has a bitmap, $n+1$ offsets and a data buffer holding only
+the 49 characters of its 49 present values; a dictionary column holds 4-byte indices into 50 distinct symbols. Data:
+\texttt{pl\_colfmt.arrow\_buffers}.}\label{fig:pl:columnar-formats:buffers}
+\end{omfigure}
+
+Nulls cost one bit each, not a sentinel value and not a byte: the condition code, null on 95\% of the rows, costs 125 bytes of
+bitmap for its 1\,000 rows plus the offsets. Market data needs nulls constantly: a quote with no bid, a trade with no condition,
+a field a venue added last year.
+
+\section{The on-disk columnar standard: row groups, pages, encodings}
+
+The open on-disk columnar standard (Apache Parquet) adds what memory does not need: compression, statistics, and the ability to
+read part of a file. Its layout (\cref{fig:pl:columnar-formats:anatomy}) is three levels deep.
+
+\begin{definition}[Row group, column chunk, data page]\label{def:pl:columnar-formats:rowgroup}
+A \emph{row group}\index{row group} is a horizontal slice of a columnar file's rows, stored as one \emph{column
+chunk}\index{column chunk} per column, each contiguous in the file. A column chunk is divided into \emph{data
+pages}\index{data page}, the unit of encoding and compression. The file's metadata (its schema, and the position, size, encoding
+and statistics of every chunk) is written in a footer after the data, so that the file can be written in one pass and read from
+its end.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,ch/.style={draw,minimum height=0.55cm,inner sep=1pt,align=center}]
+\foreach \g/\x in {0/0,1/4.3} {
+  \node[ch,fill=omDef!18,minimum width=1.2cm] at (\x+0.6,0) {\texttt{symbol}};
+  \node[ch,fill=omMeth!18,minimum width=1.2cm] at (\x+1.8,0) {\texttt{ts}};
+  \node[ch,fill=omThm!18,minimum width=1.2cm] at (\x+3.0,0) {\texttt{bid}};
+  \draw[decorate,decoration={brace,amplitude=4pt}] (\x,0.35) -- (\x+3.6,0.35) node[midway,above=4pt]{row group \g};
+}
+\node at (8.5,0) {\dots};
+\node[ch,fill=gray!15,minimum width=2.6cm] (ft) at (10.6,0) {footer};
+\foreach \p in {0,1,2} {\node[ch,fill=omMeth!10,minimum width=0.36cm,minimum height=0.4cm] at (1.44+\p*0.36,-1.2) {};}
+\draw[dashed] (1.2,-0.28) -- (1.26,-1.0); \draw[dashed] (2.4,-0.28) -- (2.34,-1.0);
+\node[anchor=north] at (1.8,-1.5) {data pages: the unit of encoding and compression};
+\node[align=left,anchor=north,text width=3.0cm] at (10.6,-0.45) {schema; for every chunk: offset, size, encoding, row count, min, max};
+\end{tikzpicture}
+
+\omcaption{Anatomy of a file in the on-disk columnar format: \omterm{def:pl:columnar-formats:rowgroup}{row groups} of \omterm{def:pl:columnar-formats:rowgroup}{column chunks}, each chunk a sequence of \omterm{def:pl:columnar-formats:rowgroup}{data pages},
+and a footer after the data that says where every chunk is and what range of values it holds.}\label{fig:pl:columnar-formats:anatomy}
+\end{omfigure}
+
+Inside a page, values are encoded before they are compressed. Four encodings do most of the work on market data, and
+\texttt{firm.colfile} implements the four in numpy (\cref{lst:pl:columnar-formats:encode}).
+
+\begin{definition}[Dictionary, run-length, delta encoding; bit packing]\label{def:pl:columnar-formats:encodings}
+\emph{Dictionary encoding}\index{dictionary encoding} stores a column's distinct values once and each value as an index into
+them. \emph{Run-length encoding}\index{run-length encoding} stores each run of equal consecutive values as the value and the run's
+length. \emph{Delta encoding}\index{delta encoding} stores the first value and then each value's difference from the previous
+one, usually as the excess over the smallest difference in a block. \emph{Bit packing}\index{bit packing} stores small
+non-negative integers in the fewest bits that hold the largest of them, with no byte boundaries between values.
+\end{definition}
+
+\omcode{code/firm/colfile/firm_colfile.py}{96}{125}{The four encodings of \texttt{firm.colfile}: plain values, a dictionary with
+bit-packed indices, runs with bit-packed lengths, and deltas over a per-block minimum, bit-packed at the block's own width.}\label{lst:pl:columnar-formats:encode}
+
+\begin{dated}{2026-09}{The encodings of the open on-disk format}\label{dat:pl:columnar-formats:encodings}
+The specification of the open on-disk columnar format (consulted September 2026) lists as encodings plain, dictionary (plain or
+run-length dictionary), a run-length and bit-packing hybrid, three \omterm{def:pl:columnar-formats:encodings}{delta encodings} (binary-packed integers, byte-array lengths,
+and byte-array prefixes), byte-stream split for floating point, and ALP (adaptive lossless floating point). Its \omterm{def:pl:columnar-formats:encodings}{delta encoding}
+bit-packs miniblocks of deltas, each at its own bit width, after subtracting a minimum delta.
+\end{dated}
+
+\Cref{tab:pl:columnar-formats:encodings} encodes one day of the chapter's quotes (50\,000 rows) column by column. Each column
+has a clear winner, and it is not the same one: the date, one value all day, is 13 bytes as a dictionary; the symbol, 50 values
+repeated, is 37.9~kB as a dictionary in capture order and 480 bytes as runs once the day is sorted by symbol; the timestamp,
+increasing, halves as deltas; the bid, a few hundred distinct prices, is best as a dictionary; the venue, four values, takes two
+bits a row.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrl}
+\toprule
+column (50\,000 rows) & plain & dictionary & run-length & delta & best \\
+\midrule
+date & 200\,000 & 13 & 15 & 449 & dictionary \\
+symbol, capture order & 400\,008 & 37\,917 & 404\,432 & -- & dictionary \\
+symbol, sorted by symbol & 400\,008 & 37\,917 & 480 & -- & run-length \\
+timestamp & 400\,000 & 500\,009 & 406\,259 & 201\,085 & delta \\
+bid & 400\,000 & 99\,097 & 410\,505 & 137\,947 & dictionary \\
+bid size & 200\,000 & 37\,705 & 208\,072 & 87\,948 & dictionary \\
+venue & 400\,008 & 12\,549 & 318\,436 & -- & dictionary \\
+\bottomrule
+\end{tabular}
+\caption{Bytes of each column of one day of quotes under each of \texttt{firm.colfile}'s encodings, before any compression;
+strings are stored plain as offsets and bytes, and \omterm{def:pl:columnar-formats:encodings}{delta encoding} applies to integers only. Data:
+\texttt{pl\_colfmt.encodings\_by\_column}.}\label{tab:pl:columnar-formats:encodings}
+\end{table}
+
+\section{Statistics and pushdown}
+
+The footer's statistics are what let a reader skip data it has not read.
+
+\begin{definition}[Zone map, predicate pushdown, projection pushdown]\label{def:pl:columnar-formats:pushdown}
+A \emph{zone map}\index{zone map} is the minimum and maximum of a column within a unit of storage (a \omterm{def:pl:columnar-formats:rowgroup}{row group}, a page).
+\emph{Predicate pushdown}\index{predicate pushdown} evaluates a query's filter against zone maps before reading, and skips every
+unit whose range cannot satisfy it. \emph{Projection pushdown}\index{projection pushdown} reads only the columns a query names,
+in its output or its filter.
+\end{definition}
+
+\begin{proposition}[Pruning by zone maps]\label{prop:pl:columnar-formats:pruning}
+\omterm{def:pl:columnar-formats:pushdown}{Predicate pushdown} never skips a matching row, and it skips a \omterm{def:pl:columnar-formats:rowgroup}{row group} exactly when some condition of the filter is false for
+every value in the group's range. A filter on a column therefore prunes in proportion to how narrow that column's ranges are in
+each \omterm{def:pl:columnar-formats:rowgroup}{row group}: well on a column the file is sorted by, hardly at all on a column whose values are spread across every group.
+\end{proposition}
+
+\begin{proof}
+A row that matches has, in its \omterm{def:pl:columnar-formats:rowgroup}{row group}, a value inside the filter's range for every filtered column, so the group's
+$[\min,\max]$ intersects that range and the group is read. Conversely a group is skipped only if some condition fails on its
+whole range. If a column's values are sorted, each group's range is a narrow interval and only the groups overlapping the
+filter survive; if every group contains nearly all values, every range contains the filter's.
+\end{proof}
+
+\omcode{code/firm/colfile/firm_colfile.py}{201}{238}{Pruning and reading in \texttt{firm.colfile}: a row group is skipped when a
+condition fails on its zone map; the chunks of the needed columns of the others are read, decoded and filtered.}\label{lst:pl:columnar-formats:read}
+
+The proposition is the whole of layout design. The chapter's month of quotes, written three ways into the on-disk format with
+zstd compression, answers three query shapes through a file object that counts every byte pyarrow reads
+(\cref{tab:pl:columnar-formats:queries}). Shuffled, the file offers no narrow range to any filter, and every query reads most of
+it: \omterm{def:pl:columnar-formats:pushdown}{projection pushdown} alone saves the columns not named. In capture order the timestamp is sorted, so the one-hour queries read
+3\% of the file; the one-symbol month still reads 28\%, the projected columns of every group. Sorted by symbol and then time,
+the one-symbol queries read 1--3\% and the one-hour cross-section 86\%.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+query & shuffled & time order & symbol, then time \\
+\midrule
+one symbol, one hour & 86.0\% & 3.30\% & 3.30\% \\
+one symbol, one month & 34.1\% & 28.2\% & 1.07\% \\
+all symbols, one hour & 81.7\% & 3.13\% & 86.1\% \\
+\bottomrule
+\end{tabular}
+\caption{Share of the file read by three queries (projecting bid and ask) from a month of quotes for fifty symbols in the on-disk
+columnar format, in three row orders, with \omterm{def:pl:columnar-formats:rowgroup}{row groups} of 32\,768 rows. Counted by a file object wrapped around the file. Data:
+\texttt{pl\_colfmt.study}.}\label{tab:pl:columnar-formats:queries}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,ymode=log,log basis x=2,xlabel={rows per row group (log scale)},
+  ylabel={MB read (log scale)},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  xtick={2048,8192,32768,131072,524288},xticklabels={2\,048,8\,192,32\,768,131\,072,524\,288},ymin=0.2,ymax=40,
+  ytick={0.3,1,3,10,30},yticklabels={0.3,1,3,10,30},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,gray] table[x=rows,y=shuffled]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\addplot[thick,mark=square*,omDef] table[x=rows,y=time]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=rows,y=symbol]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\legend{shuffled,time order,{symbol, then time}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bytes read by the one-symbol, one-hour query against the size of the \omterm{def:pl:columnar-formats:rowgroup}{row groups}, for the three row orders. Sorted,
+the curve is U-shaped: large groups make \omterm{def:pl:columnar-formats:pushdown}{zone maps} coarse, small ones lengthen the footer every query reads; its minimum
+here is at 8\,192 rows (0.39~MB in time order, 0.36~MB sorted by symbol). Shuffled, only projection helps. Data:
+\texttt{pl\_colfmt.study}.}\label{fig:pl:columnar-formats:rowgroups}
+\end{omfigure}
+
+The row-group size is the other dial (\cref{fig:pl:columnar-formats:rowgroups}). Large groups make each \omterm{def:pl:columnar-formats:pushdown}{zone map} cover a long
+stretch of time, so the one-hour query reads 5.5 to 6.0~MB at half a million rows a group. Small groups sharpen the \omterm{def:pl:columnar-formats:pushdown}{zone maps} but
+lengthen the footer that every query reads first, one entry per column per group: at 2\,048 rows (489 groups) the time-ordered
+file's footer is 444~kB against 115~kB at 8\,192 rows, and the query reads 0.57 to 0.64~MB. The minimum is where the two costs
+balance.
+
+\section{Choosing a layout for market data}
+
+No single order serves every query: time order is right for cross-sections of an hour, symbol order for the history of one name,
+and each is wrong for the other. The industry's answers combine three tools.
+
+\begin{method}[Laying out a market-data file]\label{met:pl:columnar-formats:layout}
+(1) Partition by the coarsest filter every query uses, almost always the date (chapter~2), so that no file mixes days.
+(2) Inside a partition, sort by the filter that queries use most after the date (the symbol, for research on names), then by
+time, so that both \omterm{def:pl:columnar-formats:pushdown}{zone maps} are narrow. (3) Choose the row-group size from a measurement like
+\cref{fig:pl:columnar-formats:rowgroups} on real queries, and let the writer pick each column's encoding. (4) If a second query
+shape matters as much as the first, keep a second copy in the other order: storage is cheaper than a full scan repeated every
+day.
+\end{method}
+
+\begin{remark}[Nested data, and where the design comes from]\label{rem:pl:columnar-formats:dremel}
+The on-disk format stores nested records (an order with a list of fills) by the record shredding and assembly algorithm
+published for Google's Dremel system in 2010; the in-memory format mirrors the same nested types. Flat market-data tables use
+none of it, but order and trade records from order-management systems often arrive nested.
+\end{remark}
+
+\section{Tutorial: the same quotes, three layouts}\label{tut:pl:columnar-formats:tut}
+
+\begin{tutorial}
+\textbf{Goal.} See every buffer of a column in memory and every chunk of a file on disk, then measure what layout and row-group
+size do to a query. \textbf{End state:} \cref{fig:pl:columnar-formats:buffers,fig:pl:columnar-formats:rowgroups} and
+\cref{tab:pl:columnar-formats:encodings,tab:pl:columnar-formats:queries}.
+\begin{tutsteps}
+\item \textbf{Generate} \texttt{pl\_colfmt.quotes()}: a million rows, fifty symbols, twenty days, in capture order.
+\item \textbf{Buffers.} \texttt{arrow\_buffers()} lists the buffers of an integer, a nullable string and a dictionary column.
+\item \textbf{Encodings.} \texttt{encodings\_by\_column()}, in capture order and sorted, with \texttt{firm.colfile}'s four
+encodings (\cref{lst:pl:columnar-formats:encode}).
+\item \textbf{Layouts.} \texttt{study()} writes the month in three orders and five row-group sizes and counts the bytes each query
+reads with \texttt{CountingFile}.
+\item \textbf{Your own file.} Write the month with \texttt{firm\_colfile.write}, query it with \texttt{ColFile.read}
+(\cref{lst:pl:columnar-formats:read}), and compare the answer and the bytes read with pyarrow's.
+\end{tutsteps}
+\textbf{What to change next.} Partition the month by date and sort each day by symbol, then rerun the three queries; add a
+page-level \omterm{def:pl:columnar-formats:pushdown}{zone map} to \texttt{firm.colfile} and measure what it saves on large \omterm{def:pl:columnar-formats:rowgroup}{row groups}.
+\end{tutorial}
+
+\section{Build: a columnar file from scratch}\label{bld:pl:columnar-formats:colfile}
+
+\begin{build}
+\bfield{Purpose} A columnar format small enough to read in full: the reference against which the chapter's claims about
+encodings, \omterm{def:pl:columnar-formats:pushdown}{zone maps} and pushdown are checked, and the model for the flat formats of chapter~4.
+\bfield{Interface} \texttt{ENCODINGS}; \texttt{bitpack(values, width)}, \texttt{bitunpack(data, width, n)};
+\texttt{encode(values, encoding)}, \texttt{decode(data, encoding, dtype, n)}, \texttt{best\_encoding(values)};
+\texttt{write(path, columns, row\_group\_size, encodings)} returning the footer; \texttt{ColFile(path).read(columns, where) ->
+(columns, stats)} with \texttt{row\_groups}, \texttt{row\_groups\_read}, \texttt{bytes\_read}, \texttt{file\_bytes}.
+\bfield{Rules} Magic number at both ends and a footer of chunk positions, encodings and \omterm{def:pl:columnar-formats:pushdown}{zone maps}; a chunk is decoded only if its
+\omterm{def:pl:columnar-formats:rowgroup}{row group} may match; a filter never loses a matching row; the reader's answer equals a full scan's.
+\bfield{Acceptance tests} \texttt{code/firm/colfile/tests/}: \omterm{def:pl:columnar-formats:encodings}{bit packing} at widths 0 to 64; every encoding round-trips every column
+type, and delta refuses non-integers; the obvious encoding chosen for a run, a progression and a small alphabet; a filtered read
+equal to pyarrow's, reading one \omterm{def:pl:columnar-formats:rowgroup}{row group} of twenty; a projection that reads only its chunks.
+\bfield{Stretch} Page-level \omterm{def:pl:columnar-formats:pushdown}{zone maps}; compression of each chunk after encoding; nullable columns with a \omterm{def:pl:columnar-formats:validity}{validity bitmap};
+dictionary pages shared by the \omterm{def:pl:columnar-formats:rowgroup}{row groups} of a column.
+\end{build}
+
+\begin{omsources}
+\item Apache Arrow, \emph{Arrow Columnar Format} (specification); Apache Parquet, \emph{File Format}, \emph{Concepts} and
+\emph{Encodings} (specification).
+\item D.~J.~Abadi, S.~R.~Madden and N.~Hachem, ``Column-stores vs.\ row-stores: how different are they really?'',
+\emph{SIGMOD}, 2008.
+\item S.~Melnik et al., ``Dremel: interactive analysis of web-scale datasets'', \emph{Proceedings of the VLDB Endowment} 3(1),
+2010.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:1}
+A table has five 8-byte fields and a million rows. How many bytes does a scan of one field read in a row-oriented and in a
+\omterm{def:pl:columnar-formats:layouts}{columnar layout}, before compression?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:2}
+A nullable string column of 1\,000 rows has 49 present values of one character each. Count the bytes of its \omterm{def:pl:columnar-formats:validity}{validity bitmap}, its
+32-bit offsets and its data.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:3}
+The venue column takes four values over 50\,000 rows. How many bits a value, and how many bytes, does \omterm{def:pl:columnar-formats:encodings}{dictionary encoding} with
+bit-packed indices need, and why does \cref{tab:pl:columnar-formats:encodings} show 12\,549?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:4}
+Why does the timestamp column compress to about 32 bits a value under \omterm{def:pl:columnar-formats:encodings}{delta encoding} in capture order, and why worse once the
+day is sorted by symbol?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:5}
+In time order, why does the one-symbol, one-month query still read 28\% of the file, although it returns 2\% of the rows?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:6}
+Explain the U shape of \cref{fig:pl:columnar-formats:rowgroups}: what grows on each side of the minimum?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:columnar-formats:7}
+\emph{Coding.} Write the month with \texttt{firm\_colfile.write} sorted by symbol and then time, in \omterm{def:pl:columnar-formats:rowgroup}{row groups} of 8\,192 rows,
+and read the one-symbol, one-hour query with \texttt{ColFile.read}. How many of the \omterm{def:pl:columnar-formats:rowgroup}{row groups} does it read, and does the answer
+equal pyarrow's?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:columnar-formats:8}
+\emph{Find the flaw.} ``Our quotes file is sorted by time and has statistics on every column, so any filter is pushed down and a
+query for one symbol reads only that symbol's data.''
+\end{exercise}
+
+\section{Problem: Most of the File for One Hour}
+
+\begin{problem}[{Weekend problem --- laying out a month of quotes}]\label{pb:pl:columnar-formats:1}
+The chapter's month of quotes (fifty symbols, twenty days, a million rows), its three row orders and five row-group sizes.
+
+\medskip\noindent\textbf{Part I --- Rows and columns.}
+\begin{enumerate}
+\item What share of a row-oriented table of nine fields does a query on two fields read, if all fields have equal width?
+\item Which buffers does a nullable string column have in the in-memory format?
+\item Why does a null cost one bit?
+\item Which encoding wins for the date, the symbol in capture order, the timestamp and the bid?
+\item Why does sorting by symbol make \omterm{def:pl:columnar-formats:encodings}{run-length encoding} of the symbol shrink from 404\,432 to 480 bytes?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Pushdown.}
+\begin{enumerate}[resume]
+\item What does a \omterm{def:pl:columnar-formats:pushdown}{zone map} hold, and when does it let a reader skip a \omterm{def:pl:columnar-formats:rowgroup}{row group}?
+\item Can \omterm{def:pl:columnar-formats:pushdown}{predicate pushdown} return a wrong answer? Why not?
+\item In the shuffled file, what share does the one-symbol, one-hour query read, and what saves it anything at all?
+\item In time order, what share do the two one-hour queries read at 32\,768 rows a group?
+\item Sorted by symbol, what share does the all-symbols hour read, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- \omterm{def:pl:columnar-formats:rowgroup}{Row groups}.}
+\begin{enumerate}[resume]
+\item How many megabytes does the one-symbol, one-hour query read at 524\,288 rows a group in time order?
+\item And at 8\,192?
+\item Why is the query more expensive again at 2\,048 rows?
+\item How much larger is the time-ordered file's footer at 2\,048 rows than at 8\,192?
+\item Which row-group size would you choose, and on what evidence?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the share of the file read by the one-symbol, one-hour query in each order, and the best
+row-group size.
+\item Which order serves which query shape, and which serves neither?
+\item What layout do you give a month of quotes that serves both one-symbol and one-hour queries?
+\item What would you have to measure before trusting these numbers on real data?
+\item In one sentence: what decides how many bytes a query reads from a columnar file?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:columnar-formats:1}
+Why are columnar formats used for market data research, and when is a row format better?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:columnar-formats:2}
+What is \omterm{def:pl:columnar-formats:pushdown}{predicate pushdown}, and what does the layout of the file have to do with it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:columnar-formats:3}
+Which encodings would you expect for a timestamp, a symbol and a price column, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:columnar-formats:4}
+How are nulls represented in the in-memory columnar standard, and what does a null cost?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:pl:columnar-formats:5}
+Research queries on your quotes store are slow. How do you find out whether the layout is the problem, and what do you change?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:columnar-formats:6}
+Design the file layout for five years of US equity trades that researchers query by symbol over long periods and by time across
+all symbols.
+\end{interviewq}

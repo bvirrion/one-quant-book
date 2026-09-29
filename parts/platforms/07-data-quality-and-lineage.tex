@@ -1,0 +1,388 @@
+\chapter{Data Quality and Lineage}\label{ch:pl:data-quality-and-lineage}
+
+On 6 May 2010, between 2:40 and 3:00 in the afternoon, more than 20\,000 trades in more than 300 US securities were executed at
+prices 60\% or more away from where they had been minutes before, some at a penny, some at \$100\,000. After the close the
+exchanges and their self-regulator agreed to break all of them as clearly erroneous. A \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} that had captured those
+trades faithfully, and never learned that they had been cancelled, fed them to every backtest, volatility estimate and
+execution study that touched that afternoon, for as long as it kept the data. Nothing in the store was corrupt; the data were
+exactly what the feed had sent. What was missing was a layer that checks data against what it should look like, marks what
+fails instead of deleting it, applies the corrections that arrive later as new versions, and knows which results were built
+from what. This chapter builds that layer (\texttt{firm.dataqual}) and measures it on a simulated day with planted defects and,
+just as important, genuine market events that a careless rule mistakes for defects.
+
+\section{Checks: completeness, validity, consistency, timeliness}
+
+\begin{definition}[Data-quality rule, data contract]\label{def:pl:data-quality-and-lineage:rule}
+A \emph{data-quality rule}\index{data-quality rule} is an automated check of a dataset against an expectation --- that it is
+complete, that its values are valid, that it is consistent with itself and with other sources, that it is timely --- run every
+time the data are produced, with a severity and an owner who acts on its failures. A \emph{data contract}\index{data contract}
+is the agreement between a dataset's producer and its consumers that states its schema, its rules and its delivery times, so
+that a change on either side is a change to the contract rather than a surprise.
+\end{definition}
+
+Four families of checks cover most market-data defects. Completeness: no messages missing (the feed's sequence numbers have no
+gap, chapter~2), no instrument silent when it should be quoting. Validity: every value in its domain (positive prices and sizes,
+known instruments, timestamps inside the session). Consistency: the data agree with themselves (no bid at or above the ask, trade
+prices near the quotes) and with other sources (another feed, a vendor's copy, the official close). Timeliness: the data arrived
+when the contract says. \Cref{lst:pl:data-quality-and-lineage:rules} is the suite of the chapter, written as data: each rule has
+a kind, a severity, an owner and parameters, and \texttt{firm.dataqual} runs any suite over any partition.
+
+\omcode{code/platforms/07-data-quality-and-lineage/python/pl_dataqual.py}{88}{110}{The chapter's rule suite as data: sequence gaps,
+bounds, crossed books, staleness, price spikes, broken trades and a count against a vendor's copy, each with a severity and an
+owner.}\label{lst:pl:data-quality-and-lineage:rules}
+
+The day is the second of the chapter-4 week: two instruments, 47\,472 events, 9\,258 quotes and 1\,190 trades. Two genuine events
+are part of it: SIM2's trading is halted for 60 seconds at 40\% of the session, and SIM2's price level jumps by 3\% at 60\% of it,
+on news, and stays there. Into copies of the day, twenty times with twenty seeds, the chapter plants six kinds of defect: a gap of
+200 events, three crossed quotes, eight trade prices off by a factor of ten (a decimal slip, up or down), a 90-second silence of
+SIM1's quotes, four trades broken by the venue after the close, and, separately, a vendor's later correction of an official close.
+
+\section{Anomaly flags, not deletions}
+
+\begin{definition}[Anomaly flag, quarantine]\label{def:pl:data-quality-and-lineage:flag}
+An \emph{anomaly flag}\index{anomaly flag} is a record attached to a row or a partition that names the rule it failed, the
+severity and the detail, leaving the row itself unchanged; consumers decide whether to exclude flagged rows. A
+\emph{quarantine}\index{quarantine} is the state of a partition that failed an error-severity rule: it is withheld from readers
+until a person releases it, with a reason, or it is rebuilt.
+\end{definition}
+
+Deleting a bad row is tempting and wrong. The row may be right (a genuine 3\% jump looks like a spike to a naive rule); another
+consumer may need it (a surveillance system wants the erroneous trades, chapter~30); and a deletion cannot be audited or undone.
+A flag keeps all three options open: the backtest excludes error-severity rows, the surveillance system reads them, and the rule
+can be improved and rerun.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box] (p) at (0,0) {partition\\(date, table)};
+\node[box,fill=omMeth!15] (r) at (2.9,0) {rule suite\\(data)};
+\node[box,fill=omThm!12] (f) at (5.7,0) {flags\\(row, rule, severity)};
+\node[box] (pub) at (9.2,0.8) {published:\\consumers filter};
+\node[box,fill=omThm!20] (qz) at (9.2,-0.8) {quarantined:\\withheld};
+\node[box,fill=gray!10] (rel) at (12.1,-0.8) {released\\by a person};
+\node[box,fill=omProp!15] (cor) at (2.9,-1.8) {vendor correction:\\new version};
+\draw[->] (p) -- (r); \draw[->] (r) -- (f);
+\draw[->] (f) -- node[above,sloped]{warnings} (pub.west);
+\draw[->] (f) -- node[below,sloped]{errors} (qz.west);
+\draw[->] (qz) -- (rel);
+\draw[->] (cor) -| (p);
+\end{tikzpicture}
+
+\omcaption{The data-quality layer: every partition runs the rule suite; flags are recorded beside the rows, never in place of them;
+a partition with an error-severity flag is quarantined until released; a vendor's correction arrives as a new version of the data,
+and the rules run again.}\label{fig:pl:data-quality-and-lineage:pipeline}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ymode=log,xlabel={SIM2 trade number, in sequence order},ylabel={trade price (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},ymin=20,ymax=5000,
+  ytick={30,100,300,1000,3000},yticklabels={30,100,300,1\,000,3\,000},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.8pt,omDef] table[x=n,y=price]{figdata/platforms/07-data-quality-and-lineage/sim2_prices.csv};
+\addplot[only marks,mark=o,mark size=3pt,omThm,thick] table[x=n,y=price,restrict expr to domain={\thisrow{flagged}}{1:1}]{figdata/platforms/07-data-quality-and-lineage/sim2_prices.csv};
+\legend{trade,flagged as a spike (error)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{SIM2's trades on the defective copy of seed~0, on a log scale: two decimal slips (one ten times too high, one ten times too
+low) stand out and are flagged; the genuine 3\% jump late in the day is invisible at this scale and is not flagged by the aware rule.
+Data: \texttt{fig\_dataqual.py}.}\label{fig:pl:data-quality-and-lineage:prices}
+\end{omfigure}
+
+The first version of the suite flagged the planted defects and a good deal more. The spike rule compared each trade price with the
+median of the previous 50 trades of its symbol, in robust units: the median absolute deviation of the previous deviations, with a
+floor of 0.1\% so that a one-tick move is never a spike. On the day of the jump it flagged every trade for the next few dozen, until the backward median caught up with the
+new level (\cref{fig:pl:data-quality-and-lineage:jump}). A spike and a level shift look identical from behind; from ahead they do
+not, because a spike comes back. The data-quality run happens after the close, so it may look ahead:
+
+\begin{method}[Telling a spike from a move]\label{met:pl:data-quality-and-lineage:spike}
+Flag a value when it deviates, by more than $k$ robust units, both from the median of the values before it and from the median of
+the values after it. A decimal slip deviates from both; a genuine move of the level deviates only from the values before. At the
+start of a series, where there is no history, compare with the values after only.
+\end{method}
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{78}{99}{The spike rule: deviation from the backward median in robust units, floored,
+and, with \texttt{confirm}, from the forward median too.}\label{lst:pl:data-quality-and-lineage:spike}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,xlabel={SIM2 trade number},ylabel={price},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!20},enlarge y limits=0.12,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[only marks,mark=*,mark size=1.2pt,omDef] table[x=n,y=price]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[thick,omMeth] table[x=n,y=behind]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[thick,omMeth,dashed] table[x=n,y=ahead]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[only marks,mark=o,mark size=2.6pt,omThm,thick] table[x=n,y=price,restrict expr to domain={\thisrow{naive_only}}{1:1}]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\legend{trade price,median of the previous 50,median of the next 50,flagged by the naive rule only}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{SIM2's trades around its genuine 3\% jump. Measured from the backward median, every trade for the next few dozen looks
+like a spike, and the naive rule flags 24 of them (circled); measured from the forward median too, none does, since the new level
+persists. Data: \texttt{fig\_dataqual.py} (seed 0).}\label{fig:pl:data-quality-and-lineage:jump}
+\end{omfigure}
+
+The staleness rule failed the same way on the halt: 60 seconds without a quote from SIM2 is a defect in the feed only if the market
+was open. The rule must know the market's state --- the venue's trading-action messages (chapter~2's events include them) --- and
+not count time spent halted (\cref{lst:pl:data-quality-and-lineage:stale}).
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{102}{117}{The staleness rule, which does not count the time the market itself spent
+silent (a trading halt, a scheduled pause) in a gap.}\label{lst:pl:data-quality-and-lineage:stale}
+
+\Cref{tab:pl:data-quality-and-lineage:detection} is the result over twenty seeds. Every planted defect is found by both versions of
+the suite; the difference is entirely in the false flags: 495 trades wrongly flagged as spikes and 20 halts wrongly flagged as
+stale feeds by the naive suite, none by the aware one.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+rule & planted & found & false flags, naive & false flags, aware \\
+\midrule
+sequence gap & 20 & 20 & 0 & 0 \\
+crossed book & 60 & 60 & 0 & 0 \\
+price spike & 160 & 160 & 495 & 0 \\
+stale quotes & 20 & 20 & 20 & 0 \\
+broken trades & 80 & 80 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Planted defects, defects found and rows wrongly flagged by each rule over twenty seeds of planting, with the naive suite
+(backward-looking spike rule, staleness blind to halts) and the aware one. Data: \texttt{pl\_dataqual.detection}.}\label{tab:pl:data-quality-and-lineage:detection}
+\end{table}
+
+A planted defect that every rule finds is not a test of the rules; the confounders are. A surveillance detector of One Quant
+Book~9 caught all its planted spoofers until legitimate look-alikes were added (its chapter~29), and the same lesson holds here:
+plant the genuine events the real market has, and measure the false flags.
+
+\section{Cross-source checks}
+
+\begin{definition}[Cross-source check]\label{def:pl:data-quality-and-lineage:cross}
+A \emph{cross-source check}\index{cross-source check} compares a dataset with an independent source of the same facts --- the other
+feed line, a second vendor, the venue's end-of-day file, the official close --- on an aggregate that both can compute (a count, a
+volume, a last price per interval), and flags the intervals where they differ by more than a tolerance.
+\end{definition}
+
+A single source can be complete by its own sequence numbers and still wrong: a normaliser that dropped a message type, a
+compaction that lost a file. The chapter's check counts trades per minute in the store and in a vendor's copy of the day and flags
+minutes that differ by more than 2\%: over the twenty seeds it raised 16 flags, the minutes in which the planted gap of 200 events
+happened to contain trades. It does not say which trades are missing, only where to look; that is the right division of labour
+between a cheap check that runs everywhere and an expensive investigation that runs where it points.
+
+\section{Vendor corrections and versions}
+
+\begin{definition}[Vendor correction]\label{def:pl:data-quality-and-lineage:correction}
+A \emph{vendor correction}\index{vendor correction} is a later delivery that changes a value already delivered (a close, a trade
+condition, a corporate action): it is stored as a new version of the same fact, with its own knowledge time, and never overwrites
+the earlier version.
+\end{definition}
+
+The chapter's vendor delivers SIM2's official close at 16:30 on the day, and a corrected close at 07:10 the next morning. Both are
+versions of one fact in Book~7's bitemporal store: asked at 23:00, the close is the first; asked at 08:00, the second. The broken
+trades of the hook are the same pattern: a list of cancellations, delivered after the close, applied as flags (\texttt{busted}) on
+the trades they name. What a correction changes is not only the fact but everything computed from it, and that is lineage.
+
+\section{Lineage and provenance}
+
+\begin{definition}[Data lineage, provenance record]\label{def:pl:data-quality-and-lineage:lineage}
+The \emph{data lineage}\index{data lineage} of a result is the graph of dataset versions and transformations it was derived from, back
+to its raw inputs. A \emph{provenance record}\index{provenance record} is the stored description of how one dataset version was
+produced: the versions of its inputs (by content hash), the code and its version, and when and by whom it ran.
+\end{definition}
+
+\texttt{firm.dataqual}'s lineage records each dataset version as a node, named by the content hash of its data (Book~7's
+\texttt{firm.workflow.content\_hash}), with an edge from each input version it was built from
+(\cref{lst:pl:data-quality-and-lineage:lineage}). A correction produces a new version of the input; every node downstream of the
+old version is stale. In the chapter's example (\cref{fig:pl:data-quality-and-lineage:lineage}), the corrected close makes the
+marks, the P\&L and the research features stale, and leaves the minute bars, built from the trades alone, untouched.
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{189}{203}{Lineage: a dataset version is its name and content hash, with its inputs'
+versions; everything downstream of an old version is stale once it is corrected.}\label{lst:pl:data-quality-and-lineage:lineage}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.6cm,inner sep=3pt,align=center}]
+\node[box] (tr) at (0,0) {trades\\2026-09-22};
+\node[box,fill=omMeth!25] (cl) at (3,0.9) {closes\\(corrected)};
+\node[box] (ba) at (3,-0.9) {minute bars};
+\node[box,fill=omThm!12] (mk) at (6,1.5) {marks};
+\node[box,fill=omThm!12] (pn) at (9,1.5) {P\&L};
+\node[box,fill=omThm!12] (ft) at (6,-0.3) {features};
+\draw[->] (tr) -- (cl); \draw[->] (tr) -- (ba);
+\draw[->] (cl) -- (mk); \draw[->] (mk) -- (pn);
+\draw[->] (cl) -- (ft); \draw[->] (ba) -- (ft);
+\node[omThm,anchor=west] at (7.2,-0.3) {stale: rebuild};
+\node[anchor=north] at (3,-1.25) {not affected};
+\end{tikzpicture}
+
+\omcaption{The lineage of the day's results. The vendor's correction of the close makes every version built from the old close stale
+(red): the marks, the P\&L and the research features; the minute bars, built from the trades alone, are not affected. Data:
+\texttt{pl\_dataqual.correction\_and\_lineage}.}\label{fig:pl:data-quality-and-lineage:lineage}
+\end{omfigure}
+
+\begin{dated}{2026-09}{A standard for provenance}\label{dat:pl:data-quality-and-lineage:prov}
+The World Wide Web Consortium's PROV data model (a W3C Recommendation of 30 April 2013, consulted September 2026) defines provenance
+as a record that describes the people, institutions, entities and activities involved in producing, influencing or delivering a
+piece of data; the lineage graph of this chapter is a small instance of its entities (dataset versions) and activities (the jobs
+that derive them).
+\end{dated}
+
+What quality is worth shows in the numbers of the day (seed~0). With the planted defects kept, SIM1's VWAP is 2.69\% too high and
+SIM2's 1.08\%, and SIM2's realised variance of trade-price changes is 24\,000 times its true value: eight decimal slips outweigh a
+day of genuine trading. With the error-severity rows excluded, both VWAPs are within 0.03\% of the truth (the residue is the trades
+lost in the gap, which no flag can restore) and the realised variance equals the true one.
+
+\section{Tutorial: plant, flag, correct}\label{tut:pl:data-quality-and-lineage:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Plant defects and confounders in a simulated day, run the rule suite twice (naive and aware), measure detection and
+false flags, and trace a correction through the lineage. \textbf{End state:}
+\cref{tab:pl:data-quality-and-lineage:detection}, \cref{fig:pl:data-quality-and-lineage:jump} and the VWAP and variance errors of the
+last section.
+\begin{tutsteps}
+\item \textbf{The day}: \texttt{pl\_dataqual.base()} with its halt and its jump.
+\item \textbf{Plant}: \texttt{plant(seed)} returns the defective tables and the truth of which rows are defects.
+\item \textbf{Run}: \texttt{firm\_dataqual.run(rules(\dots), tables)} (\cref{lst:pl:data-quality-and-lineage:rules}); then
+\texttt{score} and \texttt{detection} over twenty seeds, naive and aware.
+\item \textbf{Effect}: \texttt{effect(0)}: VWAP and realised variance kept, flagged out and true.
+\item \textbf{Correct}: \texttt{correction\_and\_lineage()}: two versions of the close, and the stale results.
+\end{tutsteps}
+\textbf{What to change next.} Lower the spike threshold $k$ from 8 to 4 and count the false flags on the natural day; plant a 2\%
+spike instead of a decimal slip and find the smallest one the rule still catches.
+\end{tutorial}
+
+\section{Build: the data-quality layer}\label{bld:pl:data-quality-and-lineage:dataqual}
+
+\begin{build}
+\bfield{Purpose} The checks every partition of the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} passes before it is published, the flags consumers filter on, the
+\omterm{def:pl:data-quality-and-lineage:flag}{quarantine} that withholds bad partitions, and the lineage that says what a correction invalidates; it runs as jobs of chapter~1's
+map and chapter~13's scheduler.
+\bfield{Interface} \texttt{Rule(name, kind, severity, owner, params)}, \texttt{Flag(table, row, rule, severity, detail)};
+\texttt{run(rules\_by\_table, tables)}, \texttt{clean(df, flags, table, severities)}; \texttt{Quarantine} with \texttt{apply},
+\texttt{release}, \texttt{readable}, \texttt{log}; \texttt{Lineage} with \texttt{add}, \texttt{downstream}, \texttt{upstream},
+\texttt{stale\_after}; kinds \texttt{sequence}, \texttt{bounds}, \texttt{crossed}, \texttt{spike}, \texttt{stale},
+\texttt{cross\_source}, \texttt{busted}.
+\bfield{Rules} Rules are data with an owner; flags never modify rows; an error flag \omterm{def:pl:data-quality-and-lineage:flag}{quarantines} its partition; a release names a
+person and a reason; corrections are versions; dataset versions are named by content hash.
+\bfield{Acceptance tests} \texttt{code/firm/dataqual/tests/}: each kind finds its planted defect and nothing else; the confirmed spike
+rule spares a level shift and the staleness rule a halt; the cross-source count by bucket; \omterm{def:pl:data-quality-and-lineage:flag}{quarantine} and release; lineage names the
+stale results of a correction.
+\bfield{Stretch} Rules generated from a \omterm{def:pl:data-quality-and-lineage:rule}{data contract}; a quality score per partition published with it; flags stored as a table of
+the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}, queryable like the data.
+\end{build}
+
+\begin{omsources}
+\item U.S. Commodity Futures Trading Commission and Securities and Exchange Commission, \emph{Findings regarding the market events
+of May~6, 2010}, 30 September 2010.
+\item W3C, \emph{PROV-DM: The PROV Data Model}, W3C Recommendation, 30 April 2013.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:1}
+A feed's sequence numbers jump from 91\,686 to 91\,691. How many messages are missing, and what does the capture of chapter~2 do
+about them?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:2}
+Why does the spike rule have a floor on its scale? What would happen without one on a large-tick instrument whose trades mostly
+print at the same price?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:3}
+A trade prints at 3\,000\,000 when the previous trades were at 300\,000 and the next ones are too. What kind of defect is it likely
+to be, and why does the forward median confirm it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:4}
+Why should a rule flag and not delete? Give one consumer that needs the flagged rows.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:5}
+With the defects kept, SIM2's VWAP on seed~0 is 1.08\% too high; after excluding error rows it is 0.02\% too low. Where does each
+error come from?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:6}
+The official close is corrected at 07:10 the next morning. Which of the day's results must be rebuilt, which need not, and how does
+the lineage know?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:data-quality-and-lineage:7}
+\emph{Coding.} Run \texttt{score} for seed~0 with the naive and the aware suite. How many false flags does each rule raise, and
+which genuine event causes each?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:data-quality-and-lineage:8}
+\emph{Find the flaw.} ``Our data-quality job deletes any trade more than 5\% from the previous trade and any gap in quotes longer than
+30 seconds is filled by repeating the last quote. The cleaned data go straight to the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}.''
+\end{exercise}
+
+\section{Problem: The Afternoon That Was Cancelled}
+
+\begin{problem}[{Weekend problem --- a day, its defects and its genuine surprises}]\label{pb:pl:data-quality-and-lineage:1}
+The chapter's simulated day (a halt and a 3\% jump of SIM2), its six planted defects and the two rule suites.
+
+\medskip\noindent\textbf{Part I --- The checks.}
+\begin{enumerate}
+\item Name the four families of checks and give a rule of each from the chapter's suite.
+\item What is a \omterm{def:pl:data-quality-and-lineage:rule}{data contract}, and what does it add to the rules?
+\item How many events, quotes and trades does the day have?
+\item Which of the planted defects can no rule on the day's own data detect, and what detects it?
+\item Why is the vendor's close correction not a data-quality flag?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- False flags.}
+\begin{enumerate}[resume]
+\item Why does the naive spike rule flag trades after the 3\% jump, and how many on seed~0?
+\item How many false spike flags over twenty seeds, naive and aware?
+\item Why does the naive staleness rule flag the halt, and how does the aware rule avoid it?
+\item What would a pipeline that deleted flagged rows have done to the day of the jump?
+\item Why must a test of \omterm{def:pl:data-quality-and-lineage:rule}{data-quality rules} include genuine events, not only planted defects?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- What quality is worth.}
+\begin{enumerate}[resume]
+\item How far are the two VWAPs from the truth with the defects kept, and with error rows excluded?
+\item By what factor is SIM2's realised variance inflated with the defects kept?
+\item What does the \omterm{def:pl:data-quality-and-lineage:cross}{cross-source check} find over twenty seeds, and what does it not say?
+\item How does a \omterm{def:pl:data-quality-and-lineage:flag}{quarantine} differ from a flag, and who releases it?
+\item Which results does the corrected close make stale?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the detection and false-flag counts of the two suites over twenty seeds, and the VWAP and variance
+errors with and without flags.
+\item Which single change to the naive suite removed the most false flags?
+\item What would the store have held for 6 May 2010 afternoon, with and without the broken-trade rule?
+\item What must the lineage record so that a correction names every stale result?
+\item In one sentence: what distinguishes a data-quality layer from a cleaning script?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:data-quality-and-lineage:1}
+What checks would you run on a day of \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data} before researchers use it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:data-quality-and-lineage:2}
+How do you tell a bad print from a genuine price move?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:data-quality-and-lineage:3}
+Why flag bad data rather than delete it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, risk}]\label{iq:pl:data-quality-and-lineage:4}
+A vendor corrects yesterday's closing price. What has to happen in the firm's systems?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:data-quality-and-lineage:5}
+How would you test a data-quality system, and how would you know it is not flagging too much?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:data-quality-and-lineage:6}
+Design lineage for a research platform so that any published result can be traced to its inputs and recomputed after a correction.
+\end{interviewq}

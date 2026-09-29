@@ -1,0 +1,354 @@
+\chapter{Databases and SQL}\label{ch:pl:databases-and-sql}
+
+A regulator asks for the firm's positions report exactly as it stood at 18:00 last Tuesday. On Wednesday morning operations had corrected
+Monday's and Tuesday's errors --- quantities keyed ten times too large, trades that never happened, trades booked a day late --- and they
+had corrected them in place. The positions table now gives the right answer for Tuesday evening, and nobody can say what answer the firm gave
+on Tuesday evening. This chapter builds the firm's trade database so that both answers stay available: relational tables with keys, writes in
+transactions that do not lose updates, indexes chosen by reading \omterm{def:pl:databases-and-sql:index}{query plans}, and a second time axis that records what the database believed
+and when.
+
+\section{The relational model for trades and positions}
+
+\begin{definition}[Relational model, primary key, foreign key]\label{def:pl:databases-and-sql:relational}
+The \emph{relational model}\index{relational model}, proposed by Codd in 1970, stores data as relations --- tables of rows with named, typed
+columns --- manipulated by operations on whole relations (selection, projection, join), independently of how rows are stored. A \emph{primary
+key}\index{primary key} is a set of columns whose values identify one row; a \emph{foreign key}\index{foreign key} is a set of columns whose
+values must appear as the primary key of a row in another table.
+\end{definition}
+
+\begin{definition}[Normal form]\label{def:pl:databases-and-sql:normal}
+A schema is in a \emph{normal form}\index{normal form} when each fact is stored once: every non-key column depends on the key, the whole key
+and nothing but the key (third normal form), so that an instrument's currency, say, lives in the instruments table and not on every trade.
+\end{definition}
+
+The chapter's schema (\texttt{firm.tradedb}) has three tables: instruments, accounts and trades, each trade pointing to its account and its
+instrument by \omterm{def:pl:databases-and-sql:relational}{foreign keys} that the database enforces --- a trade for an account that does not exist is refused, not stored. Positions are
+not a table: they are a query over trades, so they cannot disagree with them. Schema changes are numbered migrations, applied once each and
+recorded in the database, so that every copy of the database can say which schema it has.
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{26}{41}{The schema as migrations: primary keys, foreign keys, and a trades table with two time
+intervals per row.}\label{lst:pl:databases-and-sql:schema}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  tab/.style={draw=omDef,fill=omDef!6,rounded corners=2pt,align=left,text width=38mm,inner sep=4pt},
+  arr/.style={-{Stealth[length=2mm]},thick,omThm}]
+\node[tab] (i) at (0,1.4) {\textbf{instruments}\\\underline{id}, symbol (unique), currency};
+\node[tab] (a) at (0,-0.9) {\textbf{accounts}\\\underline{id}, name (unique)};
+\node[tab,text width=64mm] (t) at (7.4,0.25) {\textbf{trades}\\\underline{trade\_id}, account\_id, instrument\_id,\\qty, price,
+valid\_from, valid\_to,\\\underline{sys\_from}, sys\_to};
+\draw[arr] (t.west |- 0,0.75) -- node[above,font=\scriptsize]{instrument\_id} (i.east |- 0,0.75);
+\draw[arr] (t.west |- 0,-0.55) -- node[below,font=\scriptsize]{account\_id} (a.east |- 0,-0.55);
+\node[font=\scriptsize,text width=64mm,align=left] at (7.4,-1.75) {primary key underlined; arrows are foreign keys};
+\end{tikzpicture}
+
+\omcaption{The chapter's schema. Instruments and accounts are referenced by trades through enforced \omterm{def:pl:databases-and-sql:relational}{foreign keys}; the trades table's \omterm{def:pl:databases-and-sql:relational}{primary
+key} is the trade identifier with the start of its \omterm{def:pl:databases-and-sql:system}{system time}, because a corrected trade has several versions.}
+\label{fig:pl:databases-and-sql:schema}
+\end{omfigure}
+
+\section{Transactions and isolation}
+
+\begin{definition}[ACID transaction]\label{def:pl:databases-and-sql:acid}
+An \emph{ACID transaction}\index{ACID transaction} is a group of reads and writes that is atomic (all or nothing), consistent (it takes the
+database from one valid state to another), isolated (concurrent transactions do not see each other's partial work) and durable (once committed,
+it survives a crash).
+\end{definition}
+
+\begin{definition}[Isolation level, write-ahead log]\label{def:pl:databases-and-sql:isolation}
+An \emph{isolation level}\index{isolation level} states which anomalies of concurrency a database allows between transactions, from read
+uncommitted to serializable, under which the result is that of some serial order. A \emph{write-ahead log}\index{write-ahead log} records each
+change before it is applied to the database's main file, so that a crash can be recovered by replaying or discarding it: in SQLite's WAL mode
+\textquotedbl{}the original content is preserved in the database file and the changes are appended into a separate WAL file\textquotedbl{}.
+\end{definition}
+
+The anomaly that costs a trading firm money is the lost update, which Berenson and his co-authors define as a transaction reading an item,
+another updating it, and the first then writing a value computed from its earlier read, so that the second's update is lost. Two gateways
+each add 100 shares to the same position: each reads the position, adds its fill, and writes the result. SQLite is serializable --- it
+\textquotedbl{}implements serializable transactions by actually serializing the writes\textquotedbl{} --- but only within a transaction; an
+application that reads in one statement and writes in another has made two transactions, and the database cannot protect it.
+
+\omcode{code/platforms/25-databases-and-sql/python/pl_tradedb.py}{132}{144}{One writer's two steps in each of three modes: read then write
+as two transactions, the same inside one transaction taken at BEGIN, or one statement that reads and writes.}
+\label{lst:pl:databases-and-sql:lost}
+
+Over 1\,000 random interleavings of the two writers' steps, the read-then-write application loses an update 636 times, close to the two
+thirds of interleavings in which both reads come before a write. Inside a transaction taken at \texttt{BEGIN IMMEDIATE}, the second writer is
+refused until the first commits and then retries: no update is lost. A single \texttt{UPDATE pos SET q = q + 100} does the read and the write
+in one statement and loses nothing either. The rule: send an increment to the database as an increment, or let the read and the write
+share one transaction, with a retry.
+
+\section{Indexes and query plans}
+
+\begin{definition}[B-tree index, query plan]\label{def:pl:databases-and-sql:index}
+A \emph{B-tree index}\index{B-tree index} keeps a copy of chosen columns of a table in a balanced sorted tree with pointers to the rows, so
+that rows with given values or in a range are found in logarithmic time instead of by reading the table. A \emph{query plan}\index{query
+plan} is the sequence of operations the database chooses to answer a query --- which tables it scans, which indexes it searches, how it joins
+and groups --- and can be displayed before the query runs.
+\end{definition}
+
+Three queries run over the week's 500\,008 trades: a point query (one account's position in one instrument as of Tuesday 18:00), the
+report (every account's positions as of Tuesday 18:00, joined to the account and instrument names), and an analytical query (the week's
+traded value by instrument). \texttt{EXPLAIN QUERY PLAN} shows each one reading the whole trades table (\texttt{SCAN trades}); the chapter's
+advisor lists such scans, and the question for each is whether an index would select few enough rows to be worth it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.6cm,ybar,bar width=8pt,ylabel={milliseconds (median of 5, log scale)},symbolic x coords={point,report,analytic},
+  xtick=data,xticklabels={point query,positions report,traded value by instrument},enlarge x limits=0.22,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,ymin=0.005,ymax=2000,
+  log origin=infty,
+  legend cell align=left,
+  legend style={font=\scriptsize,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,/tikz/every even column/.append style={column sep=3mm}}]
+\addplot[fill=omThm!60,draw=omThm] table[x=query,y=sqlite_none]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=omDef!60,draw=omDef] table[x=query,y=sqlite_ai]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=omDef!20,draw=omDef] table[x=query,y=sqlite_v]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=gray!50,draw=gray] table[x=query,y=duckdb]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\legend{SQLite without index,SQLite with index on (account; instrument),SQLite with index on valid time,DuckDB (no index)}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Measured query times over 500\,008 trades (log scale; one core, in memory, median of five runs, on an otherwise
+idle machine). The index on (account, instrument) takes the point query from 13.7~ms to 0.01~ms; the index on valid time barely helps any query,
+because Tuesday 18:00 still selects two days of five; DuckDB runs the report 15 times and the analytical query 53 times faster than SQLite
+without any index. Data: \texttt{bench\_tradedb.py}, \texttt{measured\_queries.csv}.}\label{fig:pl:databases-and-sql:queries}
+\end{omfigure}
+
+The measurements (\cref{fig:pl:databases-and-sql:queries}) give the rule of thumb its numbers. An index pays when it selects a small part of
+the table: the point query reads about fifty rows of 500\,008 through the (account, instrument) index, a gain of three orders of magnitude.
+An index on valid time selects 40\% of the rows for Tuesday's report and saves almost nothing, and no index helps a query that must read every
+row. Each index also costs every insert its own write, so the advisor's list is a list of candidates, not of indexes to create.
+
+\section{Time in the database: system time and time travel}
+
+Book~7, chapter~3, stored data with two times, the valid time a value describes and the knowledge time at which it became available, and made
+research reproducible with them. A trade database needs the same two axes for a slightly different reason.
+
+\begin{definition}[System time, time-travel query]\label{def:pl:databases-and-sql:system}
+The \emph{system time}\index{system time} of a row version is the interval during which the database held it as current: from the
+transaction that inserted it to the transaction that superseded it. A \emph{time-travel query}\index{time-travel query} asks for the rows
+valid at one time as the database held them at another, by filtering on both intervals.
+\end{definition}
+
+\omterm{def:pl:databases-and-sql:system}{System time} differs from Book~7's knowledge time in one respect: it is when the firm's database recorded a fact, which the database stamps
+itself and nobody can backdate, where knowledge time is when the fact became available, which may be earlier and is supplied by the data.
+SQL:2011 standardised both axes: transaction time through system-versioned tables, valid time through application-time periods, and queries
+of the form \texttt{FOR SYSTEM\_TIME AS OF}.
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{82}{92}{A correction closes the old version's system time and inserts the corrected version:
+nothing that was believed is overwritten.}\label{lst:pl:databases-and-sql:correct}
+
+\begin{omfigure}
+\begin{tikzpicture}[x=0.85cm,y=0.85cm,font=\small]
+\draw[-{Stealth[length=2mm]}] (0,0) -- (12.2,0) node[right,font=\scriptsize]{system time};
+\draw[-{Stealth[length=2mm]}] (0,0) -- (0,4.4) node[above,font=\scriptsize,align=center]{valid time};
+\foreach \d/\n in {0/Mon,2.4/Tue,4.8/Wed,7.2/Thu,9.6/Fri} {\draw (\d,0) -- (\d,-0.1) node[below,font=\scriptsize]{\n};
+  \draw (0,\d*0.4) -- (-0.1,\d*0.4) node[left,font=\scriptsize]{\n};}
+\fill[omThm!25,draw=omThm] (1.2,0.48) rectangle (5.8,4.1);
+\fill[omDef!25,draw=omDef] (5.8,0.48) rectangle (12,4.1);
+\node[align=center,font=\scriptsize] at (2.7,3.0) {version 1:\\700 shares\\known from\\Monday 12:01};
+\node[align=center,font=\scriptsize] at (8.9,3.3) {version 2: 70 shares\\known from Wednesday 10:00};
+\draw[black,thick,dashed] (4.2,0) -- (4.2,4.2);
+\draw[black,thick,dashed] (0,1.68) -- (12,1.68);
+\fill (4.2,1.68) circle (2.2pt) node[below right,font=\scriptsize,fill=white,inner sep=1pt]{report as it was: Tue 18:00 / Tue 18:00};
+\fill (11.6,1.68) circle (2.2pt) node[above left,font=\scriptsize,fill=white,inner sep=1pt]{as corrected: Tue 18:00 / Fri 20:00};
+\end{tikzpicture}
+
+\omcaption{One corrected trade in the two times: executed on Monday at 12:00, keyed as 700 shares, corrected to 70 on Wednesday at 10:00.
+Each version is a rectangle, true from Monday in valid time (up) and current for an interval of \omterm{def:pl:databases-and-sql:system}{system time} (across). Tuesday's report as it
+was reads the point (valid Tuesday 18:00, system Tuesday 18:00) and finds 700; the corrected report reads (Tuesday 18:00, Friday) and finds
+70.}\label{fig:pl:databases-and-sql:bitemporal}
+\end{omfigure}
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{102}{118}{Time travel: the trades valid at \texttt{:v} as held at \texttt{:s}, and the
+positions computed from them.}\label{lst:pl:databases-and-sql:asof}
+
+The week of the model has 500\,008 trades. On Wednesday at 10:00 operations correct 30 quantities keyed ten times too large, cancel 10 trades
+that never happened, and book 8 of Tuesday's trades that had been missed; the table then holds 500\,048 row versions, forty more than trades.
+Tuesday's 18:00 report, as it was, reads valid time Tuesday 18:00 at \omterm{def:pl:databases-and-sql:system}{system time} Tuesday 18:00; the corrected report reads the same valid time
+at \omterm{def:pl:databases-and-sql:system}{system time} Friday evening. The two differ on 48 of the 10\,000 account and instrument positions --- one per correction
+(\cref{fig:pl:databases-and-sql:diff}) --- and the regulator gets the first, with the second and the audit table explaining every difference.
+The table corrected in place can only produce the second.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={the 48 positions that differ, sorted},ylabel={corrected minus as reported (shares)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=49,ymin=-1000,ymax=1100,only marks,yticklabel style={/pgf/number format/1000 sep={\,}},
+  legend style={font=\small,at={(0.02,0.98)},anchor=north west,draw=none,fill=white}]
+\addplot[scatter,only marks,mark=*,mark size=1.8pt,point meta=explicit symbolic,
+  scatter/classes={qty={omThm},cancel={black},late={omDef}}]
+  table[x=rank,y=change,meta=kind]{figdata/platforms/25-databases-and-sql/report_diff.csv};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:2,920) {$\bullet$ quantity corrected (30)};
+\node[font=\scriptsize,anchor=west] at (axis cs:2,760) {$\bullet$ trade cancelled (10)};
+\node[omDef,font=\scriptsize,anchor=west] at (axis cs:2,600) {$\bullet$ late trade booked (8)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Tuesday's 18:00 positions report, corrected minus as it was reported, for the 48 account and instrument positions that differ:
+quantity corrections (red) take nine tenths of the trade out of the position, cancellations (black) the whole trade, and late bookings
+(blue) add one. The other 9\,952 positions agree. Data: \texttt{fig\_tradedb.py}.}\label{fig:pl:databases-and-sql:diff}
+\end{omfigure}
+
+\section{Transactional and analytical workloads}
+
+\begin{definition}[Online transaction processing, online analytical processing]\label{def:pl:databases-and-sql:oltp}
+\emph{Online transaction processing}\index{online transaction processing} (OLTP) is a workload of many small transactions that read and write
+a few rows each by key --- booking trades, updating positions. \emph{Online analytical processing}\index{online analytical processing} (OLAP)
+is a workload of few large queries that read many rows and few columns to aggregate them --- traded value by instrument, P\&L by desk over a
+year.
+\end{definition}
+
+SQLite is a row store built for the first; DuckDB, the \omterm{def:pl:time-series-databases-and-the-alternatives:embedded}{embedded database} of chapter~\ref{ch:pl:time-series-databases-and-the-alternatives},
+is a columnar engine with vectorised execution built for the second. On the same SQL and the same data --- the chapter checks that every
+answer is equal --- DuckDB runs the report in 9.8~ms against SQLite's 150 and the analytical query in 2.8~ms against 148, with one thread and no
+index. SQLite with the right index still wins the point query by far (0.01~ms against 1.0). The firm keeps its trades in a transactional
+store, where the keys, the transactions and the \omterm{def:pl:databases-and-sql:system}{system time} are, and gives research and reporting a columnar copy, refreshed from the
+transactional one and never written by anyone else.
+
+\begin{dated}{2026-09}{Isolation in SQLite and temporal SQL}\label{dat:pl:databases-and-sql:temporal}
+SQLite's documentation states that its transactions are serializable, implemented by serializing the writes (except shared-cache connections
+with \texttt{read\_uncommitted}), and that in write-ahead-log mode the changes are appended to a separate WAL file while the database file keeps
+the original content. The SQL:2011 standard provides transaction time through system-versioned tables and valid time through application-time
+period tables, as described by Kulkarni and Michels (2012).
+\end{dated}
+
+\section{Tutorial: Tuesday at 18:00}\label{tut:pl:databases-and-sql:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Store a week of trades bitemporally, correct them, reproduce a past report, and measure what indexes and engines change.
+\textbf{End state:} \cref{fig:pl:databases-and-sql:diff,fig:pl:databases-and-sql:queries}.
+\begin{tutsteps}
+\item \textbf{Schema}: \texttt{firm\_tradedb.connect()} and \texttt{migrate}; try inserting a trade for an unknown account.
+\item \textbf{The week}: \texttt{pl\_tradedb.load(conn)}; the corrections of Wednesday 10:00.
+\item \textbf{Reports}: \texttt{positions(conn, TUE\_18, TUE\_18)} and \texttt{positions(conn, TUE\_18, NOW)}; the rows that differ.
+\item \textbf{Lost updates}: \texttt{lost\_updates(mode)} for the three modes.
+\item \textbf{Plans and times}: \texttt{plan} and \texttt{advise} for each query; \texttt{bench\_tradedb.py}.
+\end{tutsteps}
+\textbf{What to change next.} Add an index on (valid\_from, account\_id) and read the report's plan again; copy the tables to DuckDB with a
+system-time filter so that the columnar copy can travel in time too.
+\end{tutorial}
+
+\section{Build: the trade database}\label{bld:pl:databases-and-sql:tradedb}
+
+\begin{build}
+\bfield{Purpose} One transactional store of the firm's trades that enforces its keys, never loses an update, and can reproduce any report as
+it was produced.
+\bfield{Interface} \texttt{connect}, \texttt{migrate}, \texttt{book}, \texttt{correct}, \texttt{cancel}, \texttt{as\_of},
+\texttt{positions}, \texttt{transact}, \texttt{plan}, \texttt{advise}, \texttt{to\_duckdb}.
+\bfield{Rules} \omterm{def:pl:databases-and-sql:relational}{Foreign keys} on; schema only through migrations; corrections close and insert, never update values; every correction
+audited; read-modify-write only inside a transaction, or as one statement; indexes chosen from plans and measured.
+\bfield{Acceptance tests} \texttt{code/firm/tradedb/tests/}: keys enforced; a correction, a cancellation and a late booking seen as they were
+and as corrected; a locked writer retried and a failing transaction rolled back; the advisor before and after an index; the same answer in
+DuckDB.
+\bfield{Stretch} Valid-time corrections that split a row's interval; system-versioned tables in a database that has them; a columnar copy
+refreshed by change capture.
+\end{build}
+
+\begin{omsources}
+\item E.~F.~Codd, \emph{A Relational Model of Data for Large Shared Data Banks}, Communications of the ACM 13(6), 1970.
+\item H.~Berenson, P.~Bernstein, J.~Gray, J.~Melton, E.~O'Neil and P.~O'Neil, \emph{A Critique of ANSI SQL Isolation Levels}, SIGMOD 1995.
+\item K.~Kulkarni and J.-E.~Michels, \emph{Temporal Features in SQL:2011}, SIGMOD Record 41(3), 2012.
+\item SQLite documentation: \emph{Isolation in SQLite}; \emph{Write-Ahead Logging}.
+\item One Quant Book~7, chapter~3 (valid time, knowledge time, bitemporal data).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:1}
+Why are positions a query over trades rather than a table of their own?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:2}
+Why is the trades table's \omterm{def:pl:databases-and-sql:relational}{primary key} (trade identifier, start of \omterm{def:pl:databases-and-sql:system}{system time}) and not the trade identifier alone?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:3}
+How many row versions does the table hold after Wednesday, and why forty more than trades?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:4}
+Why does the read-then-write application lose an update in about two thirds of the interleavings?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:5}
+Why does the index on valid time barely help the positions report?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:6}
+A late trade for Tuesday is booked on Wednesday. Which of Tuesday's two reports shows it, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:databases-and-sql:7}
+\emph{Coding.} Write the query that lists every trade whose Tuesday 18:00 version differs from its current version, with both values.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:databases-and-sql:8}
+\emph{Find the flaw.} \textquotedbl{}We keep an audit table of every change, so we can always rebuild what the positions table said on any
+day.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: Tuesday at 18:00}
+
+\begin{problem}[{Weekend problem --- Tuesday at 18:00}]\label{pb:pl:databases-and-sql:1}
+The chapter's week of trades, its corrections, its writers and its queries.
+
+\medskip\noindent\textbf{Part I --- The schema.}
+\begin{enumerate}
+\item What do the primary and \omterm{def:pl:databases-and-sql:relational}{foreign keys} of the schema guarantee?
+\item What does \omterm{def:pl:databases-and-sql:normal}{normal form} keep off the trades table?
+\item Why are schema changes migrations?
+\item What does each row of the trades table carry beyond the trade?
+\item How is a trade corrected, and how is it cancelled?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Concurrency.}
+\begin{enumerate}[resume]
+\item What is a lost update, in the terms of the 1995 critique?
+\item Why does SQLite's serializable isolation not prevent it for the read-then-write application?
+\item How many updates are lost in 1\,000 interleavings under each mode?
+\item What does \texttt{BEGIN IMMEDIATE} change?
+\item When is one statement enough?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Plans and engines.}
+\begin{enumerate}[resume]
+\item What does the plan of each query show without an index?
+\item What does each index do to each query?
+\item How do SQLite and DuckDB compare on each query?
+\item Why does an index cost something even when it is not used?
+\item Which store should research query?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the positions report reproduced as it stood at 18:00 on the Tuesday against the corrected report, the
+rows that differ, and the query-time gain from each index.
+\item How does \omterm{def:pl:databases-and-sql:system}{system time} differ from Book~7's knowledge time?
+\item What does the table corrected in place lose?
+\item What would you ask of any table a report is produced from?
+\item In one sentence: what must a database remember besides the right answer?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:databases-and-sql:1}
+What is a transaction, and what do the four letters of ACID mean?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:databases-and-sql:2}
+Two services update the same position at the same time. How can an update be lost, and how do you prevent it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:databases-and-sql:3}
+A query is slow. How do you decide whether an index will help?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:databases-and-sql:4}
+A regulator asks for a report exactly as you produced it three months ago. How do you design for that?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:databases-and-sql:5}
+Design the storage of a trading firm's trades and positions for booking, reporting and research.
+\end{interviewq}

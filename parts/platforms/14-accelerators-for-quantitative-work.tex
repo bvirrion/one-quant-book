@@ -1,0 +1,347 @@
+\chapter{Accelerators for Quantitative Work}\label{ch:pl:accelerators-for-quantitative-work}
+
+A bank moved its overnight counterparty-risk Monte Carlo to graphics processors and it ran many times faster. The same bank tried the
+same devices for the intraday pricing of single trades, and nothing moved: each request spent longer crossing to the device and back
+than computing on it. Both results were predictable from three numbers per workload --- how much arithmetic it does, how many bytes it
+moves, and how many bytes must cross to the device --- and two numbers per machine. This chapter measures those numbers on the laptop's
+processor, takes a data-centre device's from its product page, and predicts both outcomes before anyone buys anything.
+
+\section{What a graphics processor is good at}
+
+A graphics processor (an accelerator in the sense of Book~12, chapter~23) has thousands of simple arithmetic units running the same
+instruction on different data, and memory attached to it that is several times faster than a server's. It is good at the same thing
+SIMD instructions are good at on a CPU (Book~13, chapter~14), at a much larger scale: a long loop of identical, independent arithmetic on
+arrays already in its memory. It is bad at three things quantitative code often does.
+
+\begin{definition}[Host--device transfer]\label{def:pl:accelerators-for-quantitative-work:transfer}
+A \emph{host--device transfer}\index{host--device transfer} moves data between the CPU's memory (the host) and an accelerator's memory
+(the device) over a link such as PCI Express; every input a device computation reads and every result it returns crosses it, at a
+bandwidth far below either memory's and with a fixed cost per crossing.
+\end{definition}
+
+\begin{definition}[Thread divergence]\label{def:pl:accelerators-for-quantitative-work:divergence}
+\emph{Thread divergence}\index{thread divergence} happens when threads that execute in lockstep take different branches: the group runs
+each branch in turn with the threads not on it idle, so code with data-dependent branches (early exercise, barrier checks, path-dependent
+payoffs with many cases) runs at a fraction of the device's rate.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.8cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!15,minimum width=2.6cm] (cpu) at (0,0) {CPU cores};
+\node[box,fill=gray!10,minimum width=2.6cm] (hm) at (0,-1.6) {host memory};
+\node[box,fill=omDef!15,minimum width=3.2cm] (gpu) at (8.5,0) {device: thousands\\ of arithmetic units};
+\node[box,fill=gray!10,minimum width=3.2cm] (dm) at (8.5,-1.6) {device memory};
+\draw[<->,thick] (cpu) -- node[left]{24.0 GB/s, one core} (hm);
+\draw[<->,very thick] (gpu) -- node[right]{3.35 TB/s} (dm);
+\draw[<->,thick,omThm] (hm.east) -- node[above]{PCIe Gen5: 128 GB/s} node[below]{every input and result crosses} (dm.west);
+\draw[->,dashed] (cpu.east) -- node[above=2pt]{launch and synchronise: $L$ per request} (gpu.west);
+\end{tikzpicture}
+
+\omcaption{Where the time goes when work moves to a device. The device's memory is 140 times faster than what one core of the laptop
+reaches, but inputs and results cross a link slower than either memory, and every request pays a fixed launch and synchronisation cost $L$
+(the chapter assumes 10~microseconds).}\label{fig:pl:accelerators-for-quantitative-work:path}
+\end{omfigure}
+
+The third is size. A computation that takes a microsecond on a CPU cannot be faster on a device whose launch and synchronisation alone
+take several: small work, like a single trade's price, pays a fixed cost that large work amortises.
+
+\section{The roofline model}
+
+\begin{definition}[Arithmetic intensity]\label{def:pl:accelerators-for-quantitative-work:intensity}
+The \emph{arithmetic intensity}\index{arithmetic intensity} of a kernel is the number of floating-point operations it performs per byte
+it moves between memory and the processor.
+\end{definition}
+
+\begin{definition}[Roofline model]\label{def:pl:accelerators-for-quantitative-work:roofline}
+The \emph{roofline model}\index{roofline model} (Williams, Waterman and Patterson, 2009) bounds the arithmetic rate a kernel of intensity
+$I$ can attain on a machine of peak rate $P$ and memory bandwidth $B$ by $\min(P,\ I B)$. Plotted on logarithmic axes it is a slanted
+line (bandwidth) meeting a flat one (peak) at the ridge point $I^* = P/B$.
+\end{definition}
+
+\begin{definition}[Memory-bound kernel, compute-bound kernel]\label{def:pl:accelerators-for-quantitative-work:bound}
+A kernel whose intensity is below the machine's ridge point is \emph{memory-bound}\index{memory-bound kernel}: its rate is limited by
+bandwidth, and more arithmetic units do not help it. A kernel above the ridge is \emph{compute-bound}\index{compute-bound kernel}.
+\end{definition}
+
+The roofline turns a question about hardware into two numbers about code. The chapter's model (\texttt{firm.roofline}) adds the transfer
+and the fixed cost: on a device, a kernel takes at least $L + X/\ell + \max(F/P, M/B)$ seconds, with $F$ its operations, $M$ its memory
+bytes, $X$ the bytes that cross a link of bandwidth $\ell$, and $L$ the launch and synchronisation latency of a request.
+
+\omcode{code/firm/roofline/firm_roofline.py}{55}{75}{A roof and the end-to-end time of a kernel on it: the roofline bound, plus a
+launch latency and a transfer over the host link for a device.}\label{lst:pl:accelerators-for-quantitative-work:roof}
+
+\section{Measuring the laptop's roof}
+
+One core of this laptop (an Intel Core Ultra 7 155H, under WSL2) was measured: the peak by a $2000\times2000$ double-precision matrix
+product on one BLAS thread, the bandwidth by a STREAM-style triad $a_i = b_i + s c_i$ in C++20 on arrays of 128~MB, counting 24 bytes per
+element. The core reaches 66.9~GFLOP/s and 24.0~GB/s: its ridge is at 2.79 operations per byte.
+
+\omcode{code/firm/roofline/cpp/firm_roofline_triad.cpp}{11}{22}{The bandwidth measurement: the triad, timed best of ten.}\label{lst:pl:accelerators-for-quantitative-work:triad}
+
+Four reference kernels were timed on the same core (\cref{tab:pl:accelerators-for-quantitative-work:kernels}): a step of geometric
+Brownian motion over $2^{23}$ paths ($S \mathrel{*}= e^{a + bZ}$), a basket payoff over 500\,000 paths of 20 assets, the aggregation of a
+cube of trade values (2\,000 paths, 50 dates, 200 trades) into an expected-positive-exposure profile, and the matrix product. The operations
+are counted by the convention of \texttt{firm.roofline}: additions and multiplications count one, and so does a call to \texttt{exp},
+although it costs many cycles.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+kernel & intensity (flop/byte) & attained (GFLOP/s) & roof (GFLOP/s) & share of roof \\
+\midrule
+path step & 0.17 & 0.65 & 3.99 & 16\% \\
+basket payoff & 0.25 & 4.82 & 5.99 & 81\% \\
+exposure aggregation & 0.13 & 2.63 & 3.03 & 87\% \\
+matrix product & 166.7 & 64.2 & 66.9 & 96\% \\
+\bottomrule
+\end{tabular}
+\caption{Four kernels on one core of the laptop: intensity by the chapter's counting convention, the rate attained (best of five runs),
+the roof at that intensity and the share reached. Data: \texttt{bench\_roofline.py}.}
+\label{tab:pl:accelerators-for-quantitative-work:kernels}
+\end{table}
+
+Three of the four are \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound}, and the two that are simple loops reach 81 and 87\% of the bandwidth roof: they are done, and only more
+bandwidth would speed them up. The path step sits far below its roof because the roofline counts operations and \texttt{exp} is one
+operation that takes many cycles; its true limit is the rate of the exponential. The matrix product, the only \omterm{def:pl:accelerators-for-quantitative-work:bound}{compute-bound kernel}, defines
+the peak: it reaches 96\% of it here only because the peak is its best over more runs than the table's five.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=12cm,height=6.4cm,xlabel={arithmetic intensity (flop per byte, log scale)},ylabel={GFLOP/s (log scale)},xmin=0.01,xmax=1000,
+  ymin=0.1,ymax=100000,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[omThm,very thick] table[x=intensity,y=cpu_gflops]{figdata/platforms/14-accelerators-for-quantitative-work/roofline.csv};
+\addplot[omDef,very thick,dashed] table[x=intensity,y=device_gflops]{figdata/platforms/14-accelerators-for-quantitative-work/roofline.csv};
+\addplot[only marks,mark=*,mark size=2pt,black]
+  table[x=intensity,y=gflops]{figdata/platforms/14-accelerators-for-quantitative-work/measured_kernels.csv};
+\node[font=\scriptsize,anchor=west] at (axis cs:0.18,0.65) {path step};
+\node[font=\scriptsize,anchor=west] at (axis cs:0.29,4.8) {basket payoff};
+\node[font=\scriptsize,anchor=south east,align=right,inner sep=1pt] at (axis cs:0.12,2.9) {exposure\\aggregation};
+\node[font=\scriptsize,anchor=south east] at (axis cs:167,64) {matrix product};
+\node[omThm,font=\scriptsize,anchor=north] at (axis cs:30,50) {one laptop core};
+\node[omDef,font=\scriptsize,anchor=north] at (axis cs:100,30000) {data-centre device (FP64)};
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Two rooflines: one core of the laptop (measured) and a data-centre graphics processor in double precision (from its product
+page), with the four kernels as measured on the core. The core's ridge is at 2.8 operations per byte, the device's at 10.1: the kernels that
+are \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound} on the core are more so on the device. Data: \texttt{bench\_roofline.py}, \texttt{fig\_roofline.py}.}
+\label{fig:pl:accelerators-for-quantitative-work:roofline}
+\end{omfigure}
+
+\begin{dated}{2026-09}{A data-centre device}\label{dat:pl:accelerators-for-quantitative-work:h100}
+NVIDIA's product page gives, for the H100 in its SXM form: 34 teraFLOPS in double precision (67 on its tensor cores), 67 in single, 80~GB of
+memory at 3.35~TB/s, a 900~GB/s NVLink interconnect, 128~GB/s over PCIe Gen5, and up to 700~W. Against one core of the laptop it offers 508
+times the double-precision peak and 140 times the bandwidth. The chapter uses these figures as the device's roof and its PCIe figure as the
+host link, the most favourable reading of it.
+\end{dated}
+
+\section{Monte Carlo and risk on a device}
+
+The overnight workload is an exposure Monte Carlo for one netting set: 10\,000 paths of 50 risk factors on 120 monthly dates, 5\,000 trades
+valued on every path and date (ten operations each: a linear trade on one factor, discounted), and the values aggregated into an
+expected-exposure profile (Book~6, chapters 17 and~18). It performs 66~billion operations and moves 98~GB through memory: \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound} on both
+machines. Only the trades' descriptions go to the device (100 bytes each) and only the profile comes back; the paths are generated where
+they are used, with a counter-based generator (Book~4, chapter~26) so that the device's paths are the CPU's.
+
+\omcode{code/platforms/14-accelerators-for-quantitative-work/python/pl_roofline.py}{43}{65}{The two workloads in the model: the exposure
+job's three kernels, its end-to-end time on the device, and a request to price $n$ trades.}\label{lst:pl:accelerators-for-quantitative-work:model}
+
+On the core, at its roof, the job takes 4.09~seconds; on the device, 29.3~milliseconds including three launches and the transfers: 140 times
+faster, the ratio of the bandwidths, because the job is \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound}. If 95\% of the overnight process is this kind of work and the rest
+(reading positions, writing reports) stays on the host, Amdahl's law caps the whole process's gain at $1/(0.05 + 0.95/140) = 17.6$ times.
+Against a server socket of many cores the per-core factor shrinks: \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound} work gains the ratio of the device's bandwidth to the
+socket's, not to one core's.
+
+\section{Training, and what the machine-learning book already said}
+
+Book~12 (chapter~23) covered the accelerator's home ground: training neural networks is dominated by matrix products, \omterm{def:pl:accelerators-for-quantitative-work:bound}{compute-bound} with
+high intensity, run in mixed precision on tensor units, and split across devices by data parallelism. The same roofline explains it: a
+matrix product of size $n$ has intensity $n/12$, far above any ridge, and a device's reduced-precision peak is many times its
+double-precision one. Quantitative finance's Monte Carlo is usually the other kind of kernel --- low intensity, double precision --- and
+gains the bandwidth ratio, not the peak ratio.
+
+\section{Deciding with a cost model}
+
+A single intraday price request is small: ten thousand operations (a hundred cash flows on an interpolated curve) and a kilobyte crossing
+the link (the trade and its result). On the core it takes 0.33~microseconds; on the device, 10.0 --- almost all of it the launch and
+synchronisation latency, which the chapter takes as 10~microseconds (an assumption, not a datasheet figure). The device is 30 times slower.
+Batched, the fixed cost is shared (\cref{fig:pl:accelerators-for-quantitative-work:batch}): the device breaks even at 31 trades per request
+and approaches, for very large batches, 32.7 times the core --- a ceiling set by the link, because every trade's kilobyte still crosses it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=11.5cm,height=5.8cm,xlabel={trades per request (log scale)},ylabel={device speed-up (log scale)},
+  xmin=1,xmax=1000000,ymin=0.02,ymax=100,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},
+  table/col sep=comma]
+\addplot[omDef,very thick] table[x=n,y=speedup]{figdata/platforms/14-accelerators-for-quantitative-work/batch.csv};
+\draw[black,dashed] (axis cs:1,1) -- (axis cs:1000000,1);
+\draw[omThm,thick] (axis cs:31,0.02) -- (axis cs:31,100) node[pos=0.12,right,font=\scriptsize]{break-even: 31 trades};
+\node[font=\scriptsize,anchor=north east] at (axis cs:900000,28) {link-bound ceiling 32.7};
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Predicted end-to-end speed-up of the device over one laptop core for a request pricing $n$ trades, with a launch and
+synchronisation latency of 10~microseconds and the product page's PCIe bandwidth. A single trade is 30 times slower on the device; the device
+wins from 31 trades, and no batch takes it beyond the link's ceiling. Data: \texttt{fig\_roofline.py}.}
+\label{fig:pl:accelerators-for-quantitative-work:batch}
+\end{omfigure}
+
+\begin{example}[Faster overnight, not intraday]\label{ex:pl:accelerators-for-quantitative-work:verdict}
+The same device, the same code style, two verdicts. The exposure job is large and \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound}, moves little across the link, and runs 140
+times faster than on one core (17.6 times for the whole process by Amdahl's law). The price request is tiny, and the latency of a launch is
+thirty times its whole cost on the CPU. The break-even batch depends on the latency assumed: 4 trades at 1~microsecond, 16 at 5, 31 at 10,
+155 at 50. A pricing service that can batch its requests to hundreds per call would gain; one that answers each request as it comes cannot.
+\end{example}
+
+\begin{remark}[What the model leaves out]\label{rem:pl:accelerators-for-quantitative-work:limits}
+The model is a bound: real kernels reach a fraction of either roof, as the table shows for the core. It ignores \omterm{def:pl:accelerators-for-quantitative-work:divergence}{thread divergence}, the cost of
+porting and maintaining a second implementation, the device's price and power, and the queueing of requests on a shared device. It is enough
+to rule an accelerator out, or to say that measuring one is worth the effort.
+\end{remark}
+
+\begin{dated}{2026-09}{A benchmark for pricing and risk hardware}\label{dat:pl:accelerators-for-quantitative-work:stac}
+STAC Research describes its STAC-A2 benchmark suite as ``the industry standard for testing technology stacks used for compute-intensive
+analytic workloads involved in pricing and risk management''. Vendors publish results on it for CPUs and accelerators; the chapter's roofline
+is the back-of-the-envelope version of the same question.
+\end{dated}
+
+\section{Tutorial: two rooflines and a decision}\label{tut:pl:accelerators-for-quantitative-work:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Measure one core's roof and four kernels on it, place them next to a cited device's roof, and predict two workloads end to
+end. \textbf{End state:} \cref{fig:pl:accelerators-for-quantitative-work:roofline,fig:pl:accelerators-for-quantitative-work:batch}.
+\begin{tutsteps}
+\item \textbf{Measure}: \texttt{bench\_roofline.py} with one BLAS thread: the peak, the triad bandwidth, the four kernels.
+\item \textbf{Place}: \texttt{Kernel.intensity} and \texttt{Roof.attainable} for each kernel on both roofs.
+\item \textbf{Predict}: \texttt{overnight(cpu\_roof())}, \texttt{request(cpu\_roof(), n)}, \texttt{break\_even}.
+\item \textbf{Stress the assumption}: \texttt{launch\_sensitivity}.
+\end{tutsteps}
+\textbf{What to change next.} Put the device's single-precision figures in the roof and see which workloads it changes; keep the market data
+on the device between requests and send only the trade.
+\end{tutorial}
+
+\section{Build: the roofline model}\label{bld:pl:accelerators-for-quantitative-work:roofline}
+
+\begin{build}
+\bfield{Purpose} A cost model that tells the platform, before any purchase or port, which workloads an accelerator would speed up and by how
+much, from measured and cited numbers.
+\bfield{Interface} \texttt{Kernel(name, flops, bytes, transfer)}; \texttt{Roof(name, peak, bandwidth, link, launch, source)} with
+\texttt{attainable}, \texttt{time}, \texttt{end\_to\_end}, \texttt{ridge}; \texttt{DEVICES}; \texttt{measure\_peak},
+\texttt{measure\_bandwidth}; the reference kernels and their descriptors; \texttt{amdahl}; \texttt{break\_even}.
+\bfield{Rules} Device figures are data with a source; CPU figures are measured on one core with one thread; a stated counting convention for
+operations; assumptions (the launch latency) marked and swept.
+\bfield{Acceptance tests} \texttt{code/firm/roofline/tests/}: the roof arithmetic; each reference kernel against a direct computation and its
+counted intensity; Amdahl's law; the break-even search, including a device that never breaks even; the device data and the triad.
+\bfield{Stretch} A measured roof of the whole socket; a device roof from a benchmark rather than a datasheet; the cost per result in money
+from rental prices.
+\end{build}
+
+\begin{omsources}
+\item S.~Williams, A.~Waterman and D.~Patterson, ``Roofline: an insightful visual performance model for multicore architectures'',
+\emph{Communications of the ACM} 52(4), 2009.
+\item G.~M. Amdahl, ``Validity of the single processor approach to achieving large scale computing capabilities'', AFIPS Spring Joint
+Computer Conference, 1967.
+\item NVIDIA, H100 product page; STAC Research, STAC-A2 benchmark page.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:1}
+What is the intensity of a matrix product of size $n$ under the chapter's convention, and above which $n$ is it \omterm{def:pl:accelerators-for-quantitative-work:bound}{compute-bound} on the core and
+on the device?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:2}
+Why is the exposure job's speed-up close to the bandwidth ratio and not to the peak ratio?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:3}
+With 95\% of a process sped up 140 times, what is the whole process's gain, and what would it be with 99\%?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:4}
+Why does the path step reach only 16\% of its roof, and what would move it closer?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:5}
+Where does the ceiling of 32.7 for large batches of price requests come from?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:6}
+Which parts of an American-option Monte Carlo with a regression at each date would suffer from \omterm{def:pl:accelerators-for-quantitative-work:divergence}{thread divergence}, and which would not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:accelerators-for-quantitative-work:7}
+\emph{Coding.} With \texttt{firm.roofline}, recompute the break-even batch if the market data (1~MB) must be sent with every request instead
+of staying on the device.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:accelerators-for-quantitative-work:8}
+\emph{Find the flaw.} ``The device has 508 times our core's peak, so our risk run, which takes ten hours on one core, will take a minute.''
+\end{exercise}
+
+\section{Problem: Faster Overnight, Not Intraday}
+
+\begin{problem}[{Weekend problem --- two workloads, one device}]\label{pb:pl:accelerators-for-quantitative-work:1}
+One laptop core as measured, the device of \cref{dat:pl:accelerators-for-quantitative-work:h100}, the chapter's two workloads.
+
+\medskip\noindent\textbf{Part I --- Roofs.}
+\begin{enumerate}
+\item What are the core's peak, bandwidth and ridge?
+\item What are the device's, and the ratios to the core?
+\item Which of the four kernels are \omterm{def:pl:accelerators-for-quantitative-work:bound}{memory-bound} on the core, and on the device?
+\item Why does the path step sit below its roof?
+\item What does a roofline not capture?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The overnight job.}
+\begin{enumerate}[resume]
+\item How many operations and bytes does the exposure job have, and what crosses the link?
+\item What are its times on the core and on the device?
+\item Why is the speed-up what it is?
+\item What does Amdahl's law make of it for the whole process?
+\item How would the comparison change against a many-core server?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The request.}
+\begin{enumerate}[resume]
+\item What are a single request's times on the core and on the device?
+\item At what batch does the device break even?
+\item How does the break-even move with the launch latency?
+\item What bounds the speed-up of very large batches?
+\item What would a pricing service have to change to benefit?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the predicted end-to-end speed-up of the exposure Monte Carlo and of a single-trade price request, and
+the batch size at which the device breaks even.
+\item Which workloads of the platform would you move to a device first?
+\item What would you measure before buying one?
+\item Why use double precision in the model?
+\item In one sentence: when does an accelerator pay?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:accelerators-for-quantitative-work:1}
+What is \omterm{def:pl:accelerators-for-quantitative-work:intensity}{arithmetic intensity}, and why does it matter for choosing hardware?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:accelerators-for-quantitative-work:2}
+Your Monte Carlo got 30 times faster on a graphics processor, your pricing service got slower. Explain.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:accelerators-for-quantitative-work:3}
+How would you estimate, without the hardware, what a device would do for a workload?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:accelerators-for-quantitative-work:4}
+Can you run a Monte Carlo on a device and get exactly the CPU's numbers? How?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:accelerators-for-quantitative-work:5}
+Design the decision process for moving parts of a risk platform to accelerators.
+\end{interviewq}

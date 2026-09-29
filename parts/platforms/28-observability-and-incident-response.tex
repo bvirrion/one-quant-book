@@ -1,0 +1,398 @@
+\chapter{Observability and Incident Response}\label{ch:pl:observability-and-incident-response}
+
+On 22 August 2013 the system that disseminates consolidated quotes for Nasdaq-listed stocks began to fail at 11:48 in the morning, with
+intermittent outages on some of its channels. At 12:03 it stopped disseminating quotes altogether; a regulatory halt stopped trading in those
+stocks on every venue; the technical fault was fixed by 12:24, and quoting and trading resumed at 15:25. A firm's monitoring that morning
+could look perfect: every process up, every queue empty, every heartbeat on time --- because nothing was arriving. This chapter builds the
+monitoring that would have noticed: signals about what users of the platform receive rather than about the processes that serve them,
+objectives with \omterm{def:pl:observability-and-incident-response:budget}{error budgets}, alerts that page only when a person should act, and the incident practice that follows the page.
+
+\section{Metrics, logs and traces}
+
+\begin{definition}[Observability]\label{def:pl:observability-and-incident-response:observability}
+\emph{Observability}\index{observability} is the degree to which the internal state of a running system can be inferred from what it
+emits --- its \omterm{def:pl:observability-and-incident-response:metric}{metrics}, logs and traces --- without deploying new code to ask a new question.
+\end{definition}
+
+\begin{definition}[Metric, structured logging]\label{def:pl:observability-and-incident-response:metric}
+A \emph{metric}\index{metric} is a named numeric measurement with labels, sampled or aggregated over time: a counter (messages received), a
+gauge (queue depth), a histogram (latency, as in Book~13, chapter~5). \emph{Structured logging}\index{structured logging} writes each log event
+as a record of named fields --- time, level, service, event, identifiers, values --- rather than a sentence, so that logs can be queried like
+data.
+\end{definition}
+
+\begin{definition}[Distributed tracing, span]\label{def:pl:observability-and-incident-response:trace}
+\emph{Distributed tracing}\index{distributed tracing} follows one unit of work --- a request, a market-data message, an order --- across the
+services it passes through. Each step is a \emph{span}\index{span}, a unit of work with a start, an end, a trace identifier shared by all the
+steps and the identifier of the step that caused it, so that the path can be rebuilt as a tree.
+\end{definition}
+
+The chapter's chain is the platform's own: capture (chapter~\ref{ch:pl:capturing-and-storing-tick-data}), the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}, the \omterm{def:pl:position-and-pnl-services:service}{position
+service} (chapter~\ref{ch:pl:position-and-pnl-services}) and real-time risk (chapter~\ref{ch:pl:real-time-risk}). \texttt{firm.observe} gives
+each a \omterm{def:pl:observability-and-incident-response:metric}{metric} registry, structured log records and \omterm{def:pl:observability-and-incident-response:trace}{spans} in the OpenTelemetry sense, carried from one service to the next. A traced message
+shows where its time goes (\cref{fig:pl:observability-and-incident-response:trace}): a fraction of a millisecond in capture, storage and
+positions, then the wait in the risk service's queue --- 50~milliseconds on a normal day, a minute when the risk service falls behind.
+
+\omcode{code/firm/observe/firm_observe.py}{103}{123}{Spans: a root span starts a trace, every child carries the trace's identifier and its
+parent's, and a trace is rebuilt from them in time order.}\label{lst:pl:observability-and-incident-response:tracer}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=5.2cm,xbar,bar width=6pt,xmin=0.005,xmax=200000,y dir=reverse,ytick={0,1,2,3,4},
+  yticklabels={capture,store,positions,risk queue,risk compute},xlabel={span duration (ms, log scale)},grid=major,grid style={gray!20},
+  tick label style={font=\small},label style={font=\small},table/col sep=comma,log origin=infty,
+  legend style={font=\small,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,
+    /tikz/every even column/.append style={column sep=4mm}}]
+\addplot[fill=omDef!40,draw=omDef] table[y=row,x=dur_ms]{figdata/platforms/28-observability-and-incident-response/trace_normal.csv};
+\addplot[fill=omThm!50,draw=omThm] table[y=row,x=dur_ms]{figdata/platforms/28-observability-and-incident-response/trace_slow.csv};
+\legend{normal day,slow risk consumer}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:pl:observability-and-incident-response:trace}{spans} of one traced market-data message through the chain (log scale). Capture, storage and positions take 0.02, 0.2 and
+0.1~ms; the risk service computes in 1~ms. What changes when the risk service falls behind is its queue: 50~ms on a normal day, 60~seconds
+at the height of the slow-consumer incident. Data: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:trace}
+\end{omfigure}
+
+Each of the three answers a different question. \omterm{def:pl:observability-and-incident-response:metric}{Metrics} say that something is wrong, cheaply, for everything, all the time. Logs say what
+happened in one service. Traces say where the time went across services, for the sampled units of work. Most trading firms have the first two
+and not the third, and learn where a message spent its minute only by reading the logs of four services side by side, with four clocks.
+
+\section{Service levels and error budgets}
+
+\begin{definition}[Service-level indicator, service-level objective]\label{def:pl:observability-and-incident-response:sli}
+A \emph{service-level indicator}\index{service-level indicator} (SLI) is a carefully defined measure of some aspect of the service a user
+receives: here, the share of seconds in which the market data the risk service uses is at most five seconds old. A \emph{service-level
+objective}\index{service-level objective} (SLO) is a target for an SLI over a period: here, 99.9\% of the trading seconds of a 30-day month.
+\end{definition}
+
+The indicator is chosen from the user's side. A heartbeat from the risk service says the process is alive; the age of its data says whether it
+is doing its job. On the hook's morning every heartbeat was on time and every age grew by one second per second. An SLO differs from Book~14's
+service-level agreement in whom it binds: an agreement is a promise to a customer with penalties, an objective is the firm's own target,
+set tighter than any promise it makes.
+
+\begin{definition}[Error budget]\label{def:pl:observability-and-incident-response:budget}
+The \emph{error budget}\index{error budget} of an SLO is the amount of bad service it allows over its period --- one minus the target, times the
+events --- which the service spends on incidents, maintenance and risky changes; when it is spent, reliability work takes priority over
+features.
+\end{definition}
+
+A 99.9\% objective on 30 trading days of 23\,400 seconds allows 702 bad seconds a month. The chapter's quiet days --- the chain's normal
+latency of tens of milliseconds, plus pauses (a burst, a collection, a slow disk) that arrive 0.8 times an hour and during which the age grows
+one second a second --- spend 115 of them, 16\% of the budget, in 18 pauses of more than five seconds
+(\cref{fig:pl:observability-and-incident-response:quiet}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.2cm,xlabel={time of day},ylabel={oldest data age in the minute (s, log scale)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=390,ymin=0.03,ymax=200,xtick={0,90,180,270,360},xticklabels={09:30,11:00,12:30,14:00,15:30}]
+\addplot[omDef,thin,const plot] table[x=minute,y=max_age]{figdata/platforms/28-observability-and-incident-response/quiet.csv};
+\draw[omThm,dashed] (axis cs:0,5) -- (axis cs:390,5) node[pos=0.02,above right,font=\scriptsize]{5 s: the SLI's limit};
+\draw[gray,dashed] (axis cs:0,30) -- (axis cs:390,30) node[pos=0.98,below left,font=\scriptsize]{30 s};
+\draw[gray,dashed] (axis cs:0,60) -- (axis cs:390,60) node[pos=0.98,above left,font=\scriptsize]{60 s};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{A quiet day of the model: the oldest market-data age the risk service used in each minute. Outside the pauses the oldest age of a minute
+stays about 0.1 to 0.3~seconds, a few times the chain's typical 50~ms; a few pauses of one or two seconds pass unnoticed; one pause at 14:35 lasts 56 seconds, crossing the SLI's five-second limit and every
+static threshold below a minute. Data: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:quiet}
+\end{omfigure}
+
+\section{Alerting that people act on}
+
+A page wakes a person. It should mean that a person must act now, and it should come early enough for the action to matter. Static
+thresholds on the data's age trade the two against each other; a rule on the \omterm{def:pl:observability-and-incident-response:budget}{error budget} does not have to.
+
+\begin{definition}[Burn-rate alert]\label{def:pl:observability-and-incident-response:burn}
+A \emph{burn-rate alert}\index{burn-rate alert} pages when the \omterm{def:pl:observability-and-incident-response:budget}{error budget} is being spent faster than a stated multiple of the rate that
+would exactly exhaust it over the SLO's period, measured over a long window and confirmed over a short one: for a 99.9\% objective, Google's
+SRE workbook recommends paging at 14.4 times over an hour (confirmed over five minutes) or 6 times over six hours (over thirty minutes).
+\end{definition}
+
+\omcode{code/firm/observe/firm_observe.py}{159}{176}{Multi-window burn-rate alerting: the share of bad seconds over each rule's long and
+short windows, against the rate times the error budget's share.}\label{lst:pl:observability-and-incident-response:burn}
+
+Three incidents are replayed on a quiet day at the hook's clock times: a feed stall from 12:03 lasting 21 minutes; intermittent stalls of 20
+seconds every minute from 11:48 for a quarter of an hour; and a slow consumer from 14:00, a risk service whose lag grows by 0.05 seconds each
+second. Five rules watch them (\cref{tab:pl:observability-and-incident-response:rules}).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+rule & feed stall & intermittent stalls & slow consumer & false pages a month\\
+\midrule
+process heartbeat & never & never & never & 0\\
+data age above 5~s & 5~s & 5~s & 100~s & 18\\
+data age above 30~s & 30~s & never & 600~s & 1\\
+data age above 60~s & 60~s & never & 1\,200~s & 0\\
+burn rate, 1~h and 6~h rules & 56~s & 191~s & 151~s & 1\\
+\bottomrule
+\end{tabular}
+\caption{\omterm{def:pl:observability-and-incident-response:ttd}{Time to detect} each replayed incident, and pages over thirty quiet days, for five alerting rules. The heartbeat never fires; the
+static thresholds buy speed with false pages or miss the intermittent stalls; the burn-rate rules detect all three within about three minutes
+and page once a month on quiet days, for the day's 56-second pause.}
+\label{tab:pl:observability-and-incident-response:rules}
+\end{table}
+
+\begin{definition}[Time to detect, time to restore]\label{def:pl:observability-and-incident-response:ttd}
+The \emph{time to detect}\index{time to detect} of an incident is the time from its start to the first alert or report that a person acts on;
+its \emph{time to restore}\index{time to restore} is the time from its start to the moment the service users receive is back within its
+objective.
+\end{definition}
+
+\omterm{def:pl:observability-and-incident-response:ttd}{Time to restore} is measured on the service a user receives, from the incident's start; Book~14's mean time to repair is a property of a
+component such as a circuit, averaged over its failures, from failure to repair.
+
+The static thresholds show the trade-off (\cref{tab:pl:observability-and-incident-response:rules}). At five seconds they detect everything at
+once and page 18 times a month on pauses that heal by themselves; within a few weeks nobody answers them. At thirty or sixty seconds the false
+pages disappear, but the intermittent stalls --- the 11:48 phase of the hook --- never reach the threshold, and a slow consumer takes ten or
+twenty minutes to be noticed. The burn-rate rules page 56 seconds into the stall, three minutes into the intermittent stalls and two and a half
+into the slow consumer (\cref{fig:pl:observability-and-incident-response:slow}), with one page a month on quiet days: the 56-second pause, which
+does spend a real share of the budget and deserves a look.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={minutes after the incident starts},ylabel={data age (s)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=-5,xmax=25,ymin=0,ymax=80,axis y line*=left]
+\addplot[omDef,thick] table[x=t_min,y=age]{figdata/platforms/28-observability-and-incident-response/incident_slow.csv};
+\draw[black,dashed] (axis cs:100/60,0) -- (axis cs:100/60,80) node[pos=0.97,left,font=\scriptsize]{5 s: 1.7 min};
+\draw[omThm,thick] (axis cs:151/60,0) -- (axis cs:151/60,80) node[pos=0.85,right,font=\scriptsize]{burn rate: 2.5 min};
+\draw[black,dashed] (axis cs:10,0) -- (axis cs:10,80) node[pos=0.97,left,font=\scriptsize]{30 s: 10 min};
+\draw[black,dashed] (axis cs:20,0) -- (axis cs:20,80) node[pos=0.97,left,font=\scriptsize]{60 s: 20 min};
+\node[omDef,font=\scriptsize,anchor=north west] at (axis cs:10.5,16) {age of the risk service's data};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The slow-consumer incident: from 14:00 the risk service processes messages slower than they arrive and the age of its data grows by
+0.05 seconds each second. Its process stays alive throughout. The five-second threshold fires at 1.7 minutes, the burn-rate rule at 2.5, the
+30- and 60-second thresholds after 10 and 20 minutes. Data: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:slow}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={minutes after 11:48},ylabel={burn rate (times the budget rate)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=-5,xmax=15,ymin=0,ymax=270]
+\addplot[gray,thin] table[x=t_min,y=burn_5m]{figdata/platforms/28-observability-and-incident-response/incident_intermittent.csv};
+\addplot[omThm,thick] table[x=t_min,y=burn_1h]{figdata/platforms/28-observability-and-incident-response/incident_intermittent.csv};
+\draw[black,dashed] (axis cs:-5,14.4) -- (axis cs:15,14.4) node[pos=0.02,above right,font=\scriptsize]{14.4};
+\draw[omThm,dotted,thick] (axis cs:191/60,0) -- (axis cs:191/60,270) node[pos=0.9,right,font=\scriptsize]{page: 3.2 min};
+\node[gray,font=\scriptsize,anchor=north] at (axis cs:10,240) {5-minute window};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:11,66) {1-hour window};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The intermittent stalls: 20 seconds without data every minute from 11:48. The data age never exceeds 20 seconds, so thresholds at 30
+and 60 seconds never fire; the burn rate over the last hour passes 14.4 --- one fiftieth of the month's budget in an hour --- after 3.2 minutes,
+with the five-minute window confirming it. Data: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:intermittent}
+\end{omfigure}
+
+\section{On call and incident command}
+
+\begin{definition}[On-call rotation, runbook]\label{def:pl:observability-and-incident-response:oncall}
+An \emph{on-call rotation}\index{on-call rotation} assigns, by a published schedule, the people who answer pages for a service at each hour,
+with a secondary behind the primary. A \emph{runbook}\index{runbook} is the written procedure for a known alert or failure: what it means,
+how to confirm it, what to do first, whom to call.
+\end{definition}
+
+\begin{definition}[Incident commander]\label{def:pl:observability-and-incident-response:ic}
+The \emph{incident commander}\index{incident commander} holds the overall state of an incident and structures the response --- assigning
+who changes the system, who communicates, who plans --- without doing the technical work themselves.
+\end{definition}
+
+In a trading firm the first minutes of an incident are about exposure, not diagnosis: is the firm trading on stale data, and should
+strategies stop? The \omterm{def:pl:observability-and-incident-response:oncall}{runbook} for a data-age page therefore starts with the kill switches of Book~13 and the risk limits of Book~11, then the
+diagnosis, and the \omterm{def:pl:observability-and-incident-response:ic}{incident commander}'s first question to the trading desk is what the firm holds. Only one group changes the system during an
+incident, so that fixes do not collide; one person communicates, so that the desk, risk and compliance hear the same thing.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+time & source & event\\
+\midrule
+12:03:00 & log & tickcap: last message on the quote channels\\
+12:03:05 & alert & data age above 5~s: page\\
+12:03:30 & alert & data age above 30~s: page\\
+12:03:56 & alert & burn rate: page\\
+12:04:00 & alert & data age above 60~s: page\\
+12:24:00 & log & tickcap: quote channels resume\\
+12:24:00 & log & rtrisk: data age back under 5~s\\
+\bottomrule
+\end{tabular}
+\caption{The replayed feed stall's timeline, merged from alerts and structured logs by \texttt{firm.observe.timeline}. \omterm{def:pl:observability-and-incident-response:ttd}{Time to detect}:
+56~seconds under the burn-rate rule; \omterm{def:pl:observability-and-incident-response:ttd}{time to restore}: 21 minutes.}\label{tab:pl:observability-and-incident-response:timeline}
+\end{table}
+
+\section{An incident replayed, and the review that follows}
+
+\begin{definition}[Blameless review]\label{def:pl:observability-and-incident-response:blameless}
+A \emph{blameless review}\index{blameless review} (post-incident review, postmortem) reconstructs an incident's timeline and contributing
+causes without indicting any individual or team, on the assumption that everyone acted in good faith with the information they had, and
+ends with actions that change the system rather than exhortations to be careful.
+\end{definition}
+
+The replayed stall's review writes itself from \cref{tab:pl:observability-and-incident-response:timeline}. The data stopped at 12:03; the
+burn-rate page came at 12:03:56; the feed returned at 12:24 and the risk service's data was fresh again the same second. The questions it asks are
+not who failed but what the system let happen: why the firm's dashboards showed green (they measured processes, not data); what the strategies
+did with stale prices for the first minute (the kill switch's trigger was on process health, not data age); why the intermittent phase from
+11:48 went unnoticed (thresholds above its twenty seconds). Its actions are changes: an SLI on data age for every consumer, burn-rate paging,
+a kill switch on stale data, and the replay itself kept as a test (chapter~\ref{ch:pl:testing-and-continuous-delivery}) so that the next
+change to the alerting is checked against it. An incident that becomes an operational loss event (Book~6, chapter~28) enters the firm's loss
+data as well; the review is what makes the loss data useful.
+
+\begin{dated}{2026-09}{The 2013 SIP outage and the SRE practices}\label{dat:pl:observability-and-incident-response:sip}
+Nasdaq's vendor alert on the UTP SIP issue of 22 August 2013 gives the timeline: intermittent outages across multiple quote channels from
+11:48, an outage on all quote channels at 12:03, the issue resolved and the environment stable at 12:24, connectivity re-established from
+14:00, and all quoting and trading in Nasdaq-listed securities resumed at 15:25; the trade feeds were not affected, and a regulatory halt was
+issued for all trading in those securities. Google's \emph{Site Reliability Engineering} defines SLIs, SLOs and the \omterm{def:pl:observability-and-incident-response:budget}{error budget} and describes
+incident command and blameless postmortems; its workbook recommends, for a 99.9\% objective, paging on burn rates of 14.4 over one hour and 6
+over six hours, each confirmed on a window one twelfth as long. OpenTelemetry defines a \omterm{def:pl:observability-and-incident-response:trace}{span} as a unit of work carrying trace, \omterm{def:pl:observability-and-incident-response:trace}{span} and parent
+identifiers.
+\end{dated}
+
+\section{Tutorial: three hours of silence}\label{tut:pl:observability-and-incident-response:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Instrument the chain, define its SLO, replay three incidents, compare alerting rules, and build the incident's timeline.
+\textbf{End state:} \cref{tab:pl:observability-and-incident-response:rules,tab:pl:observability-and-incident-response:timeline}.
+\begin{tutsteps}
+\item \textbf{Traces}: \texttt{pl\_observe.traced(ts, lag)} on a normal day and during the slow consumer.
+\item \textbf{Quiet days}: \texttt{quiet\_day(seed)} and \texttt{budget()}, the \omterm{def:pl:observability-and-incident-response:budget}{error budget} used in a month.
+\item \textbf{Incidents}: \texttt{incident(kind)} for the three kinds.
+\item \textbf{Rules}: \texttt{compare()}: \omterm{def:pl:observability-and-incident-response:ttd}{time to detect} and false pages for each rule.
+\item \textbf{Timeline}: \texttt{stall\_timeline()} and the review.
+\end{tutsteps}
+\textbf{What to change next.} Add a ticket rule (burn rate 1 over three days) and count what it catches that the pages do not; make the
+pauses twice as frequent and see which rules survive.
+\end{tutorial}
+
+\section{Build: observability}\label{bld:pl:observability-and-incident-response:observe}
+
+\begin{build}
+\bfield{Purpose} Know what the platform's users receive, page a person only when one must act, and reconstruct any incident from what the
+platform emitted.
+\bfield{Interface} \texttt{Registry} (\texttt{counter}, \texttt{gauge}, \texttt{histogram}), \texttt{log}, \texttt{Tracer} (\texttt{start},
+\texttt{finish}, \texttt{trace}), \texttt{SLO}, \texttt{error\_budget\_used}, \texttt{threshold\_pages}, \texttt{burn\_rate\_pages},
+\texttt{timeline}.
+\bfield{Rules} SLIs measured from the user's side; every service emits \omterm{def:pl:observability-and-incident-response:metric}{metrics}, structured logs and \omterm{def:pl:observability-and-incident-response:trace}{spans} with propagated identifiers; pages
+from burn rates on SLOs, tickets from slow burns; every page has a \omterm{def:pl:observability-and-incident-response:oncall}{runbook}; every incident has a commander and a \omterm{def:pl:observability-and-incident-response:blameless}{blameless review} with
+changes.
+\bfield{Acceptance tests} \texttt{code/firm/observe/tests/}: registry kinds and labels, a structured log line; a trace rebuilt from parent
+links; budgets and burn rates; threshold pages with a minimum gap; a burn-rate page at the 52nd bad second of an outage and none before; a
+merged timeline.
+\bfield{Stretch} Exemplars linking a histogram bucket to a trace; tail-based trace sampling; alerts on the CUSUM of an SLI (Book~7,
+chapter~13).
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{UTP Vendor Alert \#2013-9: UTP SIP Issue on Thursday, August 22, 2013}.
+\item B.~Beyer, C.~Jones, J.~Petoff and N.~R.~Murphy (eds.), \emph{Site Reliability Engineering}, O'Reilly, 2016 (chapters 3, 4, 14, 15);
+\emph{The Site Reliability Workbook}, 2018 (\emph{Alerting on SLOs}).
+\item OpenTelemetry documentation, \emph{Traces}.
+\item One Quant Book~13, chapters~5 and~24 (latency histograms, kill switches); Book~14, chapter~15 (service-level agreements, mean time to
+repair).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:1}
+How many bad seconds does a 99.9\% objective allow over thirty days of 23\,400 seconds, and how many did the quiet month spend?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:2}
+Why does the process heartbeat never fire in any of the three incidents?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:3}
+How long does the burn-rate rule take to page on a complete stall, and where does the number come from?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:4}
+Why do the thirty- and sixty-second thresholds never see the intermittent stalls?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:5}
+What does the short window of a burn-rate rule add to the long one?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:6}
+What is the replayed stall's \omterm{def:pl:observability-and-incident-response:ttd}{time to restore}, and why is it not a mean time to repair?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:observability-and-incident-response:7}
+\emph{Coding.} Make the pauses twice as frequent (\texttt{pauses\_per\_hour=1.6}) and recount the false pages of the five-second threshold and
+of the burn-rate rules over thirty days.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:observability-and-incident-response:8}
+\emph{Find the flaw.} \textquotedbl{}Our monitoring was fine: every service reported healthy throughout the outage.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: Three Hours of Silence}
+
+\begin{problem}[{Weekend problem --- three hours of silence}]\label{pb:pl:observability-and-incident-response:1}
+The chapter's chain, SLO, quiet days, incidents and rules.
+
+\medskip\noindent\textbf{Part I --- Signals.}
+\begin{enumerate}
+\item What do \omterm{def:pl:observability-and-incident-response:metric}{metrics}, logs and traces each answer?
+\item Where does a traced message spend its time on a normal day and during the slow consumer?
+\item Why is the SLI the data's age and not the process's health?
+\item What does the SLO allow, and what do quiet days spend?
+\item How does an SLO differ from a service-level agreement?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Rules.}
+\begin{enumerate}[resume]
+\item What are the three replayed incidents?
+\item What does each static threshold detect, and how fast?
+\item How many false pages a month does each rule send?
+\item What do the burn-rate rules detect, and how fast?
+\item Why is the burn-rate rule's one false page a month acceptable?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Response.}
+\begin{enumerate}[resume]
+\item What does the \omterm{def:pl:observability-and-incident-response:ic}{incident commander} do and not do?
+\item What comes first in the \omterm{def:pl:observability-and-incident-response:oncall}{runbook} for a data-age page in a trading firm?
+\item What is the replayed stall's timeline?
+\item What are its \omterm{def:pl:observability-and-incident-response:ttd}{time to detect} and \omterm{def:pl:observability-and-incident-response:ttd}{time to restore}?
+\item What does a \omterm{def:pl:observability-and-incident-response:blameless}{blameless review} produce?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the \omterm{def:pl:observability-and-incident-response:ttd}{time to detect} a feed stall and a slow consumer under a static threshold and under \omterm{def:pl:observability-and-incident-response:burn}{burn-rate
+alerts}, and the false pages a month each costs, on the replayed incident and on thirty quiet days.
+\item Which rule would you deploy, and with what ticket rule behind it?
+\item What would have made the firm's dashboards turn red on the hook's morning?
+\item What changes would the review of the replayed stall require?
+\item In one sentence: what should a page mean?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:observability-and-incident-response:1}
+What is the difference between monitoring a process and monitoring a service?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:observability-and-incident-response:2}
+What are an SLI, an SLO and an \omterm{def:pl:observability-and-incident-response:budget}{error budget}? Give one for a market-data platform.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:observability-and-incident-response:3}
+Your team gets thirty pages a week and ignores most of them. What do you change?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:observability-and-incident-response:4}
+A message takes a minute to go from the feed to the risk system. How do you find out where?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:observability-and-incident-response:5}
+Design the \omterm{def:pl:observability-and-incident-response:observability}{observability} and incident process for a trading firm's data and risk platform.
+\end{interviewq}

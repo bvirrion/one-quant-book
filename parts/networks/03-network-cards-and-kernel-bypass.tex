@@ -1,0 +1,431 @@
+\chapter{Network Cards and Kernel Bypass}\label{ch:nw:network-cards-and-kernel-bypass}
+
+Between the wire and a UDP socket's \texttt{recv} a datagram is copied by the card into the host's memory, announced by an
+interrupt, picked up by the kernel's networking code in a software interrupt, matched to a socket, queued, and copied again into
+the buffer the program handed to \texttt{recv}; the program, meanwhile, was asleep and must be woken. On the laptop this book is
+written on, the median datagram spends under a microsecond getting into the kernel over loopback and about fifteen more
+microseconds getting out of it to a sleeping reader. None of that work decides anything a trading program cares about.
+
+This chapter follows a packet through the network card and the kernel, then removes the kernel from the path. One Quant
+Book~13 (chapter~13) tuned the host so that busy polling and kernel bypass can do their job; this chapter looks at the same
+machinery from the card's side: \omterm{def:nw:network-cards-and-kernel-bypass:ring}{descriptor rings}, interrupts and their coalescing, the steering of flows to queues, the stacks
+that run in user space, and the timestamps the card itself can take.
+
+\section{The path of a packet through the kernel}
+
+A network card and its driver share memory. The card writes arriving packets into buffers that the driver has given it,
+and says which ones it has filled; the driver takes them, hands the buffers back, and passes the packets up.
+
+\begin{definition}[Descriptor ring]\label{def:nw:network-cards-and-kernel-bypass:ring}
+A \emph{descriptor ring}\index{descriptor ring} is a circular array of descriptors, each pointing at a packet buffer in host memory
+and carrying an ownership flag. On the receive side the card fills the next descriptor it owns with an arriving packet (by direct
+memory access), marks it as the host's, and advances its head; the host processes the descriptors it owns in order and hands them
+back to the card. When the next descriptor still belongs to the host, the card has nowhere to put the packet and drops it.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (w) at (0,0) {wire};
+\node[b,fill=omDef!18] (n) at (2.0,0) {card};
+\node[b,fill=omDef!10] (r) at (4.4,0) {descriptor\\ ring (DMA)};
+\node[b,fill=omThm!12] (i) at (6.9,0.9) {interrupt,\\ softirq};
+\node[b,fill=omThm!12] (s) at (9.2,0.9) {socket\\ queue};
+\node[b,fill=omThm!12] (c) at (11.4,0.9) {copy, wake,\\ \texttt{recv}};
+\node[b,fill=omMeth!20] (u) at (8.1,-1.1) {user-space poll of the ring (bypass)};
+\draw[->] (w) -- (n);
+\draw[->] (n) -- (r);
+\draw[->,omThm,thick] (r.north east) -- (i.west);
+\draw[->,omThm,thick] (i) -- (s);
+\draw[->,omThm,thick] (s) -- (c);
+\draw[->,omMeth,thick] (r.south east) -- (u.west);
+\node[font=\scriptsize,omThm] at (9.2,1.75) {kernel path};
+\node[font=\scriptsize,omMeth] at (8.1,-1.75) {bypass path: the program owns the ring};
+\end{tikzpicture}
+
+\omcaption{Two ways out of a \omterm{def:nw:network-cards-and-kernel-bypass:ring}{descriptor ring}. The kernel path (top) takes an interrupt, processes the packet in a software
+interrupt, queues it on a socket and copies it to a program that must be woken. A kernel-bypass stack (bottom) maps the ring into
+the program, which polls it and reads the packet where the card wrote it.}\label{fig:nw:network-cards-and-kernel-bypass:path}
+\end{omfigure}
+
+On Linux the kernel side of this is NAPI, the networking stack's event mechanism: the card raises an interrupt, the kernel
+schedules the ring's processing in a software interrupt, and the processing runs until the ring is empty or a budget is spent,
+with further interrupts from that ring disabled meanwhile. Under load the kernel is thus already polling; what it does not do by
+default is spare the program the socket queue, the copy and the wake-up.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \k in {0,...,11} {
+  \pgfmathsetmacro{\a}{90-30*\k}
+  \pgfmathtruncatemacro{\host}{(\k>=2 && \k<=6) ? 1 : 0}
+  \ifnum\host=1 \def\c{omThm!30}\else\def\c{omDef!15}\fi
+  \draw[fill=\c] (\a+15:1.3) arc (\a+15:\a-15:1.3) -- (\a-15:2.2) arc (\a-15:\a+15:2.2) -- cycle;
+}
+\draw[->,very thick,omMeth] (0,0) -- (30:1.2);
+\node[font=\scriptsize,omMeth] at (30:0.45) [above left] {tail};
+\draw[->,very thick,omDef] (0,0) -- (-120:1.2);
+\node[font=\scriptsize,omDef] at (-120:0.5) [left] {head};
+\node[anchor=west,align=left] at (2.8,0.9) {\tikz\fill[omThm!30] (0,0) rectangle (0.3,0.2);\ owned by the host: filled by the card,\\
+  \hphantom{\tikz\fill (0,0) rectangle (0.3,0.2);\ }waiting to be processed or handed back};
+\node[anchor=west,align=left] at (2.8,-0.3) {\tikz\fill[omDef!15] (0,0) rectangle (0.3,0.2);\ owned by the card: empty buffers};
+\node[anchor=west,align=left] at (2.8,-1.2) {the card fills at the head and advances it clockwise;\\ the host reads at the tail;
+  when the head reaches\\ a host-owned descriptor, the next packet is dropped};
+\end{tikzpicture}
+
+\omcaption{A receive ring of twelve descriptors. Five are the host's (filled and not yet handed back), seven are the card's. The card
+writes at the head, the host reads at the tail; the ring is full when the head meets a descriptor the host still owns, whether the
+host has read it or merely not yet handed it back.}\label{fig:nw:network-cards-and-kernel-bypass:ring}
+\end{omfigure}
+
+\begin{proposition}[When a ring overflows]\label{prop:nw:network-cards-and-kernel-bypass:full}
+Let a ring of $N$ descriptors receive packets at rate $\lambda$ while the host processes none for a time $T$, starting from a ring in
+which the host holds $H$ descriptors. The ring drops $\bigl(\lambda T - (N - H)\bigr)^{+}$ packets. A host that hands descriptors
+back in batches of $b$ holds up to $b - 1$ processed descriptors at any time, so it must size the ring for the longest pause plus
+$b - 1$.
+\end{proposition}
+
+\begin{proof}
+The card has $N - H$ descriptors to fill; each arrival consumes one and none come back during the pause. Descriptors processed but
+not yet handed back remain the host's until the batch completes.
+\end{proof}
+
+\section{Interrupts, coalescing and receive-side scaling}
+
+An interrupt costs the host a switch into the kernel, the handler, and, for a sleeping reader, the scheduler's wake-up: microseconds,
+paid per interrupt. Cards therefore wait before interrupting.
+
+\begin{definition}[Interrupt coalescing]\label{def:nw:network-cards-and-kernel-bypass:coalesce}
+\emph{Interrupt coalescing}\index{interrupt coalescing} is a card's practice of delaying the receive interrupt after a packet
+arrives, until a given time has passed or a given number of packets are waiting, so that one interrupt serves several packets.
+On Linux the two limits are set with \texttt{ethtool -C} as \texttt{rx-usecs} and \texttt{rx-frames}; zero microseconds and one frame
+disable coalescing.
+\end{definition}
+
+\begin{proposition}[What coalescing buys and costs]\label{prop:nw:network-cards-and-kernel-bypass:coalesce}
+Let packets arrive as a Poisson process of rate $\lambda$, let the card interrupt $u$ after the first waiting packet (the frame limit
+never binding), and let each interrupt cost $c_{\mathrm{irq}}$ of CPU and each packet $c_{\mathrm{pkt}}$. Each interrupt serves on
+average $1 + \lambda u$ packets, the host spends a fraction
+\[
+  \frac{\lambda\, c_{\mathrm{irq}}}{1 + \lambda u} + \lambda\, c_{\mathrm{pkt}}
+\]
+of one core, and the first packet of each batch waits $u$ for the interrupt. Without coalescing ($u = 0$) the host saturates one core
+at $\lambda = 1/(c_{\mathrm{irq}} + c_{\mathrm{pkt}})$.
+\end{proposition}
+
+\begin{proof}
+A batch opens with a packet and lasts $u$; by the memorylessness of the Poisson process, $\lambda u$ more packets arrive on
+average. Interrupts therefore come at rate $\lambda/(1+\lambda u)$, each costing $c_{\mathrm{irq}}$, and every packet costs
+$c_{\mathrm{pkt}}$.
+\end{proof}
+
+\begin{definition}[Receive-side scaling, flow steering]\label{def:nw:network-cards-and-kernel-bypass:rss}
+\emph{Receive-side scaling}\index{receive-side scaling} (RSS) is a multi-queue card's distribution of arriving packets over several
+receive rings, by a hash of their addresses and ports, so that different cores can process different flows. \emph{Flow
+steering}\index{flow steering} is the card's placing of chosen flows (by exact match on addresses and ports) on a chosen ring,
+overriding the hash.
+\end{definition}
+
+A trading host uses both against RSS's intent. RSS spreads load evenly, which is what a web server wants; a feed handler wants every
+packet of line A on the one ring its pinned core polls, and nothing else there. \omterm{def:nw:network-cards-and-kernel-bypass:rss}{Flow steering} puts the venue's groups on the rings of
+the cores that handle them and the rest of the machine's traffic elsewhere, and the core that polls a ring should sit on the socket
+the card is attached to (One Quant Book~13, chapter~4).
+
+\section{Polling drivers and user-space stacks}
+
+\begin{definition}[Poll-mode driver, user-space network stack]\label{def:nw:network-cards-and-kernel-bypass:pmd}
+A \emph{poll-mode driver}\index{poll-mode driver} runs in the application's process: it maps a card's rings into user space and
+reads and refills them in a loop on a dedicated core, with no interrupts and no system calls. A \emph{user-space network
+stack}\index{user-space network stack} implements IP, UDP and TCP in the application's process on top of such access to the card,
+usually behind the standard socket calls, so that an unmodified program runs over it.
+\end{definition}
+
+\begin{remark}[The families of bypass]\label{rem:nw:network-cards-and-kernel-bypass:families}
+Three kinds are in use, and a firm often runs two. Raw ring access through a vendor's interface (AMD's \texttt{ef\_vi} for its
+Solarflare cards) or a portable poll-mode framework (DPDK) gives the program frames and nothing else: it must parse its own UDP and,
+for orders, bring its own TCP. A user-space stack behind the socket calls (OpenOnload, open source, which intercepts the socket calls
+of an unmodified binary) keeps the program's code and removes the kernel from its path. And Linux's own AF\_XDP moves frames from a
+card's ring to a region of the program's memory through an in-kernel filter, in copy or in zero-copy mode, with the kernel still in
+charge of the device. \Cref{met:nw:network-cards-and-kernel-bypass:choose} says which to use where.
+\end{remark}
+
+\begin{method}[Choosing a receive path]\label{met:nw:network-cards-and-kernel-bypass:choose}
+\begin{enumerate}
+\item Market data on the hot path: raw ring access, polled by a pinned core on the card's socket, the handler parsing UDP itself; the
+  feed is multicast UDP, which needs no protocol state.
+\item Order entry: a user-space TCP stack, or the card vendor's TCP in hardware (chapter~7), because order entry needs TCP's state and
+  retransmission and writing one's own TCP is a project of its own.
+\item Everything else (drop copy, reference data, monitoring): the kernel, on cores and rings of its own, so that it never shares a
+  queue with the hot path.
+\item In every case measure: the gain depends on the card, the host's tuning and the traffic, and a poller that is ever descheduled
+  loses more than it gained.
+\end{enumerate}
+\end{method}
+
+\omcode{code/firm/nicring/cpp/firm_nicring.hpp}{18}{37}{The receive ring of \texttt{firm.nicring}: the card fills descriptors it owns;
+the poll loop processes those it owns and hands them back in batches.}\label{lst:nw:network-cards-and-kernel-bypass:ring}
+
+\section{Zero copy and the transmit side}
+
+\begin{definition}[Zero-copy networking]\label{def:nw:network-cards-and-kernel-bypass:zerocopy}
+\emph{Zero-copy networking}\index{zero-copy networking} is the delivery of a packet to the program, or from it, in the buffer the card
+reads or writes by direct memory access, without the processor copying its bytes between a kernel buffer and the program's.
+\end{definition}
+
+A copy of a 100-byte datagram is a few nanoseconds of memory traffic; what zero copy saves on the receive side is less the copy than
+the machinery around it (the socket buffer, its accounting, the cache lines of a second location). On the transmit side the same
+ring structure runs in reverse: the program writes an order into a transmit buffer, fills a descriptor and writes the card's doorbell
+register, and the card fetches the frame by direct memory access. Each of those steps is a crossing of the processor's interconnect to
+the card (One Quant Book~13, chapter~4). Some cards let the program push the frame's bytes into the card's own memory with processor
+writes instead: AMD's \texttt{ef\_vi} documents such a programmed-I/O region, which ``avoids the latency associated with a DMA read'',
+can be filled before the critical path and updated on it, and, in a cut-through mode, starts transmitting while the frame is still
+crossing the bus. The cheapest transmit is the one prepared before it is needed: the order's
+frame built in advance, with only price, size and identifier to fill, the same idea chapter~7 takes into hardware.
+
+\section{Timestamps on the card}
+
+The kernel can timestamp a packet when it enters the kernel (\texttt{SO\_TIMESTAMPING}, software receive timestamps), and a card with
+its own clock can timestamp it when it reaches the card's port, a hardware timestamp in the sense of One Quant Book~13, chapter~5. The
+difference is the time the packet spent in the card and its ring, which is exactly what a firm tuning its receive path wants to see and
+what software timestamps cannot show. The card's clock is only as good as its synchronisation to the firm's time reference, the
+subject of chapter~4, and the timestamps of the whole cage are compared in chapter~5.
+
+\section{Tutorial: the kernel's receive path, measured and modelled}\label{tut:nw:network-cards-and-kernel-bypass:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Measure what the kernel's receive path costs on the laptop, model what interrupts and polling cost on a card, and run
+the \omterm{def:nw:network-cards-and-kernel-bypass:ring}{descriptor ring} in three languages. \textbf{End state:} \cref{tab:nw:network-cards-and-kernel-bypass:measured},
+\cref{fig:nw:network-cards-and-kernel-bypass:measured,fig:nw:network-cards-and-kernel-bypass:coalesce}, and the ring's fixture green in
+Python, C++ and Rust.
+\begin{tutsteps}
+\item \textbf{Three ways to read.} \texttt{cpp/nw\_rx.hpp} sends 64-byte datagrams over loopback, each carrying its send time, and reads
+  them by a blocking \texttt{recvmsg}, by non-blocking reads in a loop, and by \texttt{recvmmsg} in batches of 16, with the kernel's software
+  receive timestamp in each (\cref{lst:nw:network-cards-and-kernel-bypass:rx}). \texttt{python bench\_rx.py} runs 20\,000 datagrams per
+  mode, 20 microseconds apart, and writes the quantiles.
+\item \textbf{Split the path.} The kernel's timestamp splits each datagram's latency into getting into the kernel and getting out of it
+  to the program.
+\item \textbf{Model the card.} \texttt{nw\_nic.coalesce} and \texttt{poll} simulate a card's interrupts with coalescing and a polling
+  core, with the model's costs; \texttt{python fig\_nic.py} writes \cref{fig:nw:network-cards-and-kernel-bypass:coalesce}'s data.
+\item \textbf{The ring.} \texttt{firm.nicring} runs the same stream of arrivals and polls through four ring configurations in Python,
+  C++ and Rust and checks counters and hashes against the shared fixture.
+\end{tutsteps}
+\textbf{What to change next.} Pin the busy-polling reader to a core and the sender to another (\texttt{taskset}) and read its tail
+again; in the ring's fixture, find the smallest ring that drops nothing when the host hands back in batches of 32.
+\end{tutorial}
+
+\omcode{code/networks/03-network-cards-and-kernel-bypass/cpp/nw_rx.hpp}{100}{116}{The three reads: a blocking read, a non-blocking
+read in a loop, and a batched read; each datagram keeps its send, kernel and application times.}\label{lst:nw:network-cards-and-kernel-bypass:rx}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+Read method & Into the kernel, p50 & Kernel to program, p50 & Total, p50 & Total, p99 \\
+\midrule
+Blocking \texttt{recvmsg} & \qty{0.75}{\micro\second} & \qty{15.4}{\micro\second} & \qty{16.2}{\micro\second} & \qty{215}{\micro\second} \\
+Busy polling & \qty{0.62}{\micro\second} & \qty{0.92}{\micro\second} & \qty{1.5}{\micro\second} & \qty{3\,457}{\micro\second} \\
+Batched \texttt{recvmmsg} & \qty{0.45}{\micro\second} & \qty{21.4}{\micro\second} & \qty{22.0}{\micro\second} & \qty{75}{\micro\second} \\
+\bottomrule
+\end{tabular}
+\caption{The kernel's receive path over loopback, 20\,000 datagrams of 64 bytes per method, 20 microseconds apart (the batched
+reader's sender sends bursts of 16). Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, no isolated cores; g++~11,
+\texttt{-O2}. Data: \texttt{bench\_rx.py}, \texttt{measured\_rx.csv}.}\label{tab:nw:network-cards-and-kernel-bypass:measured}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ymode=log,xmin=0,xmax=1,ymin=0.7,ymax=6000,
+  xlabel={quantile},ylabel={latency (\unit{\micro\second}, log scale)},
+  ytick={1,10,100,1000},yticklabels={1,10,100,1\,000},xtick={0,0.25,0.5,0.75,0.9,1},
+  xticklabels={0,0.25,0.5,0.75,0.9,1},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=q,y=blocking]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=q,y=busy]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\addplot[omMeth,very thick,mark=triangle*,mark size=1.6pt] table[x=q,y=batched]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\legend{blocking read,busy polling,batched read}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Quantiles of the time from \texttt{sendto} to the program holding the datagram, on the laptop's loopback, by read method.
+Busy polling cuts the median tenfold; without an isolated core the polling thread is sometimes descheduled for milliseconds, and every
+datagram behind it waits: from the 95th quantile on, it is the worst of the three. Measured on a laptop (Intel Core Ultra 7 155H) under
+WSL2, no isolated cores. Data: \texttt{bench\_rx.py}.}\label{fig:nw:network-cards-and-kernel-bypass:measured}
+\end{omfigure}
+
+The measurement shows the two halves of this chapter's argument (\cref{tab:nw:network-cards-and-kernel-bypass:measured}). Getting a
+datagram into the kernel costs under a microsecond; getting it out to a sleeping program costs fifteen at the median and hundreds of
+microseconds at the 99th percentile, because the program must be woken and scheduled. A program that never sleeps removes that: busy
+polling brings the median down to \qty{1.5}{\micro\second}. And a program that never sleeps must never be interrupted: on a laptop
+whose cores are shared with everything else the poller is sometimes descheduled, and the datagrams that arrive meanwhile wait for
+milliseconds. Batching amortises the system call but not the wake-up, and waits for its batch. Loopback involves no card at all, so
+these figures are the kernel's share alone; a real card adds its ring, its interrupt and its coalescing.
+
+\omcode{code/networks/03-network-cards-and-kernel-bypass/python/nw_nic.py}{24}{45}{The coalescing model: an interrupt at the $m$-th
+waiting packet or $u$ after the first, then wake-up, interrupt cost and per-packet cost.}\label{lst:nw:network-cards-and-kernel-bypass:model}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,xmin=0,xmax=66,
+  xlabel={coalescing timer (\unit{\micro\second})},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},table/col sep=comma,unbounded coords=jump]
+\nextgroupplot[ymin=0,ymax=48,ylabel={mean latency (\unit{\micro\second})},xtick={0,8,16,32,64},
+  legend columns=2,legend style={font=\footnotesize,at={(1.15,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=timer_us,y=lat_01]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.3pt] table[x=timer_us,y=lat_05]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\legend{100\,000 packets a second,500\,000 packets a second}
+\nextgroupplot[ymin=0,ymax=0.7,ylabel={share of one core},xtick={0,8,16,32,64}]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=timer_us,y=cpu_01]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.3pt] table[x=timer_us,y=cpu_05]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Model: \omterm{def:nw:network-cards-and-kernel-bypass:coalesce}{interrupt coalescing} at two packet rates. Longer timers cost latency and save CPU. At 500\,000 packets a second an
+interrupt per packet saturates the core (no point at zero). A polling core, not drawn, holds latency near
+\qty{0.4}{\micro\second} at both rates and uses the whole core. Model costs: \qty{2}{\micro\second} per interrupt,
+\qty{3}{\micro\second} of wake-up, \qty{0.3}{\micro\second} per packet. Data: \texttt{fig\_nic.py}.}\label{fig:nw:network-cards-and-kernel-bypass:coalesce}
+\end{omfigure}
+
+The model (\cref{lst:nw:network-cards-and-kernel-bypass:model}) takes \qty{2}{\micro\second} of CPU per interrupt,
+\qty{3}{\micro\second} of wake-up and \qty{0.3}{\micro\second} per packet: model values of the order of the laptop's wake-up, not a
+particular card's. At 100\,000 packets a second an interrupt per packet gives \qty{5.6}{\micro\second} of mean latency for 23\% of a
+core; an \qty{8}{\micro\second} timer gives \qty{11.7}{\micro\second} for 14\%; polling gives \qty{0.4}{\micro\second} for the whole
+core. At 500\,000 an interrupt per packet is beyond one core (the saturation rate of
+\cref{prop:nw:network-cards-and-kernel-bypass:coalesce} is 435\,000 a second), and coalescing is what keeps the host alive. A trading
+host resolves the trade-off by not choosing it: the hot path polls on cores bought for the purpose, and everything else coalesces.
+
+\section{Build: the descriptor ring}\label{bld:nw:network-cards-and-kernel-bypass:nicring}
+
+\begin{build}
+\bfield{Purpose} A model of a card's receive ring precise enough to reason about drops, batching and polling budgets, in the three
+languages of the firm's systems.
+\bfield{Interface} Python \texttt{firm\_nicring.Ring(size, refill)} with \texttt{nic\_rx(seq, length)}, \texttt{poll(budget)},
+\texttt{run(events)} and the counters \texttt{rx}, \texttt{drops}, \texttt{processed}, \texttt{doorbells}, \texttt{max\_owned},
+\texttt{hash}; \texttt{make\_events}. C++20 \texttt{firm::nicring::Ring} (\texttt{cpp/firm\_nicring.hpp}) and Rust
+\texttt{firm\_nicring::Ring} with the same methods.
+\bfield{Rules} The ring's size is a power of two; the card never overwrites a descriptor the host owns; the host processes in order,
+never more than its budget per poll, and hands back in batches of \texttt{refill}, one doorbell per batch; the hash is FNV-1a over
+the processed packets' sequence numbers and lengths in processing order.
+\bfield{Acceptance tests} \texttt{code/firm/nicring/}: the shared fixture (20\,000 arrivals, four configurations) reproduced exactly in
+Python, C++ and Rust; a full ring drops and a processed but unreturned descriptor still counts as full; under random interleavings
+every accepted packet is processed once and in order.
+\bfield{Stretch} A transmit ring with a completion queue; several rings with a steering function, to reproduce the imbalance of a hash
+that puts two busy groups on one ring.
+\end{build}
+
+\begin{omsources}
+\item Linux kernel documentation: ``NAPI'', ``Scaling in the Linux Networking Stack'', ``Timestamping'', ``AF\_XDP'';
+\texttt{include/uapi/linux/ethtool.h} (\texttt{struct ethtool\_coalesce}); man page \texttt{recvmmsg(2)}.
+\item DPDK Programmer's Guide, ``Poll Mode Driver''; AMD, \emph{ef\_vi User Guide}; OpenOnload README.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:1}
+A ring of 512 descriptors, of which the host holds 40, receives 1.5 million packets a second while its core is interrupted for
+\qty{400}{\micro\second}. How many packets are dropped?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:2}
+With coalescing at 20 microseconds, and packets at 200\,000 a second, how many packets does an interrupt serve on average, and at what
+rate do interrupts arrive?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:3}
+From \cref{tab:nw:network-cards-and-kernel-bypass:measured}, what share of the blocking read's median is spent after the datagram entered
+the kernel?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:4}
+Why does \omterm{def:nw:network-cards-and-kernel-bypass:rss}{receive-side scaling}'s even spreading of flows work against a feed handler, and what does \omterm{def:nw:network-cards-and-kernel-bypass:rss}{flow steering} change?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:5}
+With the model's costs, at what packet rate does an interrupt per packet use a whole core? And if every interrupt serves 16 packets?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:6}
+Busy polling improved the median tenfold and made the 99th percentile sixteen times worse
+(\cref{tab:nw:network-cards-and-kernel-bypass:measured}). Explain both, and say what must change on a production host.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:7}
+\emph{Coding.} With \texttt{firm.nicring} and the fixture's events, find the smallest ring size that drops nothing when descriptors are
+handed back in batches of 32.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:8}
+\emph{Find the flaw.} ``We moved order entry to a raw poll-mode interface and wrote our own minimal TCP: no retransmission timer, since
+colocation links do not lose packets. Latency fell by two microseconds.''
+\end{exercise}
+
+\section{Problem: Interrupts or Polling}
+
+\begin{problem}[{Weekend problem --- the price of a sleeping reader}]\label{pb:nw:network-cards-and-kernel-bypass:1}
+A feed arrives at 200\,000 packets a second on one receive ring. Use the chapter's model costs: \qty{2}{\micro\second} of CPU per
+interrupt, \qty{3}{\micro\second} of wake-up, \qty{0.3}{\micro\second} per packet, and a polling loop that checks the ring every
+\qty{0.2}{\micro\second}.
+
+\medskip\noindent\textbf{Part I --- One interrupt per packet.}
+\begin{enumerate}
+\item What share of a core do interrupts and packets take?
+\item What is the smallest latency a packet can have?
+\item The model's mean latency is \qty{6.3}{\micro\second}. Why is it above the minimum?
+\item At what rate would the core saturate?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- A 10-microsecond timer.}
+\begin{enumerate}[resume]
+\item How many packets does an interrupt serve on average?
+\item At what rate do interrupts come?
+\item What share of the core is used?
+\item The model's mean latency is \qty{12.4}{\micro\second}. Where does the increase come from?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Polling.}
+\begin{enumerate}[resume]
+\item What is the mean wait for the next check of the ring?
+\item What is the mean latency, and the model's (\qty{0.41}{\micro\second})?
+\item What share of a core is used?
+\item What must be true of that core?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the mean latency and CPU of the timer and of polling at this rate, and the rate at which interrupts
+  alone would take a whole core.
+\item How many microseconds per packet does polling save over the timer?
+\item At what packet rate does the timer's CPU reach a quarter of a core?
+\item Why do trading hosts poll the hot path and coalesce the rest?
+\item What would you measure on the real card before believing the model?
+\item What does a \omterm{def:nw:network-cards-and-kernel-bypass:ring}{descriptor ring} of 1\,024 entries give the polling core, in time, at this rate?
+\item In one sentence: what does a sleeping reader cost?
+\item Which of the chapter's three families of bypass would you use for this feed, and why?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:network-cards-and-kernel-bypass:1}
+Walk me through what happens between a packet arriving at the card and \texttt{recv} returning.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:network-cards-and-kernel-bypass:2}
+What is \omterm{def:nw:network-cards-and-kernel-bypass:coalesce}{interrupt coalescing}? How would you set it on a market-data host?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:network-cards-and-kernel-bypass:3}
+What is kernel bypass, what forms does it take, and what do you give up?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:network-cards-and-kernel-bypass:4}
+Your busy-polling feed handler has a great median and a terrible 99.9th percentile. What do you check?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:network-cards-and-kernel-bypass:5}
+A \omterm{def:nw:network-cards-and-kernel-bypass:ring}{descriptor ring} drops packets although the handler's average load is 30\%. Explain how, and how you would size the ring.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:network-cards-and-kernel-bypass:6}
+Why would you want hardware receive timestamps when you already timestamp in the kernel?
+\end{interviewq}

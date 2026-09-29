@@ -1,0 +1,378 @@
+\chapter{Market-Data Distribution and Entitlements}\label{ch:pl:market-data-distribution-and-entitlements}
+
+An exchange's auditor asks a firm for the list of every person and every program that used the exchange's depth data in the past three years.
+The firm can name forty screens: it pays for forty. It cannot name, at first, the eleven applications that read the same feed from the
+firm's distribution platform --- strategies, a risk service, a tick recorder, a surveillance system, a research dashboard --- and each of them is
+a use the exchange charges for. The firm in this chapter is a model, but the documents it is audited against are real: one exchange's price
+list, data policies and subscriber agreement. The chapter builds the platform that distributes market data inside a firm and the part of it
+that is usually missing: the record of who used what, for which purpose, counted the way the venue counts.
+
+\section{Distributing data inside the firm}
+
+A direct feed (Book~1, chapter~9) arrives once at the firm's feed handlers. From there it must reach dozens of consumers with very different
+needs: a strategy that wants every message within microseconds, a risk service that wants current prices, a trader's screen that cannot show
+more than a few updates a second, a research job that records everything. Connecting each of them to the feed would multiply the network
+load, the licences and the points of failure; the firm puts one platform in between.
+
+\begin{definition}[Market-data distribution platform]\label{def:pl:market-data-distribution-and-entitlements:platform}
+A \emph{market-data distribution platform}\index{market-data distribution platform} receives normalised market data once and delivers it
+inside the firm to subscribers by topic (an instrument, a venue, a data type), with a delivery policy per subscriber --- every message in
+order, or conflated --- and with an \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} check on every subscription.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=5mm,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=9mm,text width=22mm},
+  chk/.style={draw=omThm,fill=omThm!8,rounded corners=2pt,align=center,minimum height=9mm,text width=22mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (f) {feed handler\\(normalised)};
+\node[box,right=8mm of f,minimum height=34mm,text width=18mm] (b) {bus:\\topics,\\one queue per\\subscriber};
+\node[box,right=12mm of b,yshift=19.5mm,text width=36mm,minimum height=7mm] (s1) {strategy, every message};
+\node[box,right=12mm of b,yshift=6.5mm,text width=36mm,minimum height=7mm] (s2) {risk service};
+\node[box,right=12mm of b,yshift=-6.5mm,text width=36mm,minimum height=7mm] (s3) {research dashboard};
+\node[box,right=12mm of b,yshift=-19.5mm,text width=36mm,minimum height=7mm] (s4) {trader's screen (conflated)};
+\node[chk,below=12mm of f] (e) {entitlement\\system};
+\node[chk,right=4mm of e,xshift=22mm,yshift=-12mm] (u) {usage log};
+\node[chk,right=6mm of u] (r) {usage report\\and audit};
+\draw[arr] (f) -- (b);
+\foreach \x in {s1,s2,s3,s4} \draw[arr] (b.east) -- (\x.west);
+\draw[arr,omThm] (e.east) -- node[above,font=\scriptsize,sloped]{check} (b.south west);
+\draw[arr,omThm] (b.south) |- (u.west);
+\draw[arr,omThm] (u) -- (r);
+\end{tikzpicture}
+
+\omcaption{The chapter's distribution platform: one normalised feed, one bus with a queue per subscriber, an \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} check at subscription
+and at delivery, and every access written to a usage log from which the monthly \omterm{def:pl:market-data-distribution-and-entitlements:report}{usage report} and the audit \omterm{def:pl:post-trade-systems:recon}{reconciliation} are
+produced.}\label{fig:pl:market-data-distribution-and-entitlements:platform}
+\end{omfigure}
+
+The chapter's bus (\texttt{firm.entitle}) is simulated in virtual time. Ten minutes of depth updates for twenty instruments --- 240\,267
+messages, from Book~7's tape generator, the order flow that Book~10's simulator replays --- go to four subscribers: a strategy that takes
+20~microseconds per message, a risk service that takes 2~milliseconds, a research dashboard that takes 10, and a trader's screen following
+five instruments at 50~milliseconds a refresh. Each subscriber has its own queue, so that a slow one cannot delay the others: the
+publish--subscribe design of chapter~\ref{ch:pl:messaging-and-event-driven-architecture}, and the slow-consumer problem of Book~13,
+chapter~12, one level up.
+
+\omcode{code/firm/entitle/firm_entitle.py}{98}{111}{The two delivery policies: a queue of every update in order, or conflation, which keeps only
+the latest update per topic and serves the topic that has waited longest.}\label{lst:pl:market-data-distribution-and-entitlements:queue}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llrrrr}
+\toprule
+policy & subscriber & delivered & largest queue & mean age & largest age\\
+\midrule
+every message & strategy & 240\,267 & 1\,199 & 0.1~ms & 24~ms\\
+ & risk service & 240\,267 & 1\,203 & 58~ms & 2.4~s\\
+ & research dashboard & 240\,267 & 180\,267 & 891~s & 1\,803~s\\
+conflated & strategy & 238\,870 & 20 & 0.0~ms & 0.4~ms\\
+ & risk service & 221\,364 & 20 & 4.0~ms & 32~ms\\
+ & research dashboard & 60\,012 & 20 & 67~ms & 134~ms\\
+\bottomrule
+\end{tabular}
+\caption{Ten minutes of depth updates for twenty instruments delivered to three subscribers, with every message queued or conflated per
+instrument. The age of a message is the time from its publication to the end of its processing. The screen, conflated in both runs, sees a
+mean age of 125~ms. The strategy's largest queue is the opening snapshot, which arrives at one instant.}
+\label{tab:pl:market-data-distribution-and-entitlements:policies}
+\end{table}
+
+The research dashboard is the lesson of \cref{tab:pl:market-data-distribution-and-entitlements:policies}. It can process 100 messages a
+second and the feed brings about 400: with every message queued, its queue grows through the whole session to 180\,267 messages, it shows prices
+fifteen minutes old on average, and it is still working through the session half an hour after it ended
+(\cref{fig:pl:market-data-distribution-and-entitlements:age}). Conflated, it processes a quarter of the messages and never shows a price
+older than 134~ms. The risk service can keep up on average but not in bursts; conflation takes its worst age from 2.4~seconds to 32~ms. A
+screen or a risk service wants the current state, not the history, and should be conflated; a strategy or a recorder needs every message
+and must be fast enough not to need it.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.6cm,xlabel={time since the start of the session (s)},ylabel={age of the price shown (s, log scale)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,xmin=0,xmax=2450,
+  ymin=0.01,ymax=5000,xtick={0,600,1200,1800,2400}]
+\addplot[omThm,thick,mark=none] table[x=t,y=age_s]{figdata/platforms/23-market-data-distribution-and-entitlements/age_all.csv};
+\addplot[omDef,thick,mark=none] table[x=t,y=age_s]{figdata/platforms/23-market-data-distribution-and-entitlements/age_conflate.csv};
+\draw[gray,dashed] (axis cs:600,0.01) -- (axis cs:600,5000) node[pos=0.5,right,font=\scriptsize]{session ends};
+\node[omThm,font=\scriptsize,anchor=north] at (axis cs:1500,250) {every message queued};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:20,0.15) {conflated per instrument};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Age of the prices shown by the research dashboard, sampled every 2\,000 deliveries (queued) or 500 (conflated). Queued, the age
+grows through the session and the backlog takes another half hour to drain; conflated, it stays near a tenth of a second. Data:
+\texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:age}
+\end{omfigure}
+
+\section{Licences, uses and units of count}
+
+What the firm pays for is not the feed: it is each use of it. Venues distinguish display use, by a person looking at a screen, from
+non-display use by a machine, which Book~1, chapter~29, introduced with the non-display fee; and they count each in a stated unit.
+
+\begin{definition}[Unit of count]\label{def:pl:market-data-distribution-and-entitlements:unit}
+A \emph{unit of count}\index{unit of count} is what a venue's licence counts to charge for its data: for display use typically each device or
+each unique user identification, so that one person with two logins counts twice; for non-display use typically each device (usually a
+server) that receives and benefits from the data, or each person who can change the application in real time.
+\end{definition}
+
+The definition is the venue's, and it is where firms lose money. The chapter's venue --- Nasdaq, whose documents are in the ledger --- counts a
+display subscriber as \textquotedbl{}a device, computer terminal, automated service, or unique user identification and password
+combination\textquotedbl{}, and non-display use by the servers that receive and benefit from the data, including those that compute on it or
+create \omterm{def:pl:market-data-distribution-and-entitlements:derived}{derived data} from it. Servers that only transport, normalise or store the data are not necessarily fee-liable, but the firm must be able
+to show which they are. A firm that counts people instead of identifiers, or applications instead of servers, undercounts by construction.
+
+\section{Entitlements}
+
+\begin{definition}[Entitlement, entitlement system]\label{def:pl:market-data-distribution-and-entitlements:entitlement}
+An \emph{entitlement}\index{entitlement} is a permission for a subject --- a user identifier or an application --- to receive one source of
+data for one use. An \emph{entitlement system}\index{entitlement system} holds the entitlements with their grant and revocation times,
+answers whether a subject is entitled at a given time, and is checked by the distribution platform before any data is delivered.
+\end{definition}
+
+The question is when to check. Checking at subscription is cheap and enough while nothing changes; but a trader who leaves the desk, or an
+application whose licence lapses, keeps receiving until it next subscribes. In the chapter's run the screen user's \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} is revoked five
+minutes into the session. With the check made only at subscription, the screen receives another 6\,005 updates it was not entitled to; checked
+at every delivery, none.
+
+\omcode{code/firm/entitle/firm_entitle.py}{133}{147}{Delivery: the entitlement is checked again at each delivery, so that a revocation takes
+effect at once, and the age of each delivered message is recorded.}\label{lst:pl:market-data-distribution-and-entitlements:serve}
+
+A real platform does not call the \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement system} for each of millions of messages: it caches the answer per subscription and invalidates the
+cache when an \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} changes, which has the same effect at almost no cost. What matters is that revocation is pushed to the platform
+rather than discovered at the next login.
+
+\section{Usage reporting and exchange audits}
+
+\begin{definition}[Usage report]\label{def:pl:market-data-distribution-and-entitlements:report}
+A \emph{usage report}\index{usage report} is the periodic declaration a firm makes to a data source of how many units of count used its data,
+by product and by use, from which the source bills its fees.
+\end{definition}
+
+\begin{definition}[Market-data audit]\label{def:pl:market-data-distribution-and-entitlements:audit}
+A \emph{market-data audit}\index{market-data audit} is a venue's or vendor's review of a firm's actual use of its data over a past period,
+reconciled with what the firm reported; the difference is billed back, usually with interest and, above a threshold, the audit's costs.
+\end{definition}
+
+The chapter's firm reported 40 display subscribers every month for three years and no non-display use. Its usage log --- which the platform
+writes on every subscription --- tells a different story (\cref{fig:pl:market-data-distribution-and-entitlements:usage}). Traders grew from 38
+to 47, and six of them have a second login, so display identifiers went from 43 to 53; the eleven applications came into use one after another
+and by the end ran on 22 servers.
+
+\omcode{code/firm/entitle/firm_entitle.py}{168}{195}{The usage report counts distinct units of count by use; the audit reconciles each month
+with the licences held and prices the difference with the fee schedule.}\label{lst:pl:market-data-distribution-and-entitlements:audit}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={month},ylabel={units of count},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=35,ymin=0,ymax=63,const plot]
+\addplot[omDef,thick] table[x=month,y=display_used]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\addplot[omDef,thick,dashed] table[x=month,y=display_licensed]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\addplot[omThm,thick] table[x=month,y=nd_used]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:20,53) {display identifiers used};
+\node[font=\scriptsize,anchor=north] at (axis cs:24,39) {display subscribers reported: 40};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:25,24) {non-display servers used (reported: 0)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Three years of the model firm's usage log against what it reported. Display identifiers exceed the 40 reported from the first month
+(43, because of second logins) and reach 53; non-display servers grow from 4 to 22 as the eleven applications come into use. Data:
+\texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:usage}
+\end{omfigure}
+
+Priced with the venue's 2026 fees for its depth product --- \$84 a month per professional display subscriber, and for non-display use \$412 a
+month per subscriber up to 39, then a flat \$16\,490 a firm from 40 to 99 (\cref{fig:pl:market-data-distribution-and-entitlements:fees}) ---
+the shortfall is \$1\,900 in the first month and \$10\,156 in the last, \$258\,596 over the three years: \$22\,932 for display and \$235\,664 for
+non-display. The unreported units reach 87.5\% of those reported, far above the 10\% at which the venue's subscriber agreement adds the
+audit's costs; interest comes on top, at a rate the model does not price. The display shortfall is the smaller part. The firm's real mistake
+was believing that data it had paid to receive could be used by any program.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={non-display subscribers (servers)},ylabel={monthly fee (\$ thousand)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=120,ymin=0,ymax=38,const plot]
+\addplot[omThm,thick] table[x=devices,y expr=\thisrow{fee}/1000]{figdata/platforms/23-market-data-distribution-and-entitlements/fees.csv};
+\draw[omDef,dashed] (axis cs:22,0) -- (axis cs:22,9.064);
+\draw[omDef,-{Stealth[length=1.5mm]}] (axis cs:55,6) node[right,font=\scriptsize]{the model firm: 22 servers, \$9\,064} -- (axis cs:23,8.8);
+\node[font=\scriptsize,anchor=south east] at (axis cs:37,17.5) {39: \$16\,068};
+\node[font=\scriptsize,anchor=south] at (axis cs:70,17.5) {40 to 99: \$16\,490};
+\node[font=\scriptsize,anchor=north east] at (axis cs:98,32) {100 to 249: \$32\,990};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The venue's 2026 monthly non-display fee for its depth product against the number of fee-liable subscribers: \$412 each up to 39,
+then flat per firm. Between 40 and 99 servers the fee does not change, which is why the count and the tier, not the price, drive the bill.
+Data: \texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:fees}
+\end{omfigure}
+
+The remedy is technical as much as contractual. The platform's usage log is the evidence an audit asks for, and it must record the \omterm{def:pl:market-data-distribution-and-entitlements:unit}{unit of
+count} the venue uses --- identifiers, not people; servers, not applications --- for as long as the look-back. The chapter's venue limits
+liability for a good-faith error to three years before the underreporting was found, so three years of logs is the minimum. A monthly
+\omterm{def:pl:post-trade-systems:recon}{reconciliation} of the log against the licences, run by the firm before any auditor does, turns a back-bill into a licence purchase.
+
+\section{Derived data}
+
+\begin{definition}[Derived data]\label{def:pl:market-data-distribution-and-entitlements:derived}
+\emph{Derived data}\index{derived data} is information computed in whole or in part from a venue's data that cannot be reverse-engineered to
+recreate it or used as a reasonable substitute for it: an index, a signal, a model's fair value. What is and is not derived data is decided by
+each venue's policy.
+\end{definition}
+
+A conflated quote is not \omterm{def:pl:market-data-distribution-and-entitlements:derived}{derived data}: it is the venue's data, delivered less often, and needs the same licence. A mid-price published every
+second may be a substitute for the quote; a volatility estimate or a basket's fair value usually is not. The distinction matters in two
+directions: \omterm{def:pl:market-data-distribution-and-entitlements:derived}{derived data} may be redistributed under terms that the raw data does not allow, and the servers that create it are, for the
+chapter's venue, among the non-display units that count. The \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} model should therefore carry the use --- display, non-display,
+derived --- and not only the source, and the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} of chapter~\ref{ch:pl:a-tick-store-on-open-formats} should record which licence
+each dataset was captured under, since the licence follows the data into research.
+
+\begin{dated}{2026-09}{One venue's data policies and fees}\label{dat:pl:market-data-distribution-and-entitlements:nasdaq}
+Nasdaq's US equities price list sets, from 1 January 2026, monthly fees for Nasdaq TotalView of \$84.00 per professional subscriber (\$80.50
+in 2025) and \$15.00 per non-professional; for non-display use of its depth data with direct access, \$412.00 per subscriber from 1 to 39,
+\$16\,490 per firm from 40 to 99, \$32\,990 from 100 to 249 and \$75\,000 from 250; and distributor fees of \$1\,690 per firm for internal
+distribution and \$3\,340 for direct access. Its US Equities and Options Data Policies (version 2.6) define the subscriber, non-display use and
+\omterm{def:pl:market-data-distribution-and-entitlements:derived}{derived data} as quoted in this chapter, and state that undeclared usage of a system cannot be netted over the audit period. Its subscriber
+agreement limits liability for a good-faith error to three years of unpaid fees with interest, and adds the audit's costs when underreporting
+reaches 10\% of the reported units.
+\end{dated}
+
+\section{Tutorial: distribute, entitle, report, audit}\label{tut:pl:market-data-distribution-and-entitlements:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Distribute a feed to subscribers of different speeds, enforce \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlements}, and reconcile three years of usage with the
+licences held. \textbf{End state:} \cref{tab:pl:market-data-distribution-and-entitlements:policies} and the audit's
+\$258\,596.
+\begin{tutsteps}
+\item \textbf{Feed}: \texttt{pl\_entitle.updates()}, ten minutes of twenty instruments.
+\item \textbf{Distribution}: \texttt{distribute(ups, \textquotedbl all\textquotedbl)} and
+\texttt{distribute(ups, \textquotedbl conflate\textquotedbl)}; compare queues and ages.
+\item \textbf{\omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{Entitlements}}: rerun with \texttt{check\_on\_delivery=False} and count the screen's deliveries after the revocation.
+\item \textbf{Usage}: \texttt{usage\_log()} and \texttt{firm\_entitle.usage\_report} for any month.
+\item \textbf{Audit}: \texttt{audit()}, the months, the shortfalls and the amount owed.
+\end{tutsteps}
+\textbf{What to change next.} Move the research dashboard onto the servers of a distribution tier and see what the non-display count becomes;
+price the audit with each year's fees instead of 2026's.
+\end{tutorial}
+
+\section{Build: entitlements}\label{bld:pl:market-data-distribution-and-entitlements:entitle}
+
+\begin{build}
+\bfield{Purpose} Deliver market data inside the firm to each subscriber in the form it can use, only to those entitled, with the evidence of
+every use counted as the venue counts it.
+\bfield{Interface} \texttt{Entitlement}, \texttt{EntitlementSystem} (\texttt{grant}, \texttt{revoke}, \texttt{check}), \texttt{Bus}
+(\texttt{subscribe}, \texttt{run}), \texttt{UsageLog}, \texttt{usage\_report}, \texttt{audit}.
+\bfield{Rules} One queue per subscriber; conflation for subscribers that want state; \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} checked at subscription and enforced at
+delivery; every use logged in the venue's \omterm{def:pl:market-data-distribution-and-entitlements:unit}{unit of count}; logs kept at least as long as the look-back; a monthly \omterm{def:pl:post-trade-systems:recon}{reconciliation} before any
+audit.
+\bfield{Acceptance tests} \texttt{code/firm/entitle/tests/}: checks by subject, source, use and time; queued and conflated delivery; a busy
+subscriber scheduled correctly; revocation at delivery against at subscription; usage counts by identifier and device, and an audit's
+shortfall and amount.
+\bfield{Stretch} Tiered fees with enterprise licences; a derived-data register; a \omterm{def:pl:market-data-distribution-and-entitlements:report}{usage report} in a venue's file format.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{U.S. Equities Price List}, fees effective 2025, 2026 and 2027.
+\item Nasdaq, \emph{US Equities and Options Data Policies}, version 2.6.
+\item Nasdaq, \emph{Global Subscriber Agreement}, sections 5(g) and 5(h).
+\item One Quant Book~1, chapters~9 and~29 (direct feeds, non-display fees); Book~13, chapter~12 (slow consumers and conflation).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:1}
+Why does the platform keep one queue per subscriber rather than one per topic?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:2}
+A trader uses the same depth data on a desktop and, with a second login, on a laptop. How many display subscribers is that for the chapter's
+venue?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:3}
+What is the model firm's non-display fee in the last month, and what would it be with 45 servers?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:4}
+Which of the four subscribers should be conflated, and why not the strategy?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:5}
+Why does the research dashboard, queued, show prices fifteen minutes old on average when it takes 10~milliseconds per message?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:6}
+The firm wants to check \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlements} at every delivery without calling the \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement system} millions of times a minute. How?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:7}
+\emph{Coding.} Rerun \texttt{audit} with the firm reporting its display identifiers correctly every month but still no non-display use. How
+much is owed?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:8}
+\emph{Find the flaw.} \textquotedbl{}We pay the distributor fee for internal distribution, so any application inside the firm may use the
+data.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: Eleven Applications}
+
+\begin{problem}[{Weekend problem --- eleven applications}]\label{pb:pl:market-data-distribution-and-entitlements:1}
+The chapter's platform, its four subscribers, and the model firm's three years of usage.
+
+\medskip\noindent\textbf{Part I --- Distribution.}
+\begin{enumerate}
+\item What does the distribution platform do that connecting each consumer to the feed does not?
+\item How fast does each subscriber process messages, and how fast does the feed arrive?
+\item What happens to the research dashboard with every message queued?
+\item What does conflation change for the risk service and the dashboard?
+\item What is the strategy's largest queue, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{Entitlements}.}
+\begin{enumerate}[resume]
+\item What does an \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} name?
+\item What happens after a revocation when \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlements} are checked only at subscription?
+\item How does a platform enforce \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlements} at every delivery cheaply?
+\item What is the \omterm{def:pl:market-data-distribution-and-entitlements:unit}{unit of count} for display and for non-display use at the chapter's venue?
+\item Which servers are not necessarily fee-liable?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The audit.}
+\begin{enumerate}[resume]
+\item What did the firm report, and what does its usage log show in the first and last months?
+\item What are the monthly fees used to price the shortfall?
+\item What is owed in the first and last months?
+\item What is owed over the three years, for display and for non-display?
+\item Why does the audit cost the firm more than the back-billed fees?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the licence shortfall in display users and non-display applications found by reconciling three years of
+usage logs, and its back-billed cost under the venue's 2026 fees.
+\item How long must usage logs be kept, and in what unit?
+\item Is a conflated quote \omterm{def:pl:market-data-distribution-and-entitlements:derived}{derived data}?
+\item What would you change first in the firm's platform?
+\item In one sentence: what does a market-data licence pay for?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:market-data-distribution-and-entitlements:1}
+What is conflation, and when would you use it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:market-data-distribution-and-entitlements:2}
+A slow consumer is holding up your market-data bus. What do you do?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:market-data-distribution-and-entitlements:3}
+What is the difference between display and non-display use of market data, and why does it matter to a developer?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:market-data-distribution-and-entitlements:4}
+An exchange announces an audit of your data usage over the past three years. What do you need to have?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:market-data-distribution-and-entitlements:5}
+Design the market-data distribution and \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{entitlement} platform of a firm with a thousand users and a hundred applications.
+\end{interviewq}

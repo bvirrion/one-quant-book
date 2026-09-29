@@ -1,0 +1,106 @@
+\section*{Chapter \ref{ch:iv:system-design} --- System Design}
+
+\begin{solution}{iq:iv:system-design:1}
+$200\,000 \times 23\,400 \times 64 \approx 2.995 \times 10^{11}$ bytes, about 300 gigabytes a day uncompressed, some 75
+terabytes a year of 250 days. Compression reduces it by a factor that is worth measuring on the data
+rather than assuming.
+\iqlookfor{a clean chain with units and a year's extrapolation.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:2}
+$10^6 \times 64 \times 8 = 512$ megabits a second of payload; with 42 bytes of Ethernet, IPv4 and UDP headers ($14 + 20 + 8$) per
+message sent alone, 848 megabits. A 1-gigabit link is marginal at best (and bursts inside the second are higher); 10 gigabits leaves room. Batching
+several messages per packet cuts the header overhead.
+\iqlookfor{payload versus wire bytes, and bursts shorter than a second.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:3}
+Instruments and order types; peak and average message rates, and the number of participants and sessions; latency targets (median,
+99th and 99.9th percentile); matching rules (price-time or pro-rata, auctions, self-trade prevention); what market data is published
+(depth, full order-by-order); durability and failover requirements (what may be lost, how fast to recover); regulatory records and
+clock requirements.
+\iqlookfor{requirements before design, including tails and failure.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:4}
+Add a limit order, cancel by identifier, modify (usually cancel and replace, losing priority unless only the size falls), match an
+incoming order, and read the best price and the depth. With a sorted map of levels, a FIFO list per level and a hash index by
+identifier: add at a new level $O(\log L)$ and at an existing one $O(1)$, cancel $O(1)$, best price $O(1)$, matching $O(1)$ per fill
+(\cref{ch:iv:algorithms-and-data-structures}).
+\iqlookfor{the operation set and the data-structure trio behind the complexities.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:5}
+Orders: $5 \times 10^6 \times 48 = 240$ megabytes. Levels: $10\,000 \times 2 \times 1\,000 \times 16 = 320$ megabytes. About 560
+megabytes (534 MiB), which fits in memory easily but not in cache: the design question becomes locality (keep each instrument's hot
+levels together, pre-allocate order records in pools) rather than capacity.
+\iqlookfor{the arithmetic and the conclusion that locality, not size, matters.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:6}
+Sequence every inbound message and journal the sequenced input durably before acknowledging (or replicate it to a standby that
+acknowledges); on restart, load the last snapshot and replay the journal from it. Gateways retransmit unacknowledged messages with
+their client identifiers, and the engine discards duplicates it has already sequenced. It works only if the engine is deterministic:
+its output is a function of the sequenced input alone, with no wall-clock reads, no iteration over unordered containers, and no
+concurrency inside a partition (One Quant Book~13, chapter~24).
+\iqlookfor{sequencing, journaling, replay, duplicate suppression and determinism.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:7}
+One publisher sequences updates per channel and sends them by multicast or, inside the firm, through a shared-memory or messaging
+bus; each consumer has its own queue so that a slow one never blocks the publisher. A consumer that detects a gap requests a
+retransmission or joins the snapshot channel and resumes from the snapshot's sequence number; a consumer too far behind is
+disconnected and must resynchronise (\cref{fig:iv:system-design:md}). Monitor per-consumer lag.
+\iqlookfor{sequencing, isolation of slow consumers, and a recovery path.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:8}
+An event loop over the merged, time-ordered recorded events; a simulated clock that the strategy reads through the same interface as
+in production; latencies applied to data and to orders; a fill model that respects queue position and the recorded trades; fees and
+rebates. Reproducible: data versions, code versions and random seeds recorded with each run. Believable: validated against live
+fills of the same strategy (simulation--production parity, One Quant Book~15, chapter~12), with the fill model's assumptions stated.
+\iqlookfor{event-driven structure, fill-model realism, and reproducibility.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:9}
+\Cref{lst:iv:system-design:match}: while the incoming order has quantity and the best opposite level crosses its limit, fill against the
+level's orders in time order at the resting price, removing filled makers from the queue and the index and empty levels from the
+map; any remainder rests at its limit behind earlier orders. Test it against a deliberately naive book (scan every resting order for
+the best price and earliest time) on random order streams, comparing every fill and the best prices after each event, as the chapter's
+C++ test does for 200 streams, and check invariants (the resting book never crossed).
+\iqlookfor{correct price-time logic and a differential test against a brute force.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:10}
+Each gateway holds the state it needs to check an order locally in microseconds (its share of limits, its open orders and fills),
+reserving against a limit before sending and releasing on cancel or fill; a central service holds the firm-wide positions and
+limits, allocates limit shares to the gateways, and reconciles with the drop copies of the venues. If the central service is down,
+gateways continue within their allocated shares and then stop: fail closed. A kill switch at each gateway and at the venues' cancel-on-
+disconnect is independent of all of it (One Quant Book~11, chapter~27).
+\iqlookfor{local fast state with central authority, reservation, and fail-closed behaviour.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:11}
+At half load a thread carries 500\,000 messages a second, so $3\,000\,000/500\,000 = 6$ partitions, about 1\,667 instruments each if
+load were even. It is not: assign instruments by measured load, not by count, and keep hot instruments on their own partitions. An
+order that spans partitions (a spread between two instruments) cannot be matched atomically by either: route such instruments to one
+partition, or use a coordinator that reserves both legs, at a cost in latency.
+\iqlookfor{the division, load balancing by activity, and the cross-partition problem.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:12}
+Run the standby as a replica consuming the same sequenced input (from the sequencer or the journal) in lock step, so that it holds
+the same state at every sequence number. Acknowledge an order only when the sequenced message is on the standby as well (or in a
+replicated journal), so no acknowledged order is lost. Detect the primary's death by heartbeats with a sub-second timeout; the standby
+finishes processing its queued input, then takes over the gateways' sessions; clients reconnect and resend unacknowledged messages,
+which the sequencer deduplicates. Fence the old primary so that it cannot resume after a partition.
+\iqlookfor{a replicated state machine, the acknowledgement rule, fencing and deduplication.}
+\end{solution}
+
+\begin{solution}{iq:iv:system-design:13}
+$100\,000 \times 50 \times 0.01 \times 1\,000 = 5 \times 10^7$ position updates a second. Do not revalue on every tick: index
+positions by instrument so that a tick touches only its holders, revalue incrementally with sensitivities (delta and gamma) between
+full revaluations, batch ticks into short intervals (the risk decision rarely needs every tick), and partition accounts across
+workers; aggregate per account and per firm in trees.
+\iqlookfor{the rate and the incremental, indexed, batched design that avoids it.}
+\end{solution}

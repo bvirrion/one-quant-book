@@ -1,0 +1,358 @@
+\chapter{Programmable Hardware I: Architecture and Toolchain}\label{ch:nw:programmable-hardware-i-architecture-and-toolchain}
+
+A \qty{10}{\giga\bit\per\second} Ethernet link delivers a design its bytes at ten billion bits a second; a design that takes them
+64 bits at a time must accept a word every \qty{6.4}{\nano\second}, at 156.25~MHz. A design built of registers and logic between them
+takes a fixed number of those cycles to decide, and it takes that number every time: no cache miss, no interrupt, no scheduler, no
+garbage collector sits between the last byte of a price and the decision. Determinism, rather than raw speed, is what programmable
+hardware sells to a trading firm, and it is bought with a different way of writing programs.
+
+This chapter introduces the devices, the languages and the tools, and writes a first design: a field extractor that pulls a price out
+of a frame while the frame is still arriving, simulated cycle by cycle in two independent simulators and checked against a Python
+model. Chapter~7 builds the trading designs on top of it.
+
+\section{The fabric: logic blocks, memories, transceivers and clocks}
+
+\begin{definition}[Field-programmable gate array, configurable logic block]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}
+A \emph{field-programmable gate array}\index{field-programmable gate array} (FPGA) is a chip whose logic and wiring are configured
+after manufacture by loading a configuration file: an array of small programmable logic elements, memories, arithmetic blocks and
+serial transceivers, joined by programmable routing. A \emph{configurable logic block}\index{configurable logic block} is the array's
+repeated logic element: a group of lookup tables, each of which computes any Boolean function of a few inputs by looking it up in a
+small memory, with flip-flops to register their outputs and a carry chain for arithmetic.
+\end{definition}
+
+\begin{definition}[Block RAM]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}
+A \emph{block RAM}\index{block RAM} is a dedicated on-chip memory of a few tens of kilobits, of which an FPGA has hundreds or
+thousands, each readable and writable in one clock cycle, typically through two independent ports.
+\end{definition}
+
+The resources are concrete. In AMD's UltraScale family each \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}{configurable logic block} holds eight 6-input lookup tables and sixteen
+flip-flops, with an 8-bit carry chain, and each \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAM} holds 36 kilobits, usable as one memory or two independent halves. A 6-input
+lookup table computes any function of six bits in one level of logic; a function of more bits needs several tables in several levels,
+and the depth of that tree of levels, together with the wiring between the tables, sets how fast the design can be clocked. Beside the
+logic sit the serial transceivers, which turn the optical module's bit stream into parallel words, and the clocking resources, which
+distribute clocks and let parts of the design run at different rates.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt}]
+\foreach \i in {0,...,5} {\foreach \j in {0,1,2} {\node[b,fill=omDef!12,minimum width=0.9cm] at (1.1*\i,0.9*\j) {CLB};}}
+\foreach \j in {0,1,2} {\node[b,fill=omMeth!20,minimum width=0.9cm] at (6.9,0.9*\j) {BRAM};}
+\foreach \j in {0,1,2} {\node[b,fill=omThm!15,minimum width=0.9cm] at (8.25,0.9*\j) {DSP};}
+\node[b,fill=gray!15,minimum height=2.5cm,minimum width=1.1cm] at (-1.5,0.9) {serial\\ trans-\\ ceivers};
+\node[b,fill=gray!8,minimum width=9.6cm] at (3.25,-0.95) {clocking and routing between every block};
+\node[b,fill=white,align=left,anchor=west] at (9.2,0.9) {a CLB: 8 lookup\\ tables of 6 inputs,\\ 16 flip-flops,\\ a carry chain};
+\end{tikzpicture}
+
+\omcaption{The fabric of an FPGA, schematically: columns of \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}{configurable logic blocks}, \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAMs} and arithmetic (DSP) blocks, serial
+transceivers at the edge that turn the optical bit stream into words, and the clocking and routing that join them. Real devices have
+hundreds of thousands of lookup tables; the CLB contents are those of AMD's UltraScale family.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:fabric}
+\end{omfigure}
+
+\section{Describing hardware: register-transfer level and high-level synthesis}
+
+\begin{definition}[Register-transfer level, hardware description language]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:rtl}
+A design written at \emph{register-transfer level}\index{register-transfer level} (RTL) describes, for every clock cycle, how the values
+held in registers are computed from the registers' previous values and the inputs, through combinational logic. A \emph{hardware
+description language}\index{hardware description language} (Verilog, SystemVerilog, VHDL) is a language in which such designs are
+written: its statements describe circuits that all operate at once, not instructions executed in order.
+\end{definition}
+
+\begin{definition}[Logic synthesis, place and route]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:synth}
+\emph{Logic synthesis}\index{logic synthesis} translates an RTL description into a network of the device's primitives (lookup tables,
+flip-flops, memories). \emph{Place and route}\index{place and route} assigns each primitive to a location on the chip and chooses the
+programmable wires between them; its result is the configuration file loaded into the device.
+\end{definition}
+
+\begin{definition}[High-level synthesis]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:hls}
+\emph{High-level synthesis}\index{high-level synthesis} (HLS) compiles a function written in C or C++ into an RTL design, choosing its
+registers and schedule; the designer steers it with directives such as the pipeline's initiation interval, the number of cycles between
+successive inputs (an interval of one accepts a new input every cycle).
+\end{definition}
+
+The difference in thinking is the chapter's first lesson. A C++ loop over the eight bytes of a word runs eight times, one after the
+other; the same loop in SystemVerilog describes eight copies of its body that all exist and all compute in the same cycle.
+\Cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field} is the combinational heart of the field extractor: for each of the
+beat's eight byte lanes it asks whether that byte belongs to the field and, if so, shifts it into the value, all in one cycle. What would
+be a data-dependent branch in software becomes a set of multiplexers whose delay does not depend on the data.
+
+\omcode{code/firm/hdlkit/hdl/hdk_field.sv}{19}{29}{The field extractor's combinational logic in SystemVerilog: eight byte lanes examined
+in the same cycle; the loop describes eight copies of hardware, not eight iterations.}\label{lst:nw:programmable-hardware-i-architecture-and-toolchain:field}
+
+\section{Timing closure: clock periods, critical paths and pipelining}
+
+\begin{definition}[Critical path, timing closure]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}
+The \emph{critical path}\index{critical path} of a synchronous design is its slowest path from one register to the next: the delay of
+its logic and wiring plus the registers' own overhead, which sets the shortest clock period the design supports. \emph{Timing
+closure}\index{timing closure} is the work of making every register-to-register path fit within the target clock period.
+\end{definition}
+
+\begin{definition}[Clock domain crossing]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}
+A \emph{clock domain crossing}\index{clock domain crossing} is a signal passing between parts of a design clocked by unrelated clocks;
+it must go through a synchroniser or an asynchronous FIFO, or it will sometimes be sampled while it changes.
+\end{definition}
+
+\begin{proposition}[What pipelining buys]\label{prop:nw:programmable-hardware-i-architecture-and-toolchain:pipe}
+Let a decision need $L$ levels of logic of delay $t_{\mathrm{lvl}}$ each, and let a register add $t_{\mathrm{reg}}$. Split into $s$
+registered stages of at most $\lceil L/s\rceil$ levels, the design's clock period is $T_{\mathrm{clk}} = \lceil L/s\rceil\,t_{\mathrm{lvl}}
++ t_{\mathrm{reg}}$ and its latency is $s\,T_{\mathrm{clk}}$. Pipelining raises the maximum clock $f_{\mathrm{clk}} = 1/T_{\mathrm{clk}}$
+and never lowers the latency: $s\,T_{\mathrm{clk}} \ge L\,t_{\mathrm{lvl}} + s\,t_{\mathrm{reg}}$.
+\end{proposition}
+
+\begin{proof}
+Each stage is one register-to-register path of at most $\lceil L/s\rceil$ levels, so the period is its delay. The decision crosses $s$
+stages, one period each, and $s\lceil L/s\rceil \ge L$.
+\end{proof}
+
+The proposition explains a design choice that looks backwards: a trading design adds registers, and cycles, to go faster. The line sets
+the clock. A \qty{10}{\giga\bit\per\second} link taken 64 bits at a time needs 156.25~MHz; a \qty{25}{\giga\bit\per\second} link at the
+same width needs 390.625~MHz. A decision that fits in one cycle at the first clock may need three cycles at the second, and its latency
+in nanoseconds then rises a little while the design keeps up with a link two and a half times as fast. \Cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}
+draws the trade-off with model delays of \qty{0.5}{\nano\second} per level and \qty{0.4}{\nano\second} per register, stated as model values:
+a real device's delays come from its timing reports.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,xmin=0.5,xmax=6.5,
+  xtick={1,2,3,4,5,6},xlabel={registered stages},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},table/col sep=comma]
+\nextgroupplot[ymin=0,ymax=800,ylabel={maximum clock (MHz)}]
+\addplot[omDef,very thick,mark=*,mark size=1.5pt] table[x=stages,y=fmax_mhz]{figdata/networks/06-programmable-hardware-i-architecture-and-toolchain/pipeline.csv};
+\addplot[gray,dashed,domain=0.5:6.5] {156.25};
+\addplot[omThm,dashed,domain=0.5:6.5] {390.625};
+\node[font=\scriptsize,anchor=south west] at (axis cs:3.6,160) {10G at 64 bits};
+\node[font=\scriptsize,anchor=north west,omThm] at (axis cs:4.1,385) {25G at 64 bits};
+\nextgroupplot[ymin=0,ymax=10,ylabel={latency at its own clock (ns)}]
+\addplot[omMeth,very thick,mark=square*,mark size=1.5pt] table[x=stages,y=latency_ns]{figdata/networks/06-programmable-hardware-i-architecture-and-toolchain/pipeline.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Model: a decision of 12 levels of logic split into registered stages (\qty{0.5}{\nano\second} per level,
+\qty{0.4}{\nano\second} per register, model values). Left: the maximum clock, against the clocks two \omterm{def:nw:networking-for-trading:ser}{line rates} require; right: the latency
+at that clock. Five stages are no better than four, because $\lceil 12/5\rceil = \lceil 12/4\rceil = 3$. Data:
+\texttt{fig\_fpga.py}.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}
+\end{omfigure}
+
+\omcode{code/firm/hdlkit/hdl/hdk_cmp.sv}{13}{32}{A comparison in one stage and in two: the two-stage version compares four 16-bit slices,
+registers the results, then combines them, one cycle later.}\label{lst:nw:programmable-hardware-i-architecture-and-toolchain:cmp}
+
+\section{Simulation and verification}
+
+\begin{definition}[Testbench, cycle-accurate model]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}
+A \emph{testbench}\index{testbench} is the code that drives a design's inputs in simulation and checks its outputs. A \emph{cycle-accurate
+model}\index{cycle-accurate model} is a software model of a design that reproduces its outputs cycle by cycle, used as a reference against
+which the hardware is checked, and as a fast stand-in for it.
+\end{definition}
+
+A design is verified long before it is synthesised, because a synthesised design is slow to build and hard to observe. This book
+simulates every design in two independent tools. Verilator compiles the SystemVerilog into a C++ model driven by a C++ \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbench}: it is
+a compiler rather than a traditional simulator, and fast. Icarus Verilog interprets the same source under a SystemVerilog \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbench}. The
+two \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbenches} read the same stimulus and print the same event lines, and the test compares them cycle for cycle and against a Python
+golden model; a disagreement between the simulators is a bug in the design (usually an ambiguity the language permits) before it is a bug
+in either tool. The designs are written for the versions installed here (Verilator 4.038, Icarus Verilog 11) and for their newer releases,
+and the tests fail, rather than skip, when a simulator is missing.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rll}
+\toprule
+Cycle & Input accepted & Outputs registered at the end of the cycle \\
+\midrule
+0 & beat 0: bytes \texttt{10}--\texttt{17} & --- \\
+1 & beat 1: bytes \texttt{18}--\texttt{1f}, last & --- \\
+2 & --- & field \texttt{16171819}; CRC-32 \texttt{f4a7fd67} \\
+3 & --- & comparison (one stage): at most the threshold \\
+4 & --- & comparison (two stages): at most the threshold \\
+\bottomrule
+\end{tabular}
+\caption{The first frame through \texttt{hdk\_top} in Verilator, no back-pressure: a 16-byte frame of bytes \texttt{10} to \texttt{1f}, the
+field at bytes 6 to 9, the threshold equal to the field. The skid buffer registers each accepted beat; the field and the CRC are registered
+the cycle after the beat that completes them. Icarus prints the same cycles. Data: \texttt{nw\_fpga.first\_frame}.}\label{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=omDef!8] (hls) at (-3.4,0) {C++ with\\ HLS directives};
+\node[b,fill=omDef!15] (rtl) at (0,0) {RTL\\ (SystemVerilog)};
+\node[b,fill=omMeth!18] (syn) at (2.8,0) {synthesis};
+\node[b,fill=omMeth!18] (par) at (5.1,0) {place and\\ route};
+\node[b,fill=omMeth!18] (sta) at (7.5,0) {timing\\ analysis};
+\node[b,fill=gray!12] (bit) at (10.2,0) {configuration\\ file};
+\node[b,fill=omThm!12] (sim) at (4.6,-1.7) {simulation: Verilator, Icarus, against a golden model};
+\draw[->] (hls) -- node[above,font=\scriptsize]{HLS} (rtl);
+\draw[->] (rtl) -- (syn);
+\draw[->] (syn) -- (par);
+\draw[->] (par) -- (sta);
+\draw[->] (sta) -- node[above,font=\scriptsize]{met} (bit);
+\draw[->,omThm] (sta.north) -- ++(0,0.5) -| node[pos=0.25,above,font=\scriptsize]{timing not met: restructure, pipeline} (rtl.north);
+\draw[<->,omThm] (rtl.south) |- (sim.west);
+\end{tikzpicture}
+
+\omcaption{The toolchain. The design is simulated against its golden model before synthesis; synthesis, placement and routing produce a
+design whose timing is analysed; a path that does not meet the clock sends the designer back to the RTL.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:flow}
+\end{omfigure}
+
+\section{Smart network cards}
+
+\begin{definition}[SmartNIC]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:smartnic}
+A \emph{SmartNIC}\index{SmartNIC} is a \omterm{def:nw:networking-for-trading:frame}{network interface card} with its own programmable processing (an FPGA, or processors) between the
+network ports and the host, so that packets can be parsed, filtered, timestamped, answered or generated on the card without reaching
+the host.
+\end{definition}
+
+For a trading firm the FPGA card is where hardware meets the rest of the system: its transceivers terminate the exchange's links, its
+logic decodes and decides, and its bus connects it to the host's software, which configures it and receives what it has seen. A design
+on such a card reads the frame as it arrives, before the last byte is in, which is what the table of this chapter shows at small scale:
+the field is known the cycle after the beat that completes it, while the rest of the frame is still to come. Chapter~7 decides on it.
+
+\section{Tutorial: a field extractor in two simulators}\label{tut:nw:programmable-hardware-i-architecture-and-toolchain:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Simulate the first design cycle by cycle in Verilator and Icarus, check both against a Python model under random
+back-pressure, and model what pipelining costs. \textbf{End state:} \cref{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles},
+\cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline} and the green tests of \texttt{firm.hdlkit}.
+\begin{tutsteps}
+\item \textbf{Read the design.} \texttt{hdl/hdk\_top.sv} chains a skid buffer, the field extractor
+  (\cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field}), a CRC-32 unit and the comparator
+  (\cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:cmp}).
+\item \textbf{Build both.} \texttt{firm\_hdlkit.build\_verilator} runs \texttt{verilator --cc --exe --build} with the C++ \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbench};
+  \texttt{build\_icarus} runs \texttt{iverilog -g2012} with the SystemVerilog one.
+\item \textbf{Run and compare.} \texttt{write\_stim} turns frames into 8-byte beats, \texttt{write\_ready} gives the downstream's
+  back-pressure; both simulators print the same event lines, and \texttt{golden} computes the fields, CRCs and comparisons in Python.
+\item \textbf{Cycles and clocks.} \texttt{nw\_fpga.first\_frame} gives the table; \texttt{timing} and \texttt{depth\_for} evaluate
+  \cref{prop:nw:programmable-hardware-i-architecture-and-toolchain:pipe}, and \texttt{python fig\_fpga.py} writes the chart's data.
+\end{tutsteps}
+\textbf{What to change next.} Move the field to bytes 60 to 63 and read the cycle it appears in; set the downstream ready to 50\% and count
+the cycles the whole stream takes.
+\end{tutorial}
+
+\section{Build: the hardware toolkit}\label{bld:nw:programmable-hardware-i-architecture-and-toolchain:hdlkit}
+
+\begin{build}
+\bfield{Purpose} The primitives and the verification harness every hardware design of this book uses.
+\bfield{Interface} SystemVerilog modules \texttt{hdk\_skid} (skid buffer, parameter \texttt{W}), \texttt{hdk\_field} (\texttt{OFF},
+\texttt{LEN}), \texttt{hdk\_crc32}, \texttt{hdk\_cmp} (\texttt{PIPE}) and \texttt{hdk\_top}; \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{testbenches} \texttt{tb/hdk\_tb.cpp} (Verilator)
+and \texttt{tb/hdk\_tb.sv} (Icarus) printing the same event lines. Python \texttt{firm\_hdlkit}: \texttt{require}, \texttt{beats},
+\texttt{write\_stim}, \texttt{write\_ready}, \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{run\_verilator},
+\texttt{run\_icarus}, \texttt{events}, \texttt{golden}, \texttt{CycleModel}.
+\bfield{Rules} Beats of 8 bytes, byte 0 in the most significant lane; every output registered; the HDL is accepted by Verilator 4.038 with
+\texttt{-Wall} and by Icarus 11 with \texttt{-g2012}, without warnings; a missing simulator raises \texttt{ToolMissing}.
+\bfield{Acceptance tests} \texttt{code/firm/hdlkit/tests/}: both simulators identical cycle for cycle and equal to the golden model on random
+frames with random back-pressure, for one- and two-stage comparators; every beat accepted once; the latencies in cycles; the beat and golden
+functions by hand.
+\bfield{Stretch} An asynchronous FIFO for a \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{clock domain crossing} and a test that samples it at unrelated clocks; a wider (512-bit) beat.
+\end{build}
+
+\begin{omsources}
+\item AMD, \emph{UltraScale Architecture Configurable Logic Block User Guide} (UG574) and \emph{Memory Resources} (UG573); AMD, \emph{Vitis
+High-Level Synthesis User Guide} (UG1399).
+\item Verilator documentation; Icarus Verilog documentation; IEEE~1800 (SystemVerilog).
+\item J.~W. Lockwood and co-authors, ``A Low-Latency Library in FPGA Hardware for High-Frequency Trading (HFT)'', \emph{IEEE Symposium on
+High-Performance Interconnects} (2012).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:1}
+What clock does a design need to take a \qty{25}{\giga\bit\per\second} link 32 bits at a time, and 128 bits at a time?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:2}
+With the model delays, what is the maximum clock of a decision of 12 levels in one stage, and its latency?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:3}
+In \cref{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles}, at which cycle would the field appear if it were at bytes 12 to
+15? And at bytes 14 to 17 of a 24-byte frame?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:4}
+Why does the loop of \cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field} take one cycle whatever the data, while the same
+loop in C++ may not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:5}
+In \cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}, why is six stages faster than five? What does that say about
+counting levels?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:6}
+What does the skid buffer do that a single register cannot, and what would happen to the stream without it when the downstream stalls?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:7}
+\emph{Coding.} Build \texttt{hdk\_top} with the field at offset 10 and length 8 in both simulators, run the tests' random frames, and check
+both against the golden model. How many cycles after the completing beat does the field appear?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:8}
+\emph{Find the flaw.} ``The design passes in Verilator, so it will work on the card; running a second simulator is redundant.''
+\end{exercise}
+
+\section{Problem: Eight Cycles}
+
+\begin{problem}[{Weekend problem --- a decision against a line's clock}]\label{pb:nw:programmable-hardware-i-architecture-and-toolchain:1}
+A firm's hardware decision (parse a field, compare it with a threshold, check a limit) needs 12 levels of logic. Use the chapter's model:
+\qty{0.5}{\nano\second} per level, \qty{0.4}{\nano\second} per register. The design takes the line 64 bits per cycle.
+
+\medskip\noindent\textbf{Part I --- The clocks.}
+\begin{enumerate}
+\item What clock does a \qty{10}{\giga\bit\per\second} line require at 64 bits a cycle? A \qty{25}{\giga\bit\per\second} line?
+\item What is the maximum clock of the decision in one stage?
+\item Does it meet either line's clock?
+\item How long does a 128-byte frame take to arrive at each line's clock, in cycles and nanoseconds?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Pipelining.}
+\begin{enumerate}[resume]
+\item How many stages does the \qty{25}{\giga\bit\per\second} line require?
+\item What is the maximum clock with that many stages?
+\item What is the latency of the decision when the design runs at the line's clock?
+\item What is the latency at the design's own maximum clock?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Where the time goes.}
+\begin{enumerate}[resume]
+\item If the field ends at byte 40 of a 128-byte frame, how many beats must have arrived for the field to be complete?
+\item Add the decision at the \qty{25}{\giga\bit\per\second} clock: when is the decision made, counted from the frame's first bit?
+\item How much of the frame is still arriving at that moment?
+\item Why is it worth deciding before the frame's check sequence arrives, and what is the risk?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the pipeline depth that meets the \qty{25}{\giga\bit\per\second} clock and the decision's latency, against
+  the unpipelined design at its own clock.
+\item Would a 128-bit datapath change the answer?
+\item What would a real design's timing report replace in this model?
+\item Why does pipelining never reduce latency?
+\item Why may the firm accept a longer decision latency for a faster line?
+\item How would you verify the pipelined design against the unpipelined one?
+\item What does a \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{clock domain crossing} add if the decision runs at a clock other than the line's?
+\item In one sentence: what does the line's rate decide about the design?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:1}
+What is an FPGA, and why do trading firms use them?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:2}
+What is \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{timing closure}? What do you do when a path fails timing?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:3}
+Pipelining adds cycles. How can it make a design faster?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:4}
+RTL or \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:hls}{high-level synthesis} for a trading design? Argue both sides.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:5}
+How would you verify a hardware feed parser before it runs against a live exchange?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:6}
+What is a \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{clock domain crossing}, and what goes wrong if it is not handled?
+\end{interviewq}

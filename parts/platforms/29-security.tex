@@ -1,0 +1,397 @@
+\chapter{Security}\label{ch:pl:security}
+
+On 21 February 2025 a large crypto exchange signed a transaction from one of its wallets that required several signatures. The signers
+approved what their screens showed them: a legitimate transaction. The web application that prepared it had been altered two days earlier to
+display legitimate transaction data while changing what was actually signed, and the signatures gave the attackers the wallet's ether. The
+FBI attributed the theft of about \$1.5 billion to North Korea. No cryptography was broken; the attackers changed what people were shown.
+Security in a trading firm is mostly about who and what is allowed to do things, and about making sure that what they see is what they
+sign. This chapter writes the firm's access policy as data and checks it, keeps secrets and venue keys under rules, segments the network,
+and looks for the insider who copies a little too much every day.
+
+\section{What a trading firm protects, and from whom}
+
+\begin{definition}[Threat model]\label{def:pl:security:threat}
+A \emph{threat model}\index{threat model} lists what a system must protect (its assets), from whom (the adversaries and their means), through
+which paths (the attack surface), and which controls address each path, so that security effort goes where the losses would be.
+\end{definition}
+
+A trading firm's assets are unusual in two ways. Some are money that moves by itself on a signature --- exchange balances, wallets (Book~3,
+chapter~24), payment instructions --- so a stolen credential is a loss within minutes. Others are information whose value is its secrecy ---
+strategy code, signals, parameters, positions --- so a copy is a loss even when nothing is deleted. The adversaries follow: criminals and
+states for the first, competitors and departing employees for the second. The operational risk of Book~6, chapter~28, covers both; this
+chapter builds the controls.
+
+\section{Identity, access and least privilege}
+
+\begin{definition}[Least privilege, role-based access control]\label{def:pl:security:rbac}
+\emph{Least privilege}\index{least privilege} gives each person and program only the permissions its task needs, for only as long as it needs
+them. \emph{Role-based access control}\index{role-based access control} grants permissions --- an action on a resource --- to roles and roles
+to people, so that access follows the job rather than the individual.
+\end{definition}
+
+\begin{definition}[Multi-factor authentication]\label{def:pl:security:mfa}
+\emph{Multi-factor authentication}\index{multi-factor authentication} requires more than one distinct kind of authentication factor ---
+something one knows, has or is --- before access; NIST's current guidance requires, at its middle assurance level, two distinct factors and
+the offer of a phishing-resistant one.
+\end{definition}
+
+The chapter's firm has twelve roles and a hundred people. Its policy is data (\texttt{firm.accessctl}): roles grant (resource, action)
+pairs, people hold roles, deny rules override grants, and five segregation-of-duties constraints (Book~6, chapter~28) name pairs of
+permissions no single person may hold.
+
+\omcode{code/platforms/29-security/python/pl_accessctl.py}{22}{27}{The firm's five segregation-of-duties constraints, each a pair of
+permissions that no one person may hold.}\label{lst:pl:security:sod}
+
+\omcode{code/firm/accessctl/firm_accessctl.py}{34}{56}{The policy model: permissions through roles, minus denies; toxic combinations found at
+the level of roles and of people.}\label{lst:pl:security:policy}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+role & first permission & second permission\\
+\midrule
+developer & merge code & deploy to production\\
+head of desk & propose parameters & approve parameters\\
+operations & create payments & release payments\\
+site reliability & create venue keys & withdraw from wallets\\
+trader & submit orders & amend trades\\
+\bottomrule
+\end{tabular}
+\caption{The five roles that, before the fix, held both halves of a segregation-of-duties constraint on their own. Through them and through
+three researchers who were also risk managers, 60 of the 100 people held a toxic combination; after splitting the roles, adding a release manager and
+removing the second roles, none do.}\label{tab:pl:security:toxic}
+\end{table}
+
+Each toxic role was created for convenience and each is how a known kind of loss happens: a trader who amends his own bookings can hide losses
+(the rogue-trading cases of Book~6); a developer who deploys his own merge skips chapter~\ref{ch:pl:testing-and-continuous-delivery}'s review;
+a head of desk who approves his own parameters skips chapter~\ref{ch:pl:signal-serving-and-parameter-management}'s four eyes. The check is a
+few lines of code over the policy data and belongs in the policy's own \omterm{def:pl:testing-and-continuous-delivery:ci}{continuous integration}: a change that creates a toxic combination fails
+like a failing test.
+
+\section{Secrets and keys}
+
+\begin{definition}[Secrets management, secret rotation]\label{def:pl:security:secrets}
+\emph{Secrets management}\index{secrets management} keeps credentials --- passwords, API keys, private keys, database passwords --- in a
+vault that issues them to authenticated programs under leases and logs every access, never in code or configuration files. \emph{Secret
+rotation}\index{secret rotation} replaces a secret on a schedule and on any suspicion, so that a leaked secret is valid only until its next
+rotation: its cryptoperiod, in NIST's terms.
+\end{definition}
+
+\begin{definition}[Hardware security module]\label{def:pl:security:hsm}
+A \emph{hardware security module}\index{hardware security module} (HSM) is a tamper-resistant device that generates and stores keys and
+performs operations with them, so that private keys never leave it in plain form; signing happens inside, on data the host presents.
+\end{definition}
+
+Rotation bounds exposure: a secret that leaks at a random time and is rotated every 90 days stays valid 45 days on average; rotated weekly,
+three and a half. An HSM, or the multi-party computation of Book~3, chapter~24, removes the key from the host --- but not the question the hook
+asks: the device signs whatever it is shown. The defence is to make what is signed verifiable independently of the screen that prepared it:
+a second channel that shows the transaction's actual content, a policy engine that refuses a transaction type (a contract upgrade, a new
+destination) whatever the signers approve.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=6mm,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=11mm,text width=31mm},
+  bad/.style={draw=omThm,fill=omThm!10,rounded corners=2pt,align=center,minimum height=11mm,text width=24mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[bad] (app) {web application\\(altered)};
+\node[box,right=18mm of app,yshift=10mm] (scr) {signer's screen:\\the expected transfer};
+\node[box,right=18mm of app,yshift=-10mm] (dev) {signing device:\\another transaction};
+\node[box,right=10mm of dev,text width=27mm] (chk) {independent decoder\\and policy engine};
+\node[box,right=10mm of chk,text width=14mm] (chain) {wallet};
+\draw[arr] (app) -- node[above,sloped,font=\scriptsize]{what is shown} (scr);
+\draw[arr,omThm] (app) -- node[below,sloped,font=\scriptsize]{what is signed} (dev);
+\draw[arr] (dev) -- (chk);
+\draw[arr] (chk) -- node[below,font=\scriptsize,align=center]{only if\\allowed} (chain);
+\draw[dashed,gray] (scr.east) -| (chk.north);
+\node[gray,font=\scriptsize,anchor=south west] at (scr.north east) {the check made on the screen};
+\end{tikzpicture}
+
+\omcaption{The hook's attack in one picture: the altered application showed the signers one transaction and sent their devices another. A
+control that decodes what is actually to be signed, independently of the application, and a policy that refuses what no signer should approve
+(a change to the wallet's own contract, a new destination), check the thing signed rather than the thing shown.}\label{fig:pl:security:signing}
+\end{omfigure}
+
+\section{Exchange and wallet credentials}
+
+\begin{definition}[Withdrawal allow-list]\label{def:pl:security:allowlist}
+A \emph{withdrawal allow-list}\index{withdrawal allow-list} restricts the destinations to which an account or key may send assets to a list
+fixed in advance, changed only through a separate, slower procedure, so that a stolen credential cannot move assets to the thief.
+\end{definition}
+
+Venue API keys (Book~3, chapter~15) are the firm's most exposed secrets: they sit on the trading servers and sign every order. The chapter's
+keys carry scopes --- a trading key can read and trade but not withdraw; a withdrawal key can only withdraw, to allow-listed addresses --- and
+every request is signed with Book~13's HMAC signer and stamped with its time. The venue's checks decide what a stolen key can do
+(\cref{tab:pl:security:keys}).
+
+\omcode{code/firm/accessctl/firm_accessctl.py}{99}{114}{The venue's checks on a request: a known key, a valid signature, a fresh timestamp, an
+action within the key's scope, and a withdrawal address on the allow-list.}\label{lst:pl:security:verify}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+attempt & accepted & reason\\
+\midrule
+trade with the trading key & yes & ok\\
+withdraw with the trading key & no & action outside the key's scope\\
+withdraw to an outside address & no & address not on the allow-list\\
+withdraw to the custodian & yes & ok\\
+forged signature & no & bad signature\\
+replayed a minute later & no & stale request\\
+\bottomrule
+\end{tabular}
+\caption{A stolen trading key and a stolen withdrawal key tried against the venue's checks. The thief can trade --- which can still cost money
+--- but cannot move assets anywhere the firm has not listed in advance.}\label{tab:pl:security:keys}
+\end{table}
+
+\section{Segmentation and insider risk}
+
+\begin{definition}[Network segmentation, zero-trust architecture]\label{def:pl:security:segmentation}
+\emph{Network segmentation}\index{network segmentation} divides a firm's network into zones --- trading, research, corporate, the outside ---
+with traffic between zones allowed only on stated paths, so that a compromise in one zone does not reach the others. A \emph{zero-trust
+architecture}\index{zero-trust architecture} grants no implicit trust for being inside a network: every request is authenticated and
+authorised on its own, by identity and device, before a session to a resource is established.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  zone/.style={draw=omDef,fill=omDef!6,rounded corners=3pt,minimum width=30mm,text width=30mm,minimum height=16mm,align=center},
+  hot/.style={draw=omThm,fill=omThm!8,rounded corners=3pt,minimum width=30mm,text width=30mm,minimum height=16mm,align=center},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[hot] (t) at (0,0) {trading zone\\\scriptsize strategies, gateways, keys};
+\node[zone] (r) at (6.2,0) {research zone\\\scriptsize tick store, notebooks};
+\node[zone] (c) at (12.2,0) {corporate zone\\\scriptsize e-mail, laptops};
+\node[zone] (v) at (0,-2.8) {venues\\\scriptsize cross-connects};
+\node[zone] (i) at (12.2,-2.8) {internet};
+\draw[arr] (t) -- node[left,font=\scriptsize]{orders only} (v);
+\draw[arr] ([yshift=3mm]t.east) -- node[above,font=\scriptsize]{fills, positions} ([yshift=3mm]r.west);
+\draw[arr,dashed] ([yshift=-3mm]r.west) -- node[below,font=\scriptsize,align=center]{parameters, through\\review (ch.~16)} ([yshift=-3mm]t.east);
+\draw[arr] (c) -- node[above,font=\scriptsize,align=center]{authenticated\\access} (r);
+\draw[arr] (i) -- node[right,font=\scriptsize]{mail, web} (c);
+\draw[omThm,thick] (6.2,-2.8) node[cross out,draw,minimum size=4mm]{} node[below=3mm,font=\scriptsize,align=center]{no path from the\\internet or laptops to trading};
+\end{tikzpicture}
+
+\omcaption{The chapter's network zones and the only paths allowed between them. The trading zone, which holds the venue keys, talks to venues
+and sends fills to research; parameters come back only through chapter~16's reviewed path; nothing from the corporate zone or the internet
+reaches it directly.}\label{fig:pl:security:zones}
+\end{omfigure}
+
+\begin{definition}[Insider threat, data-loss prevention]\label{def:pl:security:insider}
+An \emph{insider threat}\index{insider threat} is harm done by someone with legitimate access --- an employee, a contractor --- through theft,
+sabotage or negligence. \emph{Data-loss prevention}\index{data-loss prevention} is the set of controls that detect and block the movement of
+protected data out of the places it is allowed to be: copies to removable media, uploads, mail, and unusual volumes of reading.
+\end{definition}
+
+The best-known case in trading is also a warning about the law's limits: in 2009 a programmer uploaded more than 500\,000 lines of his
+employer's high-frequency trading code to a server in Germany on his last day; his federal conviction was reversed on appeal in 2012, on
+the reach of the statutes rather than the facts. A firm cannot rely on the courts (Book~16, chapter~11, on trade secrets); it must see the
+copying. The difficult insider is not the one who takes everything on the last day but the one who takes a little more than usual every day.
+
+The chapter's model gives each of the hundred people a year of 250 trading days of access logs --- the strategy-code files each reads a
+day, at each person's own level, with a weekly rhythm and noise --- and plants an insider who, from a random day, reads a stated share more
+than usual, every day. Four detectors score each person against their own baseline, the median and median absolute deviation of 30 days:
+a single-day threshold, or a CUSUM of the daily scores (Book~7, chapter~13), each with a baseline that trails today or one that ends 60 days
+earlier. All four are calibrated on clean people to one false alarm a month per hundred people.
+
+\omcode{code/firm/accessctl/firm_accessctl.py}{118}{137}{Per-person robust scores against a baseline that can be lagged, and the one-sided CUSUM
+that accumulates small daily excesses.}\label{lst:pl:security:scores}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={extra reading per day (\% above the person's usual, log scale)},ylabel={insiders flagged (of 20)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmode=log,xmin=4,xmax=120,ymin=0,ymax=21,xtick={5,10,20,30,50,100},xticklabels={5,10,20,30,50,100}]
+\addplot[omThm,thick,mark=*] table[x=extra_pct,y=cusum_lagged_found]{figdata/platforms/29-security/detection.csv};
+\addplot[omThm,thick,dashed,mark=o] table[x=extra_pct,y=cusum_trailing_found]{figdata/platforms/29-security/detection.csv};
+\addplot[omDef,thick,mark=square*] table[x=extra_pct,y=day_lagged_found]{figdata/platforms/29-security/detection.csv};
+\addplot[omDef,thick,dashed,mark=square] table[x=extra_pct,y=day_trailing_found]{figdata/platforms/29-security/detection.csv};
+\node[omThm,font=\scriptsize,anchor=south east] at (axis cs:28,17) {CUSUM, lagged baseline};
+\node[omThm,font=\scriptsize,anchor=north west] at (axis cs:32,6) {CUSUM, trailing};
+\node[omDef,font=\scriptsize,anchor=south east] at (axis cs:48,12.5) {single day, lagged};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:45,1.6) {single day, trailing};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Planted insiders flagged, out of twenty, against how much more than usual they read each day, at one false alarm a month per
+hundred people. A single-day threshold on a trailing baseline almost never sees them; a CUSUM on a baseline lagged by 60 days finds 12 of 20 at
++20\% a day and 19 of 20 at +30\%. Data: \texttt{fig\_accessctl.py}.}\label{fig:pl:security:detection}
+\end{omfigure}
+
+Two things matter, and \cref{fig:pl:security:detection} separates them. A single day of reading 30\% more than usual is well inside a person's
+noise; only accumulation --- the CUSUM --- turns thirty such days into a signal. And a baseline that trails today learns the new habit: after
+thirty days the insider's copying is the person's normal, and the score returns to zero. Lagging the baseline by sixty days keeps the copying
+out of its own reference long enough to be seen. With both, an insider reading 30\% more than usual is flagged in a median of 22 days (19 of
+20), one reading 50\% more in 12 (all 20); a single-day threshold on a trailing baseline flags one of twenty.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.2cm,xlabel={trading day},ylabel={CUSUM of daily scores},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=90,xmax=250,ymin=0,ymax=60]
+\addplot[omThm,thick] table[x=day,y=cusum_lagged]{figdata/platforms/29-security/insider.csv};
+\addplot[omThm,dashed] table[x=day,y=cusum_trailing]{figdata/platforms/29-security/insider.csv};
+\addplot[gray,thin] table[x=day,y=clean_cusum_lagged]{figdata/platforms/29-security/insider.csv};
+\draw[black,dashed] (axis cs:90,12.709) -- (axis cs:250,12.709) node[pos=0.98,above left,font=\scriptsize]{threshold 12.7};
+\draw[black,dotted] (axis cs:120,0) -- (axis cs:120,40) node[pos=0.75,left,font=\scriptsize,align=right]{copying\\starts};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:205,57) {lagged baseline};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:175,6) {trailing baseline};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One planted insider reading 30\% more strategy code than usual from day 120. The CUSUM on the lagged baseline crosses its calibrated
+threshold on day 131; on the trailing baseline it just reaches its own threshold (11.2) on day 147, then falls back once the copying has entered
+the baseline. A clean person's
+CUSUM (grey) stays near zero. Data: \texttt{fig\_accessctl.py}.}\label{fig:pl:security:insider}
+\end{omfigure}
+
+\begin{dated}{2026-09}{The cases and the standards}\label{dat:pl:security:sources}
+The FBI's public service announcement of 26 February 2025 attributed to North Korea the theft of about \$1.5 billion in virtual assets from the
+exchange Bybit on or about 21 February; the investigation published by Sygnia describes JavaScript altered on 19 February in the Safe\{Wallet\}
+web application so that its interface displayed legitimate transaction data while the transaction itself was altered. In \emph{United States
+v.\ Aleynikov} (2d Cir.\ 2012) the court reversed a conviction for uploading more than 500\,000 lines of trading source code. NIST SP 800-207
+(2020) defines \omterm{def:pl:security:segmentation}{zero-trust architecture}; SP 800-63B (revision of August 2025) the authentication assurance levels; SP 800-57 Part 1 (2020) the
+cryptoperiod of a key.
+\end{dated}
+
+\section{Tutorial: the slow copy}\label{tut:pl:security:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Check the access policy for toxic combinations, issue and test scoped venue keys, and find a slow insider at a fixed false-alarm
+rate. \textbf{End state:} \cref{tab:pl:security:toxic,fig:pl:security:detection}.
+\begin{tutsteps}
+\item \textbf{Policy}: \texttt{pl\_accessctl.policies()} and \texttt{toxic\_summary()}, before and after the fix.
+\item \textbf{Keys}: \texttt{stolen\_key\_attempts()}; add a key with a trade scope and an allow-list and try it.
+\item \textbf{Vault}: \texttt{firm\_accessctl.Vault} with a 90-day lease; rotate and list what expires.
+\item \textbf{Logs}: \texttt{access\_logs()} and \texttt{statistics(x)}; \texttt{thresholds()}.
+\item \textbf{Insider}: \texttt{delays(extra)} for each share of extra reading.
+\end{tutsteps}
+\textbf{What to change next.} Score people against their peers in the same role as well as against themselves; add file-level features (files
+never read before) and see how much sooner the insider is flagged.
+\end{tutorial}
+
+\section{Build: access control}\label{bld:pl:security:accessctl}
+
+\begin{build}
+\bfield{Purpose} Grant each person and program only what its job needs, keep secrets and venue keys under rules that bound a leak, and see a
+slow copy at a stated false-alarm rate.
+\bfield{Interface} \texttt{Policy} (\texttt{allowed}, \texttt{permissions}, \texttt{toxic\_roles}, \texttt{toxic\_users}), \texttt{Vault},
+\texttt{VenueKey}, \texttt{request}, \texttt{verify}, \texttt{robust\_scores}, \texttt{cusum}, \texttt{onsets}, \texttt{calibrate},
+\texttt{first\_alarm}.
+\bfield{Rules} Policy as reviewed data, checked for toxic combinations in \omterm{def:pl:testing-and-continuous-delivery:ci}{continuous integration}; secrets only from the vault, under leases,
+rotated; venue keys scoped, withdrawal only to allow-listed addresses; every request signed and time-stamped; detectors calibrated on clean
+populations and reviewed monthly.
+\bfield{Acceptance tests} \texttt{code/firm/accessctl/tests/}: grants, denies, toxic roles and users; vault leases, rotation and expiry; each of
+the venue's checks; lagged robust scores, CUSUM, calibration to a false-alarm rate, and a persistent shift found.
+\bfield{Stretch} Just-in-time access grants that expire; peer-group scoring; an independent transaction decoder for signers.
+\end{build}
+
+\begin{omsources}
+\item Federal Bureau of Investigation, \emph{North Korea Responsible for \$1.5 Billion Bybit Hack}, PSA 250226, 26 February 2025; Sygnia,
+investigation of the Bybit hack, 2025.
+\item \emph{United States v.\ Aleynikov}, 676 F.3d 71 (2d Cir.\ 2012).
+\item NIST SP 800-207, \emph{Zero Trust Architecture}, 2020; SP 800-63B, \emph{Authentication and Authenticator Management}; SP 800-57 Part 1
+Rev.~5, \emph{Recommendation for Key Management}, 2020.
+\item One Quant Book~3, chapters~14, 15 and~24 (keys, venue APIs, wallets); Book~6, chapter~28 (segregation of duties); Book~16, chapter~11
+(trade secrets).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:security:1}
+Why does the check for toxic combinations look at people as well as roles?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:security:2}
+A secret leaks at a random moment. How long does it stay valid on average under 90-day and weekly rotation?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:security:3}
+What can a thief do with the firm's stolen trading key, and what can he not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:security:4}
+Why does a baseline that trails today stop seeing a slow copy after about a month?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:security:5}
+Why is a single-day threshold the wrong tool for a slow copy, whatever its level?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:security:6}
+The signers of the hook each checked the transaction on their screen. What control would have caught the attack?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:security:7}
+\emph{Coding.} Rerun \texttt{delays(0.3)} with the CUSUM's reference value \texttt{K} at 0.25 instead of 0.5 (recalibrating the thresholds).
+What happens to the detections and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:security:8}
+\emph{Find the flaw.} \textquotedbl{}Our trading network is behind the firewall, so the systems inside it can trust each other.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: The Slow Copy}
+
+\begin{problem}[{Weekend problem --- the slow copy}]\label{pb:pl:security:1}
+The chapter's policy, keys, vault and access logs.
+
+\medskip\noindent\textbf{Part I --- Access.}
+\begin{enumerate}
+\item What does the firm protect, and from whom?
+\item What are the five segregation-of-duties constraints?
+\item Which roles were toxic before the fix, and how many people held a toxic combination?
+\item What did the fix change?
+\item Where should the toxic-combination check run?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Secrets and keys.}
+\begin{enumerate}[resume]
+\item What does a vault add to a secret in a configuration file?
+\item How does rotation bound a leak?
+\item What are the venue's checks on a request?
+\item What does each stolen key allow?
+\item What does an HSM protect, and what does it not?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Insiders.}
+\begin{enumerate}[resume]
+\item How are the four detectors built and calibrated?
+\item What does each flag at +30\% a day?
+\item Why does the CUSUM matter?
+\item Why does the lag of the baseline matter?
+\item When does the example insider's lagged CUSUM cross its threshold?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the days until a planted insider's slow exfiltration is flagged at one false alarm a month per hundred
+users, and the number of toxic role combinations in the firm's policy before and after the fix.
+\item What would you add to the detectors first?
+\item How should the trading zone be segmented?
+\item What is the lesson of the hook for any firm that signs transactions?
+\item In one sentence: what is security in a trading firm about?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:security:1}
+Where should an exchange API secret live, and how should a strategy get it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:security:2}
+What permissions should an exchange API key used for trading have?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:security:3}
+How would you detect an employee who copies strategy code slowly over months?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:security:4}
+What is zero trust, and what does it change inside a trading network?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:security:5}
+Design access control, secrets and monitoring for a trading firm of a hundred people with venue keys and a crypto treasury.
+\end{interviewq}

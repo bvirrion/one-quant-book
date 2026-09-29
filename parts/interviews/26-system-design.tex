@@ -1,0 +1,207 @@
+\chapter{System Design}\label{ch:iv:system-design}
+
+``Design a matching engine.'' Forty-five minutes, a whiteboard, no other words. The candidate who spends five minutes asking
+how many instruments, how many messages a second at peak, what latency at the ninety-ninth percentile, and what happens when
+the process dies has already done better than the one who began with the order book's data structure. \omterm{def:iv:system-design:interview}{System-design interviews}
+at trading firms ask for the systems the series builds: a matching engine and exchange simulator (One Quant Book~10, chapter~26),
+feed handlers and order gateways (Book~13), market-data distribution, backtesters (Book~7 and Book~15) and risk services. What is
+scored is the method and the numbers, not a single right architecture.
+
+\section{The method}
+
+\begin{definition}[System-design interview, capacity estimate]\label{def:iv:system-design:interview}
+A \emph{system-design interview}\index{system-design interview} asks the candidate to design a system from a one-line
+description within a fixed time, and assesses how requirements are established, how the design is sized, how its components
+and interfaces are chosen, and how it fails. A \emph{capacity estimate}\index{capacity estimate} is the back-of-envelope
+calculation of the load a design must carry (messages a second at peak, bytes a day, memory, connections) from stated
+assumptions, used to choose between designs.
+\end{definition}
+
+\begin{method}[Answering a design question]\label{met:iv:system-design:method}
+\begin{enumerate}
+\item \emph{Requirements}: functions (what it must do), scale (instruments, users, messages a second at peak and on average),
+latency (median and tail), correctness (ordering, exactly-once), availability (what may be lost on failure, how fast to recover).
+\item \emph{Capacity}: a \omterm{def:iv:system-design:interview}{capacity estimate} for messages, bandwidth, memory and storage, with the peak-to-average ratio stated.
+\item \emph{Interfaces}: the messages in and out, and their sequencing.
+\item \emph{Core design}: the data structures and the threading model of the critical path first.
+\item \emph{Failure}: what happens when each component dies, when a consumer is slow, when the network drops packets.
+\item \emph{Numbers again}: check the design against the \omterm{def:iv:system-design:interview}{capacity estimate} and the latency budget.
+\end{enumerate}
+\end{method}
+
+\begin{example}[Sizing a feed]\label{ex:iv:system-design:feed}
+Suppose (assumptions to be stated as such) 200\,000 messages a second on average over a 6.5-hour session and 64 bytes a
+message: $200\,000 \times 23\,400 \times 64 \approx 300$ gigabytes a day to capture. At a peak of one million messages a second
+the payload alone is 512 megabits a second, and with 42 bytes of Ethernet, IPv4 and UDP headers ($14 + 20 + 8$) per message sent singly,
+848 megabits: comfortably inside 10 gigabits, but not inside 1.
+\end{example}
+
+\section{The order book and the matching engine}
+
+The matching engine is the question asked most. Its core is a price-time priority book: price levels on each side in sorted
+order, a first-in-first-out queue of orders within each level, and an index from order identifier to its position so that a
+cancel costs constant time (\cref{lst:iv:system-design:match}). Around the core sit the pieces that make it an exchange: a
+sequencer that stamps every inbound message with a single order, a journal that writes the sequenced input to durable storage
+before or while it is processed, the market-data publisher and the order-entry gateways (\cref{fig:iv:system-design:engine}).
+
+\omcode{code/interviews/26-system-design/cpp/iv_book.hpp}{37}{56}{The matching loop of a price-time book: consume the best
+opposite level in time order while the incoming order crosses. The chapter's test compares every fill and best price with a
+brute-force book on 200 random order streams.}\label{lst:iv:system-design:match}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>={Stealth},
+  box/.style={draw=omDef,rounded corners=2pt,fill=omDef!6,minimum height=0.8cm,text width=2.2cm,align=center,inner sep=2pt},
+  alt/.style={draw=omThm,rounded corners=2pt,fill=omThm!8,minimum height=0.8cm,text width=2.2cm,align=center,inner sep=2pt}]
+\node[box] (gw) at (0,0) {order-entry gateways};
+\node[box] (seq) at (3.1,0) {sequencer};
+\node[box] (me) at (6.2,0) {matching engine (one thread per partition)};
+\node[box] (md) at (9.3,0.9) {market-data publisher};
+\node[box] (acks) at (9.3,-0.9) {acknow\-ledge\-ments and fills};
+\node[alt] (jr) at (3.1,-1.7) {journal of the sequenced input};
+\node[alt] (rep) at (6.2,-1.7) {replica replaying the journal};
+\draw[->,thick,omDef] (gw) -- (seq);
+\draw[->,thick,omDef] (seq) -- (me);
+\draw[->,thick,omDef] (me) -- (md);
+\draw[->,thick,omDef] (me) -- (acks);
+\draw[->,thick,omThm] (seq) -- (jr);
+\draw[->,thick,omThm] (jr) -- (rep);
+\draw[->,thick,omDef] (acks.south) -- ++(0,-1.75) -| (gw.south);
+\node[font=\scriptsize,anchor=north] at (4.6,-3.2) {acknowledgements go back to the participants through the gateways};
+\end{tikzpicture}
+
+\omcaption{A matching engine as a replicated state machine: the sequencer gives every inbound message one order and journals
+it; the engine is a deterministic function of the sequenced input, so a replica replaying the journal reaches the same state
+and can take over (One Quant Book~13, chapter~24).}\label{fig:iv:system-design:engine}
+\end{omfigure}
+
+Determinism is the design's key property: if the engine's output depends only on its sequenced input (no clocks read, no hash-map
+iteration order, no thread interleavings inside a partition), recovery is replay and a standby replica is a copy. Scaling is by
+partition: instruments are divided among engine threads or machines, each with its own book, which works because orders on
+different instruments do not interact (a spread order across two partitions needs a coordinating component).
+
+\section{Market data and the backtester}
+
+A market-data service fans out one feed to many consumers. Its design questions are sequencing (every message numbered per
+channel), recovery (a snapshot channel and a retransmission service, One Quant Book~10, chapter~26), and slow consumers, which must
+never slow the publisher: each consumer gets its own queue, and a consumer that falls too far behind is disconnected or switched to
+snapshots (\cref{fig:iv:system-design:md}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>={Stealth},
+  box/.style={draw=omDef,rounded corners=2pt,fill=omDef!6,minimum height=0.8cm,text width=2.3cm,align=center,inner sep=2pt},
+  alt/.style={draw=omThm,rounded corners=2pt,fill=omThm!8,minimum height=0.8cm,text width=2.3cm,align=center,inner sep=2pt}]
+\node[box] (fh) at (0,0) {feed handler (arbitrates lines A and B)};
+\node[box] (bk) at (3.3,0) {book builder};
+\node[box] (pub) at (6.6,0) {publisher: incremental channel};
+\node[alt] (snap) at (6.6,-1.7) {snapshot and retransmission service};
+\node[box] (c1) at (10,1.4) {consumer: strategy};
+\node[box] (c2) at (10,0.2) {consumer: risk};
+\node[alt] (c3) at (10,-1.35) {slow consumer: own queue, falls back to snapshots};
+\draw[->,thick,omDef] (fh) -- (bk);
+\draw[->,thick,omDef] (bk) -- (pub);
+\draw[->,thick,omDef] (pub) -- (c1.west);
+\draw[->,thick,omDef] (pub) -- (c2.west);
+\draw[->,thick,omDef] (pub) -- (c3.west);
+\draw[->,thick,omThm] (bk) |- (snap);
+\draw[->,thick,omThm,dashed] (snap.east) -- (c3.west |- snap.east);
+\end{tikzpicture}
+
+\omcaption{A market-data service: sequenced incremental updates for everyone, a snapshot and retransmission path for
+consumers that miss messages or fall behind, and a separate queue per consumer so that none can slow the
+publisher.}\label{fig:iv:system-design:md}
+\end{omfigure}
+
+A backtester (One Quant Book~7, chapter~17, and One Quant Book~15, chapter~11) is an event loop over a merged stream of recorded
+events, with a simulated clock, a fill model for orders against the recorded book, latencies applied to both directions, and
+the strategy code called through the same interface it uses in production. Its design questions are reproducibility (seeded
+randomness, versioned data and code), realism (queue position, latency, fees) and speed (partitioning by day or instrument).
+
+\section{The risk service and the question of state}
+
+A pre-trade risk service sits on the order path (One Quant Book~11, chapter~27): every order is checked against limits (size,
+price collar, position, credit) before it leaves, so its state (positions, open orders, limits) must be current and its latency
+small. The interview questions are where the state lives (in the gateway's process for speed, in a central service for a firm-wide
+view, usually both with the central view as the authority), how it is kept consistent (the gateway reserves against a limit
+before sending and releases on cancel or fill), and what happens when it fails: a risk check that cannot run must block orders
+(fail closed), and a kill switch must work when everything else does not.
+
+\section{Worked answers}
+
+\begin{example}[A latency budget]\label{ex:iv:system-design:budget}
+\emph{``The desk wants tick-to-order under 10 microseconds at the 99th percentile. Split the budget.''} Write the path and
+give each stage a number: network card to application 1.5 (kernel bypass), feed decode 0.5, book update 1.0, strategy 3.0,
+pre-trade risk 1.0, order encode 0.5, application to wire 2.0: 9.5 microseconds, leaving 0.5 of margin. Then the point the
+interviewer is waiting for: these are percentiles, and percentiles do not add. If each of seven stages independently has a
+1\% chance of a slow path, the chance that at least one is slow on a given message is $1 - 0.99^7 \approx 6.8\%$, so a
+budget of per-stage 99th percentiles says little about the end-to-end 99th percentile. Measure end to end, on the real
+path, with hardware timestamps, and budget the tail (cache misses, interrupts, a page fault) explicitly
+(\cref{ch:iv:concurrency-operating-systems-and-networks}).
+\end{example}
+
+\section{Question bank}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:system-design:1}
+A feed averages 200\,000 messages a second over a 6.5-hour session, 64 bytes each. How much storage does a day of capture take?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:system-design:2}
+At a peak of one million 64-byte messages a second, what bandwidth does the feed need? Is a 1-gigabit link enough? A 10-gigabit
+one?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{crypto firm}]\label{iq:iv:system-design:3}
+You are asked to design a matching engine for a new venue. List the questions you ask in the first five minutes.
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:system-design:4}
+Which operations must an order book support, and with which complexities, for a matching engine?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:system-design:5}
+Estimate the memory for full-depth books of 10\,000 instruments with five million live orders, 48 bytes an order, and up to 1\,000
+price levels a side at 16 bytes a level.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{crypto firm}]\label{iq:iv:system-design:6}
+How do you make a matching engine recoverable after a crash with no lost or duplicated orders? What must be true of the engine's
+code for your answer to work?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:system-design:7}
+Design a service that distributes one market-data feed to fifty internal consumers, some of them slow.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher} \iqfirm{systematic fund}]\label{iq:iv:system-design:8}
+Design a backtester for intraday strategies on recorded order-book data. What makes its results reproducible and believable?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer} \iqfirm{market maker}]\label{iq:iv:system-design:9}
+Write the matching loop of a price-time priority book for limit orders, and say how you would test it.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk} \iqfirm{bank}]\label{iq:iv:system-design:10}
+Design the pre-trade risk check for a firm with order gateways in three data centres. Where does the state live, how is it kept
+consistent, and what happens when the risk service is down?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer} \iqfirm{crypto firm}]\label{iq:iv:system-design:11}
+Your matching engine handles 10\,000 instruments; the peak is three million messages a second and one thread handles one million.
+How many partitions do you run at no more than half load, and what breaks when an order spans two partitions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer} \iqfirm{proprietary firm}]\label{iq:iv:system-design:12}
+Design failover for the matching engine so that a standby takes over within a second of the primary's death with no lost
+acknowledged order.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk} \iqfirm{multi-manager fund}]\label{iq:iv:system-design:13}
+A real-time risk service revalues 100\,000 accounts of 50 positions each; on each of 1\,000 price ticks a second, about 1\% of all
+positions are affected. How many position updates a second is that, and how do you design for it?
+\end{interviewq}
+
+\begin{omsources}
+\item One Quant Book~7, chapter~17; One Quant Book~10, chapters 1 and~26; One Quant Book~11, chapter~27; One Quant Book~13, chapters
+18--24; One Quant Book~15, chapter~11.
+\item The series' exchange simulator, \texttt{firm.exchsim}, and its protocol document (\texttt{code/firm/exchsim/PROTOCOL.md}), as a
+worked design of a venue.
+\end{omsources}

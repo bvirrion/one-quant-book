@@ -1,0 +1,389 @@
+\chapter{Simulation--Production Parity}\label{ch:pl:simulation-production-parity}
+
+A strategy that had passed its replay parity test quoted a tick wider than intended on its first morning in production, for the whole
+morning. Its opening period ended on a timer, and the timer had been set from the machine's clock: in production the machine's clock
+and the venue's agreed, in the backtest they did not, and the parity test had compared the backtest with itself. The code was the same
+object in both places; the environments around it were not. This chapter builds the host that lets one strategy object run in a
+backtest, in the simulator and on a production-shaped path, and the harness that finds, event by event, where two of those runs part.
+
+\section{One strategy, several environments}
+
+\begin{definition}[Simulation--production parity]\label{def:pl:simulation-production-parity:parity}
+\emph{Simulation--production parity}\index{simulation--production parity} is the property that a strategy, given the same inputs in
+the same order, produces the same outputs in simulation and in production: the same orders and cancels, at the same prices and
+quantities, in response to the same events.
+\end{definition}
+
+Parity is a property of the strategy and of everything around it. Book~7 (chapter~19) tested it by replaying a live day's inputs into
+the backtest and comparing orders; Book~12 (chapter~24) met its cousin in machine learning, the training--serving skew. A strategy can
+fail it by itself (it reads something that is not an input: the machine's clock, a random number, the order of a dictionary) or through
+its environments (they deliver the same market in different types, orders or semantics). The platform removes the second kind by
+construction and exposes the first kind by test.
+
+\begin{definition}[Strategy host, environment adapter]\label{def:pl:simulation-production-parity:host}
+A \emph{strategy host}\index{strategy host} is the component that holds a strategy object, gives it its only view of the world --- a
+clock, market data and order entry --- and delivers its inputs in the platform's \omterm{def:pl:backtest-engine-architecture:event}{event model}. An \emph{environment
+adapter}\index{environment adapter} connects the host to one environment (a backtest, a simulator, a production connection), translating
+that environment's events into the host's inputs and the strategy's requests into the environment's messages.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.7cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!15,minimum width=3.4cm] (s) at (0,2.5) {strategy object\\ (the same in every environment)};
+\node[box,fill=omDef!15,minimum width=10.4cm] (h) at (0,1.2) {strategy host: clock $\cdot$ market data $\cdot$ order entry $\cdot$
+inputs delivered in the event model};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a1) at (-4.0,-0.4) {simulator in process\\ agent context, objects};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a2) at (0,-0.4) {production-shaped\\ gateway, bytes, journal};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a3) at (4.0,-0.4) {replay\\ a production journal};
+\draw[<->] (s) -- (h);
+\foreach \a in {a1,a2,a3} {\draw[<->] (\a.north) -- (\a.north|-h.south);}
+\node[box,fill=gray!10,minimum width=5.2cm] (x) at (-1.8,-1.9) {\texttt{firm.exchsim}: one venue, the same session};
+\draw[->] (a1.south) -- (a1.south|-x.north);
+\draw[->] (a2.south) -- (a2.south|-x.north);
+\draw[->,dashed] (a2.east) -- node[above,font=\tiny]{journal} (a3.west);
+\end{tikzpicture}
+
+\omcaption{One strategy object in three environments. The host gives it a clock, market data and order entry, and delivers every input
+in the \omterm{def:pl:backtest-engine-architecture:event}{event model}; each \omterm{def:pl:simulation-production-parity:host}{environment adapter} translates its environment. The in-process and production-shaped adapters trade on the same
+simulated session; the replay reads the production run's input journal.}\label{fig:pl:simulation-production-parity:host}
+\end{omfigure}
+
+The chapter's three environments trade on Book~10's simulator with one \texttt{firm.tape} hour as background flow (chapter~11). The
+first calls the simulator's agent context directly. The second is shaped like production: the strategy's orders pass through Book~13's
+order gateway (\texttt{firm.ordergw}: its order state machine, its throttle and its worst-case exposure check), are encoded as the
+simulator's order-entry messages in SoupBinTCP frames on an in-memory byte stream, and the venue's reports come back as bytes the same way;
+every input the strategy receives is written to an input journal in Book~13's format (chapter~23: a receive time and a 48-byte record). The
+third replays that journal into a fresh strategy object: the backtest of recorded inputs.
+
+\section{Abstracting time}
+
+The host's clock is the only clock a strategy may read: \texttt{ctx.now} is the time of the input being delivered, and
+\texttt{ctx.set\_timer(delay, tag)} asks for a timer input \texttt{delay} later. In the simulator both are simulated time; in production
+both would be the venue-synchronised clock of the machine; in the replay, \texttt{now} is the journal's receive time and timers are not set
+but replayed, since the timers that fired in production are inputs in the journal. A strategy that reads the machine's clock directly reads
+something the host does not control, and its behaviour then depends on where and how fast it runs. The chapter's harness makes this
+visible by giving each environment the machine clock it would really have: the venue's time in production, and, in the simulator and the
+replay, the clock of a machine replaying the session at 20:00, a hundred times faster than real time.
+
+\section{Abstracting market data}
+
+\begin{definition}[Market-data abstraction]\label{def:pl:simulation-production-parity:md}
+A \emph{market-data abstraction}\index{market-data abstraction} is the one representation of market events that a hosted strategy
+receives in every environment: here the top of the book as integers --- bid, bid size, ask, ask size --- with prices in 1/10\,000 of the
+currency unit, whatever the source's own encoding.
+\end{definition}
+
+The rule that prices are integers is Book~10's and the series': a price is a count of the smallest unit, and every conversion to a binary
+floating-point number is a chance to be off by one. Python's documentation says it plainly: most decimal fractions cannot be represented
+exactly as binary fractions. \texttt{99.99 - 0.01} is \texttt{99.97999999999999}, and \texttt{int()} of ten thousand times it is
+999\,799, one unit below the tick grid of 999\,800.
+
+\section{Abstracting order entry}
+
+\begin{definition}[Order-entry abstraction]\label{def:pl:simulation-production-parity:oe}
+An \emph{order-entry abstraction}\index{order-entry abstraction} is the one interface through which a hosted strategy sends and cancels
+orders and learns their fate, with the same semantics in every environment: which orders count as working (here, sent and not yet known to
+be finished, whether or not acknowledged), which callbacks arrive (acknowledgement, fill, cancel, reject), and what happens to a request that
+can no longer succeed.
+\end{definition}
+
+Semantics are where environments differ silently. Book~13's gateway (chapter~21) refuses to cancel an order it already knows to be filled;
+a simulator's agent context passes the cancel to the venue, which rejects it as too late. The same strategy then sees a reject in one
+environment and nothing in the other, and the venue sees an extra message that takes 500~nanoseconds of its matching engine's time. The
+harness below found exactly this difference on its first clean run, before any defect had been planted: the in-process adapter now refuses,
+as the gateway does, to cancel an order a report has already finished.
+
+\omcode{code/firm/strathost/firm_strathost.py}{125}{145}{The host's side of the abstractions: which orders are working, timers, and
+the delivery of simultaneous inputs in the event model (market data, then order entry, then timers).}\label{lst:pl:simulation-production-parity:host}
+
+\omcode{code/firm/strathost/firm_strathost.py}{278}{305}{The production-shaped adapter: an order passes Book~13's gateway, is encoded
+and framed onto a byte stream, and becomes an order at the venue side of the stream.}\label{lst:pl:simulation-production-parity:prod}
+
+\section{The parity harness}
+
+\begin{definition}[Parity harness]\label{def:pl:simulation-production-parity:harness}
+A \emph{parity harness}\index{parity harness} runs one strategy in two environments on the same inputs and compares their outputs
+event by event, reporting the first output that differs, the inputs delivered before it, and how many outputs differ in all.
+\end{definition}
+
+The harness compares the production-shaped run with the in-process simulator run (the same session, two adapters) and with the replay of
+its own journal (the same inputs, delivered again). Outputs are compared as the venue would see them: time, order or cancel, side, price on
+the wire, quantity. The first difference and the number of inputs before it are what a developer needs to start reading; the count of
+differing outputs says how much a defect costs in an hour.
+
+\omcode{code/firm/strathost/firm_strathost.py}{431}{448}{The comparison: the first differing output, the inputs delivered before it,
+and the outputs of one run with no identical output in the other.}\label{lst:pl:simulation-production-parity:compare}
+
+The chapter's strategy (\cref{lst:pl:simulation-production-parity:quoter}) quotes a lot at the touch, one tick wider during an opening
+period of thirty seconds from the start of the session, which a timer ends; it stops adding at three lots of inventory. Four defects are
+planted, one at a time, in the production-shaped run:
+\begin{itemize}
+\item \emph{wall clock}: the strategy takes the end of its opening period and its timer's delay from the machine's clock;
+\item \emph{float prices}: the production adapters hand prices to the strategy as floating-point currency and convert them back with
+\texttt{int()};
+\item \emph{callback order}: the production host delivers simultaneous inputs as its adapter read them, order entry first;
+\item \emph{ack semantics}: production's \texttt{working()} lists only acknowledged orders.
+\end{itemize}
+
+\omcode{code/platforms/12-simulation-production-parity/python/pl_parity.py}{26}{60}{The hosted strategy. With the wall-clock defect on,
+\texttt{\_now} reads the machine and the timer's delay mixes the machine's clock with the host's.}\label{lst:pl:simulation-production-parity:quoter}
+
+\section{Four defects}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xbar,bar width=7pt,xmode=log,xmin=1,xmax=40000,log origin=infty,
+  ytick=data,symbolic y coords={ack semantics,callback order,float prices,wall clock},enlarge y limits=0.2,
+  xlabel={count (log scale)},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2},table/col sep=comma,
+  nodes near coords,point meta=explicit symbolic,nodes near coords style={font=\scriptsize,anchor=west}]
+\addplot[fill=omDef!45,draw=omDef] table[x=events,y=defect,meta=events]{figdata/platforms/12-simulation-production-parity/defects_sim.csv};
+\addlegendentry{inputs before the first diverging output}
+\addplot[fill=omThm!45,draw=omThm] table[x=affected,y=defect,meta=affected]{figdata/platforms/12-simulation-production-parity/defects_sim.csv};
+\addlegendentry{outputs affected in the hour}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Each planted defect in the production-shaped run against the in-process simulator, on the same one-hour session: the inputs
+delivered before the first output that differs, and the outputs (orders and cancels) of the production run with no identical output in the
+simulator run. Data: \texttt{fig\_parity.py}.}\label{fig:pl:simulation-production-parity:defects}
+\end{omfigure}
+
+\Cref{fig:pl:simulation-production-parity:defects} and \cref{tab:pl:simulation-production-parity:defects} give the harness's report
+for each defect on seed~1.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+defect & \multicolumn{2}{c}{first diverging output} & inputs before & \multicolumn{2}{c}{outputs affected} \\
+ & index & seconds & & vs simulator & vs replay \\
+\midrule
+wall clock & 14 & 30.0 & 175 & 539 of 553 & 305 \\
+float prices & 3 & 24.4 & 126 & 1\,686 of 1\,690 & 1\,161 \\
+callback order & 20 & 33.0 & 203 & 387 of 463 & 416 \\
+ack semantics & 2 & 1.0 & 2 & 8\,449 of 8\,452 & 8\,450 \\
+\bottomrule
+\end{tabular}
+\caption{The harness's report for each planted defect: the index and time (seconds from the start of the session, one second before the
+open) of the first output of the production-shaped run that differs from the in-process simulator's, the inputs delivered before it, and the
+outputs of the production run with no identical counterpart in the simulator run and in the replay of its own journal.}
+\label{tab:pl:simulation-production-parity:defects}
+\end{table}
+
+\begin{example}[The morning the timer fired]\label{ex:pl:simulation-production-parity:timer}
+With the wall-clock defect, production is unaffected: its machine clock is the venue's, the timer fires thirty seconds after the start and
+the strategy moves to the touch. In the simulator the timer's delay is the machine's 20:00 plus thirty seconds minus the session's 09:29:59,
+more than ten hours, and it never fires in the hour; the machine clock, a hundred times slower than the session's, keeps the opening period
+open for fifty minutes. The first diverging output is production's cancel at 30.0~seconds, after 175 inputs, and 539 of production's 553
+outputs have no twin in the simulator. The replay of production's own journal receives the timer from the journal but still reads its own
+machine clock, requotes a tick wide, and parts at 30.1~seconds.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,x=0.19cm]
+\foreach \y/\l in {0/production,-1.1/simulator,-2.2/replay} {\node[anchor=east] at (-1,\y) {\l};
+  \draw[gray] (0,\y) -- (60,\y);}
+\draw[->] (0,-3.0) -- (61.5,-3.0) node[right]{minutes};
+\foreach \m in {0,10,20,30,40,50,60} {\draw (\m,-2.9) -- (\m,-3.1) node[below]{\m};}
+\fill[omThm!50] (0,-0.15) rectangle (0.5,0.15);
+\draw[omThm,thick] (0.5,0.35) -- (0.5,-0.15) node[pos=0,above,font=\tiny]{timer: 30 s};
+\fill[omDef!40] (0.5,-0.12) rectangle (60,0.12);
+\fill[omThm!50] (0,-1.25) rectangle (50,-0.95);
+\fill[omDef!40] (50,-1.22) rectangle (60,-0.98);
+\node[font=\tiny] at (25,-0.75) {a tick wide for 50 minutes; the timer (10.5 hours) never fires};
+\fill[omThm!50] (0,-2.35) rectangle (50,-2.05);
+\fill[omDef!40] (50,-2.32) rectangle (60,-2.08);
+\draw[omThm,thick] (0.5,-1.85) -- (0.5,-2.35);
+\node[font=\tiny] at (25,-1.85) {the journalled timer fires; the machine clock keeps it wide};
+\end{tikzpicture}
+
+\omcaption{The wall-clock defect in the three environments over the hour: shaded dark, the strategy quotes a tick wide; light, at the
+touch. In production the machine's clock is the venue's and the opening lasts thirty seconds. In the simulator and the replay the machine
+runs a hundred times slower than the session, from 20:00, and the opening lasts fifty minutes.}\label{fig:pl:simulation-production-parity:clock}
+\end{omfigure}
+
+The other three defects read the same way. With float prices the first difference is the third output, at 24.4~seconds: the strategy's wide
+bid $99.99 - 0.01$ leaves as 999\,799; 1\,161 of production's 1\,501 orders are off the tick grid, rejected by the venue and sent again at the
+next quote. With inputs delivered in arrival order the strategy first differs at 33.0~seconds, after 203 inputs, on an instant where a fill
+and a quote change arrived together: delivered fill first, it sent its next sell order at once; delivered as the \omterm{def:pl:backtest-engine-architecture:event}{event model} delivers them,
+quote first, it sent the same order 0.19~seconds later. Neither order is wrong; two orders are. With working meaning acknowledged, the next
+quote change after the first two orders, half a microsecond later and long before their acknowledgements, makes the strategy send both
+again, and every quote change inside the forty-microsecond round trip does the same: 8\,452 outputs in the hour, 8\,406 of them refused by
+the gateway's worst-case exposure limit, which is all that stops the storm.
+
+\begin{remark}[Why the replay alone was not enough]\label{rem:pl:simulation-production-parity:replay}
+A replay parity test (Book~7, chapter~19) catches a strategy that reads what is not an input, but only if the replay environment differs from
+production in that input: it caught the wall clock here because the harness gave the replay a machine clock of its own. It catches adapter
+defects only when the replay host has the correct semantics and production's does not. Comparing two live-shaped environments on the same
+session catches what the replay misses; comparing the replay with production catches what two simulators share.
+\end{remark}
+
+\section{Parity after the fixes}
+
+With every defect fixed --- the strategy reads only the host's clock, prices are integers end to end, the host delivers simultaneous inputs
+in the \omterm{def:pl:backtest-engine-architecture:event}{event model} everywhere, and working means sent and not finished everywhere --- the three environments agree on every output for ten
+one-hour sessions (\cref{tab:pl:simulation-production-parity:clean}): 8\,887 outputs from 188\,079 inputs, no difference between the
+production-shaped run, the simulator and the replay.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrcc}
+\toprule
+seed & inputs & outputs & simulator & replay \\
+\midrule
+1 & 9\,492 & 553 & identical & identical \\
+2 & 16\,085 & 832 & identical & identical \\
+3 & 36\,396 & 1\,463 & identical & identical \\
+4 & 37\,621 & 1\,359 & identical & identical \\
+5 & 13\,911 & 784 & identical & identical \\
+6 & 29\,785 & 1\,426 & identical & identical \\
+7 & 6\,947 & 409 & identical & identical \\
+8 & 13\,410 & 726 & identical & identical \\
+9 & 20\,027 & 979 & identical & identical \\
+10 & 4\,405 & 356 & identical & identical \\
+\bottomrule
+\end{tabular}
+\caption{Parity after the fixes: for ten one-hour sessions, the inputs and outputs of the production-shaped run and whether the in-process
+simulator run and the replay of the production journal produced identical outputs.}\label{tab:pl:simulation-production-parity:clean}
+\end{table}
+
+\section{Tutorial: one strategy, three environments, four defects}\label{tut:pl:simulation-production-parity:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Host one strategy in three environments, plant four parity defects and let the harness find each; then show parity.
+\textbf{End state:} \cref{tab:pl:simulation-production-parity:defects,tab:pl:simulation-production-parity:clean}.
+\begin{tutsteps}
+\item \textbf{Environments}: \texttt{run\_env} with \texttt{prod} and with \texttt{sim} on the same session; \texttt{replay} of the
+production run's journal.
+\item \textbf{The harness}: \texttt{compare(prod, sim)} and \texttt{compare(prod, replay)}.
+\item \textbf{Defects}: \texttt{pl\_parity.defect\_table()}, one defect at a time.
+\item \textbf{Parity}: \texttt{pl\_parity.clean()} on seeds 1 to 10.
+\end{tutsteps}
+\textbf{What to change next.} Plant a fifth defect --- a strategy that iterates over a set of order identifiers when it cancels --- and see
+whether the harness finds it; give the in-process adapter a different latency from production's and see what parity then means.
+\end{tutorial}
+
+\section{Build: the strategy host}\label{bld:pl:simulation-production-parity:strathost}
+
+\begin{build}
+\bfield{Purpose} One strategy object that runs unchanged in the backtest, the simulator and production, and a harness that proves it.
+\bfield{Interface} \texttt{HostedStrategy} (\texttt{on\_start}, \texttt{on\_book}, \texttt{on\_ack}, \texttt{on\_fill},
+\texttt{on\_cancel}, \texttt{on\_reject}, \texttt{on\_timer}); the context (\texttt{now}, \texttt{set\_timer}, \texttt{send},
+\texttt{cancel}, \texttt{working}, \texttt{position}); \texttt{run\_env(env, strategy, seconds, seed, defects)};
+\texttt{replay(journal, strategy)}; \texttt{compare(a, b) -> Parity}; \texttt{Defects}.
+\bfield{Rules} The strategy reads nothing the host does not give it; prices are integers; simultaneous inputs in the \omterm{def:pl:backtest-engine-architecture:event}{event model}; the same
+order-entry semantics in every adapter; production's inputs journalled in Book~13's format; Book~13's gateway and Book~10's simulator used,
+not edited.
+\bfield{Acceptance tests} \texttt{code/firm/strathost/tests/}: the delivery order of simultaneous inputs, with and without the defect; clean
+parity of production, simulator and replay on a short session, and the journal's records; divergence under each adapter defect; the machine
+clock; the float adapter's truncation; no cancel of a finished order.
+\bfield{Stretch} A fourth environment on a real socket; parity across implementation languages (the C++20 and Rust gateways of Book~13); a
+bisecting harness on Book~13's \texttt{first\_difference}.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~7, chapter~19 (replay parity); One Quant Book~13, chapters 21 and 23 (the order gateway, input journals); One Quant
+Book~10, chapter~26 (the simulator and its protocols).
+\item Python documentation, ``Floating-Point Arithmetic: Issues and Limitations''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:1}
+Why is \texttt{int(ten thousand times (99.99 - 0.01))} 999\,799, and what is the correct conversion?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:2}
+In the replay environment, why are timers not set but replayed?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:3}
+With the wall-clock defect, why is production itself unaffected?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:4}
+Why does the ack-semantics defect produce a storm rather than a few duplicate orders, and what stops it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:5}
+The harness found an unplanned difference on its first clean run. Describe it, and say which adapter was right.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:6}
+Why can the count of outputs affected differ between the comparison with the simulator and with the replay?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:simulation-production-parity:7}
+\emph{Coding.} Run \texttt{run\_three} for seed~2 with each defect. Are the first diverging outputs at the same times as for seed~1?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:simulation-production-parity:8}
+\emph{Find the flaw.} ``Our parity test replays yesterday's backtest inputs into the backtest and gets identical orders, so the strategy
+is ready for production.''
+\end{exercise}
+
+\section{Problem: The Morning the Timer Fired}
+
+\begin{problem}[{Weekend problem --- four defects and a clean bill}]\label{pb:pl:simulation-production-parity:1}
+The strategy of \cref{lst:pl:simulation-production-parity:quoter}, three environments, one-hour sessions.
+
+\medskip\noindent\textbf{Part I --- The host.}
+\begin{enumerate}
+\item What may a hosted strategy read, and through what?
+\item Why does the host buffer inputs by instant?
+\item What does the production-shaped adapter add to the in-process one?
+\item What does the input journal hold, and in which format?
+\item What does the replay environment do with the strategy's orders?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The defects.}
+\begin{enumerate}[resume]
+\item How does the wall-clock defect show in the simulator and in the replay?
+\item What does the float-price defect do to the wide bid?
+\item When does the callback-order defect matter?
+\item What does ack semantics change, and why the storm?
+\item Which of the four would a replay of production's journal into a correct host miss, and why?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The report.}
+\begin{enumerate}[resume]
+\item Give the inputs before the first diverging output for each defect.
+\item Give the outputs affected in the hour for each.
+\item Which defect is the fastest to show, and which the slowest?
+\item What unplanned difference did the harness find?
+\item How many outputs and inputs do the ten clean sessions have, and how many differences?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the inputs until each defect's first diverging order, the orders affected in an hour, and the
+parity after the fixes.
+\item What would you require of every strategy before production?
+\item What would you require of every \omterm{def:pl:simulation-production-parity:host}{environment adapter}?
+\item Why compare two environments on the same session as well as replaying a journal?
+\item In one sentence: what makes parity a property of the platform rather than of each strategy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:simulation-production-parity:1}
+Your strategy behaves differently in production from the backtest on the same day. Where do you look first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:simulation-production-parity:2}
+Why should a trading system represent prices as integers?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:simulation-production-parity:3}
+How would you make a strategy's use of time testable?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:simulation-production-parity:4}
+A quote update and a fill have the same timestamp. Which should the strategy see first, and why does it matter?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:simulation-production-parity:5}
+Design a harness that proves a strategy behaves identically in simulation and production.
+\end{interviewq}

@@ -1,0 +1,353 @@
+\chapter{API Engineering for Crypto Venues}\label{ch:nw:api-engineering-for-crypto-venues}
+
+A large crypto venue lets one WebSocket connection carry at most 1\,024 streams, accepts at most 300 new connections per address every five
+minutes, disconnects any connection after 24 hours, and expects an answer to its ping within a minute. A firm that follows 400 symbols with
+depth and trades on each has 800 streams to place, a book to rebuild whenever a message is lost, and a single budget of request weight for
+the snapshots that rebuild it and the orders that trade. When one connection loses a message and the firm resynchronises every symbol on it
+from full-depth snapshots, the budget runs out after 24 of them, and the last of the 80 symbols is stale for three minutes.
+
+Chapters~16 to~19 were about where the venue is and how packets reach it. This chapter is about the interface itself: how streams are spread
+over connections and addresses, how gaps are detected and repaired, how one rate budget is shared, how an \omterm{def:nw:api-engineering-for-crypto-venues:path}{order-entry path} is chosen, and
+which timestamps to trust. It uses Book~3's order-book builder and rate-limit governor and Book~13's WebSocket client, and the venues'
+documentation, dated.
+
+\section{Websocket sharding}
+
+\begin{definition}[Connection sharding]\label{def:nw:api-engineering-for-crypto-venues:shard}
+\emph{Connection sharding}\index{connection sharding} is the assignment of a subscription set's streams to several connections, and of the
+connections to several source addresses, so that no connection or address exceeds a venue's limits and a failure or a slow consumer affects only
+part of the set.
+\end{definition}
+
+\begin{dated}{2026-09}{WebSocket limits, from venue documentation}\label{dat:nw:api-engineering-for-crypto-venues:limits}
+\begin{itemize}
+\item Binance spot streams: at most 1\,024 streams per connection; 300 connections per attempt every 5 minutes per IP; 5 incoming messages per
+  second per connection, beyond which the connection is closed (and repeatedly disconnected IPs may be banned); connections valid 24 hours; a ping
+  every 20 seconds, answered by a pong within a minute; depth events carry an event time \texttt{E}, trades a trade time \texttt{T}. A full-depth
+  snapshot (up to 5\,000 levels) costs request weight 250; 1\,000 levels cost 50; the weight limit is 6\,000 a minute.
+\item OKX: 3 connection requests per second per IP; 480 subscribe, unsubscribe or login requests per connection per hour; a connection without data
+  for 30 seconds is closed.
+\end{itemize}
+\end{dated}
+
+The venue's cap is a maximum, not a target. One connection could carry all 800 streams, but it would carry them in order: a burst on one symbol
+delays every other symbol's messages behind it (chapter~1's \omterm{def:nw:networking-for-trading:hol}{head-of-line blocking} at the application level), one disconnection drops every book,
+and the 24-hour reset takes the whole feed down at once. The chapter's firm caps a connection at 160 streams (80 symbols), which needs five
+connections; reconnecting all five at once is far within 300 per address per five minutes, so one address suffices.
+
+\begin{proposition}[How many connections and addresses]\label{prop:nw:api-engineering-for-crypto-venues:shards}
+For $S$ streams, a cap of $c$ streams per connection (the venue's or lower) and a venue limit of $L$ new connections per address per window $W$,
+a design that must be able to reconnect everything within $w \le W$ needs $\lceil S/c \rceil$ connections and $\lceil \lceil S/c \rceil / (L\,w/W)
+\rceil$ addresses, if the limit is spread evenly over the window.
+\end{proposition}
+
+\begin{proof}
+Each connection carries at most $c$ streams. Reconnecting $n$ connections in $w$ uses $n$ connection attempts; an address allows $L w/W$ of them in
+$w$ on the even-spreading reading of the limit.
+\end{proof}
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{46}{54}{The shard planner: connections at the venue's or the firm's cap, and addresses for a
+reconnection within a given window.}\label{lst:nw:api-engineering-for-crypto-venues:shards}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.5cm,align=center,inner sep=2pt},>=Stealth]
+\node[b,fill=omDef!15,minimum height=3.4cm,minimum width=2.2cm] (s) at (0,0) {400 symbols\\ $\times$ 2 streams\\ (depth, trades)};
+\foreach \k/\y in {1/1.4,2/0.7,3/0,4/-0.7,5/-1.4}{\node[b,fill=gray!10,minimum width=2.8cm] (c\k) at (4.2,\y) {connection \k: 160 streams};
+  \draw[->] (s.east) -- (c\k.west);}
+\node[b,fill=omThm!15,minimum height=3.4cm,minimum width=1.8cm] (a) at (8.2,0) {one source\\ address};
+\foreach \k in {1,...,5}{\draw[->] (c\k.east) -- (a.west);}
+\node[b,fill=omThm!25,minimum height=3.4cm] (v) at (11.2,0) {venue\\ stream\\ servers};
+\draw[->,thick] (a.east) -- (v.west);
+\node[font=\scriptsize,align=center,omMeth] at (4.2,-2.2) {a gap on one connection affects its 80 symbols only};
+\end{tikzpicture}
+
+\omcaption{The chapter's shard plan, schematically: 800 streams over five connections of 160, from one address. The venue would allow one connection
+of 800; the firm's cap limits \omterm{def:nw:networking-for-trading:hol}{head-of-line blocking} and the damage of one disconnection.}\label{fig:nw:api-engineering-for-crypto-venues:shards}
+\end{omfigure}
+
+\section{Snapshots, deltas and sequence gaps at scale}
+
+\begin{definition}[Per-symbol resynchronisation]\label{def:nw:api-engineering-for-crypto-venues:resync}
+\emph{Per-symbol resynchronisation}\index{per-symbol resynchronisation} repairs a book after a sequence gap by fetching a snapshot for the symbols whose
+own update sequence shows the gap, rather than for every symbol carried by the connection on which messages were lost.
+\end{definition}
+
+The venue's procedure is Book~3's: buffer the deltas, fetch a snapshot, drop the deltas older than it, apply the rest, and if a delta's first update
+number is beyond the book's last plus one, discard the book and start again. Book~3's \texttt{firm.wsbook} implements it; fed a stream that loses one
+event, it answers ``applied'', ``applied'', then ``gap''. What a gap costs is decided by how many books the firm throws away and how many snapshots its
+weight budget can pay for.
+
+\begin{proposition}[What a gap costs]\label{prop:nw:api-engineering-for-crypto-venues:gap}
+If each snapshot costs $w$ of a budget of $B$ per window $T$ shared by nothing else, and $m$ books must be rebuilt, the last one returns after about
+$\lceil m\,w/B \rceil - 1$ whole windows plus a round trip; with \omterm{def:nw:api-engineering-for-crypto-venues:resync}{per-symbol resynchronisation} $m$ is the number of symbols that lost messages, with
+per-connection resynchronisation it is every symbol on the connection.
+\end{proposition}
+
+\begin{proof}
+The governor admits $\lfloor B/w \rfloor$ snapshots per window; the remaining ones wait for the following windows.
+\end{proof}
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{57}{70}{Recovery under the weight governor: each snapshot waits for the budget, and a book is stale
+until its snapshot returns.}\label{lst:nw:api-engineering-for-crypto-venues:resync}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+Snapshot depth & Weight & Per symbol (5 books) & Per connection (80 books) & Last book back \\
+ & & (stale symbol-s) & (stale symbol-s) & per connection (s) \\
+\midrule
+5\,000 levels & 250 & 0.5 & 5\,769 & 180.1 \\
+1\,000 levels & 50 & 0.5 & 11.2 & 0.2 \\
+\bottomrule
+\end{tabular}
+\caption{Simulation: five messages lost on one connection of 80 symbols (they touch five symbols), repaired per symbol or per connection, with
+snapshots at two depths under the 6\,000-weight-a-minute governor of Book~3 and a \qty{100}{\milli\second} round trip; staleness in
+symbol-seconds. Data: \texttt{nw\_api.resync\_rows()}.}\label{tab:nw:api-engineering-for-crypto-venues:resync}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[ybar,width=10cm,height=5.8cm,bar width=16pt,ymode=log,ymin=0.1,ymax=20000,log origin=infty,xtick=data,
+  symbolic x coords={5000 levels,1000 levels},xticklabels={5\,000 levels,1\,000 levels},
+  ylabel={stale symbol-seconds (log)},tick label style={font=\footnotesize},
+  label style={font=\small},grid=major,grid style={gray!25},legend pos=north east,legend style={font=\footnotesize},
+  table/col sep=comma,enlarge x limits=0.5]
+\addplot[fill=omDef!55,draw=omDef] table[x=case,y=per_symbol]{figdata/networks/20-api-engineering-for-crypto-venues/staleness.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=case,y=per_conn]{figdata/networks/20-api-engineering-for-crypto-venues/staleness.csv};
+\legend{per symbol,per connection}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: stale symbol-seconds after five messages are lost on one connection, by recovery design and snapshot depth
+(\cref{tab:nw:api-engineering-for-crypto-venues:resync}). Per-connection recovery with full-depth snapshots costs four orders of magnitude more.
+Data: \texttt{fig\_api.py}.}\label{fig:nw:api-engineering-for-crypto-venues:stale}
+\end{omfigure}
+
+The table is the case for doing the harder thing. Per-symbol recovery needs sequence numbers per symbol (the venue's \texttt{U} and \texttt{u}) and a
+book per symbol that can be discarded alone; in exchange five lost messages cost five snapshots. Per-connection recovery is simpler and, with full
+depth, catastrophic: 80 snapshots of weight 250 need three and a half minutes of a 6\,000-weight budget, during which the firm has no weight left to
+send orders. Snapshots of 1\,000 levels make even the careless design survivable, which is a second lesson: ask for the depth the strategy needs.
+
+\section{Rate-limit governors across keys and addresses}
+
+A venue's limits are per address, per account, per key, and several strategies share them. The firm needs one governor per limit that everyone
+passes through (Book~3's \texttt{firm.ratelimit}), and a rule for sharing it. The chapter's allocator gives each strategy up to its demand in
+proportion to a priority weight and spreads what the satisfied ones leave: with 6\,000 a minute, a risk process that needs 500 gets all of it, and
+market making and arbitrage, asking 4\,000 and 3\,000 with weights 3 and 2, get 3\,300 and 2\,200. Snapshots for recovery must come out of the same
+budget, which is why recovery design is a rate-budget question.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar,width=10.5cm,height=5.2cm,bar width=9pt,xmin=0,xmax=4500,ytick=data,enlarge y limits=0.25,
+  yticklabels from table={figdata/networks/20-api-engineering-for-crypto-venues/budget.csv}{strategy},y dir=reverse,
+  xlabel={request weight a minute},tick label style={font=\footnotesize,/pgf/number format/1000 sep={\,}},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=south east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=gray!35,draw=gray] table[y expr=\coordindex,x=demand]{figdata/networks/20-api-engineering-for-crypto-venues/budget.csv};
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=share]{figdata/networks/20-api-engineering-for-crypto-venues/budget.csv};
+\legend{demand,share}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{One 6\,000-weight minute shared by three strategies with priority weights 3, 2 and 1: the risk process's 500 is met in full, the others share
+the rest in proportion. Data: \texttt{fig\_api.py}, \texttt{nw\_api.budget()}.}\label{fig:nw:api-engineering-for-crypto-venues:budget}
+\end{omfigure}
+
+\section{Choosing among order-entry paths}
+
+\begin{definition}[Order-entry path]\label{def:nw:api-engineering-for-crypto-venues:path}
+An \emph{order-entry path}\index{order-entry path} is one of the interfaces through which a venue accepts orders (REST requests, orders over a
+WebSocket session, a FIX session, a venue-specific binary protocol), each with its own connection model, rate limits, latency and failure behaviour.
+\end{definition}
+
+The large venue of this chapter documents several (a REST interface, a WebSocket API, a FIX API, and market-data streams in a binary
+encoding), and chapter~18's \omterm{def:nw:private-connectivity-to-crypto-venues:endpoint}{private endpoints} add routes to them. The choice follows the strategy: a persistent session removes the handshake
+from each order; REST's statelessness helps recovery; FIX brings session-level sequence numbers and resend requests. Whatever the path, it draws on
+the same governor, and a firm that sends orders on two paths must know whether the venue counts them against one limit or two.
+
+\section{Redundant connections and which timestamps to trust}
+
+\begin{definition}[Venue clock skew]\label{def:nw:api-engineering-for-crypto-venues:skew}
+\emph{Venue clock skew}\index{venue clock skew} is the difference between the clock that stamps a venue's messages (its event and transaction times)
+and the firm's own synchronised clock, which varies over time; it is estimated, never given.
+\end{definition}
+
+Every message carries the venue's event time; the firm stamps its arrival. The difference is the one-way delay plus the venue's clock error, and the
+two cannot be separated from one side alone. Its minimum over a window, however, is the smallest delay plus the error: if the smallest delay is stable,
+tracking the minimum tracks the venue's clock (chapter~4's minimum-delay filter, applied to someone else's clock).
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{91}{96}{The venue-clock estimator: the minimum of receive time minus event time over each window.}\label{lst:nw:api-engineering-for-crypto-venues:skew}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=0,xmax=61,ymin=-4.6,ymax=-1.8,xlabel={minutes},
+  ylabel={min(receive $-$ event) (ms)},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick,only marks,mark=*,mark size=1.2pt] table[x=minute,y=estimate]{figdata/networks/20-api-engineering-for-crypto-venues/skew.csv};
+\addplot[omThm,thick,no markers] table[x=minute,y=truth]{figdata/networks/20-api-engineering-for-crypto-venues/skew.csv};
+\legend{estimate (one-minute windows),truth: minimum delay $-$ venue offset}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation: a venue clock running 3 to \qty{5}{\milli\second} ahead of the firm's over an hour, messages at ten a second with a minimum
+one-way delay of \qty{0.8}{\milli\second} and exponential jitter; the one-minute minimum tracks the truth within \qty{15}{\micro\second}. Data:
+\texttt{fig\_api.py}, \texttt{nw\_api.skew\_series()}.}\label{fig:nw:api-engineering-for-crypto-venues:skew}
+\end{omfigure}
+
+Redundant connections make the question sharper: two connections to the same stream deliver the same event twice, at two arrival times, and the
+firm keeps the first (chapter~19's racing, for data). The venue's event time orders events across symbols and connections; the firm's arrival time
+says when it could act. A strategy that uses the event time to measure its own latency must first subtract the estimated skew, or it will measure
+the venue's clock.
+
+\begin{method}[Running a crypto venue's interfaces]\label{met:nw:api-engineering-for-crypto-venues:run}
+\begin{enumerate}
+\item Record the venue's limits (streams, connections, messages, weights, lifetimes) with their dates, and re-read them on every change notice.
+\item Shard below the caps, spread reconnections over time and addresses, and stagger the 24-hour resets.
+\item Detect gaps per symbol and resynchronise per symbol, with snapshots no deeper than the strategy needs.
+\item Put every request, snapshot and order through one governor per limit, and allocate it by priority.
+\item Estimate each venue's clock skew continuously and timestamp everything on arrival with a synchronised clock.
+\end{enumerate}
+\end{method}
+
+\section{Tutorial: four hundred symbols}\label{tut:nw:api-engineering-for-crypto-venues:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Plan shards, compare recovery designs under the weight governor, share a budget and estimate a venue's clock.
+\textbf{End state:} \cref{fig:nw:api-engineering-for-crypto-venues:stale,fig:nw:api-engineering-for-crypto-venues:budget,fig:nw:api-engineering-for-crypto-venues:skew}
+and \cref{tab:nw:api-engineering-for-crypto-venues:resync}.
+\begin{tutsteps}
+\item \textbf{Shards.} \texttt{firm\_cryptofeed.plan\_shards} (\cref{lst:nw:api-engineering-for-crypto-venues:shards}) with the dated
+  \texttt{LIMITS}; \texttt{nw\_api.plan()}.
+\item \textbf{Gaps.} \texttt{nw\_api.gap\_demo()} feeds Book~3's \texttt{firm.wsbook} a stream with a lost event; \texttt{resync\_staleness}
+  (\cref{lst:nw:api-engineering-for-crypto-venues:resync}) prices the recovery under Book~3's governor.
+\item \textbf{Budget.} \texttt{allocate} shares one minute of weight.
+\item \textbf{Clock.} \texttt{skew} (\cref{lst:nw:api-engineering-for-crypto-venues:skew}) on \texttt{skew\_series()}.
+\end{tutsteps}
+\textbf{What to change next.} Feed the recovery model Book~13's \texttt{firm.wsclient} decoded fixtures; give the governor the order traffic as
+well and watch the recovery starve it.
+\end{tutorial}
+
+\section{Build: the crypto feed manager}\label{bld:nw:api-engineering-for-crypto-venues:cryptofeed}
+
+\begin{build}
+\bfield{Purpose} The interface layer to crypto venues: shards, recovery, shared budgets and venue clocks; the input of the crypto rows of chapter~29's
+plan.
+\bfield{Interface} \texttt{firm\_cryptofeed}: \texttt{Limits}, \texttt{LIMITS}, \texttt{plan\_shards}, \texttt{resync\_staleness}, \texttt{allocate},
+\texttt{skew}; Book~3's \texttt{firm.ratelimit} and \texttt{firm.wsbook} wrapped, not edited.
+\bfield{Rules} Limits are dated rows with sources; every request goes through a governor; recovery is per symbol wherever the venue's sequence numbers
+allow; the venue's clock is estimated, not assumed.
+\bfield{Acceptance tests} \texttt{code/firm/cryptofeed/tests/}: shard counts at the caps, recovery waiting for the next window, water-filling, and the
+skew estimator by hand.
+\bfield{Stretch} A live shard manager that rebalances streams by message rate; recovery by incremental snapshots where a venue offers them.
+\end{build}
+
+\begin{omsources}
+\item Binance spot API documentation (WebSocket streams, local order book procedure, order-book weights); OKX API v5 documentation (WebSocket limits).
+\item RFC 6455, The WebSocket Protocol; One Quant Book~3's \texttt{firm.wsbook} and \texttt{firm.ratelimit}, One Quant Book~13's \texttt{firm.wsclient}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:1}
+How many full-depth snapshots of weight 250 fit in a 6\,000-weight minute?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:2}
+Why cap a connection at 160 streams when the venue allows 1\,024?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:3}
+What must a client do when it receives a WebSocket ping, and what happens at this chapter's venue if it does not?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:4}
+Using \cref{prop:nw:api-engineering-for-crypto-venues:shards}, how many addresses does a firm need to reconnect 40 connections within 10 seconds at 300
+connections per 5 minutes per address?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:5}
+Why does the minimum of receive time minus event time track the venue's clock, and when does it fail?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:6}
+A strategy measures its tick-to-order latency as its order time minus the venue's event time. What is wrong?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:7}
+\emph{Coding.} With \texttt{firm.cryptofeed}, find the largest snapshot weight at which a per-connection recovery of 80 symbols finishes within the
+first minute.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:8}
+\emph{Find the flaw.} ``We subscribe to everything on one connection; the venue allows it, and fewer connections are more reliable.''
+\end{exercise}
+
+\section{Problem: Four Hundred Symbols, Five Connections}
+
+\begin{problem}[{Weekend problem --- shards and recovery}]\label{pb:nw:api-engineering-for-crypto-venues:1}
+A firm follows 400 symbols on a venue with the limits of \cref{dat:nw:api-engineering-for-crypto-venues:limits}, with a depth and a trade stream each,
+at most 160 streams per connection, and one 6\,000-weight minute for snapshots and orders.
+
+\medskip\noindent\textbf{Part I --- Shards.}
+\begin{enumerate}
+\item How many streams, connections and addresses does it need?
+\item How many would it need at the venue's own cap?
+\item How many addresses to reconnect everything within 10 seconds?
+\item What does the 24-hour limit mean for the design?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- A gap.}
+\begin{enumerate}[resume]
+\item Five messages are lost on one connection. How many symbols need a snapshot per symbol, and per connection?
+\item With full-depth snapshots, how long until the last book is back per connection, and how many stale symbol-seconds?
+\item And with 1\,000-level snapshots?
+\item What can the firm not do while a per-connection recovery runs?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Budget and clocks.}
+\begin{enumerate}[resume]
+\item How does the allocator share 6\,000 between market making (4\,000, weight 3), arbitrage (3\,000, weight 2) and risk (500, weight 1)?
+\item Where do recovery snapshots fit in that allocation?
+\item How well does the one-minute minimum estimate the venue's clock in the simulation?
+\item Why estimate it at all?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the minimum connections and addresses for the subscription set under the venue's limits, and the book staleness a gap
+  costs with per-symbol against per-connection resynchronisation.
+\item Which design choice matters most?
+\item What would change at a venue without per-symbol sequence numbers?
+\item How should the shards be spread over the day's 24-hour resets?
+\item What does a second connection to the same streams buy?
+\item What does Book~3's governor add that a simple counter would not?
+\item Where does this go in chapter~29's plan?
+\item In one sentence: what does a lost message cost?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:api-engineering-for-crypto-venues:1}
+How do you keep a local order book correct from a snapshot and a stream of deltas?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:api-engineering-for-crypto-venues:2}
+You need 2\,000 streams from a venue. How do you design the connections?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:api-engineering-for-crypto-venues:3}
+Three strategies share one API key's rate limit. How do you stop one of them from starving the others?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:nw:api-engineering-for-crypto-venues:4}
+How would you estimate a venue's clock error from its market data?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:api-engineering-for-crypto-venues:5}
+REST, WebSocket or FIX for order entry: how do you choose?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:api-engineering-for-crypto-venues:6}
+Your feed handler loses messages every day at the same time. What do you look at?
+\end{interviewq}

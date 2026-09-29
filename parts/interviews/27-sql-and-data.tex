@@ -1,0 +1,151 @@
+\chapter{SQL and Data}\label{ch:iv:sql-and-data}
+
+An as-of join of trades to quotes returns more rows than there were trades. The analyst who wrote it says the join is correct
+because every trade matched a quote; the interviewer asks what happens when two quotes share a timestamp, and the duplicate rows
+explain themselves. SQL questions in research and data interviews test a handful of things: what a join does to row counts, how
+NULLs behave, window functions, time-based joins without look-ahead, and whether the candidate can express the same answer in an
+array language. The databases are One Quant Book~15's (chapters 10 and~25) and the point-in-time discipline One Quant Book~7's
+(chapter~3). Every query here runs in the chapter's tests on DuckDB and, where the dialect allows, on SQLite, against generated
+tables with planted NULLs and a planted duplicate timestamp, and is compared with a pandas or numpy computation.
+
+\section{Joins and their cardinality}
+
+An inner join keeps the pairs of rows that match; a left join keeps every left row, with NULLs where nothing matches; an anti join
+(\texttt{NOT EXISTS}) keeps the left rows with no match. The number of rows a join returns is the sum over keys of the product of
+the matching rows' counts, so a key that is not unique on the right multiplies left rows: the commonest silent bug in research
+data.
+
+\omcode{code/interviews/27-sql-and-data/sql/duplicate_join.sql}{1}{3}{Joining a table to itself on (symbol, timestamp) exposes a
+duplicated key.}\label{lst:iv:sql-and-data:dup}
+
+\begin{method}[Checking a join]\label{met:iv:sql-and-data:join}
+\begin{enumerate}
+\item Before joining, count rows per key on each side; a key that should be unique and is not is a data defect.
+\item After joining, compare the row count with the left table's; for a many-to-one join they must be equal.
+\item Count the NULLs a left join produced: they are the unmatched rows, and an anti join lists them.
+\end{enumerate}
+\end{method}
+
+NULL is not a value but the absence of one: \texttt{COUNT(*)} counts rows, \texttt{COUNT(col)} and \texttt{AVG(col)} ignore NULLs, and
+any comparison with NULL is unknown, so \texttt{WHERE col <> 5} silently drops the NULL rows. \texttt{WHERE} filters rows before
+grouping; \texttt{HAVING} filters groups after aggregation.
+
+\section{Window functions}
+
+A window function (One Quant Book~15, chapter~10) computes over a set of rows related to the current one without collapsing them:
+rankings (\texttt{ROW\_NUMBER}), running totals (\texttt{SUM} with an ordered window), neighbours (\texttt{LAG}, \texttt{LEAD}).
+
+\omcode{code/interviews/27-sql-and-data/sql/drawdown.sql}{1}{7}{Running P\&L and drawdown per account: a running sum, then the
+distance from its running maximum.}\label{lst:iv:sql-and-data:dd}
+
+The ``gaps and islands'' family asks for runs of consecutive rows with a property. The standard trick: within the rows that
+have the property, the difference between a row's position in time and its rank is constant along a run, so grouping by that
+difference groups each run.
+
+\omcode{code/interviews/27-sql-and-data/sql/islands.sql}{1}{13}{The longest run of consecutive positive-P\&L days per
+account.}\label{lst:iv:sql-and-data:islands}
+
+\section{As-of joins and time}
+
+An as-of join (One Quant Book~7, chapter~3) attaches to each event the latest record of another table at or before the event's
+time: the quote in force when a trade printed, the fundamental data known on a date. Three details decide whether it is right.
+The inequality: \texttt{quote.ts <= trade.ts} includes a quote stamped at the same instant, which may or may not have been visible to
+the trade; \texttt{<} excludes it, and the choice should follow how the timestamps were produced. Ties: two quotes with the same
+timestamp make ``the latest'' ambiguous, and engines resolve it differently unless a tie-breaker (a sequence number) is given.
+Direction: joining to the next record instead of the previous one is look-ahead, and it makes any signal built on it look
+excellent.
+
+\omcode{code/interviews/27-sql-and-data/sql/asof_duckdb.sql}{1}{3}{An as-of join in DuckDB.}\label{lst:iv:sql-and-data:asof}
+
+\omcode{code/interviews/27-sql-and-data/sql/asof_portable.sql}{1}{6}{The same join in portable SQL with a correlated
+subquery and an explicit tie-breaker (SQLite's \texttt{rowid}, the insertion order).}\label{lst:iv:sql-and-data:portable}
+
+\begin{example}[A tie decides the answer]\label{ex:iv:sql-and-data:tie}
+The fixtures contain two quotes for one symbol stamped at the same time, with bids 100.40 and 100.45, and a trade two time
+units later. DuckDB's as-of join attaches 100.40 to the trade; the portable query, which breaks ties by insertion order, and a
+numpy search for the last quote at or before the trade attach 100.45. Neither engine is wrong: the data do not say which quote
+was in force.
+\end{example}
+
+\section{Array-language versions}
+
+Array languages and dataframe libraries answer the same questions with vector operations: cumulative sums for running totals,
+\texttt{searchsorted} for as-of lookups, group-by for aggregation. Interviews for research roles often ask for both forms,
+because production pipelines are written in one and research in the other.
+
+\omcode{code/interviews/27-sql-and-data/python/iv_sql.py}{69}{76}{The as-of lookup with numpy's binary search: the last quote at
+or before each trade, ties resolved to the last of the equal timestamps.}\label{lst:iv:sql-and-data:numpy}
+
+\section{Question bank}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, developer} \iqfirm{systematic fund}]\label{iq:iv:sql-and-data:1}
+Trades reference accounts; 5 of 61 trades belong to accounts missing from the accounts table. How many rows do an inner join and a
+left join return, and how do you list the orphans?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle} \iqfirm{any}]\label{iq:iv:sql-and-data:2}
+Of 61 trades, 2 have a NULL quantity and the others total 60\,100. What do \texttt{COUNT(*)}, \texttt{COUNT(qty)}, \texttt{SUM(qty)} and
+\texttt{AVG(qty)} return?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, developer} \iqfirm{bank}]\label{iq:iv:sql-and-data:3}
+Return the desks whose total traded quantity exceeds 20\,000. Why must the condition go in \texttt{HAVING}, not \texttt{WHERE}?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, mle} \iqfirm{systematic fund}]\label{iq:iv:sql-and-data:4}
+A quotes table has 81 rows for one symbol; \cref{lst:iv:sql-and-data:dup} joins it to itself on symbol and timestamp and returns 83
+rows. What does that tell you?
+\end{interviewq}
+
+\omcode{code/interviews/27-sql-and-data/sql/top2.sql}{1}{8}{The two largest trades per symbol.}\label{lst:iv:sql-and-data:top2}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer} \iqfirm{any}]\label{iq:iv:sql-and-data:5}
+Return the two largest trades per symbol. Explain \cref{lst:iv:sql-and-data:top2}, and what changes if you use \texttt{RANK} instead of
+\texttt{ROW\_NUMBER}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, risk} \iqfirm{multi-manager fund}]\label{iq:iv:sql-and-data:6}
+From a table of daily P\&L per account, compute each account's running P\&L and drawdown in SQL. On the chapter's data the worst
+drawdowns are 8.9 and 32.3: how would you verify them outside SQL?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher} \iqfirm{systematic fund}]\label{iq:iv:sql-and-data:7}
+Compute each trade's return from the previous trade in the same symbol. What does the first trade of each symbol get?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer} \iqfirm{market maker}]\label{iq:iv:sql-and-data:8}
+Compute the volume-weighted average price per symbol per five-minute bucket, with timestamps in seconds. What do you do with trades
+whose quantity is NULL?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, risk} \iqfirm{multi-manager fund}]\label{iq:iv:sql-and-data:9}
+Find each account's longest run of consecutive days with positive P\&L. Explain the trick in \cref{lst:iv:sql-and-data:islands}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, developer} \iqfirm{market maker}]\label{iq:iv:sql-and-data:10}
+Attach to every trade the bid in force when it printed. Compare \cref{lst:iv:sql-and-data:asof,lst:iv:sql-and-data:portable}, and
+explain why they disagree on one trade of the chapter's data.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, mle} \iqfirm{systematic fund}]\label{iq:iv:sql-and-data:11}
+A colleague's as-of join uses \texttt{trade.ts <= quote.ts}. What has it computed, how would a signal built on it look, and how do you
+detect the mistake from the output alone?
+\end{interviewq}
+
+\omcode{code/interviews/27-sql-and-data/sql/halts.sql}{1}{7}{Halts from a status table.}\label{lst:iv:sql-and-data:halts}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, risk} \iqfirm{bank}]\label{iq:iv:sql-and-data:12}
+A status table records each change of an instrument's trading state. Return the halt intervals (\cref{lst:iv:sql-and-data:halts}).
+What does the query assume, and which rows would break it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{researcher, mle} \iqfirm{systematic fund}]\label{iq:iv:sql-and-data:13}
+Write the as-of join of trades to quotes in numpy, in pandas and in Polars, and say how you would check that all three agree with
+the SQL.
+\end{interviewq}
+
+\begin{omsources}
+\item DuckDB documentation, ``ASOF join'' and window functions (version 1.5); SQLite documentation, window functions (version 3.37).
+\item One Quant Book~7, chapter~3 (point-in-time data and as-of joins); One Quant Book~15, chapters 10 and~25 (dataframes; databases
+and SQL).
+\end{omsources}

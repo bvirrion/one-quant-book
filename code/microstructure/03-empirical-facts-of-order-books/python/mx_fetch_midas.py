@@ -1,5 +1,7 @@
 """Fetch the SEC's MIDAS market-structure data (US government work, public domain) and write the derived statistics
-the chapter uses to data/microstructure/ (network needed; not run by the tests).
+the chapter uses to data/microstructure/ (network needed; not run by the tests). www.sec.gov refuses scripted requests
+whose user agent carries no contact e-mail, and no personal e-mail is ever sent (user rule, 2026-09-29), so this script
+may be refused; the derived CSVs it once wrote are committed and are what the chapter and its tests read.
 
     .venv/bin/python code/microstructure/03-empirical-facts-of-order-books/python/mx_fetch_midas.py
 
@@ -16,7 +18,7 @@ import zipfile
 
 import numpy as np
 
-UA = {"User-Agent": "One Quant Book research REMOVED"}
+UA = {"User-Agent": "One Quant Book research"}  # no personal contact, ever (user rule, 2026-09-29)
 BASE = "https://www.sec.gov/files/opa/data/market-structure/"
 OUT = pathlib.Path(__file__).resolve().parents[4] / "data" / "microstructure"
 POINTS = [("1ms", 1e-3), ("10ms", 1e-2), ("100ms", 0.1), ("1s", 1.0), ("10s", 10.0), ("1min", 60.0)]

@@ -105,7 +105,7 @@ in dated boxes, each checked against public documentation at writing time.
 1. **The platform map** (10 pp) — Every system in a trading firm and how data flows among them.
 2. **Capturing and storing tick data** (14 pp) — Capture at the wire, normalised against raw storage, partitioning, compression, petabyte economics.
 3. **Columnar formats** (12 pp) — In-memory and on-disk columnar standards, encodings, predicate pushdown.
-4. **kdb+ and q** (16 pp) — The language, tick architecture, as-of joins, on-disk layouts, why it persists in the industry.
+4. **A tick store on open formats** (16 pp) — Live capture to append-only binary or Arrow IPC files, end-of-day compaction into date- and symbol-partitioned Parquet sorted by time, the intraday/historical split, as-of joins in DuckDB and Polars, memory-mapped in-house flat formats, schema evolution. The proprietary kdb+/q stack gets one sourced remark here and a place in chapter 5's survey; no q is taught (user ruling 2026-09-28: teach the open tools many firms actually run).
 5. **Time-series databases and the alternatives** (12 pp) — Open-source columnar stores and what each is good at.
 6. **Reference data and symbology services** (12 pp) — A security master through time, corporate actions as a service.
 7. **Data quality and lineage** (10 pp) — Checks, anomaly flags, provenance, vendor corrections.
@@ -145,6 +145,8 @@ in dated boxes, each checked against public documentation at writing time.
 ---
 
 ## One Quant Book 16 — The Desk and the Firm (~400 pp)
+
+Slug `desk` (not `firm`: `code/firm/` is the running project), label prefix `fm`.
 
 **Part I — Business models**
 
@@ -243,10 +245,16 @@ regulatory disclosures, the firms' own publications, reputable press).
 
 ---
 
-## One Quant Book 18 — The Interview Book (~410 pp)
+## One Quant Book 18 — The Interview Book (~240 pp)
 
 Every question has a full solution; each bank is graded one to three stars and
 tagged by role and firm type. No question is attributed to a named firm.
+
+**Shape (user ruling 2026-09-28).** New questions only — the book does not reprint or index the
+interview questions of Books 1–17. Each chapter is a short method lesson followed by one graded
+bank of about 12–15 `interviewq` with full solutions; there are no exercise, weekend-problem or
+separate interview sections. About 350 questions in all; the page figures below are the
+original proposal and overstate (budget ~8 pp a chapter, ch. 29 more).
 
 **Part I — The process**
 

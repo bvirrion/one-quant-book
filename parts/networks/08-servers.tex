@@ -1,0 +1,357 @@
+\chapter{Servers}\label{ch:nw:servers}
+
+The servers that trading firms buy for the hot path are chosen for one core's speed, not for the number of cores. A mainstream
+server processor with 128 cores runs any one of them at up to 4.1~GHz; a server processor with 16 cores runs one at up to 5~GHz;
+and specialist vendors sell machines whose processor has been tuned to run all 24 of its cores at 4.8~GHz, cooled by liquid,
+powered by a 2\,000-watt supply and warranted by the vendor rather than the chip maker. A trading path that spends most of its time
+computing gets faster almost in proportion to the clock; one that spends it waiting for memory or the network card hardly moves.
+Which of the two a firm's path is decides which server it should buy.
+
+One Quant Book~13 (chapters~2 to~4 and~13) studied the processor, the memory hierarchy, the two-socket machine and the operating
+system from the program's side. This chapter looks at the server as a thing bought and racked: how to choose its processor, what to
+set in its firmware, what \omterm{def:nw:servers:oc}{overclocking} buys and costs, how it is managed, and how many of them fit in a cabinet.
+
+\section{Choosing the processor}
+
+\begin{definition}[Thermal design power]\label{def:nw:servers:tdp}
+The \emph{thermal design power}\index{thermal design power} (TDP) of a processor is the sustained power, in watts, that its vendor
+designs it to dissipate under load at its rated frequencies, and that the server's cooling and power supply must handle.
+\end{definition}
+
+Three numbers of a processor's specification matter for a hot path, and a fourth for the cabinet. The \emph{boost} clock is the
+frequency one busy core can reach when the rest of the chip is quiet: AMD defines its EPYC processors' maximum boost as ``the maximum
+frequency achievable by any single core''. The \emph{base} clock is what every core is guaranteed under full load. The cache size sets
+how much of the order book and the strategy's state stays close to the core. And the \omterm{def:nw:servers:tdp}{thermal design power} sets how many servers a
+cabinet's power allows.
+
+\begin{proposition}[What a faster clock buys]\label{prop:nw:servers:clock}
+Let a path take $t_{\mathrm{ref}}$ on a core clocked at $f_{\mathrm{ref}}$, of which a share $\phi$ is core-bound (it scales with the
+clock) and the rest is bound by memory, the bus or the card. On a core at $f$ it takes
+\[
+  t(f) = t_{\mathrm{ref}}\Bigl(\phi\,\frac{f_{\mathrm{ref}}}{f} + 1 - \phi\Bigr),
+\]
+a speed-up that tends to $1/(1-\phi)$ however fast the clock.
+\end{proposition}
+
+\begin{proof}
+The core-bound part is a number of cycles, which take $1/f$ each; the rest is a time fixed by the memory's and the devices' own
+latencies. As $f \to \infty$ only $(1-\phi)\,t_{\mathrm{ref}}$ remains.
+\end{proof}
+
+\begin{example}[Book 13's path on three processors]\label{ex:nw:servers:book13}
+One Quant Book~13's in-process stages (decode, ring, book, strategy, risk, gateway) had medians adding up to
+\qty{1\,528}{\nano\second} on a laptop core whose maximum turbo is 4.8~GHz. Suppose 60\% of that time is core-bound. On a core at
+5.0~GHz the path takes \qty{1\,491}{\nano\second}; at 4.1~GHz, \qty{1\,685}{\nano\second}; on a core held at a base clock of 2.7~GHz,
+\qty{2\,241}{\nano\second}. The fastest clock of \cref{tab:nw:servers:candidates} saves 2.4\% over the reference; the slowest costs 47\%.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xmin=2.4,xmax=6.1,ymin=1100,ymax=3000,xlabel={core clock (GHz)},
+  ylabel={in-process median (ns)},y tick label style={/pgf/number format/1000 sep={\,}},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick] table[x=ghz,y=phi100]{figdata/networks/08-servers/model.csv};
+\addplot[omMeth,very thick] table[x=ghz,y=phi60]{figdata/networks/08-servers/model.csv};
+\addplot[omDef,very thick] table[x=ghz,y=phi30]{figdata/networks/08-servers/model.csv};
+\addplot[only marks,mark=*,mark size=2pt,black] table[x=ghz,y=ns]{figdata/networks/08-servers/candidates.csv};
+\legend{all core-bound,60\% core-bound,30\% core-bound,candidates (60\%)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Model: Book~13's in-process path (\qty{1\,528}{\nano\second} at 4.8~GHz) moved to other clocks, for three shares of core-bound
+time (\cref{prop:nw:servers:clock}); the dots are the candidates of \cref{tab:nw:servers:candidates} at their hot-core clock and 60\%.
+The more the path waits for memory, the flatter the curve. Data: \texttt{fig\_servers.py}.}\label{fig:nw:servers:model}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Server processors, from their vendors}\label{dat:nw:servers:parts}
+AMD's EPYC 9175F: 16 cores, a base clock of 4.2~GHz, a maximum boost of up to 5~GHz, 512~MB of level-3 cache, a default TDP of
+\qty{320}{\watt}, listed at 3\,703~USD in thousand-unit quantities (launched October 2024). AMD's EPYC 9755: 128 cores at 2.7~GHz base
+and up to 4.1~GHz boost, 512~MB of level-3 cache, \qty{500}{\watt}, 10\,931~USD. Intel's Xeon Gold 6544Y: 16 cores at 3.6~GHz base and
+4.1~GHz maximum turbo, 45~MB of cache, \qty{270}{\watt} (launched in the fourth quarter of 2023).
+\end{dated}
+
+\section{Firmware settings}
+
+The firmware (BIOS) decides many things the operating system cannot change afterwards: how the processor saves power, whether each
+core runs one thread or two, how memory is interleaved across sockets, and which events interrupt the processor behind the operating
+system's back.
+
+\begin{definition}[System management interrupt]\label{def:nw:servers:smi}
+A \emph{system management interrupt}\index{system management interrupt} (SMI) is an interrupt handled by the platform's firmware, not
+by the operating system, for functions such as temperature and fan control or legacy device emulation; it generally cannot be masked,
+and while it runs the operating system and every program on that processor stop.
+\end{definition}
+
+An SMI is the one interrupt that core isolation (One Quant Book~13, chapter~13) cannot move away: Red Hat's real-time documentation warns
+that a poorly written handler ``may consume many milliseconds'' that the operating system cannot preempt. Firms therefore ask their
+server vendors which SMI sources can safely be turned off, count the ones that remain through the processor's counters, and treat an
+unexplained pause of the whole machine as an SMI until shown otherwise.
+
+\begin{method}[Firmware settings for a hot-path server]\label{met:nw:servers:bios}
+\begin{enumerate}
+\item Power profile for maximum performance; deep idle states (C-states) off on the hot cores, so a waiting core is never slow to wake.
+\item A fixed turbo behaviour: either the maximum single-core boost with the other cores kept quiet, or a fixed all-core frequency, but
+  not a clock that moves with load, which vendors describe as a source of jitter.
+\item Simultaneous multithreading off, or its sibling threads left idle on the hot cores.
+\item Memory at its maximum rated speed; interleaving across sockets off, so each socket's memory stays local.
+\item Error-correction reporting and \omterm{def:nw:servers:smi}{system management interrupt} sources reduced to what the vendor states is safe.
+\item The whole list recorded as data and audited, with the operating system's settings, before the server trades (the build).
+\end{enumerate}
+\end{method}
+
+\section{Overclocked and liquid-cooled machines}
+
+\begin{definition}[Overclocking]\label{def:nw:servers:oc}
+\emph{Overclocking}\index{overclocking} is running a processor, or its memory, above its vendor's rated frequency, usually with a higher
+supply voltage and stronger cooling, and outside the vendor's warranty.
+\end{definition}
+
+A faster clock at a higher voltage dissipates more power, roughly with the frequency times the square of the voltage, which is why the
+specialist vendors pair \omterm{def:nw:servers:oc}{overclocking} with liquid cooling and oversized power supplies, and why they sell stability testing as part of the
+product. What they sell is a processor that runs its cores at a frequency close to or above the vendor's single-core boost, all of
+them, all day, without the clock changes that a load-dependent turbo brings.
+
+\begin{dated}{2026-09}{Overclocked servers, from their vendors}\label{dat:nw:servers:oc}
+Blackcore Technologies describes its ICON range as ``an overclocked, liquid-cooled server platform for Intel CPUs'', and its G3 SPR-M
+server as a tuned Intel Xeon w7-2495X ``boasting 4.8GHz across all cores'' with 45~MB of cache and overclocked DDR5 memory, on a
+custom 2\,000-watt redundant power supply. Business Systems International describes its ORION HF~310 as a single-socket overclocked server
+whose design turns off unnecessary cores and locks the rest at up to 5.2~GHz, stating that ``turbo mode creates jitter, something that
+traders want to avoid at all costs''.
+\end{dated}
+
+\begin{definition}[Burn-in test]\label{def:nw:servers:burnin}
+A \emph{burn-in test}\index{burn-in test} runs a new or reconfigured server at full load, often for days, with stress workloads that
+exercise the processor, memory and devices, and checks for errors, throttling and instability before the server is trusted with
+trading.
+\end{definition}
+
+\section{Memory, reliability and management}
+
+\begin{definition}[Error-correcting code memory]\label{def:nw:servers:ecc}
+\emph{Error-correcting code memory}\index{error-correcting code memory} (ECC) stores extra check bits with each word, so that the memory
+controller can correct a flipped bit and detect a double flip; server memory is almost always ECC, and overclocked memory makes its
+reports more important, not less.
+\end{definition}
+
+\begin{definition}[Baseboard management controller]\label{def:nw:servers:bmc}
+A \emph{baseboard management controller}\index{baseboard management controller} (BMC) is a small independent computer on the server's
+motherboard, with its own network port, that lets an operator power the server on and off, read its sensors and logs, update its firmware
+and use its console remotely, whatever the state of the main processor and operating system.
+\end{definition}
+
+A cage is often far from the firm's engineers. The BMC is how they reach a server that has hung, on the \omterm{def:nw:switches-and-layer-1-devices:oob}{out-of-band
+management network} of chapter~2, and its sensors (temperatures, fan speeds, power) are the first sign that an overclocked machine is
+drifting out of its tested envelope. It is also a computer with firmware of its own, on a network: it is patched and isolated like one.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=omDef!15,minimum width=2.6cm,minimum height=1.6cm] (s0) at (0,0) {socket 0\\ hot cores};
+\node[b,fill=omDef!8,minimum width=2.6cm,minimum height=1.6cm] (s1) at (5.0,0) {socket 1\\ other work};
+\foreach \k in {0,1,2,3} {\node[b,fill=gray!10,minimum width=0.5cm,font=\scriptsize] at (-1.0+0.65*\k,1.6) {M};}
+\foreach \k in {0,1,2,3} {\node[b,fill=gray!10,minimum width=0.5cm,font=\scriptsize] at (4.0+0.65*\k,1.6) {M};}
+\draw[<->,gray] (0,1.3) -- (s0.north);
+\draw[<->,gray] (5.0,1.3) -- (s1.north);
+\node[font=\scriptsize] at (-1.9,1.6) {memory};
+\node[b,fill=omMeth!20] (nic) at (0,-2.0) {network card\\ (feed, orders)};
+\node[b,fill=gray!8] (disk) at (5.0,-2.0) {storage, other cards};
+\node[b,fill=omThm!12] (bmc) at (9.0,-0.9) {BMC};
+\node[b,fill=gray!8] (mgmt) at (9.0,-2.4) {management\\ network};
+\draw[<->,thick] (s0) -- node[above,font=\scriptsize]{interconnect} (s1);
+\draw[<->,thick] (s0) -- node[right,font=\scriptsize]{PCIe} (nic);
+\draw[<->,thick] (s1) -- (disk);
+\draw[<->,gray] (bmc) -- (mgmt);
+\draw[gray,dashed] (bmc.west) -- ++(-0.9,0) |- (s1.east);
+\end{tikzpicture}
+
+\omcaption{A two-socket trading server. The network card sits on socket~0's bus and the hot threads run on socket~0's cores with
+socket~0's memory (One Quant Book~13, chapter~4); socket~1 takes everything else. The \omterm{def:nw:servers:bmc}{baseboard management controller} watches and
+controls the machine from its own port on the management network.}\label{fig:nw:servers:anatomy}
+\end{omfigure}
+
+\section{Racks, power and heat}
+
+\begin{definition}[Rack unit]\label{def:nw:servers:ru}
+A \emph{rack unit}\index{rack unit} (U) is the standard height of equipment in a 19-inch rack, 1.75~inches (44.45~mm); a cabinet commonly
+holds about 42 of them, and servers are 1U, 2U or taller.
+\end{definition}
+
+A colocation cabinet is sold with a power allowance in kilowatts (chapter~9), and power, not space, usually binds first. A server budgeted at
+its processors' \omterm{def:nw:servers:tdp}{thermal design power} plus \qty{250}{\watt} for everything else draws \qty{570}{\watt} with one EPYC 9175F: seventeen fit in
+\qty{10}{\kilo\watt}. The two-socket 128-core server draws \qty{1\,250}{\watt}: eight fit, with 2\,048 cores between them. The overclocked
+server, budgeted at its \qty{2\,000}{\watt} supply because its vendor publishes no draw, fits five times.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Candidate & Hot clock & Path at hot & Path at base & Servers per & Cores per \\
+ & (GHz) & clock (ns) & clock (ns) & \qty{10}{\kilo\watt} & \qty{10}{\kilo\watt} \\
+\midrule
+AMD EPYC 9175F, one socket & 5.0 & 1\,491 & 1\,659 & 17 & 272 \\
+Intel Xeon Gold 6544Y, one socket & 4.1 & 1\,685 & 1\,834 & 19 & 304 \\
+AMD EPYC 9755, two sockets & 4.1 & 1\,685 & 2\,241 & 8 & 2\,048 \\
+Overclocked w7-2495X (all cores) & 4.8 & 1\,528 & 1\,528 & 5 & 120 \\
+\bottomrule
+\end{tabular}
+\caption{Candidates for a hot-path server, with Book~13's in-process path at 60\% core-bound (\cref{prop:nw:servers:clock}); the hot clock
+is the single-core boost, or the vendor's all-core figure for the overclocked server. Servers per cabinet budget each at its processors'
+TDP plus \qty{250}{\watt} (the overclocked one at its \qty{2\,000}{\watt} supply) and 42 \omterm{def:nw:servers:ru}{rack units}. Data: \texttt{nw\_servers.table()},
+\cref{dat:nw:servers:parts,dat:nw:servers:oc}.}\label{tab:nw:servers:candidates}
+\end{table}
+
+\Cref{tab:nw:servers:candidates} makes the chapter's argument in one line each. The 16-core part with the highest boost is the fastest
+for a path that runs on one or two cores, as long as the other cores stay quiet enough to let it boost. The overclocked machine gives up
+a little of that peak for a clock that does not move, on every core, which matters when the hot path uses many cores at once. The
+128-core part is the right server for research, simulation and the firm's other work (One Quant Book~15), and the wrong one for the hot
+path.
+
+\section{Tutorial: choosing and auditing a server}\label{tut:nw:servers:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Predict the hot path's latency on candidate servers from Book~13's measurements, fit them into a cabinet, and audit a
+server's firmware settings in the same report as its operating system's. \textbf{End state:} \cref{tab:nw:servers:candidates},
+\cref{fig:nw:servers:model} and a combined audit report.
+\begin{tutsteps}
+\item \textbf{The reference.} \texttt{nw\_servers.ref\_ns()} reads Book~13's stage medians through \texttt{firm.wirepath} (1\,528~ns).
+\item \textbf{The model.} \texttt{firm.serverspec.path\_ns} applies \cref{prop:nw:servers:clock}; \texttt{curve()} traces it and
+  \texttt{python fig\_servers.py} writes the chart's data.
+\item \textbf{The candidates.} \texttt{CANDIDATES} holds the ledger's rows; \texttt{table(phi, cabinet\_kw)} predicts each one's path and fits
+  it into a cabinet.
+\item \textbf{The audit.} \texttt{firmware\_audit(settings)} checks a server's firmware against \texttt{FIRMWARE} and returns
+  \texttt{firm.tuneaudit} findings, so \texttt{firm\_tuneaudit.report} prints them with the host's own.
+\end{tutsteps}
+\textbf{What to change next.} Measure $\phi$ for Book~13's path by running it on the laptop's performance and efficiency cores (their maximum
+clocks are 4.8 and 3.8~GHz) and fitting \cref{prop:nw:servers:clock}; recompute the table for a \qty{20}{\kilo\watt} cabinet.
+\end{tutorial}
+
+\omcode{code/firm/serverspec/firm_serverspec.py}{55}{75}{The latency model, a cabinet's fit, and the ranking of \texttt{firm.serverspec}.}\label{lst:nw:servers:model}
+
+\section{Build: the server specification}\label{bld:nw:servers:serverspec}
+
+\begin{build}
+\bfield{Purpose} Server choice as data: candidates with their sources, a latency model tied to the firm's measured path, a cabinet fit, and
+a firmware checklist audited with the host's tuning, for chapter~29's bill of materials.
+\bfield{Interface} \texttt{firm\_serverspec}: \texttt{Candidate}, \texttt{CANDIDATES}, \texttt{path\_ns(t\_ref, phi, f, f\_ref)},
+\texttt{speedup}, \texttt{per\_cabinet(c, kw, u)}, \texttt{rank}, \texttt{FIRMWARE}, \texttt{firmware\_audit(settings)} returning
+\texttt{firm\_tuneaudit.Finding}s.
+\bfield{Rules} Every candidate names its ledger row; a server's power budget is its processors' TDP plus a stated allowance, or a vendor's
+figure; a setting that the server does not report is ``unknown'', never ``ok''.
+\bfield{Acceptance tests} \texttt{code/firm/serverspec/tests/}: the model's limits (all core-bound, all memory-bound), a cabinet's fit by power
+and by space, the ranking, and firmware findings reported through \texttt{firm.tuneaudit}.
+\bfield{Stretch} Fit $\phi$ from runs at two clocks; add memory bandwidth to the model for a path whose memory-bound part depends on it.
+\end{build}
+
+\begin{omsources}
+\item AMD, EPYC 9175F and EPYC 9755 product pages; Intel, Xeon Gold 6544Y and Core Ultra 7 155H specifications.
+\item Blackcore Technologies, G3 SPR-M product page; Business Systems International, ORION HF~310 product page.
+\item Red Hat, \emph{Red Hat Enterprise Linux for Real Time} reference guide (``System Management Interrupts'') and tuning guide (``Setting
+BIOS parameters for system tuning'').
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:1}
+A path takes \qty{2}{\micro\second} at 3.0~GHz and is 80\% core-bound. How long does it take at 5.0~GHz, and what is its limit as the clock
+grows?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:2}
+How many servers budgeted at \qty{570}{\watt} fit in a \qty{15}{\kilo\watt} cabinet of 42 units, if each takes one unit? And at
+\qty{1\,250}{\watt} and two units?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:3}
+A server's boost clock is 5.0~GHz and its base clock 4.2~GHz. Which one should a latency budget use for the hot path, and when?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:4}
+Why can core isolation not protect a hot core from \omterm{def:nw:servers:smi}{system management interrupts}, and what can the firm do instead?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:5}
+In \cref{fig:nw:servers:model}, how much does raising the clock from 4.0 to 5.0~GHz save for each share of core-bound time?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:6}
+Why might a firm prefer an all-core overclocked machine to a higher single-core boost, even if its peak clock is lower?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:servers:7}
+\emph{Coding.} With \texttt{firm.serverspec}, find the core-bound share below which the 16-core 5.0~GHz part saves less than 1\% over the
+laptop reference, and redo \cref{tab:nw:servers:candidates} for a \qty{20}{\kilo\watt} cabinet.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:servers:8}
+\emph{Find the flaw.} ``We moved the strategy from a 4.1~GHz server to a 5~GHz one and latency did not improve, so the benchmark was wrong.''
+\end{exercise}
+
+\section{Problem: Five Gigahertz or Fifty Cores}
+
+\begin{problem}[{Weekend problem --- a clock, a cabinet and a budget}]\label{pb:nw:servers:1}
+A firm's hot path takes \qty{1\,528}{\nano\second} at 4.8~GHz (One Quant Book~13's in-process stages). It is choosing between one-socket
+servers with the EPYC 9175F (boost 5.0~GHz, base 4.2), two-socket servers with the EPYC 9755 (boost 4.1, base 2.7), and the overclocked
+server of \cref{dat:nw:servers:oc} (4.8~GHz on all cores), for a \qty{10}{\kilo\watt} cabinet, with the chapter's power budgets.
+
+\medskip\noindent\textbf{Part I --- The clock.}
+\begin{enumerate}
+\item At 60\% core-bound, what is the path on each server's hot clock?
+\item And on each one's base clock?
+\item What is the speed-up of the 9175F's boost over the 9755's base clock?
+\item What is the largest speed-up any clock could give at 60\%?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The cabinet.}
+\begin{enumerate}[resume]
+\item How many of each server fit in \qty{10}{\kilo\watt}?
+\item How many cores does each give the cabinet?
+\item Which binds, power or space, for each?
+\item The firm needs 40 hot cores and 1\,000 other cores. How many cabinets of \qty{10}{\kilo\watt} does a mix of 9175F and 9755 servers need?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The firmware.}
+\begin{enumerate}[resume]
+\item Which settings of the method would you check first on a new overclocked server, and why?
+\item What does the \omterm{def:nw:servers:burnin}{burn-in test} protect against?
+\item The BMC reports rising temperatures on one server. What do you do?
+\item Why is SMT off on the hot cores?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the hot path on the three servers at their hot clocks, and servers per cabinet.
+\item Under what core-bound share does the choice of processor stop mattering by more than 5\%?
+\item Where would you put the 128-core servers?
+\item What would you measure before believing the model's $\phi$?
+\item Why does the overclocked server's clock stability matter more than its peak?
+\item What does the warranty question change in the purchase?
+\item How would you present the choice to the firm's CTO in two sentences?
+\item In one sentence: what decides whether a faster clock is worth buying?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:nw:servers:1}
+Why do trading firms prefer processors with fewer, faster cores for the hot path?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:servers:2}
+Which BIOS settings would you change on a new trading server, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:servers:3}
+What is a \omterm{def:nw:servers:smi}{system management interrupt} and why does it matter for latency?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, trader}]\label{iq:nw:servers:4}
+Would you buy overclocked servers? What would you ask the vendor?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:nw:servers:5}
+How would you predict how much a faster processor will improve your path before buying it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:nw:servers:6}
+Your colocation cabinet has \qty{10}{\kilo\watt}. How do you decide what goes in it?
+\end{interviewq}

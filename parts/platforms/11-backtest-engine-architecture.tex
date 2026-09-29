@@ -1,0 +1,386 @@
+\chapter{Backtest-Engine Architecture}\label{ch:pl:backtest-engine-architecture}
+
+A quoting strategy looked rich in the bar backtest, flat in the order-book replay, and lost money in the simulator. The firm had
+four backtesters, written by four teams in four styles, each with its own idea of a strategy, a clock, an order and a result; the
+strategy had been ported to each by hand. It took a week to be sure that the three answers differed because the markets differed
+--- bars against queues, queues against a market that reacts --- and not because the four ports of the strategy did. This chapter
+builds the engine that makes that question a query: one strategy object, one \omterm{def:pl:backtest-engine-architecture:event}{event model}, one \omterm{def:pl:backtest-engine-architecture:dal}{data-access layer} and one \omterm{def:pl:backtest-engine-architecture:results}{results
+store} over the four fidelity levels of One Quant Book~7 (chapter~16), the fourth being a \omterm{def:pl:backtest-engine-architecture:reactive}{reactive simulation} on the exchange simulator
+of One Quant Book~10.
+
+\section{One engine, four levels}
+
+\begin{definition}[Backtest engine]\label{def:pl:backtest-engine-architecture:engine}
+A \emph{backtest engine}\index{backtest engine} is the platform component that runs a strategy against historical or simulated
+markets at a chosen fidelity level through one strategy interface, reads its data through a \omterm{def:pl:backtest-engine-architecture:dal}{data-access layer}, records what the
+strategy saw and did in one \omterm{def:pl:backtest-engine-architecture:event}{event model}, and stores every run with the identity of its code, data, parameters and seed.
+\end{definition}
+
+The firm's backtesters already exist: Book~7's vectorised backtester (\texttt{firm.vecbt}, level~1), its event-driven backtester on
+bars (\texttt{firm.evbt}, level~2) and its order-book replay with queue positions (\texttt{firm.lobreplay}, level~3), and Book~10's
+exchange simulator (\texttt{firm.exchsim}). Book~7 defined level~4 as live trading at small size or paper trading, and in its
+chapter~19 let an agent trade inside the synthetic market as the stand-in for live; here the exchange simulator plays that part, with
+the same session replayed as real orders against which the strategy's own orders rest and trade. The engine does not rewrite any of
+them. Each level has an adapter that turns the one strategy object into what that backtester expects, and turns what the backtester
+reports into the engine's events (\cref{fig:pl:backtest-engine-architecture:arch}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.75cm,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=omMeth!15,minimum width=3.2cm] (s) at (0,2.6) {strategy object\\ \texttt{QuoteStrategy} or \texttt{TargetStrategy}};
+\node[box,fill=omDef!15,minimum width=10.6cm] (e) at (2.6,1.2) {\texttt{Engine(level, strategy, data, config).run()}: one context
+(\texttt{send}, \texttt{cancel}, \texttt{working}, \texttt{position}), one event log};
+\foreach \x/\l/\c in {-2.1/{level 1\\ \texttt{firm.vecbt}}/1,0.9/{level 2\\ \texttt{firm.evbt}}/2,3.9/{level 3\\
+  \texttt{firm.lobreplay}}/3,6.9/{level 4\\ \texttt{firm.exchsim}}/4} {
+  \node[box,fill=omThm!10,minimum width=2.5cm] (b\c) at (\x,-0.4) {\l};
+  \draw[<->] (b\c.north) -- (b\c.north|-e.south);}
+\node[font=\scriptsize\itshape] at (2.4,-1.1) {adapters: one per level, backtesters unchanged};
+\node[box,fill=gray!10,minimum width=4.4cm] (d) at (0.2,-2.0) {data-access layer\\ named datasets, content hashes};
+\node[box,fill=gray!10,minimum width=4.4cm] (r) at (5.4,-2.0) {results store\\ manifest, fills, events per run};
+\draw[->] (d.west) -| ([xshift=-4mm]e.west) -- (e.west);
+\draw[->] (s.south) -- (s.south|-e.north);
+\draw[->] (e.east) -| ++(0.5,-3.2) -- (r.east);
+\end{tikzpicture}
+
+\omcaption{The engine's architecture. One strategy object runs at any level; each level's adapter translates between the engine's
+context and one of the firm's backtesters, which are wrapped and not edited. Data come through the \omterm{def:pl:backtest-engine-architecture:dal}{data-access layer} with a content hash,
+and every run lands in the \omterm{def:pl:backtest-engine-architecture:results}{results store} with its manifest.}\label{fig:pl:backtest-engine-architecture:arch}
+\end{omfigure}
+
+The strategy interface has two forms, because the levels differ in what a strategy is. At level~1 there are no orders: a strategy is a
+rule that maps closes to a target position, run over all dates at once. At levels~2 to~4 a strategy reacts to the market and to its own
+fills by sending and cancelling orders. A \texttt{TargetStrategy} states its rule once, \texttt{target(close, i)}, and the engine runs it
+vectorised at level~1 and bar by bar at level~2; a \texttt{QuoteStrategy} has two callbacks, \texttt{on\_market} and \texttt{on\_fill},
+and runs at levels~2 to~4. Asking for a quoting strategy at level~1 is an error, not a silently empty backtest.
+
+\omcode{code/platforms/11-backtest-engine-architecture/python/pl_btengine.py}{28}{51}{The chapter's quoting strategy, written once
+against the engine's context: one lot at the best bid and ask, requoted when the touch moves, with an inventory limit of three
+lots.}\label{lst:pl:backtest-engine-architecture:quoter}
+
+\omcode{code/firm/btengine/firm_btengine.py}{254}{278}{The engine: the level decides the adapter, and every run returns the same
+\texttt{Run} with its manifest.}\label{lst:pl:backtest-engine-architecture:engine}
+
+\section{The event model and the clock}
+
+\begin{definition}[Event model]\label{def:pl:backtest-engine-architecture:event}
+An \emph{event model}\index{event model} is the set of event classes a \omterm{def:pl:backtest-engine-architecture:engine}{backtest engine} records and the total order in which it
+processes and stores them: here each event carries a time, a class and a sequence number, and events are ordered by time, then by a
+fixed rank of their class, then by sequence number.
+\end{definition}
+
+Four classes suffice for the chapter's strategies, in this rank order: \emph{market} (the top of the book the strategy saw), \emph{fill}
+(what the market did to its orders), \emph{order} and \emph{cancel} (what the strategy did in response). The rank settles the question
+every event-driven engine must answer and most answer by accident: when a quote update and a fill carry the same time, which does the
+strategy see first? A fixed answer makes two runs of the same inputs identical and two levels comparable; the sequence number breaks
+the remaining ties in arrival order.
+
+\omcode{code/firm/btengine/firm_btengine.py}{55}{78}{The event model: a total order on (time, class rank, sequence), and the log every
+level writes.}\label{lst:pl:backtest-engine-architecture:events}
+
+The clock is the simulated clock of Book~7 (chapter~17): time moves from event to event, never from the machine. Each backtester keeps
+its own clock internally --- bar ends at level~2, message times at level~3, nanoseconds of the simulated day at level~4 --- and the
+adapters convert all of them to seconds from the start of the session, so that events of different levels can be laid side by side.
+
+\section{Data access}
+
+\begin{definition}[Data-access layer]\label{def:pl:backtest-engine-architecture:dal}
+A \emph{data-access layer}\index{data-access layer} is the component through which every backtest reads its data: it resolves a dataset
+name to stored data and returns, with the data, an identity of their content (a hash) that the run records.
+\end{definition}
+
+The chapter's layer stores named datasets as Parquet (chapters~3 and~4) and keeps a content hash in each file's metadata: a
+\texttt{firm.tape} session of Book~7 (the order-by-order messages of a synthetic hour), and daily bars. The hash is what makes ``the same
+data'' checkable: two runs that read datasets with equal hashes read the same bytes, whatever the files were called, and a run's
+manifest names the hash, not the path. In the firm the same interface fronts the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} of chapter~4 and the reference data of
+chapter~6; a strategy never opens a file.
+
+\section{The results store}
+
+\begin{definition}[Results store]\label{def:pl:backtest-engine-architecture:results}
+A \emph{results store}\index{results store} keeps every backtest run with its manifest --- level, strategy and engine code hashes, data
+hashes, parameters and seed --- and its outputs (fills, events, P\&L), under an identifier derived from the manifest, and answers
+queries over runs.
+\end{definition}
+
+A run's identifier is the hash of its manifest (\cref{lst:pl:backtest-engine-architecture:save}): the same strategy code, engine code,
+data, parameters and seed give the same identifier, so a rerun is recognised rather than stored twice, and a changed line of the
+strategy gives a new one. The store answers the questions the week of the chapter's hook was spent on: which runs of this strategy
+exist, at which levels, on which data, with which code; and, for two runs, where their events first differ.
+
+\omcode{code/firm/btengine/firm_btengine.py}{429}{439}{Saving a run: its manifest, fills and events under the manifest's
+hash.}\label{lst:pl:backtest-engine-architecture:save}
+
+\begin{dated}{2026-09}{Open-source engines with one strategy for several environments}\label{dat:pl:backtest-engine-architecture:oss}
+Open-source trading platforms describe the same design goal. NautilusTrader's documentation calls it ``an open-source,
+production-grade, Rust-native engine for multi-asset, multi-venue trading systems'' in which ``the same strategy and execution-algorithm
+code can run across backtest and live systems'', with a common core used by its backtest, sandbox and live contexts and a message bus
+between components.
+\end{dated}
+
+\section{Adding a level: the reactive simulation}
+
+\begin{definition}[Reactive simulation]\label{def:pl:backtest-engine-architecture:reactive}
+A \emph{reactive simulation}\index{reactive simulation} is a backtest in which the strategy's orders are real orders in a simulated
+market: they rest in its queues, trade against the other participants' orders and change what those orders execute against afterwards,
+so that the market the strategy meets depends on the strategy's presence. The firm uses it as fidelity level~4, the exchange simulator
+standing in for the venue.
+\end{definition}
+
+At level~3 the strategy's orders are shadows (Book~7, chapter~18): they take a place in the replayed queue and fill when the recorded
+executions reach them, but the replay does not change --- a market order that filled a shadow also fills, in the recording, the orders
+it filled that day. At level~4 the same \texttt{firm.tape} session is replayed through Book~10's simulator as real orders: each recorded
+addition becomes a limit order, each cancellation a cancel, each trade a market order of its size. The strategy's orders are among them.
+A market order that meets the strategy's order trades with it and not with the order behind it, which then rests longer and trades later
+with something else; when the orders at the touch leave, the strategy's order is left alone at the front, visible to everyone, where the
+replay's shadow would have vanished with the level it was hiding in.
+
+\omcode{code/firm/btengine/firm_btengine.py}{378}{410}{Level~4: the dataset's session as the simulator's background flow, the strategy
+behind Book~10's \texttt{ReplayStrategyAdapter}, fills and events recorded as at every other
+level.}\label{lst:pl:backtest-engine-architecture:level4}
+
+Level~4 is the counterfactual impact of Book~7 (chapter~18) made concrete, with its limits: the background flow is a recording, so its
+limit orders do not requote around the strategy and its informed traders do not change their minds. It measures the mechanical part of
+the strategy's presence --- queues and matching --- and not the strategic part, which needs agents (Book~10's \texttt{firm.agentmkt}).
+
+\section{The P\&L ladder}
+
+The chapter's experiment runs the quoting strategy of \cref{lst:pl:backtest-engine-architecture:quoter} on twenty one-hour sessions of
+\texttt{firm.tape} (seeds 1 to 20) at levels~2, 3 and~4, with 20~$\mu$s of data and order-entry latency and no fees at any level. At level~2
+the strategy sees the touch at the end of each one-second bar that has trades and a quote fills in full when the bar trades at its price
+(the touch fill of Book~7, chapter~17); at level~3 it takes its place at the back of the queue; at level~4 it is in the queue.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ybar,bar width=26pt,ylabel={P\&L per hour (\$)},ymin=-150,ymax=300,ytick={-100,0,100,200,300},
+  xtick={2,3,4},xticklabels={{level 2: bars},{level 3: replay},{level 4: reactive}},enlarge x limits=0.3,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  extra y ticks={0},extra y tick style={grid style={black,thin}}]
+\addplot[fill=omDef!45,draw=omDef,error bars/.cd,y dir=both,y explicit]
+  table[x=level,y=pnl,y error=se]{figdata/platforms/11-backtest-engine-architecture/ladder.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The quoting strategy's P\&L per hour at three fidelity levels, mean over twenty one-hour sessions with one standard error.
+Touch fills on bars make it rich, the replay's queue makes it flat, and a market in which its orders are real makes it lose. Data:
+\texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:ladder}
+\end{omfigure}
+
+\Cref{fig:pl:backtest-engine-architecture:ladder} is the ladder. At level~2 the strategy makes \$228 an hour ($\pm 29$, one standard
+error over the sessions) from 841 fills: a quote that fills whenever the bar trades at its price never waits in a queue. At level~3 it
+loses \$12 an hour ($\pm 13$, indistinguishable from zero) from 333 fills: behind the queue, it fills less and mostly when the price is
+about to move through it. At level~4 it loses \$102 an hour ($\pm 18$) from 434 fills. The last step is not noise: level~4 is below
+level~3 in every one of the twenty sessions (\cref{fig:pl:backtest-engine-architecture:sessions}), by \$90 an hour on average ($\pm 7.4$).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.4cm,height=7cm,xlabel={level 3 (replay): P\&L per hour (\$)},ylabel={level 4 (reactive): P\&L per hour (\$)},
+  xmin=-260,xmax=110,ymin=-260,ymax=110,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},
+  table/col sep=comma,legend style={font=\footnotesize,at={(0.03,0.97)},anchor=north west}]
+\addplot[only marks,mark=*,mark size=1.8pt,omDef] table[x=pnl3,y=pnl4]{figdata/platforms/11-backtest-engine-architecture/sessions.csv};
+\addlegendentry{one session}
+\addplot[black,dashed,domain=-260:110] {x};
+\addlegendentry{equal P\&L}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Each of the twenty sessions at level~3 and level~4. Every point lies below the diagonal: the same strategy on the same
+recorded hour does worse when its orders are part of the market. Data: \texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:sessions}
+\end{omfigure}
+
+Because the strategy object is one and the same at every level, the difference between two runs is the market's; the engine's event
+logs say where it begins. \texttt{first\_divergence} compares the fills of the level-3 and level-4 runs of each session: they part within
+the first five fills in all twenty sessions, at a median of 11~seconds into the hour. From then on the two runs are different histories of
+the same session.
+
+\section{Where the gap comes from}
+
+Which fills make the difference? Each level-4 fill either has a level-3 counterpart --- a fill of the same side within a millisecond ---
+or it exists only because the strategy's order was in the book. Symmetrically, some replay fills have no reactive counterpart. The
+ten-second markout of each fill (the mid ten seconds later against the fill price, signed) measures what the fill earned before the
+inventory it created was marked; \cref{fig:pl:backtest-engine-architecture:decomposition} splits the markouts of both runs into the three
+groups, in the manner of the divergence decomposition of Book~7 (chapter~19).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ybar,bar width=16pt,ylabel={10-s markout per hour (\$)},ymin=-80,ymax=30,ytick={-75,-50,-25,0,25},
+  xtick=data,symbolic x coords={shared fills,replay-only fills,reactive-only fills},enlarge x limits=0.25,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.03,0.05)},anchor=south west},extra y ticks={0},extra y tick style={grid style={black,thin}}]
+\addplot[fill=omMeth!45,draw=omMeth] table[x=part,y=replay]{figdata/platforms/11-backtest-engine-architecture/decomposition.csv};
+\addlegendentry{level 3 (replay)}
+\addplot[fill=omThm!45,draw=omThm] table[x=part,y=reactive]{figdata/platforms/11-backtest-engine-architecture/decomposition.csv};
+\addlegendentry{level 4 (reactive)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Ten-second markouts of the two runs' fills, per hour, averaged over the twenty sessions, split into fills both runs share,
+fills only the replay has, and fills that exist only at level~4. The shared fills earn the same in both; the replay-only fills earn nothing;
+the reactive-only fills lose. Data: \texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:decomposition}
+\end{omfigure}
+
+\begin{example}[Four backtesters, one strategy]\label{ex:pl:backtest-engine-architecture:gap}
+Per session, 193 fills are shared by the two runs; they earn \$17.5 of ten-second markout at level~3 and \$18.3 at level~4, the same
+within noise --- the check that the classification pairs like with like. The replay has 140 fills of its own, which earn \$0.03; the
+reactive run has 241 of its own, which lose \$69.2. The markout gap between the runs is \$68.4 an hour, and the reactive-only fills account
+for 101\% of it: the loss is made of trades that happen only because the strategy's orders were there: an order that absorbs an aggressive order the
+recording gave to someone else, or that is still at the touch, visible, after the orders around it have left. The remaining \$22 of the \$90
+gap in P\&L is the inventory those fills leave, marked after more than ten seconds.
+\end{example}
+
+\begin{remark}[What the engine settled]\label{rem:pl:backtest-engine-architecture:settled}
+With four backtesters and four ports of the strategy, the gap between two levels had three candidate causes: the market, the port and the
+backtester's conventions (what the strategy sees, when a fill is reported). The engine removes the second by construction and makes the
+third explicit in the adapters. What remains is what the levels are for.
+\end{remark}
+
+\section{A rule at levels 1 and 2}
+
+The same engine runs a daily rule --- long when the close is above its level fifty days earlier, short when below --- on a thousand days of
+synthetic bars at level~1 (\texttt{firm.vecbt}, the rule's weight earned from the next close) and at level~2 (\texttt{firm.evbt}, market
+orders filled at the next open). Level~1 returns $-26.5\%$ over the period and level~2 $-31.5\%$; the five points are the overnight moves
+on the days the position changes, earned by the old position at level~2 and by the new one at level~1, which trades at a close it has
+only just seen. The rule is written once; the two runs sit next to each other in the \omterm{def:pl:backtest-engine-architecture:results}{results store} under different identifiers.
+
+\section{Tutorial: one strategy through four backtesters}\label{tut:pl:backtest-engine-architecture:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run one strategy object at every level through one engine, store every run, and find where two levels part.
+\textbf{End state:} \cref{fig:pl:backtest-engine-architecture:ladder,fig:pl:backtest-engine-architecture:decomposition} and a \omterm{def:pl:backtest-engine-architecture:results}{results
+store} holding sixty runs.
+\begin{tutsteps}
+\item \textbf{Data}: \texttt{DataAccess.tape(3600, seed)} stores a session with its hash; \texttt{daily()} stores the daily bars.
+\item \textbf{One session}: \texttt{pl\_btengine.one\_session} runs levels~2, 3 and~4 and saves each run.
+\item \textbf{The ladder}: \texttt{ladder()} over seeds 1 to 20, \texttt{summary(rows)}.
+\item \textbf{The gap}: \texttt{classify\_fills}, \texttt{markouts} and \texttt{first\_divergence} on the level-3 and level-4 runs.
+\item \textbf{Identity}: \texttt{rerun\_is\_identical()}: same inputs, same run identifier, same events.
+\end{tutsteps}
+\textbf{What to change next.} Add a one-tick spread condition to the strategy (quote only when the spread is one tick) and see which
+level's verdict changes; run level~4 with Book~10's agent population instead of the recorded session.
+\end{tutorial}
+
+\section{Build: the backtest engine}\label{bld:pl:backtest-engine-architecture:btengine}
+
+\begin{build}
+\bfield{Purpose} One engine over the firm's four fidelity levels, so that a strategy is written once, runs anywhere on the ladder, and
+every run can be found, compared and reproduced. Chapter~12 hosts the same strategy objects in production-shaped environments.
+\bfield{Interface} \texttt{Engine(level, strategy, data, config).run() -> Run}; \texttt{TargetStrategy}, \texttt{QuoteStrategy};
+\texttt{Event}, \texttt{EventLog}; \texttt{DataAccess(root)} with \texttt{put}, \texttt{get}, \texttt{hash}, \texttt{tape},
+\texttt{daily}; \texttt{ResultsStore(root)} with \texttt{save}, \texttt{load}, \texttt{query}; \texttt{first\_divergence},
+\texttt{classify\_fills}, \texttt{markouts}.
+\bfield{Rules} Book~7's backtesters and Book~10's simulator are wrapped, never edited; events in the total order (time, class rank,
+sequence); a run's identifier is its manifest's hash; a strategy never opens a file; no level silently accepts a strategy it cannot run.
+\bfield{Acceptance tests} \texttt{code/firm/btengine/tests/}: the event order on simultaneous events; content hashes; level~1 equal to
+\texttt{firm.vecbt} called directly, level~3 to \texttt{firm.lobreplay}, level~4 to \texttt{firm.exchsim} with the adapter; equal run
+identifiers for equal inputs and different ones for a changed parameter; queries; the fill classification and markouts on a worked case.
+\bfield{Stretch} Parallel runs over seeds (chapter~13); an agent-population background at level~4; a level-3 run from the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s
+recorded feed of chapter~4.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~7, chapters 16--19 (fidelity levels, event-driven backtests, order-book replay, simulation against live); One Quant
+Book~10, chapter~26 (the exchange simulator).
+\item NautilusTrader documentation, ``Overview'' and ``Architecture''.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:1}
+Order these simultaneous events by the engine's \omterm{def:pl:backtest-engine-architecture:event}{event model}: an order sent at $t = 3$, a quote update at $t = 3$, a fill at $t = 3$, a
+cancel at $t = 2$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:2}
+Why does the engine refuse a quoting strategy at level~1 instead of running it with no fills?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:3}
+Two runs have the same strategy code, data hashes and seed but different run identifiers. What can differ?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:4}
+From the ladder, is the level-3 loss of \$12 an hour ($\pm 13$) evidence that the strategy loses in replay? Is the level-3 to level-4 gap
+evidence of anything?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:5}
+Explain why the shared fills should earn the same markout at levels~3 and~4, and what it would mean if they did not.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:6}
+What does level~4 as built here not capture about the strategy's effect on the market, and which component would add it?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:backtest-engine-architecture:7}
+\emph{Coding.} Run \texttt{one\_session} for seed~3 with the inventory limit raised from three lots to ten. How do the three levels'
+P\&L change, and does the reactive-only share of the gap move?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:backtest-engine-architecture:8}
+\emph{Find the flaw.} ``We compared the strategy in our replay backtester and in the new simulator and the simulator was worse, so the
+simulator's matching has a bug. We ported the strategy carefully to both.''
+\end{exercise}
+
+\section{Problem: Four Backtesters, One Strategy}
+
+\begin{problem}[{Weekend problem --- the ladder and its gap}]\label{pb:pl:backtest-engine-architecture:1}
+The quoting strategy of \cref{lst:pl:backtest-engine-architecture:quoter}, twenty one-hour sessions, levels~2 to~4.
+
+\medskip\noindent\textbf{Part I --- The engine.}
+\begin{enumerate}
+\item What must a \omterm{def:pl:backtest-engine-architecture:engine}{backtest engine} own that each backtester does not?
+\item Why two strategy forms, and which levels run each?
+\item What does the class rank of the \omterm{def:pl:backtest-engine-architecture:event}{event model} settle?
+\item What does a run's manifest contain, and why is the identifier its hash?
+\item Why does the \omterm{def:pl:backtest-engine-architecture:dal}{data-access layer} return a hash with the data?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The levels.}
+\begin{enumerate}[resume]
+\item What does the strategy see, and when does a quote fill, at level~2?
+\item How does a level-3 shadow order differ from a level-4 order?
+\item What does level~4 replay from the session, and as what?
+\item What does level~4 not capture?
+\item How is Book~7's level~4 represented here?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The ladder.}
+\begin{enumerate}[resume]
+\item What are the P\&L per hour and the fills at each level?
+\item Which differences are statistically clear?
+\item In how many sessions is level~4 below level~3, and by how much on average?
+\item When do the level-3 and level-4 runs first differ?
+\item Why are the level-2 fills so many?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The gap.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the P\&L an hour at each level and the share of the replay-to-reactive gap explained by fills that
+exist only because the strategy was in the book.
+\item Which fills lose, and why?
+\item What part of the gap is not in the ten-second markouts?
+\item What would you conclude about the strategy?
+\item In one sentence: what does the engine make possible that four backtesters did not?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher}]\label{iq:pl:backtest-engine-architecture:1}
+Your strategy is profitable in the bar backtest and loses in the order-book simulation. Where do you look?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:backtest-engine-architecture:2}
+Two events in your event-driven backtester have the same timestamp. How should the engine order them?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:backtest-engine-architecture:3}
+How would you make every backtest run reproducible and findable a year later?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:backtest-engine-architecture:4}
+What does a replay of the order book miss for a passive strategy, and how would you measure it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:backtest-engine-architecture:5}
+Design a \omterm{def:pl:backtest-engine-architecture:engine}{backtest engine} that covers vectorised backtests, event-driven backtests and a market simulator with one strategy API.
+\end{interviewq}

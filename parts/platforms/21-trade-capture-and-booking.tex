@@ -1,0 +1,333 @@
+\chapter{Trade Capture and Booking}\label{ch:pl:trade-capture-and-booking}
+
+A swap of \$100~million was amended to \$150~million on Monday, novated to another dealer on Wednesday and partially terminated on Friday
+morning. On Friday afternoon the risk system held version~3 (\$150~million, the new dealer), the confirmation system version~2 (\$150~million,
+the old dealer) and the settlement system version~4 (\$90~million, the new dealer). Each had copied the trade when something it cared about
+happened, and none of them had followed what happened to it. This chapter treats a trade as the result of its events: captured once in a
+canonical model, booked by rule, allocated by a stated rule, and changed only by events that every downstream system reads.
+
+\section{What a trade is, as data}
+
+\begin{definition}[Canonical trade model]\label{def:pl:trade-capture-and-booking:canonical}
+A \emph{canonical trade model}\index{canonical trade model} is the firm's single representation of a trade shared by every system that
+handles it: a header (identifiers, parties, book, dates, status, version) and the economics (the instrument, quantity and price), with
+rules that every valid trade satisfies.
+\end{definition}
+
+\begin{definition}[Unique transaction identifier]\label{def:pl:trade-capture-and-booking:uti}
+A \emph{unique transaction identifier}\index{unique transaction identifier} (UTI) identifies one transaction across all the parties and
+repositories that report it: under the CPMI--IOSCO technical guidance, the legal entity identifier (Book~2, chapter~28) of the entity that
+generates it followed by a value unique for that entity, at most 52 characters, upper-case letters and digits only.
+\end{definition}
+
+The chapter's model (\texttt{firm.tradecap}) keeps the instrument in the form Book~5's pricing library serialises it, so that a captured trade
+is priced, risk-managed and reported from the same record; the validator checks the identifiers' formats, that buyer and seller differ, that
+settlement does not precede the trade, and that the quantity is positive. The industry's own models --- FpML for messages, ISDA's Common Domain
+Model for events --- follow the same idea at a much larger scale.
+
+\section{Capture: from execution to booked trade}
+
+\begin{definition}[Trade capture, booking]\label{def:pl:trade-capture-and-booking:capture}
+\emph{Trade capture}\index{trade capture} turns an execution --- an exchange execution report, an OTC ticket, a voice trade --- into a trade
+in the canonical model, once and as early as possible. \emph{Booking}\index{booking} assigns the captured trade to a book, the unit that owns
+its risk and P\&L.
+\end{definition}
+
+\begin{definition}[Booking model]\label{def:pl:trade-capture-and-booking:model}
+A \emph{booking model}\index{booking model} is the set of rules that decides where a trade is booked --- by instrument type, desk, legal
+entity and strategy --- so that the book is a consequence of the trade's attributes, not a field typed by hand.
+\end{definition}
+
+The chapter's exchange side is a block: 9\,900 shares bought on Book~10's simulator by an execution algorithm sending an order that takes the
+offer every 20~seconds, filled in 57 executions over three minutes at an average of \$100.0783. Each execution report becomes a trade with its
+own UTI, bought by the firm from the clearing house. The OTC side is 200 swaps from six dealers, captured from tickets on Monday morning.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5cm,xlabel={seconds after the open},ylabel={price (\$)},grid=major,grid style={gray!20},
+  tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  scatter,only marks,point meta={\thisrow{qty}},scatter/use mapped color={draw=omDef,fill=omDef!40},
+  visualization depends on={sqrt(\thisrow{qty})/6 \as \msize},scatter/@pre marker code/.append style={/tikz/mark size=\msize}]
+\addplot table[x=seconds,y=price]{figdata/platforms/21-trade-capture-and-booking/block.csv};
+\draw[omThm,dashed] (axis cs:0,100.0783) -- (axis cs:220,100.0783) node[pos=0.02,above right,font=\scriptsize]{average \$100.0783};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The 57 executions of the 9\,900-share block on the simulator, by time and price (marker area by size): ten child orders taking the
+offer every 20~seconds, each filled in several executions as it walks the book. Every execution is captured as a trade; every fund is allocated
+at the average. Data: \texttt{fig\_tradecap.py}.}\label{fig:pl:trade-capture-and-booking:block}
+\end{omfigure}
+
+\section{The lifecycle as events}
+
+\begin{definition}[Trade lifecycle event, trade amendment]\label{def:pl:trade-capture-and-booking:event}
+A \emph{trade lifecycle event}\index{trade lifecycle event} is anything that happens to a trade after it is executed: an amendment, a
+novation (Book~1, chapter~5), a partial termination, an exercise, an allocation, a cancellation. A \emph{trade amendment}\index{trade amendment}
+changes a term of the trade (notional, rate, dates) by agreement; it is recorded as a new version, never by overwriting the old one.
+\end{definition}
+
+ISDA's Common Domain Model describes lifecycle events in the same terms: ``a lifecycle event describes a state transition,'' with a
+before and an after state, composed from a few primitive instructions --- execution, quantity change, terms change, party change, exercise,
+transfer and a handful of others. \texttt{firm.tradecap} keeps the events and computes the trade: a store applies events in time order and
+rebuilds any version as of any time (\cref{lst:pl:trade-capture-and-booking:store}). The event sourcing of chapter~24 is the general
+pattern; here it is the only way to answer, on Friday, what the trade was on Wednesday.
+
+\omcode{code/firm/tradecap/firm_tradecap.py}{70}{98}{The trade store: events appended, never edited; a trade as of any time is the replay
+of its events up to then.}\label{lst:pl:trade-capture-and-booking:store}
+
+\omcode{code/firm/tradecap/firm_tradecap.py}{101}{124}{Each event kind as a transition from one version of the trade to the
+next.}\label{lst:pl:trade-capture-and-booking:step}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,ver/.style={draw,rounded corners=2pt,align=center,minimum height=1.0cm,minimum width=2.2cm}]
+\node[ver,fill=gray!10] (v1) at (0,0) {v1: \$100m\\ dealer 1};
+\node[ver,fill=gray!10] (v2) at (3.4,0) {v2: \$150m\\ dealer 1};
+\node[ver,fill=gray!10] (v3) at (6.8,0) {v3: \$150m\\ dealer 4};
+\node[ver,fill=omDef!15] (v4) at (10.2,0) {v4: \$90m\\ dealer 4};
+\draw[->] (v1) -- node[above=4pt,align=center]{amend\\ Mon} (v2);
+\draw[->] (v2) -- node[above=4pt,align=center]{novate\\ Wed} (v3);
+\draw[->] (v3) -- node[above=4pt,align=center]{cut 40\%\\ Fri} (v4);
+\node[omThm,align=center] at (3.4,-1.3) {confirmation\\ (copies on new, amend)};
+\node[omThm,align=center] at (6.8,-1.3) {risk\\ (copies nightly)};
+\node[omThm,align=center] at (10.2,-1.3) {settlement\\ (copies on new, terminate)};
+\draw[->,omThm] (3.4,-0.95) -- (v2.south); \draw[->,omThm] (6.8,-0.95) -- (v3.south); \draw[->,omThm] (10.2,-0.95) -- (v4.south);
+\end{tikzpicture}
+
+\omcaption{The hook's swap through the week and what three copy-based systems held on Friday at 15:00. Each copied the trade on the events
+it cares about, or on its own schedule. Settlement holds version~4 only because the last event, a termination, is one it copies on; only a
+system that follows every event holds the current version whatever the last event was.}\label{fig:pl:trade-capture-and-booking:versions}
+\end{omfigure}
+
+\section{Three versions on Friday}
+
+The week's lifecycle is seeded: 69 amendments, 26 novations and 41 partial terminations among the 200 swaps between Monday 10:00 and Friday
+14:00, the hook's swap among them. Three downstream systems keep copies: risk copies every trade at 18:00 each evening; confirmation receives a copy on
+the events it confirms (new trades and amendments); settlement on the events that move cash (new trades and terminations). On Friday at 15:00
+their copies are compared with the event-sourced trade.
+
+\omcode{code/platforms/21-trade-capture-and-booking/python/pl_tradecap.py}{118}{144}{The three copy policies and the comparison with the
+event-sourced trade on Friday afternoon.}\label{lst:pl:trade-capture-and-booking:downstream}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+system & wrong, copying & wrong, following events \\
+\midrule
+risk (nightly copy) & 25 & 0 \\
+confirmation (copy on new and amend) & 60 & 0 \\
+settlement (copy on new and terminate) & 71 & 0 \\
+\midrule
+trades on which the three disagree & 109 of 200 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Swaps whose downstream copy differs from the event-sourced trade on Friday at 15:00, after a week of lifecycle
+events.}\label{tab:pl:trade-capture-and-booking:downstream}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5cm,xbar,bar width=8pt,xmin=0,xmax=130,xlabel={swaps wrong on Friday at 15:00 (of 200)},
+  symbolic y coords={any disagreement,settlement,confirmation,risk},ytick=data,enlarge y limits=0.2,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  nodes near coords,nodes near coords style={font=\scriptsize,anchor=west},legend style={font=\footnotesize,at={(0.5,1.03)},
+  anchor=south,legend columns=2}]
+\addplot[fill=omThm!45,draw=omThm] table[y=system,x=copy_wrong]{figdata/platforms/21-trade-capture-and-booking/downstream.csv};
+\addlegendentry{copying}
+\addplot[fill=omDef!45,draw=omDef] table[y=system,x=events_wrong]{figdata/platforms/21-trade-capture-and-booking/downstream.csv};
+\addlegendentry{following the events}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Downstream systems against the event-sourced swaps on Friday afternoon, after a week of amendments, novations and partial
+terminations: copies are wrong in 25 to 71 trades and disagree on 109; systems that follow the events are never wrong. Data:
+\texttt{fig\_tradecap.py}.}\label{fig:pl:trade-capture-and-booking:downstream}
+\end{omfigure}
+
+Copying fails in a different way in each system (\cref{tab:pl:trade-capture-and-booking:downstream}): risk is wrong only about the day's events
+(25 trades), confirmation about every novation and termination it was never sent (60), settlement about every amendment and novation (71), and
+on 109 of the 200 swaps at least two systems disagree. Following the events, all three hold the same trade, the one the store rebuilds.
+
+\section{Allocations and straight-through processing}
+
+\begin{definition}[Block allocation]\label{def:pl:trade-capture-and-booking:allocation}
+A \emph{block allocation}\index{block allocation} splits a trade executed for several accounts at once --- a block for several funds --- among
+them after execution, at the block's average price, by a rule fixed before the trade that also decides where the units that do not divide
+evenly go.
+\end{definition}
+
+\omcode{code/firm/tradecap/firm_tradecap.py}{144}{166}{Allocation in whole lots at the average price, with three rules for the lots that do
+not divide.}\label{lst:pl:trade-capture-and-booking:allocate}
+
+The block of 9\,900 shares (99 lots of 100) is allocated to three funds with targets of 50\%, 30\% and 20\%, whose exact shares are 4\,950, 2\,970
+and 1\,980. The largest-remainder rule gives 4\,900, 3\,000 and 2\,000: all 99 lots allocated, no fund more than 50 shares from its target. Giving
+the odd lots to the largest funds gives 5\,000, 3\,000 and 1\,900, 80 shares from target for the smallest. Rounding each fund on its own gives
+5\,000, 3\,000 and 2\,000 --- 10\,000 shares for a block of 9\,900: an over-allocation of one lot that someone must buy or take back.
+(\cref{tab:pl:trade-capture-and-booking:allocation}). Every fund pays the block's average price, \$100.0783, whatever executions made it.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+rule & fund A & fund B & fund C & residual & largest deviation \\
+\midrule
+largest remainder & 4\,900 & 3\,000 & 2\,000 & 0 & 50 \\
+odd lots to the largest funds & 5\,000 & 3\,000 & 1\,900 & 0 & 80 \\
+each fund rounded & 5\,000 & 3\,000 & 2\,000 & $-100$ & 50 \\
+\bottomrule
+\end{tabular}
+\caption{A block of 9\,900 shares allocated to three funds (targets 50\%, 30\%, 20\%) in lots of 100 under three rules: shares per fund, the
+block minus the allocation, and the largest deviation from a fund's exact share.}\label{tab:pl:trade-capture-and-booking:allocation}
+\end{table}
+
+\begin{definition}[Straight-through processing]\label{def:pl:trade-capture-and-booking:stp}
+\emph{Straight-through processing}\index{straight-through processing} carries a trade from execution to settlement --- capture, \omterm{def:pl:trade-capture-and-booking:capture}{booking},
+allocation, confirmation, clearing, settlement --- without manual re-entry or intervention, each step reading the output of the previous one in
+the canonical model.
+\end{definition}
+
+\omterm{def:pl:trade-capture-and-booking:stp}{Straight-through processing} is what the canonical model and the event stream buy: each manual step is a copy, and each copy is a version that can
+drift. The rate of trades that pass through without a human touch is the operational measure of a platform's \omterm{def:pl:trade-capture-and-booking:capture}{trade capture} (chapter~22 measures
+the breaks when they do not).
+
+\begin{dated}{2026-09}{Identifiers and event models}\label{dat:pl:trade-capture-and-booking:standards}
+CPMI and IOSCO published their technical guidance on the harmonisation of the UTI on 28 February 2017: the generating entity's LEI concatenated
+with a value unique for that entity, no check digit, at most 52 characters from A--Z and 0--9. ISDA's Common Domain Model, maintained as open
+source, models lifecycle events as state transitions composed from primitive instructions (execution, quantity change, terms change, party
+change, exercise and others).
+\end{dated}
+
+\section{Tutorial: one block, two hundred swaps, one week}\label{tut:pl:trade-capture-and-booking:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Capture executions and tickets into one model, allocate a block, run a week of lifecycle events, and compare copying with
+following events. \textbf{End state:} \cref{tab:pl:trade-capture-and-booking:downstream,tab:pl:trade-capture-and-booking:allocation}.
+\begin{tutsteps}
+\item \textbf{Capture}: \texttt{pl\_tradecap.block\_fills()} and \texttt{capture\_block}; validate every trade.
+\item \textbf{Allocate}: \texttt{allocations(fills)} under the three rules.
+\item \textbf{Lifecycle}: \texttt{week()}; \texttt{store.versions} and \texttt{store.as\_of}.
+\item \textbf{Downstream}: \texttt{downstream(store, events)}.
+\end{tutsteps}
+\textbf{What to change next.} Add an exercise event that turns a swaption into a swap and follow it downstream; allocate by the funds' cash
+instead of fixed targets.
+\end{tutorial}
+
+\section{Build: trade capture}\label{bld:pl:trade-capture-and-booking:tradecap}
+
+\begin{build}
+\bfield{Purpose} One trade record for every system, changed only by events, from capture to settlement.
+\bfield{Interface} \texttt{uti}, \texttt{validate}, \texttt{Event}, \texttt{TradeStore} (\texttt{apply}, \texttt{as\_of},
+\texttt{versions}), \texttt{from\_execution}, \texttt{from\_ticket}, \texttt{allocate}, \texttt{BookingModel}.
+\bfield{Rules} Trades are never edited, only evented; every trade validates; identifiers follow the UTI and LEI formats; allocation rules are
+fixed before the trade and allocate the whole block; books come from rules.
+\bfield{Acceptance tests} \texttt{code/firm/tradecap/tests/}: UTI format and validation errors; a lifecycle's versions and states as of any
+time, including termination to zero and an event on an unknown trade; exercise and capture from an execution report; the three allocation
+rules; the \omterm{def:pl:trade-capture-and-booking:model}{booking model}.
+\bfield{Stretch} Messages in FpML or events in the CDM's JSON; allocations by cash with fractional shares where allowed; a straight-through
+rate report.
+\end{build}
+
+\begin{omsources}
+\item CPMI and IOSCO, \emph{Harmonisation of the Unique Transaction Identifier: Technical Guidance}, February 2017.
+\item ISDA Common Domain Model documentation, ``Event Model''.
+\item One Quant Book~1, chapter~5, and Book~2, chapter~28 (novation, LEIs); One Quant Book~10, chapter~26 (execution reports).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:trade-capture-and-booking:1}
+A block of 1\,000 shares is split among three funds with equal targets in lots of 100. What does each rule give?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:trade-capture-and-booking:2}
+Why is the risk system wrong about fewer trades than the other two?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:trade-capture-and-booking:3}
+What does a UTI generated by the firm for its 7th trade look like?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:trade-capture-and-booking:4}
+Why must the allocation rule be fixed before the trade, and what goes wrong if a trader chooses it after seeing the fills?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:trade-capture-and-booking:5}
+The confirmation system is wrong about 60 trades. Which events did it miss, and what would it have had to subscribe to?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:trade-capture-and-booking:6}
+A trade is booked in the wrong book and moved the next day. How should the move be recorded, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:trade-capture-and-booking:7}
+\emph{Coding.} Rerun \texttt{downstream} with the risk system copying at 12:00 as well as at 18:00. How many trades is it wrong about?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:trade-capture-and-booking:8}
+\emph{Find the flaw.} ``Every system has the trade, so they must agree: each one reads it from the trading system when it needs it.''
+\end{exercise}
+
+\section{Problem: Three Versions on Friday}
+
+\begin{problem}[{Weekend problem --- copies against events}]\label{pb:pl:trade-capture-and-booking:1}
+The block, the 200 swaps and the week of the chapter.
+
+\medskip\noindent\textbf{Part I --- The model.}
+\begin{enumerate}
+\item What does the canonical model hold, and why the instrument as the pricing library serialises it?
+\item How is a UTI built?
+\item What does the validator check?
+\item What does a \omterm{def:pl:trade-capture-and-booking:model}{booking model} decide?
+\item Why is a trade never edited?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The week.}
+\begin{enumerate}[resume]
+\item What events happened to the swaps?
+\item What did the hook's swap go through, and what did each system hold on Friday?
+\item What does each copy policy miss?
+\item How many trades was each system wrong about?
+\item On how many trades did the systems disagree, and how many under events?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The block.}
+\begin{enumerate}[resume]
+\item How was the block executed, and at what average price?
+\item What are the exact shares of the three funds?
+\item What does each rule allocate, and with what residual?
+\item What is the largest deviation from target under each rule?
+\item What price does each fund pay?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the number of downstream disagreements after a week of lifecycle events under copy-based and event-based
+distribution, and the allocation residuals of a block split among three funds under three rounding rules.
+\item Which allocation rule would you adopt, and why?
+\item What would you require of a new downstream system?
+\item What does \omterm{def:pl:trade-capture-and-booking:stp}{straight-through processing} measure?
+\item In one sentence: what is a trade?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:trade-capture-and-booking:1}
+Three systems show three versions of the same trade. How do you find out which is right, and how do you stop it happening?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:trade-capture-and-booking:2}
+How would you represent a trade so that pricing, risk, confirmation and settlement can all use it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:trade-capture-and-booking:3}
+A block is filled at twenty prices for five funds. How do you allocate it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:trade-capture-and-booking:4}
+What is a novation, and what does it change in the systems that hold the trade?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:trade-capture-and-booking:5}
+Design the \omterm{def:pl:trade-capture-and-booking:capture}{trade capture} and \omterm{def:pl:trade-capture-and-booking:capture}{booking} layer of a multi-asset trading firm.
+\end{interviewq}

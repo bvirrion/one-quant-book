@@ -1,0 +1,292 @@
+\chapter{The Risk Grid}\label{ch:pl:the-risk-grid}
+
+The nightly risk batch --- every trade, every historical scenario --- starts at 04:30 and must be done by 06:00, when the morning's risk
+reports are built. It finished at 06:51. Doubling the machines moved the finish to 06:25 and no earlier, because the last hour belonged to
+one task waiting for one trade that priced two hundred times slower than its estimate, and the scheduler, which believed the estimate,
+had started that task late. Nothing was broken; the grid was planned by trade counts, not by cost. This chapter plans, runs and repairs
+such a grid on the simulated cluster of chapter~13, with the costs of the real pricing library measured on this laptop.
+
+\section{Nightly revaluation at scale}
+
+\begin{definition}[Risk grid, batch window]\label{def:pl:the-risk-grid:grid}
+A \emph{risk grid}\index{risk grid} is the infrastructure that revalues a firm's trades under many market scenarios on many machines: the
+plan that cuts the work into tasks, the scheduler and cluster that run them, and the store that collects the results for the risk engine to
+aggregate. Its \emph{batch window}\index{batch window} is the interval between the moment its inputs are ready (the end-of-day positions and
+market snapshot) and the moment its outputs are needed.
+\end{definition}
+
+Book~6's risk engine (chapter~29) computes a book's P\&L vectors under historical scenarios by full revaluation, a revaluation grid or a
+delta-gamma approximation, and aggregates them into VaR and expected shortfall along the risk hierarchy. At the size of a firm the
+computation is a grid of trades by scenarios --- here 105\,000 trades and 1\,000 scenarios, 105~million pricing calls --- and the engine
+becomes a scheduling problem.
+
+The chapter's book: 60\,000 swaps and 20\,000 swaptions (Book~6's rates instruments), 20\,000 equity options and 5\,000 autocallables
+priced by Monte Carlo with the library's 100\,000 paths (Book~5). One pricing call of each, measured on this laptop with the real library,
+costs 14.5, 10.2 and 5.1~microseconds for the first three and 22.2~milliseconds for an autocallable: the 5\,000 autocallables are 99\% of
+the book's 112.2~seconds of pricing per scenario. A task costs a fixed five seconds (loading the snapshot and the trades, writing the results)
+plus its pricing. The grid has 32 cores (eight nodes of four), and the window is 90~minutes.
+
+\section{Fanning out scenarios}
+
+\begin{definition}[Scenario fan-out, task granularity]\label{def:pl:the-risk-grid:fanout}
+\emph{Scenario fan-out}\index{scenario fan-out} is the splitting of the scenarios into batches so that one trade batch's revaluation runs as
+several tasks in parallel. \emph{Task granularity}\index{task granularity} is the size of the resulting tasks --- here the number of scenarios
+in a batch, the trades being grouped into batches of about half a second of pricing per scenario --- which trades scheduling freedom against
+the fixed cost of each task.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \r in {0,...,4} {\foreach \c in {0,...,7} {\draw[fill=omDef!12] (\c*1.1,-\r*0.55) rectangle ++(1.0,0.45);}}
+\foreach \c in {0,...,7} {\node at (\c*1.1+0.5,0.75) {$s_{\c}$};}
+\foreach \r/\l in {0/{swaps 1},1/{swaps 2},2/{\dots},3/{autocallables},4/{slow trade}} {\node[anchor=east] at (-0.1,-\r*0.55+0.22) {\l};}
+\foreach \c in {0,...,15} {\draw[fill=omThm!45] (\c*0.55,-4*0.55) rectangle ++(0.5,0.45);}
+\node[anchor=west,align=left] at (9.0,-1.0) {a task = one trade batch\\ $\times$ one scenario batch};
+\node[anchor=west,align=left,omThm] at (9.0,-2.0) {the slow trade: isolated,\\ its scenarios fanned out finely};
+\node at (4.3,1.2) {scenario batches};
+\end{tikzpicture}
+
+\omcaption{The grid as tasks: rows are trade batches grouped by estimated cost, columns scenario batches; every cell is a task. A cost-aware
+plan gives a trade measured slow its own row, with finer columns, so that no single task holds the window.}\label{fig:pl:the-risk-grid:tasks}
+\end{omfigure}
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{77}{92}{Planning the grid: trade batches by estimated cost, scenario batches of a chosen size,
+and trades too costly for one task isolated and fanned out more finely.}\label{lst:pl:the-risk-grid:plan}
+
+With 1\,000 scenarios in a batch there are 220 tasks, each a trade batch across all scenarios: few, long, and impossible to balance. With
+five scenarios there are 44\,000, and their fixed costs --- 44\,000 times five seconds --- are larger than the pricing itself.
+\Cref{fig:pl:the-risk-grid:granularity} is the whole curve: on 32 cores the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} falls from 2.35~hours at 1\,000 scenarios a task to
+1.19 at 100, and rises again to 2.93 at five; only batches of 20 to 250 scenarios meet the window, 20 by sixteen seconds.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=12cm,height=6cm,xlabel={scenarios per task (log scale)},ylabel={makespan (hours)},xmin=4,xmax=1200,ymin=0,ymax=3.6,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2}]
+\addplot[color=omThm,very thick,mark=*] table[x=scen_batch,y=naive_h]{figdata/platforms/20-the-risk-grid/sweep_32.csv};
+\addlegendentry{naive, 32 cores}
+\addplot[color=omDef,very thick,mark=square*] table[x=scen_batch,y=aware_h]{figdata/platforms/20-the-risk-grid/sweep_32.csv};
+\addlegendentry{cost-aware, 32 cores}
+\addplot[color=omThm,thick,dashed,mark=o] table[x=scen_batch,y=naive_h]{figdata/platforms/20-the-risk-grid/sweep_64.csv};
+\addlegendentry{naive, 64 cores}
+\addplot[color=omDef,thick,dashed,mark=square] table[x=scen_batch,y=aware_h]{figdata/platforms/20-the-risk-grid/sweep_64.csv};
+\addlegendentry{cost-aware, 64 cores}
+\draw[black,thick,dotted] (axis cs:4,1.5) -- (axis cs:1200,1.5);
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{Makespan} of the nightly grid on 32 cores (solid) and 64 (dashed) against the number of scenarios per task, for a plan that trusts the cost estimates
+(naive) and one that isolates the trade measured slow last night (cost-aware); the dotted line is the 90-minute window. Coarse tasks cannot be balanced; fine tasks drown in their
+fixed costs. Data: \texttt{fig\_riskgrid.py}, with costs from \texttt{bench\_riskgrid.py}.}\label{fig:pl:the-risk-grid:granularity}
+\end{omfigure}
+
+\section{Task granularity, failure and retry}
+
+The slow trade makes coarse tasks worse still. One autocallable's engine falls back to daily steps and prices at 4.88~seconds, 220 times its
+estimate. In the naive plan its trade batch across all 1\,000 scenarios is a task of more than 5\,300~seconds that the scheduler, sorting by
+estimate, starts like any other: the grid finishes 8\,468~seconds after 04:30, at 06:51; on 64 cores, at 06:25 (6\,922~seconds). A cost-aware
+plan uses last night's measured cost: the slow trade gets tasks of its own, 122 scenarios each, and the 1\,000-scenario plan finishes in
+4\,123~seconds on 32 cores (05:38); the best granularity, 250 scenarios, in 3\,846 (05:34).
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{105}{122}{Running a plan: failures handled per task (retried, then lost) or per trade
+(quarantined), then the tasks scheduled longest estimate first on the simulated cluster.}\label{lst:pl:the-risk-grid:run}
+
+Failures need the same thinking. One swaption's volatility is missing, and it fails every time. If a failing trade fails its task, the
+scheduler retries the task twice and then gives up: the grid loses every result of every task that held the trade --- 38.3~million of the
+105~million cells, more than a third of the book --- and burns 1\,100 core-seconds on retries. If the pricing loop catches the failure per trade, as
+Book~6's engine does (a failing trade gives a missing value and an entry in an error report, never a stopped run), the grid loses the
+failing trade's 1\,000 cells, quarantines it with a report, and finishes 60~seconds sooner.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+failure handling & \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} (s) & core-seconds wasted & results lost \\
+\midrule
+per task (two retries, then lost) & 4\,095 & 1\,100 & 38\,263\,000 \\
+per trade (quarantined with a report) & 4\,035 & 0 & 1\,000 \\
+\bottomrule
+\end{tabular}
+\caption{One trade that always fails, in the cost-aware plan with 100 scenarios per task on 32 cores.}\label{tab:pl:the-risk-grid:failures}
+\end{table}
+
+\section{Adjoint sensitivities in production}
+
+The nightly batch also computes sensitivities. Bumping a swap's eight curve pillars up and down costs sixteen repricings; the adjoint of
+Book~4's tape (\texttt{firm.aad}, chapter~28 there) records one valuation and sweeps back once, and gives all eight derivatives --- equal to the
+bumped ones to $10^{-9}$ in the tests (\cref{lst:pl:the-risk-grid:adjoint}). On this laptop the bumped deltas of a swap take 388~microseconds
+and the adjoint 66, 5.9 times faster, with a Python tape; a compiled tape keeps the adjoint's cost at a few valuations whatever the number
+of pillars. Over the book's 60\,000 swaps, bumping needs 1.02~million pricing calls, the adjoint 60\,000 recorded valuations.
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{126}{141}{A swap's value on a pillar curve written once on the tape; one reverse sweep gives
+its derivative to every pillar.}\label{lst:pl:the-risk-grid:adjoint}
+
+\section{Intraday risk and incremental revaluation}
+
+\begin{definition}[Incremental revaluation]\label{def:pl:the-risk-grid:incremental}
+\emph{Incremental revaluation}\index{incremental revaluation} recomputes only the results whose inputs changed: each result is stored with the
+version of the trade and of the market data it was computed from, and a rerun reprices only the trades whose key is not in the store.
+\end{definition}
+
+Intraday, the scenarios and the base snapshot are the morning's, and most trades have not changed. With results keyed by (trade, trade
+version, market-data version), an intraday rerun after 1\,500 trades are amended or booked reprices those 1\,500 under the 1\,000 scenarios:
+1.5~million pricing calls instead of 105~million. A new market snapshot changes every key; for that the real-time system of chapter~18 carries
+sensitivities forward, and the grid waits for the night.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xbar,bar width=9pt,xmode=log,xmin=1e4,xmax=5e9,log origin=infty,
+  symbolic y coords={intraday incremental,intraday full,swap deltas adjoint,swap deltas bumped,nightly grid},ytick=data,
+  enlarge y limits=0.15,xlabel={pricing calls (log scale)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!20},nodes near coords,nodes near coords style={font=\scriptsize,anchor=west},point meta=explicit symbolic]
+\addplot[fill=omDef!45,draw=omDef] coordinates {(105105000,nightly grid)[105.1 million] (1020000,swap deltas bumped)[1.02 million]
+  (60000,swap deltas adjoint)[60\,000 valuations] (105000000,intraday full)[105 million] (1500000,intraday incremental)[1.5 million]};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Pricing calls of the nightly grid, of the swaps' pillar deltas by bumping and by the adjoint, and of an intraday rerun done in full
+and incrementally after 1\,500 trades changed.}\label{fig:pl:the-risk-grid:calls}
+\end{omfigure}
+
+\begin{example}[06:51 against 06:00]\label{ex:pl:the-risk-grid:batch}
+Planned by trade batches across all scenarios and trusting its estimates, the grid finishes at 06:51 on 32 cores and at 06:25 on 64: more
+cores shorten the queue, not the one long task. Cutting the scenarios into batches of 100 brings the naive plan to 05:41; isolating the slow
+trade by its measured cost brings every granularity from 20 to 1\,000 scenarios inside the window, the best at 05:34 (250 scenarios a task).
+Quarantining the failing trade instead of failing its tasks keeps more than a third of the book's results. The pricing calls saved elsewhere are larger
+still: the adjoint replaces 1.02~million bumped repricings of swaps by 60\,000 recorded valuations, and an incremental intraday rerun makes
+1.5~million calls where a full one makes 105~million.
+\end{example}
+
+\section{Tutorial: planning a nightly grid}\label{tut:pl:the-risk-grid:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Measure pricing costs, plan the grid at several granularities, repair it for a slow and a failing trade, and count the calls
+adjoints and incremental runs save. \textbf{End state:} \cref{fig:pl:the-risk-grid:granularity} and \cref{tab:pl:the-risk-grid:failures}.
+\begin{tutsteps}
+\item \textbf{Costs}: \texttt{bench\_riskgrid.py}: one pricing call per kind, bumped and adjoint swap deltas.
+\item \textbf{Plan and run}: \texttt{pl\_riskgrid.grid(scen\_batch, cost\_aware)}; \texttt{sweep()}.
+\item \textbf{Failures}: \texttt{failure\_policies()}.
+\item \textbf{Adjoints}: \texttt{firm\_riskgrid.swap\_pv\_adjoint} against the library's bumped sensitivities.
+\item \textbf{Intraday}: \texttt{intraday()}.
+\end{tutsteps}
+\textbf{What to change next.} Give the scheduler the measured costs of every trade and see how close to the lower bound the grid comes; add
+the sensitivities' repricings to the grid's work and find the new best granularity.
+\end{tutorial}
+
+\section{Build: the risk grid}\label{bld:pl:the-risk-grid:riskgrid}
+
+\begin{build}
+\bfield{Purpose} The nightly revaluation planned by cost, run to its window, robust to slow and failing trades, and cheaper by adjoints and
+incremental reruns.
+\bfield{Interface} \texttt{GridTrade}, \texttt{plan}, \texttt{run -> GridRun}, \texttt{swap\_pv\_adjoint}, \texttt{ResultCache},
+\texttt{cells}, \texttt{lower\_bound}, \texttt{hours}.
+\bfield{Rules} Plans use costs measured on the previous run where they exist; a trade's failure never fails its task; results carry their trade
+and market-data versions; adjoints are checked against bumps.
+\bfield{Acceptance tests} \texttt{code/firm/riskgrid/tests/}: batching and isolation of a heavy trade; the two failure policies and the lower
+bound; adjoint pillar deltas equal to the library's bumped sensitivities; the result cache's keys.
+\bfield{Stretch} Results written to chapter~11's \omterm{def:pl:backtest-engine-architecture:results}{results store}; the plan fed by a cost model learned from past runs; checkpointed adjoints
+through Monte Carlo paths (Book~4, chapter~28).
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~4, chapter~28 (adjoints); One Quant Book~5, chapter~28, and Book~6, chapter~29 (the library, the risk engine); chapter~13 of this book (scheduling).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:1}
+How many tasks does the plan make with 100 scenarios per task, and how much fixed cost do they add?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:2}
+Why does doubling the cores move the naive plan's finish from 06:51 only to 06:25?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:3}
+How many pricing calls do bumped pillar deltas of a swap need, and how many valuations does the adjoint need?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:4}
+Why does the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} rise again below 50 scenarios per task?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:5}
+Why does failing a task for one trade lose 38 million results?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:6}
+When does \omterm{def:pl:the-risk-grid:incremental}{incremental revaluation} save nothing, and what covers that case?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-risk-grid:7}
+\emph{Coding.} Run the sweep on 64 cores. Which granularities meet the window with each plan, and which is best?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-risk-grid:8}
+\emph{Find the flaw.} ``The batch was late, so we bought twice the machines.''
+\end{exercise}
+
+\section{Problem: 06:51 Against 06:00}
+
+\begin{problem}[{Weekend problem --- a grid that misses its window}]\label{pb:pl:the-risk-grid:1}
+The chapter's book, costs, cluster and plans.
+
+\medskip\noindent\textbf{Part I --- The grid.}
+\begin{enumerate}
+\item What is the grid's work, in trades, scenarios and pricing calls?
+\item Which trades dominate its cost, and why?
+\item What does a task cost besides its pricing?
+\item What is the window, and on how many cores?
+\item What is the lower bound on 32 cores?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Granularity.}
+\begin{enumerate}[resume]
+\item What is the \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} at 1\,000, 100 and 5 scenarios a task?
+\item Which granularities meet the window with the naive plan?
+\item What does the slow trade do to coarse tasks, and why does the scheduler not help?
+\item What does the cost-aware plan change?
+\item What is the best cost-aware finish?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Failures and savings.}
+\begin{enumerate}[resume]
+\item What happens to a failing trade per task and per trade?
+\item How many results and core-seconds does each policy lose?
+\item How fast are adjoint swap deltas against bumped ones, here?
+\item How many pricing calls does the adjoint save over the book's swaps?
+\item What does an incremental intraday rerun cost?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the batch's \omterm{def:pl:distributed-compute-and-schedulers:makespan}{makespan} as a function of \omterm{def:pl:the-risk-grid:fanout}{task granularity} and cluster size, the granularity that meets the
+window, and the pricing calls saved by adjoint sensitivities and by incremental intraday revaluation.
+\item What would you change first in the grid's planning?
+\item What would you monitor every night?
+\item When would you buy more machines?
+\item In one sentence: what decides when a nightly batch ends?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:the-risk-grid:1}
+Your nightly risk batch misses its window. What do you look at first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:the-risk-grid:2}
+How would you split a million trades by a thousand scenarios into tasks?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:the-risk-grid:3}
+Why use adjoint differentiation for risk, and where does it not help?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:the-risk-grid:4}
+One trade fails to price every night. What should the grid do with it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:the-risk-grid:5}
+Design the nightly and intraday revaluation infrastructure of a bank's trading book.
+\end{interviewq}

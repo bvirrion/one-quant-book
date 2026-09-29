@@ -1,0 +1,434 @@
+\chapter{Capturing and Storing Tick Data}\label{ch:pl:capturing-and-storing-tick-data}
+
+The consolidated US options feed is planned for hundreds of billions of messages on a busy day (the dated box of
+\cref{sec:pl:capturing-and-storing-tick-data:economics} gives the figure). A firm that keeps every one of those messages for
+five years is running a storage business on the side, and the first decision it makes is not which database to buy but what
+exactly to keep: the packets as they arrived, with their duplicates, their gaps and their arrival times, or the events they
+meant, cleaned, arbitrated and laid out for reading. This chapter captures ten busy minutes of Book~10's simulated exchange
+on both of its feed lines, turns them into the firm's event records, measures what each layout costs in bytes, and scales the
+result, with cited message counts and prices, to the question of the title of its weekend problem: a petabyte a year?
+
+\section{What tick data is, and where it is captured}
+
+\begin{definition}[Tick data]\label{def:pl:capturing-and-storing-tick-data:tick}
+\emph{Tick data}\index{tick data} is the record of every event a venue publishes about its instruments --- order additions,
+modifications, cancellations and executions, trades, quotes, status and trading-action messages --- with the timestamps the
+venue put on them and the time the firm received them.
+\end{definition}
+
+\omterm{def:pl:capturing-and-storing-tick-data:tick}{Tick data} is the finest record of a market a firm can keep, and everything coarser is derived from it: bars (One Quant Book~7,
+chapter~2), order-book features (chapter~8 of that book), the replays of its chapter~18. What is less obvious is that ``the''
+\omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data} of a day depends on where it was captured. \Cref{fig:pl:capturing-and-storing-tick-data:points} shows the three
+usual capture points on the path of Book~13's market-data handling.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,
+  box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center},
+  cpt/.style={draw,rounded corners=2pt,fill=omThm!12,minimum height=0.6cm,inner sep=3pt,align=center}]
+\node[box] (a) at (0,0.6) {line A};
+\node[box] (b) at (0,-0.6) {line B};
+\node[box] (fh) at (3.2,0) {feed handler\\arbitration, gaps};
+\node[box] (bk) at (6.5,0) {book builder,\\ strategy};
+\node[box] (st) at (10.0,0) {conflated view\\(screens, risk)};
+\draw[->] (a) -- (fh);
+\draw[->] (b) -- (fh);
+\draw[->] (fh) -- node[above]{events} (bk);
+\draw[->] (bk) -- node[above]{updates} (st);
+\node[cpt] (c1) at (1.4,-1.9) {1. at the wire:\\packets, both lines};
+\node[cpt] (c2) at (4.9,-1.9) {2. after arbitration:\\one event per message};
+\node[cpt] (c3) at (8.3,-1.9) {3. after conflation:\\what was acted on};
+\draw[->,dashed,omThm] (1.4,0) -- (c1);
+\draw[->,dashed,omThm] (4.9,0) -- (c2);
+\draw[->,dashed,omThm] (8.3,0) -- (c3);
+\end{tikzpicture}
+
+\omcaption{Three capture points on the market-data path. At the wire (a network tap or capture appliance, One Quant Book~14,
+chapter~5) the packets of both lines are kept as they arrived; after the feed handler's arbitration each message appears once,
+in sequence; after conflation only the updates a consumer actually saw remain.}\label{fig:pl:capturing-and-storing-tick-data:points}
+\end{omfigure}
+
+Each point answers different questions. Only the wire capture can say which line lost which packet and when each packet
+arrived, which is what a latency or network investigation needs. Only the capture after arbitration is the market as the firm's
+book saw it, one message at a time. Only the capture after conflation is what a slow consumer (One Quant Book~13, chapter~12)
+actually acted on. Research wants the second; operations and compliance sometimes need the first or the third.
+
+\begin{definition}[Raw capture]\label{def:pl:capturing-and-storing-tick-data:raw}
+A \emph{raw capture}\index{raw capture} is the sequence of bytes received at a capture point, kept without interpretation,
+each unit (a packet, a frame) with the time the firm received it.
+\end{definition}
+
+The chapter's capture is at the first point, in the recorded-file format of Book~10's simulator: for every packet received on a
+line, its receive time (8 bytes), its length (4 bytes) and the MoldUDP64 packet itself. Ten minutes of the simulator's busy open,
+two instruments, with its seeded impairments --- independent losses on each line, bursts of loss, duplicated packets, jitter and
+a five-second outage on line B --- give 15.8~MB on line A and 15.6~MB on line B.
+
+\section{Raw capture against normalised storage}
+
+To turn the capture into the market the book saw, the two lines are merged by sequence number: the first copy of each message
+wins, later copies are duplicates, and a gap is held open until the other line has had time to fill it. What neither line fills
+is a gap in the record; a live feed handler would ask the venue's retransmission service or rebuild from a snapshot (One Quant
+Book~13, chapter~18), and a capture that is written for research records it and moves on.
+\Cref{lst:pl:capturing-and-storing-tick-data:arb} is the arbitration of \texttt{firm.tickcap}.
+
+\omcode{code/firm/tickcap/firm_tickcap.py}{53}{87}{Line arbitration for storage: first copy wins, duplicates are counted, and a
+gap that neither line fills within the timeout is recorded and skipped.}\label{lst:pl:capturing-and-storing-tick-data:arb}
+
+On the ten-minute session the two lines carry 503\,024 packets. Arbitration delivers 258\,535 messages, discards 255\,899
+duplicates (nearly every packet arrives twice, once per line) and records four gaps, eight messages in all, lost on both lines at
+once. Each delivered message is then normalised into the firm's event record: the receive time followed by the 48-byte event of
+Book~13's feed handler (kind, side, instrument, sequence number, exchange time, order references, price, quantity), 56 bytes in
+all. The store and the trading path therefore share one layout, and a test checks that the capture's events are, message for
+message, the feed handler's.
+
+\begin{proposition}[Raw is sufficient, normalised is not]\label{prop:pl:capturing-and-storing-tick-data:sufficient}
+The normalised records of a session are a function of its \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} (and of the normaliser's code). The \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} is not a
+function of the normalised records.
+\end{proposition}
+
+\begin{proof}
+The first part is the construction: arbitration and normalisation are deterministic functions of the captured packets and their
+receive times. For the second, two captures that differ only in what normalisation discards --- which line delivered a message
+first, the duplicates, the packet boundaries, the receive time of a later copy, the bytes of a message type the normaliser does
+not know --- give the same records.
+\end{proof}
+
+The proposition is the whole argument for keeping \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw captures}. A normaliser has bugs, and a field that nobody needed when it was
+written (a flag, a new message type after a venue's upgrade) is needed a year later; with the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} both are fixed by
+running the corrected normaliser again, without it they are lost. The price is the bytes, which the rest of this chapter
+counts.
+
+\begin{example}[A field nobody kept]\label{ex:pl:capturing-and-storing-tick-data:field}
+The simulator's executed-with-price messages (type C) carry a printable flag that says whether the execution counts toward the
+day's volume, and its order additions carry the instrument's symbol and a tracking number. The normalised record has no field for
+any of them. A researcher who later wants volume that excludes non-printable executions can recompute
+it only from the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}; from the normalised store, the information is gone for every day already written.
+\end{example}
+
+\section{Record layouts and encodings}
+
+\Cref{fig:pl:capturing-and-storing-tick-data:layouts} counts bytes per message. The \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} costs 61.0 bytes a message on one
+line: the simulator sends one message per packet, so each message carries a 12-byte file record header, a 20-byte MoldUDP64
+header and a 2-byte length besides its own 23 to 44 bytes. Real feeds pack many messages into a packet and pay less framing;
+the share is a property of the feed, and it is one reason to measure on the feed one actually captures. The normalised record is
+56 bytes, fixed: it is barely smaller, but every record is at a known offset, which chapter~4 exploits.
+
+\begin{definition}[Compression ratio]\label{def:pl:capturing-and-storing-tick-data:ratio}
+The \emph{compression ratio}\index{compression ratio} of a layout is the size of the uncompressed data divided by the size of the
+compressed data, $\mathrm{CR} = b_{\mathrm{raw}} / b_{\mathrm{comp}}$; bytes per message after compression are
+$b_{\mathrm{raw}} / \mathrm{CR}$.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,xbar,bar width=9pt,xmin=0,xmax=72,
+  ytick={0,1,2,3,4,5},yticklabels from table={figdata/platforms/02-capturing-and-storing-tick-data/layouts.csv}{layout},
+  xlabel={bytes per message},tick label style={font=\small},label style={font=\small},y dir=reverse,
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=1},
+  grid=major,grid style={gray!20},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=bytes_per_msg,y=k]{figdata/platforms/02-capturing-and-storing-tick-data/layouts.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bytes per message of the ten-minute session by layout: the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} of one line, the normalised 56-byte records,
+and each compressed by a generic compressor (zlib at level 6), in a columnar file with zstd (chapter~3), and as columns with the
+time, sequence and price columns delta-encoded before zlib. Data: \texttt{pl\_tickcap.study}.}\label{fig:pl:capturing-and-storing-tick-data:layouts}
+\end{omfigure}
+
+A generic compressor on the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} gets a ratio of 3.32; on the normalised records, 3.67. The columnar layouts do better,
+and the best of the chapter is the simplest columnar trick: write each field as its own column, and write the columns whose
+values increase slowly (receive time, sequence number, exchange time) or move by small steps (price) as differences from the
+previous value, before a generic compressor. The deltas of the sequence number are all 1, those of the receive time are small
+integers, and the ratio rises to 4.70, 11.9 bytes a message. Chapter~3 explains why columns compress better than rows; this
+chapter only counts.
+
+\omcode{code/firm/tickcap/firm_tickcap.py}{121}{131}{Delta encoding by column: each field written as a column, the slowly
+changing ones as differences from the previous row.}\label{lst:pl:capturing-and-storing-tick-data:delta}
+
+\begin{remark}[The message mix]\label{rem:pl:capturing-and-storing-tick-data:mix}
+Of the session's 258\,535 messages, 49.3\% are order additions and 47.3\% deletions; executions are 3.4\%. That is the shape of
+a quoted market, and it is why a trades-only store is a hundred times smaller than a full-depth one and answers none of the
+questions of One Quant Book~7's chapters~8 and~18.
+\end{remark}
+
+\section{Partitioning and compression}
+
+\begin{definition}[Partitioning, partition key]\label{def:pl:capturing-and-storing-tick-data:partition}
+\emph{Partitioning}\index{partitioning} splits a dataset into separately stored parts by the value of one or more fields, its
+\emph{partition key}\index{partition key} (the trading date, the instrument), so that a query that names key values reads only
+the parts that carry them.
+\end{definition}
+
+\begin{proposition}[Pruning]\label{prop:pl:capturing-and-storing-tick-data:pruning}
+A query whose filter fixes the \omterm{def:pl:capturing-and-storing-tick-data:partition}{partition key} to a set $S$ of values reads $\sum_{v\in S} B_v$ bytes, where $B_v$ is the size of
+the partition of value $v$, instead of the whole dataset; with per-file overhead $o$ it also pays $|S|\,o$.
+\end{proposition}
+
+\begin{proof}
+Partitions outside $S$ cannot contain a matching row, so they need not be opened; each opened partition costs its size and its
+overhead.
+\end{proof}
+
+The chapter's session is written under \texttt{date=2026-09-28/locate=N/}. Its two instruments are very unequal: instrument~1
+takes 811\,160 bytes of the 14\,477\,960, 5.6\% of the day, so a query about it reads 5.6\% of what the unpartitioned file would
+cost. The overhead term is the limit. Partition a US options day by option series and a query for one underlying opens
+thousands of small files, each costing a directory lookup and an open; partition by underlying and each file is large and the
+query opens few. The rule of thumb that follows --- choose the \omterm{def:pl:capturing-and-storing-tick-data:partition}{partition key} from the filters queries actually use, and keep
+partitions large enough that their overhead is negligible --- is the subject of chapter~4's tick store.
+
+Compression has its own trade-off, between ratio and speed (\cref{fig:pl:capturing-and-storing-tick-data:speed}). On this laptop
+zlib at level 9 gains about 2\% of ratio over level 6 at a twelfth of its speed, and zstd at level 9 inside a columnar file is
+both faster and better than zlib at level 6 on the same records. Capture writes once and in real time, so it wants speed; the historical store writes once
+at night and is read thousands of times, so it wants ratio.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6.8cm,xmode=log,xlabel={compression throughput (MB/s, log scale)},ylabel={compression ratio},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},xmin=1.5,xmax=1000,ymin=2.7,ymax=5.0,
+  nodes near coords,point meta=explicit symbolic,visualization depends on={value \thisrow{anchor}\as\myanchor},
+  nodes near coords style={font=\scriptsize,anchor=\myanchor},table/col sep=comma]
+\addplot[only marks,mark=*,omDef] table[x=mb_per_s,y=ratio,meta=method]{figdata/platforms/02-capturing-and-storing-tick-data/measured_compress.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:capturing-and-storing-tick-data:ratio}{Compression ratio} against throughput for the session's \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} (``raw'') and normalised records, by method and
+level, best of five runs on one core. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, machine otherwise idle. Data:
+\texttt{bench\_compress.py}.}\label{fig:pl:capturing-and-storing-tick-data:speed}
+\end{omfigure}
+
+\begin{method}[Choosing a layout for a capture]\label{met:pl:capturing-and-storing-tick-data:choose}
+Keep the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} of the lines the firm trades on, compressed fast, for as long as investigations need it. Normalise into
+fixed-width records in the order of arrival for the intraday store. At the end of the day, rewrite into columns, partitioned by
+date and by the key queries filter on, compressed for ratio. Measure bytes per message and the compressor's speed on the
+firm's own feeds, not on a benchmark's.
+\end{method}
+
+\section{Retention, tiers and the economics of petabytes}\label{sec:pl:capturing-and-storing-tick-data:economics}
+
+\begin{definition}[Storage tier, retention policy]\label{def:pl:capturing-and-storing-tick-data:tier}
+A \emph{storage tier}\index{storage tier} is a class of storage with its own price, access time and access charge (hot storage
+read in milliseconds, infrequent-access storage, archive storage restored in hours). A \emph{retention policy}\index{retention policy}
+states how long each dataset is kept, in which tier at each age, and when it is deleted.
+\end{definition}
+
+\begin{dated}{2026-09}{A full feed's message count and storage prices}\label{dat:pl:capturing-and-storing-tick-data:numbers}
+The operator of the US consolidated options feed projects, in a notice to subscribers of 15 September 2025 (consulted September
+2026), capacity for 311 billion messages a day from July 2026, with peaks of 13.6 million messages per 100 milliseconds, for one
+of the two redundant streams. A major cloud provider's list prices for object storage in its US East region (consulted September
+2026) are USD 0.023 per GB-month for standard storage, 0.0125 for infrequent access and 0.00099 for its deepest archive tier.
+\end{dated}
+
+\begin{dated}{2026-09}{How long order records are kept}\label{dat:pl:capturing-and-storing-tick-data:retention}
+In the European Union (consulted September 2026), investment firms engaged in algorithmic trading keep the records of their
+orders for five years from the submission of each order (Commission Delegated Regulation (EU) 2017/589, article 28). Market data
+is not an order record, but the data a firm needs to explain an order is kept at least as long.
+\end{dated}
+
+The storage model of \texttt{firm.tickcap} multiplies it out: bytes a day are messages times bytes per message times the number
+of copies; a year is 252 trading days; the steady-state cost of keeping five years is the last month (21 trading days) in hot
+storage, the rest of the first year in infrequent access and the four older years in the archive.
+\Cref{tab:pl:capturing-and-storing-tick-data:economics} applies it to the options feed's planned capacity with the session's
+bytes per message.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+layout & TB a day & PB a year & PB in 5 years & USD a year, tiered \\
+\midrule
+\omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}, both lines & 37.95 & 9.56 & 47.8 & 1\,989\,000 \\
+\omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}, one line & 18.97 & 4.78 & 23.9 & 995\,000 \\
+normalised & 17.42 & 4.39 & 21.9 & 913\,000 \\
+delta columns, zlib 6 & 3.70 & 0.93 & 4.67 & 194\,000 \\
+\bottomrule
+\end{tabular}
+\caption{Full capture of the options feed at its planned daily capacity (dated box), with the simulated session's bytes per
+message: storage a day, a year and after five years, and the yearly cost of keeping five years in three tiers at the dated
+prices. Data: \texttt{pl\_tickcap.economics}.}\label{tab:pl:capturing-and-storing-tick-data:economics}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={years kept},ylabel={petabytes stored},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!20},xmin=0,xmax=5,ymin=0,ymax=50,xtick={0,1,2,3,4,5},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.28)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[thick,omThm] table[x=years,y=s0]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omThm,dashed] table[x=years,y=s1]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omDef] table[x=years,y=s2]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omMeth] table[x=years,y=s3]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\legend{raw; both lines,raw; one line,normalised,delta columns + zlib}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Petabytes accumulated by full capture of the options feed at its planned capacity, by layout: five years of \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw
+capture} of both lines reach 48~PB, five years of compressed columns 4.7~PB. Data: \texttt{pl\_tickcap.economics} (message count
+and prices in the dated box).}\label{fig:pl:capturing-and-storing-tick-data:stored}
+\end{omfigure}
+
+Two cautions keep the table honest. The message count is a capacity the feed's operator plans for, a ceiling rather than an
+average day, so the table is an upper bound. And the bytes per message are the simulator's: real options messages have other
+sizes and other redundancy, and a real ratio can be higher or lower. The method transfers; the digits must be re-measured on the
+feed itself. What does transfer is the shape: the cheapest petabyte is the one not written twice (both lines), not written in
+its heaviest layout, and not kept in the hot tier after the month in which anyone reads it.
+
+\section{Tutorial: ten minutes on two lines}\label{tut:pl:capturing-and-storing-tick-data:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Capture a busy simulated session on both lines, arbitrate and normalise it, measure every layout, and scale the
+result to a full feed. \textbf{End state:} \cref{fig:pl:capturing-and-storing-tick-data:layouts,fig:pl:capturing-and-storing-tick-data:stored}
+and \cref{tab:pl:capturing-and-storing-tick-data:economics}.
+\begin{tutsteps}
+\item \textbf{Generate.} \texttt{pl\_tickcap.day()} runs Book~10's \texttt{make\_recorded\_day} for ten minutes and two
+instruments into \texttt{data/platforms/generated/} (about 43~MB, git-ignored, regenerated by the script).
+\item \textbf{Arbitrate and normalise} (\cref{lst:pl:capturing-and-storing-tick-data:arb}): 258\,535 messages, 255\,899
+duplicates, four gaps of eight messages.
+\item \textbf{Measure} with \texttt{study()}: bytes per message and \omterm{def:pl:capturing-and-storing-tick-data:ratio}{compression ratio} of each layout.
+\item \textbf{Partition} with \texttt{firm\_tickcap.partition} and compare the bytes a one-instrument query reads.
+\item \textbf{Scale} with \texttt{economics()} and the cited inputs.
+\end{tutsteps}
+\textbf{What to change next.} Sort the records by instrument before the delta encoding and predict, then measure, the change in
+ratio; run \texttt{bench\_compress.py} with zstd at more levels and find the level at which the capture would keep up with the
+feed's peak rate.
+\end{tutorial}
+
+\section{Build: the tick capture}\label{bld:pl:capturing-and-storing-tick-data:tickcap}
+
+\begin{build}
+\bfield{Purpose} The first stage of the firm's data spine: \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw captures} of each line, arbitrated normalised records, a
+partitioned layout, and the numbers that size the storage. Chapter~4's tick store reads its records; chapter~7's quality checks
+read its gaps and counters.
+\bfield{Interface} \texttt{RECORD} (56 bytes: receive time and Book~13's feed event); \texttt{read\_capture(data)};
+\texttt{arbitrate(lines, timeout\_ns) -> (messages, gaps, counters)}; \texttt{normalise(messages)};
+\texttt{partition(rec, root, date)}, \texttt{read\_partition}; \texttt{delta\_encode}, \texttt{compressed\_size(data, method,
+level)}; \texttt{StorageModel(msgs\_per\_day, bytes\_per\_msg, ratio, days\_per\_year, copies)} with \texttt{bytes\_per\_day},
+\texttt{bytes\_per\_year}, \texttt{stored\_after}, \texttt{cost\_per\_year}.
+\bfield{Rules} \omterm{def:pl:capturing-and-storing-tick-data:raw}{Raw capture} is never modified; arbitration is deterministic (first copy by receive time, then by line); every gap
+is recorded with its sequence range; the normalised record is Book~13's event plus the receive time, byte for byte.
+\bfield{Acceptance tests} \texttt{code/firm/tickcap/tests/}: the record layout; a capture round trip; arbitration with a loss on
+one line, duplicates and a gap on both; the same events as Book~13's feed handler on a recorded session up to the first gap;
+partitions written and read back; every compression method smaller than the input and the delta encoding invertible; the
+storage model by hand.
+\bfield{Stretch} Retransmission and snapshot recovery during capture (reuse \texttt{firm.feedhandler}); a capture that writes
+compressed blocks with an index; the model with a message count that grows each year.
+\end{build}
+
+\begin{omsources}
+\item Options Price Reporting Authority, \emph{Revised OPRA Capacity Projections}, notice to multicast data subscribers,
+15 September 2025.
+\item Y.~Collet and M.~Kucherawy (ed.), \emph{Zstandard Compression and the application/zstd Media Type}, RFC~8878, 2021;
+P.~Deutsch and J.-L.~Gailly, \emph{ZLIB Compressed Data Format Specification}, RFC~1950, 1996.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS~6), article~28.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:1}
+Line A's capture is 15\,773\,858 bytes for 258\,535 messages, one message per packet. How many bytes per message is that, and
+what share of it is framing (the 12-byte file record header, the 20-byte packet header and the 2-byte length)?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:2}
+The normalised records compress with zlib at level 6 to 15.24 bytes a message. What is the \omterm{def:pl:capturing-and-storing-tick-data:ratio}{compression ratio}?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:3}
+Instrument 1's partition holds 811\,160 bytes of the day's 14\,477\,960. How many records is that, and what share of the day
+does a query for instrument~1 read with and without \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitioning} by instrument?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:4}
+Keeping both lines' \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw captures} doubles their cost. Give one question only the two \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw captures} can answer, and one the
+arbitrated records answer equally well.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:5}
+At 311 billion messages a day and 11.9 bytes a message, how many terabytes a day and petabytes a year (252 days) does the
+compressed columnar layout take?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:6}
+With the dated prices, what does keeping five years of the compressed layout cost per year if everything stays in standard
+storage, compared with the tiered policy of \cref{tab:pl:capturing-and-storing-tick-data:economics}?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:capturing-and-storing-tick-data:7}
+\emph{Coding.} Sort the session's records by instrument and then sequence number before delta encoding. Predict the change in
+\omterm{def:pl:capturing-and-storing-tick-data:ratio}{compression ratio}, then measure it with \texttt{compressed\_size}, and explain the result.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:capturing-and-storing-tick-data:8}
+\emph{Find the flaw.} ``Our capture compresses every packet with zlib at level 9 before writing it, because that gives the best
+ratio on our benchmark.''
+\end{exercise}
+
+\section{Problem: A Petabyte a Year?}
+
+\begin{problem}[{Weekend problem --- sizing the capture of a full feed}]\label{pb:pl:capturing-and-storing-tick-data:1}
+The chapter's ten-minute session, its layouts, and the options feed's planned capacity and the storage prices of the dated
+boxes.
+
+\medskip\noindent\textbf{Part I --- The capture.}
+\begin{enumerate}
+\item How many packets do the two lines carry, and how many messages does arbitration deliver?
+\item How many duplicates are discarded, and why is the number close to half the packets?
+\item How many messages were lost on both lines, and what would a live feed handler have done about them?
+\item Why can the normalised records not be turned back into the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}?
+\item Name one field of the simulator's messages that the normalised record drops.
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Layouts.}
+\begin{enumerate}[resume]
+\item Give bytes per message for the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}, the normalised records, and the delta-encoded columns with zlib.
+\item What are the \omterm{def:pl:capturing-and-storing-tick-data:ratio}{compression ratios} of the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} with zlib and of the delta-encoded columns?
+\item Why does delta encoding help the sequence number most?
+\item Which layout would you keep for how long?
+\item Why must the bytes per message be re-measured on the real feed?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Scale.}
+\begin{enumerate}[resume]
+\item At the planned capacity, how many terabytes a day does \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture} of both lines take?
+\item How many petabytes does it accumulate in five years?
+\item Same questions for the delta-encoded columns.
+\item What is the yearly cost of keeping five years of each in the three tiers?
+\item Why is the capacity figure an upper bound for a typical day?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the petabytes a year and the yearly cost of full capture in the heaviest and the lightest
+layout.
+\item Does the answer to the title's question depend more on the layout or on the tiering?
+\item What does \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitioning} by instrument save a query for one instrument on the session, and what does it cost when there
+are millions of series?
+\item Where in the pipeline should the fast compressor run, and where the slow one?
+\item In one sentence: what should a firm keep of its \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data}, and in which form?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:capturing-and-storing-tick-data:1}
+What is the difference between raw and normalised \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data}, and why would a firm keep both?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:capturing-and-storing-tick-data:2}
+Two redundant feed lines are captured. How do you turn them into one stream of messages, and what do you do with a gap?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:capturing-and-storing-tick-data:3}
+How would you estimate the storage needed to keep five years of a full-depth feed, and what would you measure first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:capturing-and-storing-tick-data:4}
+How do you choose a \omterm{def:pl:capturing-and-storing-tick-data:partition}{partition key} for \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data}, and what goes wrong if you choose one that is too fine?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:capturing-and-storing-tick-data:5}
+Why does market data compress well, and which fields compress best?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:capturing-and-storing-tick-data:6}
+Design the tick-data storage of a firm trading US options: what is captured where, in which layout, kept how long, in which
+tier, and at what cost order of magnitude?
+\end{interviewq}

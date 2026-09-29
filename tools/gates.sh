@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 # slug -> book number; the entry file is found from the number.
 declare -A BOOKNO=([markets-1]=1 [markets-2]=2 [markets-3]=3 [methods]=4 [derivatives]=5
   [rates-credit-risk]=6 [research]=7 [strategies-1]=8 [strategies-2]=9 [microstructure]=10
-  [hft]=11 [ml]=12 [low-latency]=13 [networks]=14 [platforms]=15 [firm]=16 [industry]=17 [interviews]=18)
+  [hft]=11 [ml]=12 [low-latency]=13 [networks]=14 [platforms]=15 [desk]=16 [industry]=17 [interviews]=18)
 entry(){ local f; for f in one_quant_book_"$(printf %02d "${BOOKNO[$1]}")"_*.tex; do echo "${f%.tex}"; return; done; }
 fail=0
 bad(){ echo "  FAIL: $*"; fail=1; }
@@ -52,6 +52,18 @@ chapter(){ local ch="$1" C="parts/$1.tex" S="parts/${1%/*}/solutions/${1##*/}.te
   grep -n 'begin{lstlisting}' "$C" "$S" && bad "inline lstlisting"
   grep -n 'end{[a-z]*>' "$C" "$S" && bad "\\end{...> typo"
   grep -n 'omterm' "$C" "$S" >/dev/null; true
+  if [ "${ch%%/*}" = interviews ]; then
+    # Book 18 anatomy (user ruling 2026-09-28): a short lesson and one bank of ~12-15
+    # interview questions; no exercises, weekend problem, tutorial or build.
+    e=$(grep -c 'begin{exercise}' "$C"); [ "$e" = 0 ] || bad "$e exercises (Book 18 has none)"
+    p=$(grep -c 'begin{problem}' "$C"); [ "$p" = 0 ] || bad "$p weekend problems (Book 18 has none)"
+    i=$(grep -c 'begin{interviewq}' "$C"); { [ "$i" -ge 6 ] && [ "$i" -le 18 ]; } || bad "$i interview questions (want 6-18, ~12-15)"
+    # the tags sit in the optional argument, which may wrap over several lines
+    r=$(perl -0777 -ne '$n=0; while(/\\begin\{interviewq\}\[((?:[^\[\]]|\[[^\]]*\])*)\]/g){$n++ if $1=~/\\iqroles\{/} print $n' "$C"); [ "$r" = "$i" ] || bad "$((i-r)) interview questions without \\iqroles"
+    f=$(perl -0777 -ne '$n=0; while(/\\begin\{interviewq\}\[((?:[^\[\]]|\[[^\]]*\])*)\]/g){$n++ if $1=~/\\iqfirm\{/} print $n' "$C"); [ "$f" = "$i" ] || bad "$((i-f)) interview questions without \\iqfirm"
+    l=$(grep -c 'iqlookfor{' "$S"); [ "$l" = "$i" ] || bad "$l of $i solutions say what the interviewer is looking for"
+    grep -q 'begin{omsources}' "$C" || bad "no omsources"
+  else
   e=$(grep -c 'begin{exercise}' "$C"); [ "$e" = 8 ] || bad "$e exercises (want 8)"
   s1=$(grep -c 'begin{exercise}\[\$\\star\$\]' "$C"); s2=$(grep -c 'begin{exercise}\[\$\\star\\star\$\]' "$C"); s3=$(grep -c 'begin{exercise}\[\$\\star\\star\\star\$\]' "$C")
   [ "$s1/$s2/$s3" = "3/3/2" ] || bad "star ramp $s1/$s2/$s3 (want 3/3/2)"
@@ -60,6 +72,7 @@ chapter(){ local ch="$1" C="parts/$1.tex" S="parts/${1%/*}/solutions/${1##*/}.te
   grep -q 'begin{omsources}' "$C" || bad "no omsources"
   grep -q 'label{tut:' "$C" || bad "no tutorial"
   grep -q 'label{bld:' "$C" || bad "no build"
+  fi
   t="code/$ch/tests/test_solutions.py"; [ -f "$t" ] || bad "no $t"
   sources "$ch"; firms "$ch"
   echo "  lines: body $(wc -l < "$C"), solutions $(wc -l < "$S"); figures $(grep -c 'begin{omfigure}' "$C"); listings $(grep -c 'omcode{' "$C"); dated $(grep -c 'begin{dated}' "$C")"

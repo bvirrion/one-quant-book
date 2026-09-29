@@ -530,3 +530,28 @@ baselines; Book 10 `agentmkt` stylised-fact checks callable on any message strea
 Book 13 `wirecodec` generated from `exchsim/schema.json`. When two batch books are written at the same
 time, a consumer that reaches its chapter first writes against this contract and a thin adapter, and the
 main session wires them together at the reconciliation.
+
+## 9. Books 14–16 components (reserved 2026-09-28 at the sync, all new and unique; all **landed** 2026-09-28/29)
+
+- **Book 14** (`networks`): netsim cagenet nicring clocksync wirecap wirepath hdlkit hwtrade serverspec colobill geomap venuesites dissem fibreroute radiolink slamodel cloudplan venuefind privlink routerace cryptofeed chainnet portplan gwmodel fxlinks rfqlink powerlink vendormap drplan connplan
+- **Book 15** (`platforms`): platmap tickcap colfile tickstore tsbench refdata dataqual pyscale natext marketdf btengine strathost jobgraph roofline envaudit paramstore posservice rtrisk payoffdsl riskgrid tradecap posttrade entitle eventlog tradedb cloudcost goldtest observe accessctl survpipe
+- **Book 16** (`desk`): firmecon partnership podshop fundterms bankdesk deskplan limitalloc ddrules projsel bonuspool gardenleave escalation opsmetrics treasury signoff compliance regmap docterms techtier buildbuy teamtopo databudget dealterms entryplan fundlaunch decisionlog crisisdrill casebook moats
+
+Rules: existing components are wrapped or extended by a new component, never edited (report defects).
+`wirepath` extends Book 13's `ticktotrade` read-only (and reads `figdata/low-latency/26-*/measured_stages.csv`);
+`hwtrade` adds a hardware variant to `wirepath`. `btengine` wraps Book 7's levels 1–3 unchanged and adds the
+reactive simulation on `exchsim`, which Book 15 presents as Book 7's fidelity level 4 with the simulator
+standing in for the venue (as Book 7 ch. 19 did with `firm_tape`). `payoffdsl` registers through
+`firm_pricing.register`; `riskgrid` runs on `firm_pricing` + `firm_riskengine` (+ `firm_aad` for checks).
+`firm.recon` is Book 1's index-reconstitution predictor: position and cash reconciliation is new in
+`posttrade`. Cross-book contract inside the batch: Book 16 `techtier` reads Book 14 `connplan`'s budget
+output (a dated cost table); until it lands, `techtier` takes tier costs as inputs from cited figures and
+the main session wires the two at the reconciliation.
+
+## 10. Books 17–18 components (reserved 2026-09-29 at the sync, all new and unique; all **landed** 2026-09-29)
+
+- **Book 17** (`industry`): industrymap profiles lineage formadv teamtenure firmsize bankmix ownercost payband tokencomp filings industrypnl payoffer paydata aftertax roles workload locations careerpath edupipe careerdec
+- **Book 18** (`interviews`): none (answer checkers under `code/interviews/`).
+
+Book 17 wraps Book 16's `firmecon`, `podshop`, `ddrules`, `partnership`, `gardenleave`, `moats`, Book 8's
+`multistrat` and others read-only, and never edits them.

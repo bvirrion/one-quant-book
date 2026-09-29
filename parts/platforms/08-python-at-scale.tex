@@ -1,0 +1,356 @@
+\chapter{Python at Scale}\label{ch:pl:python-at-scale}
+
+A researcher's first version of a signal walks the day's events one at a time: for each record, read its side and quantity,
+update an exponentially weighted average, store it. On the laptop it costs 960 nanoseconds an event, three minutes for a day of
+two hundred million messages. The same computation written as one array expression costs 14 nanoseconds an event, and streamed
+through the file in chunks of ten thousand events it never holds more than a third of a megabyte, whatever the length of the
+history. Nothing about the mathematics changed. What changed is how much work the interpreter does per number, how many bytes
+each representation of the data costs, and what is in memory at once. This chapter measures those three costs on tick-store
+data and turns the lessons into the chunked-pipeline tool of the research platform (\texttt{firm.pyscale}).
+
+\section{What the interpreter costs}
+
+Python is the research platform's language because it is quick to write and has the libraries; the price is that every
+operation written in Python is executed by an interpreter that manipulates objects.
+
+\begin{definition}[Interpreter overhead]\label{def:pl:python-at-scale:overhead}
+The \emph{interpreter overhead}\index{interpreter overhead} of an operation is the work the Python interpreter does around the
+arithmetic itself: decoding the bytecode, looking up names and attributes, checking types, creating and destroying the objects
+that hold intermediate values, and counting references. For a scalar operation it is tens to hundreds of times the cost of the
+arithmetic.
+\end{definition}
+
+\Cref{lst:pl:python-at-scale:loops} is the first version of the signal, twice. The first loop reads the memory-mapped records of
+the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} one at a time; every access to a field of \texttt{rec[i]} creates a record object and then a scalar object. The second converts
+the two columns to Python lists once and then loops over plain integers.
+
+\omcode{code/platforms/08-python-at-scale/python/pl_pyscale.py}{53}{73}{The signal as a Python loop: over the mapped records, and
+over lists made once from the columns.}\label{lst:pl:python-at-scale:loops}
+
+\Cref{fig:pl:python-at-scale:methods} measures them: 960 nanoseconds an event over the records, 145 over lists. The difference is
+the cost of building the objects that the record access creates; what remains, 150 nanoseconds for about ten bytecode operations,
+is the interpreter itself. Neither is a bug; both are the price of the language.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xbar,bar width=9pt,xmode=log,log origin=infty,xmin=5,xmax=3000,
+  xlabel={nanoseconds per event (log scale)},y dir=reverse,
+  ytick={0,1,2,3},yticklabels from table={figdata/platforms/08-python-at-scale/measured_methods.csv}{method},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},point meta=explicit,
+  nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=ns_per_event,y expr=\coordindex,meta=ns_per_event]{figdata/platforms/08-python-at-scale/measured_methods.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The cost per event of one signal (the exponentially weighted average of signed volume) computed four ways on
+tick-store records: a Python loop over the mapped records, a Python loop over lists, one array expression, and the same
+expression streamed in chunks of 65\,536 events. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, machine
+otherwise idle. Data: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:methods}
+\end{omfigure}
+
+\section{Thinking in arrays}
+
+\begin{definition}[Array programming]\label{def:pl:python-at-scale:array}
+\emph{Array programming}\index{array programming} expresses a computation as operations on whole arrays --- elementwise
+arithmetic, reductions, cumulative sums, filters, sorts --- so that the interpreter is entered once per operation and the loop
+over elements runs in compiled code over contiguous memory.
+\end{definition}
+
+The only hard part is recursion. An exponentially weighted average $y_t = (1-\alpha)\,y_{t-1} + \alpha\,x_t$ looks inherently
+sequential, but it is a linear filter: its output is the input convolved with $\alpha(1-\alpha)^k$, and a filter routine computes
+it in compiled code in one call (\cref{lst:pl:python-at-scale:ewma}). On the laptop that is 14 nanoseconds an event, 70 times
+faster than the loop over records and 11 times faster than the loop over lists, and the answers are identical to the last bit:
+the filter performs the same multiplications and additions in the same order.
+
+\omcode{code/firm/pyscale/firm_pyscale.py}{39}{50}{The recursive average as a linear filter; the filter's internal state for the
+first element comes from the last output of the previous chunk.}\label{lst:pl:python-at-scale:ewma}
+
+\begin{method}[From a loop to arrays]\label{met:pl:python-at-scale:arrays}
+Look for the pattern in the loop: an elementwise map (arithmetic, \texttt{where}); a running total (\texttt{cumsum}); a window
+(differences of cumulative sums, or a sliding view); a linear recursion (a filter); a group-by (sort, then reduce by segments);
+an as-of lookup (\texttt{searchsorted}, chapter~4). What does not fit --- a book that changes with every event, a state machine
+with many branches --- is a case for compiled code (chapter~9), not for a slower loop.
+\end{method}
+
+A compiler that turns the Python loop into machine code at run time is the other route, the just-in-time compilation of One Quant
+Book~13 (chapter~10); the series' environment does not install one, and chapter~9 takes the explicit route of writing the kernel in
+C++ or Rust.
+
+\section{Memory: objects, arrays and copies}
+
+The second cost is space. A Python object carries a header (a type pointer and a reference count) before its value, and a list of
+them is an array of pointers to objects scattered in memory. An array of machine numbers is the numbers.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=4.8cm,xbar,bar width=9pt,xmin=0,xmax=72,xlabel={megabytes for one million symbols},y dir=reverse,
+  ytick={0,1,2,3},yticklabels from table={figdata/platforms/08-python-at-scale/memory.csv}{representation},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omMeth!45,draw=omMeth] table[x=mb,y=k]{figdata/platforms/08-python-at-scale/memory.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The same column of one million symbols (fifty distinct four-character tickers) in four representations: pandas objects
+(a Python string per row), a pandas categorical (integer codes and fifty strings), an Arrow string column (offsets and bytes), and
+a numpy fixed-width unicode array. Data: \texttt{fig\_pyscale.py}.}\label{fig:pl:python-at-scale:memory}
+\end{omfigure}
+
+\Cref{fig:pl:python-at-scale:memory} measures one column of symbols. As Python objects it takes 61~MB, a string object per row of
+which a few bytes are the characters; as a categorical, 1.0~MB, a small integer per row and fifty strings once; as Arrow strings,
+8~MB, an offset and four bytes per row; as a numpy fixed-width unicode array, 16~MB, four characters of four bytes each. The
+categorical is 61 times smaller than the objects: the \omterm{def:pl:columnar-formats:encodings}{dictionary encoding} of chapter~3, in memory. Every column of a research
+dataframe that holds repeated strings --- symbols, venues, conditions, sides --- is worth the conversion.
+
+\begin{remark}[Copies]\label{rem:pl:python-at-scale:copies}
+\omterm{def:pl:python-at-scale:array}{Array programming} has its own trap: every intermediate expression allocates a new array. \texttt{np.where(side == B, 1.0, -1.0) *
+qty} on a day of two hundred million events allocates a boolean array, two float arrays and a product, several gigabytes of
+temporaries for a result of 1.6~GB. The remedies are to compute in place where the library allows it, to choose narrow types, and,
+above all, not to hold the whole day at once.
+\end{remark}
+
+\section{Chunks and out-of-core loops}
+
+\begin{definition}[Chunked processing, peak resident memory]\label{def:pl:python-at-scale:chunked}
+\emph{Chunked processing}\index{chunked processing} runs a computation over a dataset one slice at a time, carrying between slices
+only the state the computation needs to continue exactly (a filter's last value, a window's tail), so that the memory it uses is
+set by the chunk size and not by the size of the data. The \emph{peak resident memory}\index{peak resident memory} of a process is
+the largest amount of physical memory it occupied at any moment; it, not the average, decides whether a job fits a machine.
+\end{definition}
+
+The \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s flat files are memory-mapped (chapter~4), so a slice of the file is a view: nothing is read until it is touched,
+and nothing needs to be released. \Cref{lst:pl:python-at-scale:stream} streams the signal through the file and keeps only its
+running maximum; the filter's state carries across chunk boundaries, so the result equals the whole-array result.
+
+\omcode{code/platforms/08-python-at-scale/python/pl_pyscale.py}{152}{159}{The signal streamed through the mapped file: one chunk's
+temporaries and the filter's state are all that is ever in memory.}\label{lst:pl:python-at-scale:stream}
+
+\begin{proposition}[Chunked equals whole]\label{prop:pl:python-at-scale:exact}
+If a computation over a sequence can be written as $y_t = f(y_{t-1}, x_t)$, or as a function of a window of the last $w$ inputs, then
+processing the sequence in chunks, with the last output (or the last $w-1$ inputs) of each chunk passed to the next, gives the same
+outputs as processing it whole.
+\end{proposition}
+
+\begin{proof}
+By induction over chunks: the first output of a chunk is $f$ applied to the carried state and its first input, which is what the
+whole computation applies at that position; within a chunk the recursion is the same.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ymode=log,xlabel={chunk size, events},ylabel={peak memory, MB (log scale)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},xmin=-0.8,xmax=4.4,ymin=0.01,ymax=300,
+  xtick={0,1,2,3,4},xticklabels={1\,000,10\,000,100\,000,1\,000\,000,whole},ytick={0.01,0.1,1,10,100},
+  yticklabels={0.01,0.1,1,10,100},
+  nodes near coords,point meta=explicit,nodes near coords style={font=\footnotesize,anchor=south east,
+  /pgf/number format/fixed,/pgf/number format/precision=3},table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x expr=\coordindex,y=peak_mb,meta=seconds]{figdata/platforms/08-python-at-scale/measured_chunks.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Peak memory of the streamed signal on a history of two million events against the chunk size, each point labelled with
+its time in seconds; the last point computes the whole array at once. Memory grows with the chunk; time is lowest for chunks of
+a hundred thousand events and within ten per cent of it from ten thousand to the whole array, once the per-chunk overhead is
+amortised. Measured on a laptop
+(Intel Core Ultra 7 155H) under WSL2, one thread, machine otherwise idle; memory counted by tracemalloc, the mapped input not
+included. Data: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:chunks}
+\end{omfigure}
+
+\Cref{fig:pl:python-at-scale:chunks} is the trade-off. Chunks of a thousand events pay the interpreter once per thousand and take
+0.048~s for the two million events; chunks of ten thousand take 0.025~s with a peak of 0.31~MB, and chunks of a hundred thousand,
+the fastest here, 0.023~s with 2.5~MB; the whole array at once takes 0.028~s with a peak of 32~MB, 16 bytes an event. At 16 bytes an event, the series' rule of at most 1.5~GB a process allows about
+94 million events at once, a small fraction of a day of a large feed; streamed, the only limit is time.
+
+\section{Processes, threads and the interpreter lock}
+
+\begin{definition}[Global interpreter lock]\label{def:pl:python-at-scale:gil}
+The \emph{global interpreter lock}\index{global interpreter lock} of the standard Python interpreter allows one thread at a time to
+execute Python bytecode; threads run Python code concurrently but not in parallel, while compiled code that releases the lock (much
+of numpy, input and output) runs in parallel with them.
+\end{definition}
+
+Two threads each running a pure-Python loop of five million additions take 0.20~s against 0.11~s for one: twice the work in twice
+the time, no parallelism. Two threads each sorting a numpy array of eight million values take 0.094~s against 0.086~s for one: the
+sort releases the lock, and the two run largely in parallel. Python code that must use several cores therefore uses several processes.
+
+\begin{dated}{2026-09}{An interpreter without the lock}\label{dat:pl:python-at-scale:freethreading}
+PEP~703 (status Final, consulted September 2026) added a build configuration of CPython that runs Python code without the \omterm{def:pl:python-at-scale:gil}{global
+interpreter lock}; starting with release 3.13 CPython supports this free-threaded build, and the official macOS and Windows installers
+optionally install it. The lock remains the default. The series' environment (Python 3.10) has the lock.
+\end{dated}
+
+\begin{definition}[Process-based parallelism, serialisation cost]\label{def:pl:python-at-scale:processes}
+\emph{Process-based parallelism}\index{process-based parallelism} runs work in several operating-system processes, each with its own
+interpreter and lock, so that Python code runs on several cores at once. Its \emph{serialisation cost}\index{serialisation cost} is
+the time spent converting data to bytes and back to move them between processes (pickling, copying through a pipe), which shared
+memory or files mapped by both processes avoid.
+\end{definition}
+
+Moving a 64~MB array to a second process and summing it there takes 0.14~s pickled through a pipe and 0.03~s through shared memory,
+the copy into the shared block included: the serialisation dominates the pipe, and a sum of eight million numbers is negligible
+beside either. The research platform's rule follows: move work to the data, not data to the workers. Give each process a slice of a
+\omterm{def:pl:a-tick-store-on-open-formats:mmap}{memory-mapped file}, a list of Parquet partitions or a shared block, and have it return a small result.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xbar,bar width=9pt,xmin=0,xmax=0.27,xlabel={seconds},y dir=reverse,
+  xtick={0,0.05,0.10,0.15,0.20,0.25},xticklabels={0,0.05,0.10,0.15,0.20,0.25},
+  ytick={0,1,2,3,4,5},yticklabels from table={figdata/platforms/08-python-at-scale/measured_parallel.csv}{task},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=3},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=seconds,y expr=\coordindex]{figdata/platforms/08-python-at-scale/measured_parallel.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Moving a 64~MB array to a second process (pickled through a pipe, or placed in shared memory), and running a pure-Python
+loop and a numpy sort on one thread and on two (each thread doing the whole task). Measured on a laptop (Intel Core Ultra 7 155H)
+under WSL2, machine otherwise idle. Data: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:parallel}
+\end{omfigure}
+
+\section{Tutorial: four ways to compute one signal}\label{tut:pl:python-at-scale:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Compute one signal over tick-store records by a loop, by arrays and in chunks, show that the answers agree, and
+measure time and memory. \textbf{End state:} \cref{fig:pl:python-at-scale:methods,fig:pl:python-at-scale:memory,fig:pl:python-at-scale:chunks}.
+\begin{tutsteps}
+\item \textbf{History}: \texttt{pl\_pyscale.history(path, n)} writes $n$ version-1 events as a tick-store flat file.
+\item \textbf{Agree}: \texttt{agree()} runs the two loops (\cref{lst:pl:python-at-scale:loops}), the array expression and the
+chunked version on 20\,000 events: the differences are zero.
+\item \textbf{Measure}: \texttt{bench\_pyscale.py} times the four methods, the chunk sizes and the parallel tasks.
+\item \textbf{Memory}: \texttt{symbol\_memory()} for the four representations of a column.
+\item \textbf{Windows}: \texttt{firm\_pyscale.rolling\_sum\_kernel(w)} carries a window's tail across chunks; check it against a whole
+cumulative sum.
+\end{tutsteps}
+\textbf{What to change next.} Stream the signal from the week's Parquet partitions of chapter~4 instead of the flat file; split the
+history between two processes by halves and combine their results, and find what state crosses the boundary.
+\end{tutorial}
+
+\section{Build: the chunked pipeline}\label{bld:pl:python-at-scale:pyscale}
+
+\begin{build}
+\bfield{Purpose} The research platform's way to run any per-event computation over histories larger than memory, and to measure what
+a computation costs in time and memory before it is scheduled (chapter~13).
+\bfield{Interface} \texttt{chunks(array, size)}; \texttt{run(source, kernel, state) -> (outputs, state)}, a kernel being
+\texttt{kernel(chunk, state) -> (output, state)}; \texttt{ewma\_kernel(alpha)}, \texttt{rolling\_sum\_kernel(window)};
+\texttt{probe(fn, *args) -> (result, seconds, peak\_bytes)}.
+\bfield{Rules} Chunks are views, never copies; the carried state is the minimal one that makes the chunked result equal the whole
+result, and a test proves it for every kernel; memory is measured as a peak, with the method stated.
+\bfield{Acceptance tests} \texttt{code/firm/pyscale/tests/}: chunks cover the array exactly; the EWMA and rolling-sum kernels give the
+whole result for every chunk size, including one and the whole length; the probe reports a peak that grows with the allocation.
+\bfield{Stretch} A pool of worker processes each given a range of a mapped file (at most two here, by the resource rule); a kernel
+for a trade-sign filter that needs a state machine; \omterm{def:pl:python-at-scale:chunked}{peak resident memory} from the operating system alongside tracemalloc's count.
+\end{build}
+
+\begin{omsources}
+\item S.~Gross, \emph{PEP 703 -- Making the Global Interpreter Lock Optional in CPython} (Final); Python documentation,
+\emph{Python support for free threading}.
+\item Python documentation, \texttt{multiprocessing.shared\_memory}.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:1}
+At 960, 145 and 14 nanoseconds an event, how long does each method take for a day of two hundred million events?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:2}
+Why does the loop over records cost about six times the loop over lists, although both run the same arithmetic?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:3}
+A dataframe has a million rows and three string columns of fifty distinct values each. Estimate its string memory as objects and as
+categoricals from \cref{fig:pl:python-at-scale:memory}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:4}
+Write the rolling sum of the last $w$ values as an array expression, and state the state a chunked version must carry.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:5}
+Two threads each ran the same pure-Python loop in twice the time of one. What would two processes have done, and what would they
+have cost if each needed a 64~MB input?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:6}
+At 16 bytes an event for the whole-array computation, how many events fit a 1.5~GB budget at once, and what fraction of a day of the
+options feed's planned 311 billion messages (chapter~2) is that?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:python-at-scale:7}
+\emph{Coding.} Check \texttt{rolling\_sum\_kernel(50)} against a whole-array cumulative-sum version on 100\,000 random values for
+chunk sizes 1, 7, 50, 1\,000 and the whole length. What is the largest difference?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:python-at-scale:8}
+\emph{Find the flaw.} ``Our feature job is slow, so we split the day into eight parts with a thread pool of eight threads, each running
+the Python feature loop on its part, and concatenate the results.''
+\end{exercise}
+
+\section{Problem: Three Minutes or Three Seconds}
+
+\begin{problem}[{Weekend problem --- a signal over a year of events}]\label{pb:pl:python-at-scale:1}
+The chapter's signal (an exponentially weighted average of signed volume), its four implementations and the measurements of
+\texttt{bench\_pyscale.py}.
+
+\medskip\noindent\textbf{Part I --- The interpreter.}
+\begin{enumerate}
+\item What does the interpreter do per event in the loop over records that it does not do in the array expression?
+\item How many nanoseconds an event does each of the four methods cost?
+\item What is the speed-up of the array expression over each loop?
+\item Why are the loop's and the filter's answers identical to the last bit?
+\item What kinds of loop cannot be written as array operations, and where do they go?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Memory.}
+\begin{enumerate}[resume]
+\item How many bytes a row does a column of symbols cost as objects, as a categorical, as Arrow strings and as fixed-width unicode?
+\item Why is the categorical smallest?
+\item What does the whole-array computation of the signal cost in memory per event, and where does it come from?
+\item How many events does a 1.5~GB budget hold at once?
+\item What is \omterm{def:pl:python-at-scale:chunked}{peak resident memory}, and why does it, not the average, decide whether a job fits?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Chunks and cores.}
+\begin{enumerate}[resume]
+\item Why does the chunked result equal the whole result, and what state is carried?
+\item Which chunk size is fastest here, and what is its peak memory?
+\item Why are chunks of a thousand events slower?
+\item What do two threads gain on a Python loop and on a numpy sort?
+\item What does it cost to move 64~MB to another process by pickling, and by shared memory?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the speed-up of the array expression over the loops, the chunk size that minimises time and its
+peak memory, and the largest history that fits the budget whole.
+\item How long would a year of 250 days of two hundred million events take by each method, on one core?
+\item How would you use eight cores for that year without paying the \omterm{def:pl:python-at-scale:processes}{serialisation cost}?
+\item Which of the chapter's lessons would a free-threaded interpreter change, and which not?
+\item In one sentence: what makes Python fast enough for \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data}?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{researcher, developer}]\label{iq:pl:python-at-scale:1}
+Why is a Python loop over a numpy array slow, and what do you do instead?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher, developer}]\label{iq:pl:python-at-scale:2}
+How would you compute an exponential moving average over a billion values in Python?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:python-at-scale:3}
+What is the \omterm{def:pl:python-at-scale:gil}{global interpreter lock}, and when does it not matter?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{researcher}]\label{iq:pl:python-at-scale:4}
+Your dataframe uses 40~GB of memory. Where would you look first?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer, researcher}]\label{iq:pl:python-at-scale:5}
+Design a job that computes features over five years of \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data} on one 32-core machine with 128~GB of memory.
+\end{interviewq}

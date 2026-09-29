@@ -1,0 +1,320 @@
+\chapter{Position and P\&L Services}\label{ch:pl:position-and-pnl-services}
+
+Thirty-three minutes into the session, the order-entry session dropped for four seconds. Four executions happened while it was down, and
+when it came back the strategy's own execution reports put it 500 shares less short than the venue's drop copy did. The \omterm{def:pl:position-and-pnl-services:service}{position service} had
+to decide which to believe. The answer is neither, until they agree: count every execution any source reports, once, and say that the
+position is pending until the sources match. Every downstream number --- risk (chapter~18), limits, P\&L, the books that close at night ---
+starts from positions, and positions start from executions that arrive twice, late, out of order, and sometimes are taken back.
+
+\section{Positions from executions}
+
+\begin{definition}[Position service]\label{def:pl:position-and-pnl-services:service}
+A \emph{position service}\index{position service} maintains the firm's positions and P\&L by account and instrument from its executions,
+merged from every source that reports them, and serves them as of any time, by trade date or settlement date, with a status that says
+whether its sources agree.
+\end{definition}
+
+\begin{definition}[Execution identifier]\label{def:pl:position-and-pnl-services:execid}
+An \emph{execution identifier}\index{execution identifier} is the venue's unique identifier of one execution (in the simulator, its match
+number with the order's client identifier); it is what makes an execution reported by two sources, or twice by one, recognisably the same.
+\end{definition}
+
+The chapter's service (\texttt{firm.posservice}) stores executions keyed by that identifier and never stores a position: every position is
+computed by replaying the executions in time order through Book~1's exact keeper (\texttt{firm.pnl}), in which quantity and cash are
+integers, so that cash plus quantity times the mark, less fees, holds to the ten-thousandth of a dollar. Storing the events rather than their
+sum makes arrival order irrelevant, makes duplicates harmless (idempotent processing, Book~13, chapter~24) and makes every past position
+recomputable.
+
+\omcode{code/firm/posservice/firm_posservice.py}{59}{71}{Executions from any source, counted once; busts and corrections kept as events,
+not applied by editing the past.}\label{lst:pl:position-and-pnl-services:events}
+
+\omcode{code/firm/posservice/firm_posservice.py}{74}{97}{A position is a replay: the executions in force at a time (busts and corrections
+applied if known by then), in time order, through the exact keeper.}\label{lst:pl:position-and-pnl-services:position}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.8cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!12,minimum width=2.8cm] (s) at (0,1.2) {order-entry session\\ execution reports};
+\node[box,fill=omMeth!12,minimum width=2.8cm] (d) at (0,0) {drop copy\\ every execution, a little late};
+\node[box,fill=omMeth!12,minimum width=2.8cm] (b) at (0,-1.2) {venue notices\\ busts, corrections};
+\node[box,fill=omDef!15,minimum width=3.4cm,minimum height=2.6cm] (p) at (4.4,0) {position service\\ executions keyed by\\ execution identifier\\ status: agreed or pending};
+\node[box,fill=gray!10,minimum width=3.4cm] (v) at (8.9,1.1) {views: trade date, settlement date;\\ marks: intraday, end of day};
+\node[box,fill=gray!10,minimum width=3.4cm] (r) at (8.9,-1.1) {reconciliation with the\\ clearing statement};
+\foreach \x in {s,d,b} {\draw[->] (\x.east) -- (p.west|-\x.east);}
+\draw[->] (p.east) -- (v.west); \draw[->] (p.east) -- (r.west);
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:pl:position-and-pnl-services:service}{position service}. Executions arrive from the session and from the drop copy, busts and corrections from the venue; the service
+keeps executions, not positions, and computes every view from them; the clearing statement is the check at the end of the
+chain.}\label{fig:pl:position-and-pnl-services:service}
+\end{omfigure}
+
+\section{Two feeds of the same truth: sessions and drop copies}
+
+The order-entry session reports the executions of the orders it sent; the drop copy (Book~13, chapter~21) sends the firm a copy of every
+execution of its sessions on a separate connection, for exactly the moment the first one fails. A session that drops and logs back in asking
+only for new messages never receives the reports generated while it was down; a drop copy that runs a little late (50~milliseconds here) has
+them. The service takes both, counts each execution once, and compares the two sets: when they differ, the position it serves is the union,
+and its status is pending.
+
+\omcode{code/firm/posservice/firm_posservice.py}{99}{107}{The status: agreed when every source has reported the same executions, pending
+otherwise, with the executions each source is missing.}\label{lst:pl:position-and-pnl-services:status}
+
+\section{Busts, corrections and late fills}
+
+\begin{definition}[Trade bust]\label{def:pl:position-and-pnl-services:bust}
+A \emph{trade bust}\index{trade bust} is the cancellation of an execution by the venue after it happened --- for example under its rules on
+clearly erroneous trades (Book~1, chapter~31) --- so that for the clearing statement the trade never took place.
+\end{definition}
+
+A bust arrives minutes or hours after the execution; a correction changes an execution's price or quantity. The service applies both as
+events with their own times, so that the position as of any moment can be computed as it was known then (the bust not yet received) or as it
+is known now (the trade never happened). A late fill --- an execution report that arrives after the position has been read --- is only a late
+event: the replay puts it in its place.
+
+\section{Intraday P\&L and end-of-day marks}
+
+\begin{definition}[Intraday P\&L, end-of-day mark]\label{def:pl:position-and-pnl-services:marks}
+\emph{Intraday P\&L}\index{intraday P\&L} is the P\&L of positions marked at current market prices during the day, for monitoring and limits.
+The \emph{end-of-day mark}\index{end-of-day mark} is the price at which positions are valued for the day's official P\&L and books, usually
+the official closing price, set by the valuation policy rather than by the last print the strategy happened to see.
+\end{definition}
+
+The chapter marks intraday at the feed's mid and at the close at the venue's last trade, which stands for the official close. The P\&L is
+exact: \texttt{firm.pnl} keeps cash and quantity in integers, and the realised and unrealised parts under average cost (Book~1, chapter~7)
+add up, with fees, to the total at the mark.
+
+\section{Start of day and the books that close}
+
+\begin{definition}[Start-of-day position, trade-date position, settlement-date position]\label{def:pl:position-and-pnl-services:sod}
+The \emph{start-of-day position}\index{start-of-day position} is the position a day begins with: the previous day's end-of-day position,
+reconciled. The \emph{trade-date position}\index{trade-date position} counts every execution from the moment it trades; the
+\emph{settlement-date position}\index{settlement-date position} counts it only from its settlement date (one business day later in US
+equities, Book~1, chapter~5), which is what custody and cash reflect.
+\end{definition}
+
+At the end of the day the service records each position with its \omterm{def:pl:position-and-pnl-services:marks}{end-of-day mark} and total; the next day's \omterm{def:pl:position-and-pnl-services:sod}{start-of-day position} is that
+record. The clearing firm's statement --- the executions it cleared, busts removed --- is the check: the service reconciles its positions
+against it and lists every break before the next day starts.
+
+\section{Four seconds without a session}
+
+The chapter's experiment runs a quoting strategy (500 shares a side, an inventory limit of 5\,000 shares, orders left working if the session
+drops) for an hour on ten \texttt{firm.tape} sessions of Book~10's simulator, each with a drop-copy session. At a seeded minute the order-entry
+session drops for four seconds; the client logs back in asking for new messages only, and operations request a replay of the missed reports a
+minute later. At minute~50 the venue busts the execution nearest minute~30. Three services are compared with the clearing statement: session
+reports only; session and drop copy merged; merged with the bust applied.
+
+\omcode{code/platforms/17-position-and-pnl-services/python/pl_posservice.py}{72}{91}{The three services fed in arrival order: the session's
+reports (the lost ones only on replay), the drop copy 50~milliseconds late, and the bust notice.}\label{lst:pl:position-and-pnl-services:feed}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,xlabel={minutes into the session},ylabel={position minus statement (shares)},xmin=25,xmax=60,
+  ymin=-50,ymax=700,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=t_min,y expr=\thisrow{session}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\addplot[color=omDef,thick,const plot] table[x=t_min,y expr=\thisrow{merged}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\addplot[color=black,thick,dashed,const plot] table[x=t_min,y expr=\thisrow{merged_bust}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\node[omThm,font=\scriptsize,anchor=north west] at (axis cs:34,585) {session only: four executions lost at minute 33};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:50.5,120) {with drop copy};
+\node[font=\scriptsize,anchor=east] at (axis cs:49.5,45) {with drop copy and bust};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The position of each service minus the clearing statement's, through the hour of seed~3 (sampled every five seconds). The busted
+execution of minute~30 puts every service 100 shares off the statement; the outage of minute~33 adds 500 to the session-only service; the
+service with the drop copy and the bust agrees with the statement from the bust notice at minute~50. Data:
+\texttt{fig\_posservice.py}.}\label{fig:pl:position-and-pnl-services:timeline}
+\end{omfigure}
+
+\begin{example}[Seed 3]\label{ex:pl:position-and-pnl-services:seed3}
+The session drops at minute~33 and four executions happen in the four seconds; the session-only service is 500 shares off from then on. The
+merged service has them 50~milliseconds after they happen, from the drop copy, and reports its position as pending for 62~seconds, until the
+replay brings the session into agreement. Both carry the execution of minute~30, which the venue busts at minute~50; only the service that
+applies the notice agrees with the clearing statement at the close. At the close the statement shows $-3\,300$ shares and $-\$3\,493$; the
+session-only service is 600 shares and \$252 off, the merged service 100 shares and \$47 off, the merged service with the bust exact.
+\end{example}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+service & mean $|$position error$|$ (shares) & mean $|$P\&L error$|$ (\$) \\
+\midrule
+session reports only & 290 & 52.4 \\
+with the drop copy & 220 & 28.4 \\
+with the drop copy and the bust & 0 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Errors at the close against the clearing statement, averaged over ten one-hour sessions, each with a four-second outage at a seeded
+minute and one execution busted twenty minutes after it happened.}\label{tab:pl:position-and-pnl-services:close}
+\end{table}
+
+Over the ten sessions (\cref{tab:pl:position-and-pnl-services:close}), the outage costs little execution by execution --- it catches
+executions in four sessions (one, four, three and one), because in four seconds a quoting strategy trades rarely --- and the bust costs
+something every day. Without the drop copy the service ends the day 290 shares and \$52 off on average; with it, 220 shares and \$28 off, all
+of it the bust; with the bust applied, exact. In the sessions where the outage lost executions, the merged service reported pending for 60 to
+63~seconds, until the replay; without a replay it would have reported pending until someone looked.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,ybar,bar width=5pt,ylabel={position error at the close (shares)},
+  xlabel={session (seed)},xtick={1,2,3,4,5,6,7,8,9,10},ymin=-700,ymax=700,grid=major,grid style={gray!20},tick label style={font=\small},
+  label style={font=\small},table/col sep=comma,legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=3}]
+\addplot[fill=omThm!45,draw=omThm] table[x=seed,y=session_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{session only}
+\addplot[fill=omDef!45,draw=omDef] table[x=seed,y=merged_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{with drop copy}
+\addplot[fill=black!30,draw=black] table[x=seed,y=merged_bust_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{with drop copy and bust}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Each service's position minus the clearing statement's at the close, session by session. Without the drop copy the error is the
+lost executions plus the busted one; with it, the busted one alone; with the bust applied, nothing (the third bar is zero everywhere).
+Data: \texttt{fig\_posservice.py}.}\label{fig:pl:position-and-pnl-services:close}
+\end{omfigure}
+
+\begin{remark}[What pending buys]\label{rem:pl:position-and-pnl-services:pending}
+A pending status turns a silent error into a visible one. The merged service's position was right during the outage, but only the
+disagreement between its sources said that something had happened to the session; the session-only service was wrong and confident. Risk
+(chapter~18) should treat a pending position as the union of what any source reports --- the larger exposure --- until it agrees.
+\end{remark}
+
+\section{Tutorial: one day, three sources, one statement}\label{tut:pl:position-and-pnl-services:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Build positions from two execution feeds and a bust, watch them disagree and agree, and reconcile with the clearing statement.
+\textbf{End state:} \cref{fig:pl:position-and-pnl-services:timeline} and \cref{tab:pl:position-and-pnl-services:close}.
+\begin{tutsteps}
+\item \textbf{A day}: \texttt{pl\_posservice.day(seed)} runs the simulator with a drop-copy session and a scheduled outage.
+\item \textbf{Services}: \texttt{services(d)}; \texttt{status} and \texttt{missing} during the outage.
+\item \textbf{The statement}: \texttt{truth(d)}; \texttt{reconcile(service, statement)}.
+\item \textbf{The close}: \texttt{at\_close()} over ten seeds; \texttt{end\_of\_day} and \texttt{start\_of\_day} for the roll.
+\end{tutsteps}
+\textbf{What to change next.} Cancel orders on disconnect and see what the outage costs then; delay the drop copy by a second and watch the
+pending windows grow.
+\end{tutorial}
+
+\section{Build: the position service}\label{bld:pl:position-and-pnl-services:posservice}
+
+\begin{build}
+\bfield{Purpose} One source of positions and P\&L for risk, limits, reporting and the books, correct under duplicate, late and missing
+reports, busts and corrections, and honest about when it is not sure.
+\bfield{Interface} \texttt{Execution}; \texttt{PositionService(sources)} with \texttt{on\_execution}, \texttt{on\_bust},
+\texttt{on\_correction}, \texttt{position(account, symbol, as\_of, view, date)}, \texttt{status}, \texttt{missing}, \texttt{pnl},
+\texttt{end\_of\_day}, \texttt{start\_of\_day}; \texttt{reconcile}.
+\bfield{Rules} Executions are stored, positions computed; an \omterm{def:pl:position-and-pnl-services:execid}{execution identifier} counts once; busts and corrections are events with times;
+integer quantities and cash (\texttt{firm.pnl}); pending whenever sources disagree.
+\bfield{Acceptance tests} \texttt{code/firm/posservice/tests/}: idempotent merge and status; exact P\&L and independence from arrival order;
+busts and corrections as of times; trade-date and settlement-date views, the end-of-day roll, and reconciliation breaks.
+\bfield{Stretch} Many accounts and instruments with allocations from an average-price account; corporate actions on positions (chapter~6);
+the service's events journalled and replayed (chapter~12).
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~1, chapters 5, 7 and 31 (settlement, positions and P\&L, erroneous trades); One Quant Book~13, chapters 21 and 24 (drop
+copies, idempotent processing); One Quant Book~10, chapter~26 (the simulator's drop copy and session faults).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:1}
+The same execution arrives from the session, then twice from the drop copy. What is the position, and why?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:2}
+A buy of 100 at \$100.00 and a sell of 300 at \$100.02, marked at \$100.00. What are the position, the realised and the unrealised P\&L?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:3}
+Why is a busted trade removed as an event rather than deleted from the store?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:4}
+Why did the outage lose executions in only four of the ten sessions, and what would change it?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:5}
+A trade on Friday settles the next business day. What do the trade-date and settlement-date views show on Friday evening and on Monday?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:6}
+The merged service's position was right during the outage. Why is its pending status still useful?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:position-and-pnl-services:7}
+\emph{Coding.} Run \texttt{at\_close} with the strategy cancelling its orders on disconnect. What happens to the executions lost in the outage?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:position-and-pnl-services:8}
+\emph{Find the flaw.} ``Our \omterm{def:pl:position-and-pnl-services:service}{position service} adds each fill to the position as it arrives, and resets from the clearing file every morning, so
+it is right at least once a day.''
+\end{exercise}
+
+\section{Problem: Four Seconds Without a Session}
+
+\begin{problem}[{Weekend problem --- positions from two feeds and a bust}]\label{pb:pl:position-and-pnl-services:1}
+The chapter's strategy, ten sessions, a four-second outage and a bust each.
+
+\medskip\noindent\textbf{Part I --- The service.}
+\begin{enumerate}
+\item What does the service store, and how does it compute a position?
+\item What makes two reports the same execution?
+\item What does the status say, and when?
+\item How does the service handle a bust and a correction?
+\item What keeps the P\&L exact?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- The sources.}
+\begin{enumerate}[resume]
+\item Why does a session lose reports in an outage?
+\item What does the drop copy add, and at what cost?
+\item What is a replay, and why is it requested?
+\item What does the clearing statement represent?
+\item When does each service agree with the statement?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The day.}
+\begin{enumerate}[resume]
+\item In how many sessions did the outage lose executions, and how many?
+\item How long was the merged service pending?
+\item What were the errors at the close in seed 3?
+\item What were the mean errors over the ten sessions?
+\item Which error does the drop copy remove, and which not?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the position and P\&L error at the close without the drop copy, with it, and with it plus the bust, and
+the time until the service agrees with the clearing statement.
+\item What should risk do with a pending position?
+\item What should happen at the start of the next day?
+\item What would you monitor on the \omterm{def:pl:position-and-pnl-services:service}{position service} itself?
+\item In one sentence: what makes a position trustworthy?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:position-and-pnl-services:1}
+How do you make a \omterm{def:pl:position-and-pnl-services:service}{position service} robust to duplicate execution reports?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:position-and-pnl-services:2}
+Your order-entry session dropped for a few seconds. How do you know your position is right?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:position-and-pnl-services:3}
+Why store executions rather than positions?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:position-and-pnl-services:4}
+What is the difference between trade-date and \omterm{def:pl:position-and-pnl-services:sod}{settlement-date positions}, and who uses each?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:position-and-pnl-services:5}
+Design the position and P\&L service of a multi-strategy trading firm.
+\end{interviewq}

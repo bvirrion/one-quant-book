@@ -1,0 +1,424 @@
+\chapter{A Tick Store on Open Formats}\label{ch:pl:a-tick-store-on-open-formats}
+
+At 16:05 the day's capture files close. By 16:40 they must be compacted, sorted and queryable, because the overnight research
+starts at 17:00, and a researcher who asks for the quote prevailing before each of this week's trades must not notice which
+days come from the files written during the session and which from the compacted history. A week in the life of such a store
+is this chapter: five simulated days go through capture, an \omterm{def:pl:a-tick-store-on-open-formats:split}{intraday store} written as the session runs, a compaction at the
+close, a \omterm{def:pl:a-tick-store-on-open-formats:split}{historical store} of partitioned columnar files, and one query layer over both. On the fourth day the quotes gain a
+field, and the store has to carry on. Nothing here needs a proprietary database: the store is built from the open formats of
+chapter~3, an embedded query engine and a dataframe library, with a memory-mapped flat file for the hottest data, read the same
+way from Python, C++ and Rust (\texttt{firm.tickstore}).
+
+\section{Live capture: append-only files}
+
+\begin{definition}[Tick store, append-only file]\label{def:pl:a-tick-store-on-open-formats:store}
+A \emph{tick store}\index{tick store} is the system that keeps a firm's \omterm{def:pl:capturing-and-storing-tick-data:tick}{tick data} and answers queries on it, from the current
+session to the oldest year retained. An \emph{append-only file}\index{append-only file} is a file whose writer only adds bytes at
+its end and never changes what it has written, so that a reader can use every complete record already there while the writer
+continues.
+\end{definition}
+
+During the session the store writes the way data arrives: in time order, as it comes, with nothing sorted, compressed or
+indexed. The events of chapter~2 --- the receive time followed by the feed handler's 48-byte event --- go to a flat file of
+fixed-width records; the quotes and trades derived from them (the top of book after each change, from Book~13's book builder,
+and each execution with its price) go to Arrow IPC streams, the in-memory columnar format of chapter~3 written as a sequence of
+record batches.
+
+\begin{definition}[Flat file format, schema version]\label{def:pl:a-tick-store-on-open-formats:flat}
+A \emph{flat file format}\index{flat file format} stores records of one fixed width one after another, after a header that
+states their layout, so that record $i$ is at a computable offset and nothing needs to be parsed to reach it. The header's
+\emph{schema version}\index{schema version} identifies the layout; a reader refuses a version it does not know.
+\end{definition}
+
+The store's flat file (\cref{fig:pl:a-tick-store-on-open-formats:flat}) starts with a magic number, the version, the record
+width and the layout as JSON, padded to 64 bytes so that every record that follows is aligned the same way; version~1 records are
+56 bytes, version~2 appends a venue, flags and padding for 64. \Cref{lst:pl:a-tick-store-on-open-formats:flat} is the writer and
+the reader.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{55}{83}{The flat file: a versioned header padded to 64 bytes, records appended
+at the end, and a reader that maps the records instead of reading them.}\label{lst:pl:a-tick-store-on-open-formats:flat}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.55cm,inner sep=2pt,align=center}]
+\node[f,fill=gray!15,minimum width=1.0cm] (m) at (0.5,0) {OQTS};
+\node[f,fill=gray!15,minimum width=1.3cm,anchor=west] (v) at (m.east) {v, width};
+\node[f,fill=gray!10,minimum width=3.1cm,anchor=west] (s) at (v.east) {schema (JSON), pad};
+\foreach \i/\c in {0/omDef,1/omMeth,2/omDef,3/omMeth,4/omDef} {\node[f,fill=\c!18,minimum width=1.2cm,anchor=west] at (5.4+\i*1.2,0) {rec \i};}
+\node at (11.8,0) {\dots};
+\draw[decorate,decoration={brace,amplitude=4pt}] (0,0.35) -- (5.4,0.35) node[midway,above=4pt]{header: multiple of 64 bytes};
+\draw[decorate,decoration={brace,amplitude=4pt}] (5.4,0.35) -- (11.5,0.35) node[midway,above=4pt]{56 or 64 bytes each, appended};
+\foreach \x in {5.4,9.4} {\draw[dashed,omThm] (\x,-0.35) -- (\x,-0.9);}
+\node[omThm,anchor=north] at (7.4,-0.9) {one page of the mapping, read on first touch};
+\draw[omThm,<->] (5.4,-0.75) -- (9.4,-0.75);
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s flat file: a header of multiple of 64 bytes (magic, version, record width, the layout as JSON),
+then fixed-width records appended as they arrive. A reader maps the file; the operating system reads a page from disk the first
+time a record in it is touched.}\label{fig:pl:a-tick-store-on-open-formats:flat}
+\end{omfigure}
+
+\begin{remark}[Why two intraday forms]\label{rem:pl:a-tick-store-on-open-formats:twoforms}
+The flat file is the fastest thing to write and to scan, and the layout the trading path already uses; the IPC stream carries a
+schema, nullable and string columns, and is read into any Arrow-speaking tool without conversion. A store needs both because
+its intraday readers differ: a C++ replay tool wants the flat records, a researcher's notebook wants a table. Each is written
+once; nothing is converted during the session.
+\end{remark}
+
+\section{End-of-day compaction}
+
+\begin{definition}[End-of-day compaction, sort key]\label{def:pl:a-tick-store-on-open-formats:compaction}
+\emph{End-of-day compaction}\index{end-of-day compaction} rewrites a day's intraday files into the historical layout: partitioned,
+sorted, encoded and compressed for reading. The \emph{sort key}\index{sort key} of a file is the list of columns its rows are
+ordered by; the \omterm{def:pl:columnar-formats:pushdown}{zone maps} of chapter~3 prune well on its leading columns.
+\end{definition}
+
+The compaction of \texttt{firm.tickstore} (\cref{lst:pl:a-tick-store-on-open-formats:compact}) sorts each table by symbol and
+time and writes one Parquet file per partition, under \texttt{<table>/date=YYYY-MM-DD/symbol=S/}: the directory names carry
+the partition values, a convention the query engines read as columns. It is \cref{met:pl:columnar-formats:layout} of
+chapter~3 made concrete: partition by date and symbol, sort by time inside.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{147}{161}{End-of-day compaction: sort by symbol then time, and write one Parquet
+file per date and symbol, the partition values in the directory names.}\label{lst:pl:a-tick-store-on-open-formats:compact}
+
+\Cref{fig:pl:a-tick-store-on-open-formats:sizes} counts the bytes of the simulated week in each form. The busiest day, Monday,
+has 258\,535 events; its intraday files take 17.5~MB (the flat events and the two IPC streams), its compacted partitions 6.15~MB,
+2.85 times less, with the events at 20.0 bytes each in their partitions. Compaction of that day took 0.12~s on the laptop:
+about 2.2 million events a second on one core, sorting, \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitioning}, encoding and compressing included.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,ybar,bar width=8pt,ylabel={MB},xlabel={trading day (month-day)},
+  xtick={0,1,2,3,4},xticklabels from table={figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv}{day},
+  tick label style={font=\small},label style={font=\small},ymin=0,ymax=16,grid=major,grid style={gray!20},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=k,y=flat]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\addplot[fill=omMeth!45,draw=omMeth] table[x=k,y=ipc]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=parquet]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\legend{flat events (intraday),IPC quotes and trades (intraday),Parquet partitions (historical)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Bytes of each day of the simulated week in the intraday forms and, for the four compacted days, in the historical
+Parquet partitions (events, quotes and trades together). The fifth day is the current one and has no historical form yet; its
+flat records are 64 bytes, the version~2 layout. Data: \texttt{fig\_tickstore.py}.}\label{fig:pl:a-tick-store-on-open-formats:sizes}
+\end{omfigure}
+
+\begin{method}[Safe compaction]\label{met:pl:a-tick-store-on-open-formats:safe}
+(1) Write the day's partitions to new files in a staging directory, never over the intraday files. (2) Verify them against
+the intraday data: the same row count per table and symbol, the same range of sequence numbers with the same gaps, the same
+sums of quantities. (3) Make them visible in one atomic step --- a rename of the staging directory, or a new version of a
+manifest that lists the day's files. (4) Only then delete the intraday files, or keep them for the retention of the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw
+capture} (chapter~2).
+\end{method}
+
+A reader that lists a directory while the compactor writes into it sees half a day; a reader of a manifest sees either the old
+day or the new one. The verification step is cheap because the intraday files are still there, and it is the last moment at
+which a lost partition can be rebuilt without going back to the \omterm{def:pl:capturing-and-storing-tick-data:raw}{raw capture}; chapter~7 turns such checks into the firm's
+data-quality rules.
+
+\begin{dated}{2026-09}{The proprietary design this one mirrors}\label{dat:pl:a-tick-store-on-open-formats:kdb}
+The intraday/historical split is the design of the kdb+tick architecture of the proprietary kdb+ database, long common in banks
+and trading firms: in its documentation (consulted September 2026) a tickerplant writes incoming records to a log and pushes
+them to a real-time database, which holds the current day in memory and writes it to the historical database at the end of
+day; the historical database gives access to all earlier days. This book teaches the open-format version of the same design.
+\end{dated}
+
+\section{The intraday and the historical store}
+
+\begin{definition}[Intraday store, historical store]\label{def:pl:a-tick-store-on-open-formats:split}
+The \emph{intraday store}\index{intraday store} holds the current session's data in the forms written during it, optimised for
+appending and for recent reads; the \emph{historical store}\index{historical store} holds every compacted day, optimised for
+reading ranges across days and symbols.
+\end{definition}
+
+The split is invisible to a reader only if one query layer covers both. \texttt{Store} opens an embedded DuckDB and creates one
+view per table: the historical Parquet partitions, read with their directory names as columns, and the current day's IPC tables,
+registered in memory, joined by a union that matches columns by name (\cref{lst:pl:a-tick-store-on-open-formats:store}). A
+query on \texttt{quotes} then covers Monday to Friday, whichever store holds each day.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{165}{187}{The query layer: one view per table over the historical partitions and
+the current day's intraday table, matched by column name.}\label{lst:pl:a-tick-store-on-open-formats:store}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box] (feed) at (0,0.1) {feed lines\\(capture)};
+\node[box,fill=omMeth!15] (flat) at (3.3,0.7) {flat events\\(append-only)};
+\node[box,fill=omMeth!15] (ipc) at (3.3,-0.5) {IPC quotes, trades\\(record batches)};
+\draw[dashed,gray] (1.9,-1.15) rectangle (4.7,1.35);
+\node[font=\scriptsize\itshape,anchor=south] at (3.3,1.35) {intraday store};
+\node[box,fill=omThm!12] (cmp) at (3.3,-2.4) {end-of-day\\compaction};
+\node[box,fill=omProp!15,text width=2.6cm] (hist) at (7.2,-2.4) {Parquet\\date=D/symbol=S\\sorted by time};
+\node[font=\scriptsize\itshape,anchor=north] at (7.2,-3.15) {historical store};
+\node[box] (q) at (10.4,0.1) {query layer\\(DuckDB, Polars)};
+\node[box,fill=gray!10] (u) at (10.4,1.5) {research, replay};
+\draw[->] (feed) -- (flat);
+\draw[->] (feed) -- (ipc);
+\draw[->] (3.3,-1.15) -- (cmp);
+\draw[->] (cmp) -- (hist);
+\draw[->] (hist.east) -| (q.south);
+\draw[->] (4.7,0.1) -- node[above]{today} (q.west);
+\draw[->] (q) -- (u);
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}: capture writes the \omterm{def:pl:a-tick-store-on-open-formats:split}{intraday store} as the session runs; compaction at the close turns each day into
+sorted, partitioned columnar files; one query layer reads the historical partitions and the current day together.}\label{fig:pl:a-tick-store-on-open-formats:arch}
+\end{omfigure}
+
+\begin{example}[One window, two stores]\label{ex:pl:a-tick-store-on-open-formats:window}
+The count of SIM2's quote changes from 09:32 to 09:35 on each day of the week comes back as 12\,291, 996, 1\,388, 1\,197 and
+4\,473: four days from the Parquet partitions, the fifth from the intraday IPC table, in one SQL statement that names neither.
+The query took 18~ms on the laptop.
+\end{example}
+
+\section{As-of joins at scale}
+
+The as-of join of One Quant Book~7, chapter~3 --- each row of one table with the last row of another known at its time --- is
+the \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s most frequent query: each trade with the quote that prevailed when it happened, for effective spreads, trade
+signs and mark-outs. The store computes it three ways, which must agree row for row: DuckDB's \texttt{ASOF JOIN}, Polars'
+\texttt{join\_asof}, and Book~7's \texttt{firm.pit.asof\_join} applied to each day and symbol.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{190}{202}{The as-of join in SQL: each trade with the last quote of its day and
+symbol of an earlier sequence number (key \texttt{seq}), or at or before its timestamp (key \texttt{ts}).}\label{lst:pl:a-tick-store-on-open-formats:asof}
+
+The first version of the chapter joined on the timestamp, and the three engines disagreed. The reason is in the data: an
+execution and the change of quote it causes carry the same exchange timestamp, so ``the last quote at or before the trade's
+time'' can be the quote the trade itself produced, and which of two quotes with equal timestamps an engine returns is not
+specified. The quote that prevailed \emph{before} the trade is the last one of an earlier sequence number, and the feed's
+sequence number totally orders events.
+
+\begin{proposition}[Join on the sequence number]\label{prop:pl:a-tick-store-on-open-formats:seq}
+If every quote and trade row carries the sequence number of the event that produced it, the strict as-of join on sequence
+number returns, for each trade, the top of book immediately before the event that executed it, and the result does not depend
+on the join algorithm.
+\end{proposition}
+
+\begin{proof}
+Sequence numbers are distinct across events and increase in the order the book processed them. The quote rows of a symbol with
+sequence numbers below the trade's are the states of its book before the execution; the last of them is the state just before
+it. Distinct keys leave no tie for an algorithm to break.
+\end{proof}
+
+On the week's 17\,281 trades, the three engines agree on every row with the sequence-number join. The timestamp join returns a
+different quote for 223 of them, 1.3\%, each time the quote the execution itself had just produced: exactly the trades whose
+effective spread a researcher would measure as zero or negative. On this data DuckDB's join took 16~ms, Polars' 45~ms, and the
+Python reference 0.17~s (\cref{fig:pl:a-tick-store-on-open-formats:times}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6.2cm,xbar,bar width=8pt,xmode=log,log origin=infty,xmin=0.0005,xmax=1,
+  xlabel={seconds, best of several runs (log scale)},y dir=reverse,
+  ytick={0,1,2,3,4,5,6},yticklabels from table={figdata/platforms/04-a-tick-store-on-open-formats/measured_tickstore.csv}{task},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  point meta=explicit,nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=4},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=seconds,y expr=\coordindex,meta=seconds]{figdata/platforms/04-a-tick-store-on-open-formats/measured_tickstore.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Time of the store's main tasks on the simulated week: the compaction of the busiest day (258\,535 events), the
+five-day window query, the as-of join of 17\,281 trades by three engines, and a scan of one column of a day from the flat file
+and from Parquet. Measured on a laptop (Intel Core Ultra 7 155H) under WSL2, one thread, machine otherwise idle. Data:
+\texttt{bench\_tickstore.py}.}\label{fig:pl:a-tick-store-on-open-formats:times}
+\end{omfigure}
+
+\section{Flat files and memory mapping}
+
+\begin{definition}[Memory-mapped file]\label{def:pl:a-tick-store-on-open-formats:mmap}
+A \emph{memory-mapped file}\index{memory-mapped file} is a file mapped into a process's virtual address space, so that its bytes
+are read as memory: the operating system loads each page from disk (or from its cache) the first time it is touched, and
+processes that map the same file share one copy of its pages.
+\end{definition}
+
+A fixed-width file and a memory map fit together: record $i$ is at a known address, nothing is parsed, and only the pages a
+query touches are read. Book~12's memory-mapped datasets (chapter~23) use the same mechanism for training data. The store's reader
+in Python is \texttt{numpy.memmap}; the C++20 reader (\cref{lst:pl:a-tick-store-on-open-formats:cpp}) calls \texttt{mmap}
+itself, and the Rust twin declares \texttt{mmap} and \texttt{munmap} from the C library, since the series' Rust uses no external
+crates. The three compute the same per-instrument summary --- records, quantity executed, last sequence number --- on the same
+fixtures of both versions. Scanning one column of Monday's events took 0.8~ms from the mapped flat file and 2.1~ms from its
+Parquet partitions: the flat file is more than twice as fast to scan and 2.8 times larger to keep.
+
+\omcode{code/firm/tickstore/cpp/firm_tickstore.hpp}{29}{62}{The C++20 reader: map the file, check the header, and read a record
+at a computed offset; the page under it is loaded by the operating system on first touch.}\label{lst:pl:a-tick-store-on-open-formats:cpp}
+
+\section{Schema evolution}
+
+On Thursday the venue added a field to its quotes, and the store's quotes carry it from that day on. Monday to Wednesday have no
+such column.
+
+\begin{definition}[Schema evolution]\label{def:pl:a-tick-store-on-open-formats:evolution}
+\emph{Schema evolution}\index{schema evolution} is the change of a dataset's layout over time under rules that let every reader
+read every version: here, fields may be added at the end with a default, and are never removed, renamed, retyped or reordered.
+\end{definition}
+
+Under that rule a reader of the new version reads an old file by filling the new fields with their defaults, and a reader of the
+old version reads a new file by ignoring the fields it does not know; the flat file does both by its version number
+(\texttt{upgrade}), the query layer by matching columns by name (a missing column reads as null). The same week's window query
+counts the venue on none of the first three days and on every quote of the last two. The registry's check
+(\texttt{check\_evolution}) refuses the changes that would break old readers: a field retyped from 32 to 64 bits, a field
+dropped, two fields swapped, a field inserted before existing ones.
+
+\begin{method}[Evolving a tick store's schema]\label{met:pl:a-tick-store-on-open-formats:evolve}
+(1) Add the field at the end, with a default that means ``not known''. (2) Increase the version in the header and register the new
+layout next to the old one. (3) Write every reader to accept every registered version. (4) Never rewrite history to the new
+version unless the old readers are retired; if a correction is needed, write the corrected days as new versions (chapter~7).
+\end{method}
+
+\section{Tutorial: a week in the store}\label{tut:pl:a-tick-store-on-open-formats:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Run five simulated days through capture, the \omterm{def:pl:a-tick-store-on-open-formats:split}{intraday store}, compaction and the query layer, with a schema change
+on the fourth day, and check the as-of join three ways. \textbf{End state:} \cref{fig:pl:a-tick-store-on-open-formats:sizes},
+the window of \cref{ex:pl:a-tick-store-on-open-formats:window}, and three identical joins of 17\,281 trades.
+\begin{tutsteps}
+\item \textbf{Build the week}: \texttt{pl\_tickstore.build(root)} captures each day (\texttt{capture\_day}: events to a flat
+file, quotes and trades to IPC streams, one flush every 20\,000 events) and compacts the first four
+(\cref{lst:pl:a-tick-store-on-open-formats:compact}).
+\item \textbf{Query}: \texttt{window(root)} counts SIM2's quotes in the same three minutes of each day.
+\item \textbf{Join}: \texttt{asof\_all(root)} runs DuckDB, Polars and the reference; then rerun DuckDB with the timestamp as the key
+and count the trades whose quote changes.
+\item \textbf{Map}: build and run \texttt{firm\_tickstore\_test.cpp} and \texttt{cargo test} in \texttt{code/firm/tickstore/rust}
+on the fixtures; compare with \texttt{flat\_summary}.
+\item \textbf{Measure}: \texttt{bench\_tickstore.py} times the compaction and the queries.
+\end{tutsteps}
+\textbf{What to change next.} Add a third \omterm{def:pl:a-tick-store-on-open-formats:flat}{schema version} with a condition code and read the whole week; make the compaction
+write two sort orders (symbol then time, and time then symbol) and compare a cross-sectional query on each.
+\end{tutorial}
+
+\section{Build: the tick store}\label{bld:pl:a-tick-store-on-open-formats:tickstore}
+
+\begin{build}
+\bfield{Purpose} The firm's \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}: every later chapter of this book that reads market data reads it here, the backtest
+engine of chapter~11 through its data-access layer, the quality rules of chapter~7 on its partitions.
+\bfield{Interface} \texttt{EVENT\_V1}, \texttt{EVENT\_V2}, \texttt{SCHEMAS}; \texttt{FlatWriter(path, version)},
+\texttt{flat\_open(path) -> (version, memmap)}, \texttt{upgrade}; \texttt{IpcWriter}, \texttt{ipc\_read};
+\texttt{quotes\_trades(events, symbols)}; \texttt{compact(tables, root, date, row\_group\_size)}; \texttt{Store(root, intraday,
+date).sql(q)}; \texttt{asof\_duckdb}, \texttt{asof\_polars}, \texttt{asof\_reference}; \texttt{check\_evolution}. C++20
+\texttt{firm::tickstore::FlatFile}, \texttt{summarise}; Rust \texttt{FlatFile::open}, \texttt{get}, \texttt{summarise}.
+\bfield{Rules} Intraday files are append-only; the header states the version and a reader refuses an unknown one; historical
+files are written once per day and partition; every quote and trade carries its event's sequence number; the as-of join is
+strict on the sequence number; schemas only grow at the end.
+\bfield{Acceptance tests} \texttt{code/firm/tickstore/tests/}, \texttt{cpp/firm\_tickstore\_test.cpp}, \texttt{rust/}: flat files of
+both versions written, mapped and refused when foreign; the Python reader equal to the fixture the twins check; quotes and trades
+from a hand-made book; an IPC round trip; the query layer over two historical days of different schemas and the current day;
+three identical joins and the timestamp join's tie; the evolution rules.
+\bfield{Stretch} A second sort order written by the compaction; a sorted merge of intraday and historical rows without a union;
+compaction of a day while the next day's capture runs.
+\end{build}
+
+\begin{omsources}
+\item KX, \emph{kdb+tick} documentation (tickerplant, real-time and historical databases).
+\item DuckDB, \emph{AsOf Join} (documentation); Polars, \texttt{DataFrame.join\_asof} (API reference).
+\item Apache Arrow, \emph{IPC streaming format} (specification); \texttt{mmap(2)}, Linux manual page.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:1}
+Monday's flat file is 14\,478\,152 bytes for 258\,535 records of version~1. How long is its header, and how long would the file
+be in version~2?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:2}
+Why may a reader use an \omterm{def:pl:a-tick-store-on-open-formats:store}{append-only file} while the writer is still writing it, and what must it do with a partial last record?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:3}
+Monday's intraday files take 17.5~MB and its compacted partitions 6.15~MB. What is the ratio, and where does the saving come
+from?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:4}
+A researcher computes effective spreads with an as-of join on the timestamp. On the week's data, how many trades get the wrong
+quote, and in which direction are their spreads biased?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:5}
+At the measured compaction rate, how many events can the store compact between 16:05 and 16:40 on one core, and how does that
+compare with the options feed's planned 311 billion messages a day of chapter~2?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:6}
+A new field is inserted in the middle of the record instead of appended. What does an old reader see, and what does
+\texttt{check\_evolution} report?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:a-tick-store-on-open-formats:7}
+\emph{Coding.} With \texttt{flat\_summary} and the C++ reader, check the current day's flat file: how many records does each
+instrument have, and what quantity was executed on instrument~2?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:a-tick-store-on-open-formats:8}
+\emph{Find the flaw.} ``To save space we compact the day in place: the compactor reads the intraday files, writes the Parquet
+partitions over them, and a query during compaction reads whatever is there.''
+\end{exercise}
+
+\section{Problem: The 16:40 Deadline}
+
+\begin{problem}[{Weekend problem --- a week in the tick store}]\label{pb:pl:a-tick-store-on-open-formats:1}
+The chapter's simulated week, its store and the measurements of \texttt{bench\_tickstore.py}.
+
+\medskip\noindent\textbf{Part I --- Intraday.}
+\begin{enumerate}
+\item How many events, quotes and trades does the week hold?
+\item What is in a flat file's header, and why is it padded to 64 bytes?
+\item Why does the \omterm{def:pl:a-tick-store-on-open-formats:split}{intraday store} write two forms, and which readers use which?
+\item How many bytes is a record in version~1 and in version~2?
+\item Why is nothing sorted or compressed during the session?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Compaction.}
+\begin{enumerate}[resume]
+\item What \omterm{def:pl:a-tick-store-on-open-formats:compaction}{sort key} and \omterm{def:pl:capturing-and-storing-tick-data:partition}{partition key} does the compaction use, and why those?
+\item How many bytes does Monday take before and after compaction?
+\item How long did Monday's compaction take on the laptop, and at what rate?
+\item How many events could the 35 minutes from 16:05 to 16:40 absorb at that rate on one core?
+\item What would you change to compact a full options feed in the window?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Queries.}
+\begin{enumerate}[resume]
+\item How does one SQL statement read both stores?
+\item How many quote changes does SIM2 have from 09:32 to 09:35 each day?
+\item Why must the as-of join use the sequence number rather than the timestamp?
+\item How many trades change quote between the two joins, and which engines agree?
+\item How long did the three joins take?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the compaction rate and the size reduction of the busiest day, the query latencies, and the
+largest day the window absorbs.
+\item How do old and new quotes coexist after Thursday's schema change?
+\item What does the memory-mapped flat file buy over Parquet for the current day, and what does it cost?
+\item Which part of this design comes from the proprietary tick databases, and which from the open formats?
+\item In one sentence: what makes a \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store}'s two halves look like one?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer, researcher}]\label{iq:pl:a-tick-store-on-open-formats:1}
+Why do \omterm{def:pl:a-tick-store-on-open-formats:store}{tick stores} separate the current day from history?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:a-tick-store-on-open-formats:2}
+You join trades to quotes as of the trade time and some effective spreads come out negative. What is wrong?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:a-tick-store-on-open-formats:3}
+What does memory-mapping a file give you, and when is it a bad idea?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:a-tick-store-on-open-formats:4}
+A venue adds a field to its feed. How do you change the store without breaking five years of readers?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:a-tick-store-on-open-formats:5}
+How would you partition and sort a year of quotes for 8\,000 symbols, and why?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:a-tick-store-on-open-formats:6}
+Design a \omterm{def:pl:a-tick-store-on-open-formats:store}{tick store} on open formats for a firm without a proprietary database: capture, intraday, compaction, historical layout,
+query layer, and what you would measure first.
+\end{interviewq}

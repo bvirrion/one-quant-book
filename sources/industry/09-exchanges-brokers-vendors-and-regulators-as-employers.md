@@ -1,0 +1,33 @@
+# 9. Exchanges, Brokers, Vendors and Regulators as Employers — brief and source ledger
+
+## Brief
+
+- **Hook.** Listed exchange groups publish what trading firms do not: headcount, revenue and pay costs every year. So do regulators, which also publish the pay bands of their grades. The rest of the ecosystem is the most transparent part of the industry to work in.
+- **Sections.** Exchange groups and clearing houses; Brokers and trading-technology vendors; Data vendors; Regulators and central banks; Moving between the sides.
+- **Defines.** financial market infrastructure, pay band.
+- **Uses (defined earlier).** exchange (B1.4), broker (B1.4), central counterparty (B1.5), clearing member (B1.30), market data feed (B1.4), independent software vendor (B14.27), self-regulatory organisation (B16.17), revenue per head (ch12, forward).
+- **Tutorial.** A derived table of listed exchange groups' and vendors' revenue, operating profit and employees (CME, ICE, Nasdaq, Cboe, LSEG, Deutsche Boerse, Euronext, HKEX, SGX, JPX) for 2021-2025, and the published pay bands of three regulators with firm.payband (grade, band, locality adjustment, conversion to annual ranges). End state: revenue per head by firm and a chart of regulators' bands against LCA ranges for comparable occupations.
+- **Build.** `firm.payband`: public pay-scale reader (grades, steps, bands, locality supplements), conversion to annual ranges in one currency, and comparison with other range sources; Python; reused in ch. 14 and 24.
+- **Weekend problem.** Revenue per head at the infrastructure -- named result: the range of revenue and of operating profit per employee across exchange groups in 2025, and the ratio of a regulator's top quantitative-analyst band to the LCA median for the same occupation.
+- **Facts to verify.** exchange groups' 10-K and annual reports 2021-2025: revenue, operating income, employees (dated); SEC SK pay schedule and locality (sec.gov careers) (dated); CFTC CT pay schedule (dated); FCA and Bank of England annual reports: staff numbers and pay-band disclosures (dated); ESMA staff numbers (annual report) (dated); CPMI-IOSCO Principles for Financial Market Infrastructures (2012): definition.
+- **Data.** data/industry/infrastructure_employers.csv, data/industry/regulator_payscales.csv (derived).
+
+## Ledger
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | CME Group 2025: total revenues $6,520.6m; operating income $4,229.5m (XBRL); 'our global employee population consisted of approximately 3,875 employees, with 58% (approximately 2,230) working in the U.S.' | CME Group Inc., Form 10-K for 2025; SEC XBRL company facts | https://www.sec.gov/Archives/edgar/data/1156375/000115637526000009/cme-20251231.htm ; https://data.sec.gov/api/xbrl/companyfacts/CIK0001156375.json | 2026-09-29 | sentence quoted; Revenues and OperatingIncomeLoss CY2025 | data/industry/infrastructure_employers.csv; dat:in:exchanges-brokers-vendors-and-regulators-as-employers:exchanges |
+| F2 | Intercontinental Exchange 2025: 'As of December 31, 2025, we had a total of 12,844 employees'; three reportable segments 'Exchanges; Fixed Income and Data Services; and Mortgage Technology'; total revenues $12,640m (2024: $11,761m); operating income $4,929m (2024: $4,309m) | Intercontinental Exchange, Inc., Form 10-K for 2025 | https://www.sec.gov/Archives/edgar/data/1571949/000157194926000004/ice-20251231.htm | 2026-09-29 | sentences and income statement quoted | data; dated box |
+| F3 | Nasdaq 2025: three business segments 'Capital Access Platforms, Financial Technology and Market Services'; employees 'increased to 9,525 employees as of December 31, 2025 from 9,162'; total revenues $8,262m (2024: $7,400m); total revenues less transaction-based expenses $5,249m; operating income $2,331m | Nasdaq, Inc., Form 10-K for 2025 | https://www.sec.gov/Archives/edgar/data/1120193/000162828026007703/ndaq-20251231.htm | 2026-09-29 | sentences quoted | data; dated box |
+| F4 | Cboe 2025: 'As of December 31, 2025, we employed 1,661 individuals'; revenue from contracts with customers $4,714.2m; operating income $1,467.1m (XBRL); Cboe Options 'is a hybrid market combining open outcry floor trading with electronic trading' | Cboe Global Markets, Inc., Form 10-K for 2025; SEC XBRL company facts | https://www.sec.gov/Archives/edgar/data/1374310/000162828026010013/cboe-20251231.htm ; https://data.sec.gov/api/xbrl/companyfacts/CIK0001374310.json | 2026-09-29 | sentence quoted; RevenueFromContractWithCustomerIncludingAssessedTax and OperatingIncomeLoss CY2025 | data; dated box |
+| F5 | SEC 2026 basic pay, SK employees (effective 5 April 2026): grade minimum and maximum, e.g. SK-14 $114,315-$193,670, SK-16 $130,550-$221,711, SK-17 (supv) $138,383-$239,449; locality rates, e.g. New York 37.95%, Chicago 30.86%, Washington DC 33.94%; 'The salary cap, including locality pay, is $292,300 for all SK staff' | SEC, Compensation overview (careers) (Internet Archive copy) | https://www.sec.gov/about/careers/sec-compensation | 2026-09-29 | table and sentences quoted | data/industry/sec_sk_2026.csv; dat:in:exchanges-brokers-vendors-and-regulators-as-employers:sec |
+| F6 | CPMI-IOSCO Principles for financial market infrastructures (April 2012): 'The principles apply to all systemically important payment systems, central securities depositories, securities settlement systems, central counterparties and trade repositories (collectively financial market infrastructures)' | BIS, CPMI publication d101a page | https://www.bis.org/cpmi/publ/d101a.htm | 2026-09-29 | sentence quoted | definition |
+| F7 | Fiscal 2025 labour condition applications, median offered base by role family: exchange groups all titles USD 130,800 (462, 4 employers), software 140,400 (329), quantitative research 107,100 (35), machine learning and data 108,500 (60); banks 154,260, 155,688, 158,100, 140,714; market makers 175,000 in each | chapter 14 derived table (DOL OFLC disclosure files) | https://www.dol.gov/agencies/eta/foreign-labor/performance | 2026-09-29 | data/industry/lca_ranges.csv | dat:in:exchanges-brokers-vendors-and-regulators-as-employers:lca; figure 9.3 |
+
+## EXCLUDED
+
+- European exchange groups (LSEG, Deutsche Boerse, Euronext, HKEX, SGX, JPX): not fetched; the chapter uses four US groups.
+- CFTC, FCA and Bank of England pay scales: not fetched; the SEC's scale is the worked example.
+- Data vendors' and brokers' headcounts and pay: not fetched; described generically with pointers to Book 14 chapter 27.
+- Statistics on staff moving between regulators and the industry: none fetched; not stated.
+

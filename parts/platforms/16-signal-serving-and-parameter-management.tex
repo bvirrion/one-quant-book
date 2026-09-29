@@ -1,0 +1,333 @@
+\chapter{Signal Serving and Parameter Management}\label{ch:pl:signal-serving-and-parameter-management}
+
+A risk parameter entered as 50 meant fifty basis points to the person who typed it and fifty percent to the strategy that read it. Nothing
+checked the unit; the change went to every strategy at once; the first sign was the fill rate. A parameter is code that nobody compiles:
+it changes behaviour as much as a release does, it is edited by more people, and it usually has no types, no tests and no history. This
+chapter gives parameters and research signals the machinery code already has --- types, review, history, gradual rollout --- and measures,
+on ten simulated strategies, what each piece of that machinery saves when fifty means the wrong thing.
+
+\section{From research signal to production input}
+
+A research signal becomes a production input when a strategy reads it on a schedule and trades on it. Between the two sit the questions a
+research notebook never asks: which version is live, how old the value may be before it is not to be used, what the strategy does when it is
+missing, and who changed it. Book~12 (chapters 24 and 25) answered them for machine-learning features and models --- the feature store,
+feature freshness, the model registry and its audit trail. This chapter applies the same answers to the plainer inputs every strategy has:
+signals computed by research jobs and parameters typed by people.
+
+\section{The signal service}
+
+\begin{definition}[Signal service]\label{def:pl:signal-serving-and-parameter-management:service}
+A \emph{signal service}\index{signal service} serves research signals to production strategies: each value with its version and publication
+time, served only while it is fresher than a stated bound, and replaced by a declared fallback when it is stale or missing, with the status
+reported to the reader.
+\end{definition}
+
+The fallback is part of the signal's contract, chosen when the signal is designed, not by the strategy's author at three in the morning: for
+a directional signal, usually zero (no view); for a risk input, usually the most conservative value.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{148}{165}{The signal service: the latest value if it is fresh, else the declared
+fallback, always with the version and a status.}\label{lst:pl:signal-serving-and-parameter-management:service}
+
+With a freshness bound of five minutes and a fallback of zero, a momentum signal published at time 0 and again at 60~seconds is served as
+0.7 (version~3, fresh) at 200~seconds and as 0 with the status ``stale-fallback'' at 600~seconds; a signal never published is served as the
+fallback with the status ``missing-fallback''. The strategy knows which it got.
+
+\section{Configuration as data}
+
+\begin{definition}[Parameter store, configuration as data]\label{def:pl:signal-serving-and-parameter-management:store}
+A \emph{parameter store}\index{parameter store} holds every production parameter of every strategy, each value with the time from which it
+applies and the time it was recorded, the change that set it and its approvals. \emph{Configuration as data}\index{configuration as data} is
+the practice of keeping configuration in such a store, as typed, versioned records that tools can validate, compare and query, rather than as
+text edited in place on production machines.
+\end{definition}
+
+A value's two times are the valid time and knowledge time of Book~7 (chapter~3): the time from which it applies and the time the store learned
+it. They let the store answer the question every post-mortem asks --- what was live at 10:31 last Tuesday --- in both of its senses: as the
+firm knew it then, and as it is known now that a correction has been recorded.
+
+\section{Schemas, approvals and history}
+
+\begin{definition}[Configuration schema]\label{def:pl:signal-serving-and-parameter-management:schema}
+A \emph{configuration schema}\index{configuration schema} declares, for each parameter, its canonical unit and the units it may be entered
+in, its bounds, the largest change allowed in one step, and the size of change that needs a second approver; every proposed value is converted
+and checked against it before anyone approves it.
+\end{definition}
+
+The chapter's parameter is an inventory limit, as a share of the strategy's capital: canonical unit a fraction, entered in basis points,
+percent or as a fraction, bounded by 2\%, changed by at most 50 basis points at a time, and needing two approvers for any change above 20 basis
+points --- the four-eyes principle of One Quant Book~16 (chapter~12) applied to a number.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{75}{96}{A proposal: converted to the canonical unit, checked against bounds and the
+step limit, and told how many approvals it needs; every proposal, refused or not, goes to the audit trail.}\label{lst:pl:signal-serving-and-parameter-management:propose}
+
+The fifty of the hook, entered without a unit, is refused: a value with no unit is not accepted. Entered as ``50 percent'', it is refused twice over: 0.5 is
+outside $[0, 0.02]$, and a step of 0.495 exceeds the allowed 0.005. Entered as ``50 bp'' it is accepted as 0.005. A raise to 75 basis points
+(a step of 25) waits after one approval, cannot be approved by its author, and applies after the second. Every proposal, approval and
+application is a line of Book~12's hash-chained audit trail (\texttt{firm.exptrack}): editing any line breaks the chain, and
+\texttt{verify} says where.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{98}{120}{Approval by someone other than the author, as many as the change needs, and the
+bitemporal query: the value in force at a valid time, as known at a knowledge time.}\label{lst:pl:signal-serving-and-parameter-management:approve}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.9cm,minimum width=1.8cm,
+  fill=omDef!10},>=Stealth]
+\node[box] (p) at (0,0) {proposal\\ value + unit};
+\node[box] (s) at (2.3,0) {schema\\ units, bounds};
+\node[box] (a) at (4.6,0) {approvals\\ by others};
+\node[box] (f) at (6.9,0) {flag\\ one strategy};
+\node[box] (r) at (9.2,0) {rollout\\ all strategies};
+\foreach \x/\y in {p/s,s/a,a/f,f/r} {\draw[->] (\x) -- (\y);}
+\node[box,fill=omThm!10,minimum width=9.6cm] (h) at (4.6,-1.5) {bitemporal history (valid and knowledge time) and hash-chained audit trail};
+\foreach \x in {p,s,a,f,r} {\draw[->,gray] (\x.south) -- (\x.south|-h.north);}
+\node[omThm,font=\scriptsize,anchor=south] at (2.3,0.55) {refused: 50 with no unit, 50 percent};
+\node[font=\scriptsize,anchor=south] at (8.05,0.55) {monitor fires: flag off, value rolled back};
+\end{tikzpicture}
+
+\omcaption{The life of a parameter change in the store: typed on entry, checked by the schema, approved by others, rolled out behind a flag
+to one strategy and then to all, every step recorded with its times in a history that cannot be edited
+unnoticed.}\label{fig:pl:signal-serving-and-parameter-management:life}
+\end{omfigure}
+
+\begin{example}[What was live at 10:31 last Tuesday]\label{ex:pl:signal-serving-and-parameter-management:asof}
+The raise to 75 basis points was recorded on Tuesday at 09:43 and took effect at 10:00. On Thursday a correction was recorded: from Tuesday
+10:30 the limit should have been 60. Asked on Wednesday what was live at 10:31 on Tuesday, the store answers 75 basis points; asked now, it
+answers 60. Both answers are right, and a post-mortem needs both: what the strategy used, and what it should have used.
+\end{example}
+
+\section{Rolling out a change}
+
+\begin{definition}[Feature flag]\label{def:pl:signal-serving-and-parameter-management:flag}
+A \emph{feature flag}\index{feature flag} is a named switch in configuration that turns a behaviour or a new value on for chosen strategies,
+users or a share of traffic without a new release, so that a change can be rolled out to one first and withdrawn by switching the flag off.
+\end{definition}
+
+\begin{definition}[Configuration drift]\label{def:pl:signal-serving-and-parameter-management:drift}
+\emph{Configuration drift}\index{configuration drift} is a difference between the configuration a system is declared to run and the one it
+actually runs: a server not updated, a value edited in place, a flag left from an old release.
+\end{definition}
+
+Flags are how the canary deployment and staged rollout of Book~7 (chapter~21) apply to parameters: the new value is behind a flag switched on
+for one strategy, watched, and extended. Drift is what a flag, left in place, becomes: the chapter's \texttt{drift} compares, strategy by
+strategy, the declared value with the one each strategy reports it is running, and on the demonstration finds the one strategy running 0.5
+where the store says 0.005. The best-known case of both is Knight Capital's: on 1 August 2012 a flag once used for an old function was
+repurposed for new code, the new code had not reached one of eight servers, and orders carrying the flag triggered the old code there; the
+loss exceeded \$460 million (Book~7, chapter~21, and Book~13, chapter~22, tell it in full).
+
+\section{Fifty of what?}
+
+The chapter's incident runs ten quoting strategies (chapter~11's quoter, one lot a side) for an hour each on Book~10's simulator, each on its
+own \texttt{firm.tape} session, with \$4 million of capital each. The intended limit, 50 basis points of capital, is two lots at \$100; read as
+50 percent it is two hundred. The change arrives ten minutes into the session. A monitor compares each strategy's fills in every five-minute
+window with its usual count for that window --- here, the same session without the change, a better baseline than any real monitor has --- and
+fires above 1.3 times; a firing rolls the parameter back. Exposure is the inventory beyond what the intended limit allows (three lots, with
+one order pending), in dollars.
+
+\omcode{code/platforms/16-signal-serving-and-parameter-management/python/pl_paramstore.py}{62}{68}{The monitor: the end of the first
+five-minute window after the change in which fills exceed 1.3 times the usual count.}\label{lst:pl:signal-serving-and-parameter-management:monitor}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,xlabel={minutes after the change},ylabel={excess inventory (\$ thousands)},xmin=-1,xmax=20,ymin=0,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=minutes,y=all_k]{figdata/platforms/16-signal-serving-and-parameter-management/timeline.csv};
+\addplot[color=omDef,thick,const plot] table[x=minutes,y=staged_k]{figdata/platforms/16-signal-serving-and-parameter-management/timeline.csv};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:5.4,380) {all at once: detected at 5 minutes};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:6,45) {staged: the canary alone, detected at 15 minutes};
+\node[font=\scriptsize,anchor=east] at (axis cs:19.6,250) {schema check: refused at entry, nothing};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Inventory beyond the intended limit, summed over the strategies that received the wrong value, from the change until the monitor
+fires and the value is rolled back, on a ten-second grid. All at once, ten strategies accrue it for five minutes; staged, one strategy for
+fifteen; with a schema, the value never enters. Data: \texttt{fig\_paramstore.py}.}\label{fig:pl:signal-serving-and-parameter-management:timeline}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+policy & detection (minutes) & peak excess (\$k) & excess \$-minutes (k) \\
+\midrule
+all at once & 5 & 410 & 1\,348 \\
+staged (one canary for 30 min) & 15 & 30 & 53 \\
+schema check & 0 (refused) & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{The units error under three policies: minutes from the change to detection, the peak of the excess inventory summed over affected
+strategies, and its integral over time.}\label{tab:pl:signal-serving-and-parameter-management:policies}
+\end{table}
+
+\Cref{tab:pl:signal-serving-and-parameter-management:policies} is the result. All at once is detected soonest --- ten monitors watch instead of
+one, and the first fires at five minutes --- and costs most: \$410\,000 of excess inventory at the peak and 1.35 million dollar-minutes. The
+canary's own monitor takes fifteen minutes to fire (its session is quiet), but only the canary holds the wrong value: \$30\,000 at the peak and
+53\,000 dollar-minutes, 25 times less. The schema check costs nothing, because the error never becomes a value. The strategies differ widely in
+how soon their fill rate shows the error: five of the ten after five minutes, three after fifteen, one after thirty and one after fifty.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,ybar,bar width=12pt,ylabel={minutes to detection},ymin=0,ymax=58,
+  symbolic x coords={q01,q02,q03,q04,q05,q06,q07,q08,q09,q10},xtick=data,enlarge x limits=0.06,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  nodes near coords,nodes near coords style={font=\scriptsize}]
+\addplot[fill=omDef!45,draw=omDef] table[x=strategy,y=detect_min]{figdata/platforms/16-signal-serving-and-parameter-management/detection.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Minutes from the units error to the fill-rate monitor's first firing, strategy by strategy, each on its own one-hour session. How soon
+an error shows depends on the market the strategy happens to trade: five strategies show it in the first window, one only at the end of the
+hour. The staged rollout's canary is q01. Data: \texttt{fig\_paramstore.py}.}\label{fig:pl:signal-serving-and-parameter-management:detection}
+\end{omfigure}
+
+\begin{remark}[Detection is not protection]\label{rem:pl:signal-serving-and-parameter-management:detect}
+Faster detection did not make all at once safer: it had ten chances to notice and ten strategies accruing exposure while it did. A staged
+rollout limits the damage to the canary whatever the monitor's speed; a schema prevents the damage whatever the rollout. The monitor here is
+optimistic --- it knows each strategy's counterfactual fill count --- and a real one would be slower, which widens every gap.
+\end{remark}
+
+\begin{dated}{2026-09}{Configuration at scale}\label{dat:pl:signal-serving-and-parameter-management:scale}
+Facebook's configuration-management paper (Tang and others, SOSP 2015) described a system handling thousands of online configuration changes
+a day and trillions of configuration checks, used for product rollouts, experiments, load balancing and model deployment. The SEC's order on
+Knight Capital (Release 34-70694, 2013) records the repurposed flag, the server not updated, about 45 minutes of unintended orders and a loss
+of more than \$460 million.
+\end{dated}
+
+\section{Tutorial: a units error, three ways}\label{tut:pl:signal-serving-and-parameter-management:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Serve a signal with a freshness bound, put a parameter under a schema with approvals and history, and measure what a units error
+costs under three policies. \textbf{End state:} \cref{fig:pl:signal-serving-and-parameter-management:timeline} and
+\cref{tab:pl:signal-serving-and-parameter-management:policies}.
+\begin{tutsteps}
+\item \textbf{Signals}: \texttt{pl\_paramstore.signals()}.
+\item \textbf{Parameters}: \texttt{governance(dir)}: the refused entries, the two approvals, the bitemporal answers, flags, drift, the audit.
+\item \textbf{Incident}: \texttt{incident()} runs twenty hours of simulated trading (ten strategies, with and without the error).
+\item \textbf{Policies}: read the detection times and exposures from the result.
+\end{tutsteps}
+\textbf{What to change next.} Lower the monitor's threshold to 1.2 and count its false alarms on the unchanged runs; stage the rollout in three
+steps (one, three, all) instead of two.
+\end{tutorial}
+
+\section{Build: the parameter store}\label{bld:pl:signal-serving-and-parameter-management:paramstore}
+
+\begin{build}
+\bfield{Purpose} Every production input a strategy reads --- signal or parameter --- typed, versioned, approved, auditable and rolled out
+gradually.
+\bfield{Interface} \texttt{Schema}; \texttt{ParamStore(root)} with \texttt{register}, \texttt{propose}, \texttt{approve}, \texttt{as\_of},
+\texttt{history}, \texttt{audit}; \texttt{Flags}; \texttt{drift}; \texttt{SignalService(max\_age, fallback)} with \texttt{publish} and
+\texttt{get}.
+\bfield{Rules} A value enters with its unit or not at all; the author never approves; changes above a threshold need two approvers; values
+carry valid and knowledge times; the audit trail is hash-chained; signals carry a version, a freshness bound and a declared fallback.
+\bfield{Acceptance tests} \texttt{code/firm/paramstore/tests/}: units, bounds and steps; approvals (author refused, two distinct approvers);
+bitemporal queries and history; the audit trail's verification and its detection of an edited line; flags, drift and the \omterm{def:pl:signal-serving-and-parameter-management:service}{signal service}'s
+three statuses.
+\bfield{Stretch} Percentage rollouts by hash of the strategy name; automatic rollback wired to the monitor; drift checks against each strategy's
+own report at start-up.
+\end{build}
+
+\begin{omsources}
+\item C.~Tang et al., ``Holistic configuration management at Facebook'', SOSP 2015.
+\item US Securities and Exchange Commission, \emph{In the Matter of Knight Capital Americas LLC}, Release No.\ 34-70694, 2013.
+\item One Quant Book~7, chapters 3 and 21; One Quant Book~12, chapters 24 and 25; One Quant Book~16, chapter~12.
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:1}
+How many lots is an inventory limit of 50 basis points of \$4 million at \$100 a share, and of 50 percent?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:2}
+Why does the raise from 50 to 75 basis points need two approvers under the chapter's schema, and the correction to 60 only one?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:3}
+What does the \omterm{def:pl:signal-serving-and-parameter-management:service}{signal service} return at 400 seconds in the chapter's example, and why?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:4}
+Why was the all-at-once rollout detected sooner than the staged one, and why is it still worse?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:5}
+A post-mortem asks what limit a strategy used at 10:31 on Tuesday. Which of the store's two answers does it want, and when does it want the
+other?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:6}
+Which of the chapter's controls would have stopped the Knight Capital incident as the SEC describes it, and which would not?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:signal-serving-and-parameter-management:7}
+\emph{Coding.} Rerun \texttt{incident} with the canary chosen as the strategy whose monitor fires last (q10). What happens to the staged
+rollout's detection time and exposure?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:signal-serving-and-parameter-management:8}
+\emph{Find the flaw.} ``Our parameters live in a YAML file in the repository, so they are versioned, reviewed and safe.''
+\end{exercise}
+
+\section{Problem: Fifty of What?}
+
+\begin{problem}[{Weekend problem --- a units error under three policies}]\label{pb:pl:signal-serving-and-parameter-management:1}
+The ten strategies, the schema and the monitor of the chapter.
+
+\medskip\noindent\textbf{Part I --- The store.}
+\begin{enumerate}
+\item What does the schema of the inventory limit declare?
+\item What happens to 50 entered without a unit, as percent, and as basis points?
+\item Who may approve a change, and how many approvals does it need?
+\item What are a value's two times, and what question do they answer?
+\item What does the audit trail guarantee?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Signals and flags.}
+\begin{enumerate}[resume]
+\item What does the \omterm{def:pl:signal-serving-and-parameter-management:service}{signal service} return, and with what status, when a signal is stale?
+\item Who chooses a signal's fallback, and when?
+\item What is a \omterm{def:pl:signal-serving-and-parameter-management:flag}{feature flag} for, and what does it become if left in place?
+\item What does the drift check find in the demonstration?
+\item What did a repurposed flag do at Knight Capital?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- The incident.}
+\begin{enumerate}[resume]
+\item What do 50 basis points and 50 percent mean in lots?
+\item How does the monitor decide, and why is it optimistic?
+\item When does each strategy's monitor fire?
+\item What are the exposure and time to detection all at once?
+\item And staged?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: the exposure accrued before detection by the units error under an all-at-once change, a staged rollout
+and a schema check, and the minutes to detection in each case.
+\item Why is detection not protection?
+\item Which control would you build first?
+\item What would you add to catch a units error that stays within bounds?
+\item In one sentence: what does a parameter need that a variable does not?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:signal-serving-and-parameter-management:1}
+How do you stop a units error in a production parameter?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer, researcher}]\label{iq:pl:signal-serving-and-parameter-management:2}
+A research signal feeds live strategies. What happens when the job that computes it fails?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:signal-serving-and-parameter-management:3}
+How would you roll out a change to a risk limit across a hundred strategies?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:signal-serving-and-parameter-management:4}
+What is \omterm{def:pl:signal-serving-and-parameter-management:drift}{configuration drift}, and how would you detect it?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:signal-serving-and-parameter-management:5}
+Design a parameter management system for a trading firm.
+\end{interviewq}

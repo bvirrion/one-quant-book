@@ -1,0 +1,381 @@
+\chapter{Messaging and Event-Driven Architecture}\label{ch:pl:messaging-and-event-driven-architecture}
+
+A consumer of the fills topic crashes after applying a batch of messages to the positions and before recording how far it has read. When it
+restarts it reads the batch again and applies it again, and the firm's position in one stock is double until someone compares it with the
+drop copy. Nothing was broken: the messaging system delivered every message at least once, which is exactly what it promised. This chapter
+is about what messaging systems promise, what they cannot, and how a consumer turns \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{at-least-once delivery} into exactly-once effects --- with a
+\omterm{def:pl:messaging-and-event-driven-architecture:log}{partitioned log} built in process, a \omterm{def:pl:position-and-pnl-services:service}{position service} run under a thousand crashes in three modes, and the outbox that lets a service change
+its database and announce it without losing either.
+
+\section{Why systems talk through messages}
+
+The platform map of chapter~\ref{ch:pl:the-platform-map} is a set of services: \omterm{def:pl:trade-capture-and-booking:capture}{trade capture}, positions, risk, P\&L, surveillance. They can
+call each other directly, each one knowing who needs what; or each can publish what happened, and whoever needs it subscribes. The second
+decouples them in three ways --- in knowledge (the publisher does not know its consumers), in time (a consumer can be down and catch up), and
+in rate (a slow consumer does not slow the publisher) --- and makes the flow of events itself a record that can be replayed.
+
+\begin{definition}[Publish--subscribe]\label{def:pl:messaging-and-event-driven-architecture:pubsub}
+\emph{Publish--subscribe}\index{publish--subscribe} is a messaging pattern in which producers publish messages to named topics without
+addressing any consumer, and each consumer receives the messages of the topics it subscribes to.
+\end{definition}
+
+The cost is that the call graph becomes invisible, and failures move from the call (which fails loudly) to the delivery (which can lose or
+repeat messages quietly). Most of this chapter is about the second.
+
+\section{Brokers and brokerless transports}
+
+\begin{definition}[Message broker, brokerless messaging]\label{def:pl:messaging-and-event-driven-architecture:broker}
+A \emph{message broker}\index{message broker} is a server that receives messages from producers, stores them, and delivers them to consumers,
+so that producers and consumers only know the broker. In \emph{brokerless messaging}\index{brokerless messaging} producers send directly to
+consumers --- by unicast, multicast or shared memory --- through a library in each process, with no server in the path.
+\end{definition}
+
+The two answer different needs. A broker adds a hop and a server to run, and gives in return storage, replay, and consumers that come and go.
+Brokerless transports give the lowest latency and no central component: the market-data and order paths of Book~13 are brokerless, with
+multicast (Book~13, chapter~16) and ring buffers in shared memory, and libraries such as Aeron --- \textquotedbl{}efficient reliable UDP
+unicast, UDP multicast, and IPC message transport\textquotedbl{} --- provide the reliability on top. Between services that care more about
+not losing an event than about microseconds --- \omterm{def:pl:trade-capture-and-booking:capture}{trade capture}, positions, risk, the post-trade chain --- the firm uses a log.
+
+\section{The log as the backbone}
+
+\begin{definition}[Partitioned log, consumer offset]\label{def:pl:messaging-and-event-driven-architecture:log}
+A \emph{partitioned log}\index{partitioned log} stores each topic as several partitions, each an append-only sequence of messages addressed by
+their position in it; a message's partition is chosen from its key, so that messages with the same key keep their order. A \emph{consumer
+offset}\index{consumer offset} is the position up to which a consumer has read a partition, recorded by the consumer (committed) so that it
+can resume there.
+\end{definition}
+
+\begin{definition}[Consumer group]\label{def:pl:messaging-and-event-driven-architecture:group}
+A \emph{consumer group}\index{consumer group} is a set of consumer processes that share a topic's partitions, each partition read by exactly
+one member at a time, with one committed offset per partition for the whole group; when members join or leave, the partitions are reassigned
+(a rebalance).
+\end{definition}
+
+This is the design Kreps, Narkhede and Rao described for Kafka in 2011: a message has no identifier of its own, \textquotedbl{}each message is
+addressed by its logical offset in the log\textquotedbl{}. The chapter's \texttt{firm.eventlog} builds it in process: topics, partitions by a
+stable hash of the key, append-only segments on disk, retention that drops whole segments, and committed offsets per group. Keying fills by
+account puts all of an account's fills in one partition, in order; eight partitions shared by three consumers are assigned three, three and
+two.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  cell/.style={draw=omDef,fill=omDef!8,minimum width=6mm,minimum height=6mm,inner sep=0pt,font=\scriptsize},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[draw=omDef,rounded corners=2pt,align=center,text width=16mm,minimum height=24mm] (prod) at (-0.9,0) {producers\\(trade\\capture)};
+\foreach \p/\n in {0/7,1/5,2/8,3/6} {
+  \node[font=\scriptsize,anchor=east] at (2.4,1.35-0.9*\p) {partition \p};
+  \foreach \i in {1,...,\n} \node[cell] at (2.3+0.62*\i,1.35-0.9*\p) {\the\numexpr\i-1\relax};
+}
+\draw[arr] (prod.east) -- (0.8,0);
+\draw[omThm,very thick] (2.3+0.62*4.5,1.7) -- (2.3+0.62*4.5,1.0) node[above,pos=0,font=\scriptsize]{committed 4};
+\draw[omThm,very thick] (2.3+0.62*3.5,-1.0) -- (2.3+0.62*3.5,-1.7) node[below,pos=1,font=\scriptsize]{committed 3};
+\node[draw=omThm,rounded corners=2pt,align=center,text width=24mm] (c1) at (9.8,0.9) {consumer 1\\partitions 0, 1};
+\node[draw=omThm,rounded corners=2pt,align=center,text width=24mm] (c2) at (9.8,-0.9) {consumer 2\\partitions 2, 3};
+\node[font=\scriptsize,omThm] at (9.8,-1.9) {one consumer group};
+\draw[arr] (6.95,1.35) -- (c1.west); \draw[arr] (5.7,0.45) -- (c1.west);
+\draw[arr] (7.6,-0.45) -- (c2.west); \draw[arr] (6.35,-1.35) -- (c2.west);
+\end{tikzpicture}
+
+\omcaption{A topic of four partitions, each an append-only sequence of messages addressed by offset, and a \omterm{def:pl:messaging-and-event-driven-architecture:group}{consumer group} of two members that
+share them. The group commits one offset per partition (red): the position from which a member resumes after a restart or a
+rebalance.}\label{fig:pl:messaging-and-event-driven-architecture:log}
+\end{omfigure}
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{53}{64}{Appending to a partitioned log: the key chooses the partition, and a producer's
+(identifier, sequence) pair already stored is ignored, so that a resend does not duplicate.}\label{lst:pl:messaging-and-event-driven-architecture:append}
+
+\section{Delivery guarantees and the exactly-once myth}
+
+A consumer does two things with a batch: it processes the messages, and it commits the offset. A crash can fall between them, and the order
+of the two decides what the crash costs.
+
+\begin{definition}[At-most-once and at-least-once delivery]\label{def:pl:messaging-and-event-driven-architecture:delivery}
+Under \emph{at-most-once delivery}\index{at-most-once delivery} a message may be lost but is never processed twice: the consumer commits the
+offset before processing. Under \emph{at-least-once delivery}\index{at-least-once delivery} a message is never lost but may be processed more
+than once: the consumer commits after processing, and a crash in between repeats the uncommitted messages.
+\end{definition}
+
+\begin{definition}[Exactly-once processing]\label{def:pl:messaging-and-event-driven-architecture:exactly}
+\emph{Exactly-once processing}\index{exactly-once processing} is the guarantee that each message's effect on the consumer's state happens
+once, whatever the crashes: obtained not from the transport, which can only deliver at least once, but by making the effect idempotent
+(Book~13, chapter~24) or by storing the state and the offset in one atomic transaction.
+\end{definition}
+
+The 2011 paper was explicit: \textquotedbl{}Kafka only guarantees \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{at-least-once delivery}\textquotedbl{}, and an application that cares about
+duplicates \textquotedbl{}must add its own deduplication logic\textquotedbl{}. Later versions added an idempotent producer and transactions,
+which give exactly-once between Kafka topics; for any other destination, the documentation says, exactly-once \textquotedbl{}generally
+requires cooperation with such systems\textquotedbl{}. The \omterm{def:pl:position-and-pnl-services:service}{position service} is such a destination.
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{105}{126}{One batch under the three modes: commit before processing, commit after, or apply the
+batch and the next offset in one database transaction.}\label{lst:pl:messaging-and-event-driven-architecture:modes}
+
+The chapter's day is 10\,000 synthetic fills for ten accounts and twenty stocks, keyed by account into four partitions and consumed in batches
+of 100. Each day ten crashes strike at points drawn uniformly over the consumer's steps --- every message processed, and the moment between
+processing a batch and committing it --- and a hundred days are run in each mode. For every fill we count how many times it reached the
+positions.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ybar,bar width=14pt,ylabel={fills per 1\,000 crashes},symbolic x coords={at-most-once,at-least-once,atomic},
+  xtick=data,xticklabels={commit first\\(at most once),commit after\\(at least once),state and offset\\atomic},
+  xticklabel style={align=center},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,ymin=0,ymax=62000,
+  nodes near coords,every node near coord/.append style={font=\scriptsize,/pgf/number format/1000 sep={\,}},scaled y ticks=false,
+  yticklabel style={/pgf/number format/1000 sep={\,}},
+  legend style={font=\small,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,/tikz/every even column/.append style={column sep=4mm}}]
+\addplot[fill=omThm!60,draw=omThm] table[x=mode,y=lost_per_1000]{figdata/platforms/24-messaging-and-event-driven-architecture/modes.csv};
+\addplot[fill=omDef!40,draw=omDef] table[x=mode,y=dup_per_1000]{figdata/platforms/24-messaging-and-event-driven-architecture/modes.csv};
+\legend{lost,duplicated}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Fills lost and duplicated per 1\,000 consumer crashes, over a hundred days of ten crashes in each mode. Committing first loses about
+half a batch per crash (50\,323 per 1\,000); committing after duplicates as much (48\,652); state and offset in one transaction, none. Data:
+\texttt{fig\_eventlog.py}.}\label{fig:pl:messaging-and-event-driven-architecture:modes}
+\end{omfigure}
+
+The first two modes are mirror images (\cref{fig:pl:messaging-and-event-driven-architecture:modes}). A crash inside a batch of 100 falls on
+average half-way, so committing first loses about 50 fills and committing after repeats about 50; a crash just after processing and before the
+commit --- the hook's --- repeats all 100. In the third mode the positions and the next offset are written in one SQLite transaction: a crash
+anywhere before the commit rolls both back, the consumer resumes from the offset that matches the state, and no fill is lost or counted
+twice in 1\,000 crashes. The same effect comes from idempotent processing: store each fill's identifier with the state and skip identifiers
+already applied.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={day, sorted by its error},ylabel={largest position error (shares)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=1,xmax=100,ymin=-200,ymax=7000,yticklabel style={/pgf/number format/1000 sep={\,}}]
+\addplot[omThm,thick] table[x=rank,y=at_most_once]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\addplot[omDef,thick] table[x=rank,y=at_least_once]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\addplot[black,thick] table[x=rank,y=atomic]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\node[omDef,font=\scriptsize,anchor=east] at (axis cs:88,6300) {commit after: up to 6\,500};
+\node[omThm,font=\scriptsize,anchor=north west] at (axis cs:55,3200) {commit first: up to 5\,100};
+\node[font=\scriptsize,anchor=south west] at (axis cs:3,150) {atomic: 0 every day};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{The largest end-of-day position error in any account and stock, for each of the hundred days, sorted. Ten crashes a day leave a
+median worst error of 3\,500 shares when committing first and 3\,800 when committing after, and up to 5\,100 and 6\,500; the atomic mode ends
+every day exact. Data: \texttt{fig\_eventlog.py}.}\label{fig:pl:messaging-and-event-driven-architecture:worst}
+\end{omfigure}
+
+\section{Patterns: outbox, event sourcing, dead letters}
+
+The consumer's problem has a mirror on the producer's side. The trade-capture service must store a trade in its database and publish the
+event that announces it. Two separate writes cannot be atomic: write then publish, and a crash in between leaves a trade nobody hears about;
+publish then write, and consumers act on a trade that does not exist.
+
+\begin{definition}[Transactional outbox]\label{def:pl:messaging-and-event-driven-architecture:outbox}
+A \emph{transactional outbox}\index{transactional outbox} is a table in a service's own database into which the service writes each event in
+the same transaction as the change it announces; a separate relay reads the table, publishes the events in order, and marks them sent, so
+that an event is published if and only if its change was committed --- at least once, with a key that lets the log or the consumer drop the
+repeats.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=9mm,text width=24mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (svc) {trade-capture\\service};
+\node[box,right=12mm of svc,yshift=6mm] (t) {table \texttt{trades}};
+\node[box,right=12mm of svc,yshift=-6mm] (o) {table \texttt{outbox}};
+\node[draw=omThm,dashed,rounded corners=3pt,fit=(t)(o),inner sep=4pt,label={[font=\scriptsize,omThm]above:one transaction}] (tx) {};
+\node[box,right=12mm of tx] (r) {relay};
+\node[box,right=18mm of r] (l) {log, topic\\\texttt{trades}};
+\draw[arr] (svc.east) -- (tx.west);
+\draw[arr] (o.east) -- node[below,font=\scriptsize]{unsent} (r.west |- o.east);
+\draw[arr] (r) -- node[above,font=\scriptsize]{1. publish} (l);
+\draw[arr,omThm] (r.south) to[bend left=35] node[below,font=\scriptsize]{2. mark sent} (o.south east);
+\end{tikzpicture}
+
+\omcaption{The \omterm{def:pl:messaging-and-event-driven-architecture:outbox}{transactional outbox}: the trade and the event that announces it are committed in one database transaction; a relay publishes
+unsent events to the log and then marks them sent. A crash between 1 and 2 repeats an event, never loses one, and the idempotence key lets
+the log drop the repeat.}\label{fig:pl:messaging-and-event-driven-architecture:outbox}
+\end{omfigure}
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{171}{192}{The outbox: the trade and its event in one transaction, and the relay that publishes
+each event with its outbox number as idempotence key before marking it sent.}\label{lst:pl:messaging-and-event-driven-architecture:outbox}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+design & events lost & phantom events & duplicated events\\
+\midrule
+write the trade, then publish & 22 & 0 & 0\\
+publish, then write the trade & 0 & 22 & 0\\
+outbox, relay without idempotence key & 0 & 0 & 22\\
+outbox, relay with idempotence key & 0 & 0 & 0\\
+\bottomrule
+\end{tabular}
+\caption{2\,000 trades published with a 1\% chance of a crash at the dangerous point of each design: between the two writes, or between
+publishing and marking an outbox row sent. A phantom event announces a trade the database does not hold.}
+\label{tab:pl:messaging-and-event-driven-architecture:outbox}
+\end{table}
+
+\Cref{tab:pl:messaging-and-event-driven-architecture:outbox} shows the three failure modes and the fix. The outbox moves the problem from
+two systems to one, and what is left --- a relay that published and died before marking --- is a repeat, which the idempotent producer or
+the consumer removes.
+
+\begin{definition}[Event sourcing]\label{def:pl:messaging-and-event-driven-architecture:sourcing}
+\emph{Event sourcing}\index{event sourcing} stores a system's state as the sequence of events that changed it, appended and never edited, and
+derives every current state, and every past one, by replaying them.
+\end{definition}
+
+Chapter~\ref{ch:pl:trade-capture-and-booking}'s trade store is event-sourced, and the log is its natural home: a new downstream system
+subscribes and replays the topic from its start to build its own state. The price is retention --- the log must keep every event, or a
+snapshot with the offset it covers --- and discipline about changing the events' format.
+
+\begin{definition}[Dead-letter queue]\label{def:pl:messaging-and-event-driven-architecture:dlq}
+A \emph{dead-letter queue}\index{dead-letter queue} is a topic to which a consumer sends a message it has failed to process a stated number of
+times, with the partition and offset it came from, so that one malformed message does not stop the partition behind it.
+\end{definition}
+
+In a \omterm{def:pl:messaging-and-event-driven-architecture:log}{partitioned log} a message that always fails is worse than in a queue: the consumer cannot skip it without committing past it, so every
+message behind it in the partition waits. The dead-letter topic lets the consumer move on and leaves a record to be repaired and replayed ---
+which, for fills, must be done before anyone trusts the positions.
+
+\begin{dated}{2026-09}{Kafka's delivery semantics}\label{dat:pl:messaging-and-event-driven-architecture:kafka}
+Kafka's documentation distinguishes at most once (messages may be lost but are never redelivered), at least once (never lost but may be
+redelivered) and exactly once; a consumer that saves its position before processing gets the first, after processing the second. Since version
+0.11.0.0 its producer offers an idempotent delivery option, so that resending does not create duplicate entries in the log, and transactions
+that write to several partitions atomically; exactly-once delivery to other systems generally requires their cooperation.
+\end{dated}
+
+\section{Tutorial: a thousand crashes}\label{tut:pl:messaging-and-event-driven-architecture:tut}
+
+\begin{tutorial}
+\textbf{Goal.} Consume a day of fills under crashes in three modes and publish trades three ways. \textbf{End state:}
+\cref{fig:pl:messaging-and-event-driven-architecture:modes} and \cref{tab:pl:messaging-and-event-driven-architecture:outbox}.
+\begin{tutsteps}
+\item \textbf{Log}: \texttt{firm\_eventlog.Log}, a topic of four partitions; \texttt{pl\_eventlog.publish(fills())}.
+\item \textbf{One day}: \texttt{day(fs, mode, crash\_steps)} for each mode, with the same crash steps; count applications per fill.
+\item \textbf{A hundred days}: \texttt{schedules(mode)}, lost and duplicated fills per 1\,000 crashes and the worst position error.
+\item \textbf{Outbox}: \texttt{publishing(design)} for the four designs.
+\item \textbf{Dead letters}: put a malformed fill in a partition and consume it with \texttt{process\_with\_dlq}.
+\end{tutsteps}
+\textbf{What to change next.} Replace the atomic store by idempotent processing (a table of applied fill identifiers) and check that it gives
+the same result; rebalance the group in the middle of the day.
+\end{tutorial}
+
+\section{Build: the event log}\label{bld:pl:messaging-and-event-driven-architecture:eventlog}
+
+\begin{build}
+\bfield{Purpose} Carry the firm's events between services in order per key, durably, with consumers that can turn \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{at-least-once delivery}
+into exactly-once effects.
+\bfield{Interface} \texttt{Log} (\texttt{create}, \texttt{append}, \texttt{read}, \texttt{end}, \texttt{retain}, \texttt{commit},
+\texttt{committed}), \texttt{assign}, \texttt{run\_batch}, \texttt{AtomicStore}, \texttt{Outbox}, \texttt{process\_with\_dlq}.
+\bfield{Rules} Partition by key; never edit a message; every consumer states its mode; state and offset atomic, or processing idempotent,
+for any consumer whose state matters; every event published through an outbox; a message that keeps failing goes to dead letters with its
+origin.
+\bfield{Acceptance tests} \texttt{code/firm/eventlog/tests/}: one key in one partition and in order, segments and retention; a resend
+ignored; the group assignment; the three modes under a crash; the outbox relay's resend deduplicated; a poison message to dead letters.
+\bfield{Stretch} Consumer-group rebalancing with a generation number that fences out a stale member; compaction by key; a network server.
+\end{build}
+
+\begin{omsources}
+\item J.~Kreps, N.~Narkhede and J.~Rao, \emph{Kafka: a Distributed Messaging System for Log Processing}, NetDB 2011.
+\item Apache Kafka documentation, \emph{Design}: message delivery semantics.
+\item One Quant Book~13, chapters~12, 16 and~24 (ring buffers and slow consumers, multicast, idempotent processing and sequencers).
+\end{omsources}
+
+\section{Exercises}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:1}
+Why are fills keyed by account rather than sent round-robin to the partitions?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:2}
+A consumer commits after processing and crashes after applying 30 messages of a batch of 100. What happens when it restarts?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:3}
+Eight partitions and three consumers in a group: how are they assigned, and what happens if a fourth joins?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:4}
+Why does committing first lose about 50 fills per crash, and committing after duplicate about as many?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:5}
+The \omterm{def:pl:position-and-pnl-services:service}{position service} keeps its state in memory and writes a snapshot every minute. Where should it keep its offset?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:6}
+Why does the outbox relay still produce repeats, and who removes them?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:7}
+\emph{Coding.} Make the at-least-once \omterm{def:pl:position-and-pnl-services:service}{position service} idempotent by storing applied fill identifiers, and run \texttt{schedules} on it.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:8}
+\emph{Find the flaw.} \textquotedbl{}We turned on exactly-once in the messaging system, so the positions cannot be double-counted any
+more.\textquotedbl{}
+\end{exercise}
+
+\section{Problem: Double for Eleven Minutes}
+
+\begin{problem}[{Weekend problem --- double for eleven minutes}]\label{pb:pl:messaging-and-event-driven-architecture:1}
+The chapter's log, fills, crash schedules and trade-capture service.
+
+\medskip\noindent\textbf{Part I --- The log.}
+\begin{enumerate}
+\item What does \omterm{def:pl:messaging-and-event-driven-architecture:pubsub}{publish--subscribe} decouple, and what does it cost?
+\item When would you choose a broker, and when a brokerless transport?
+\item How is a message addressed in a \omterm{def:pl:messaging-and-event-driven-architecture:log}{partitioned log}, and how is its partition chosen?
+\item What does a \omterm{def:pl:messaging-and-event-driven-architecture:group}{consumer group} share, and what is a rebalance?
+\item What does retention drop, and what must a new subscriber do if it has dropped events it needs?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part II --- Crashes.}
+\begin{enumerate}[resume]
+\item What are the two steps of consuming a batch, and where can a crash fall?
+\item How many crashes happened in each mode, and why fewer in one?
+\item How many fills were lost or duplicated per 1\,000 crashes in each mode?
+\item What is the worst end-of-day position error in each mode, and the median?
+\item How does the atomic mode avoid both losses and duplicates?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part III --- Producing.}
+\begin{enumerate}[resume]
+\item Why can the trade and its event not be written atomically without an outbox?
+\item What does each naive design produce under crashes?
+\item What does the outbox leave, and how is it removed?
+\item What is \omterm{def:pl:messaging-and-event-driven-architecture:sourcing}{event sourcing}, and what does it require of the log?
+\item What does a \omterm{def:pl:messaging-and-event-driven-architecture:dlq}{dead-letter queue} protect?
+\end{enumerate}
+
+\medskip\noindent\textbf{Part IV --- The verdict.}
+\begin{enumerate}[resume]
+\item State the \emph{named result}: duplicated and lost fills per thousand crashes under at-most-once, at-least-once and
+idempotent-with-atomic-offset processing, and the maximum position error each produces.
+\item Which mode should the \omterm{def:pl:position-and-pnl-services:service}{position service} use, and which a monitoring dashboard?
+\item What does exactly-once in a messaging product cover?
+\item How would you detect the hook's error within minutes?
+\item In one sentence: where does exactly-once come from?
+\end{enumerate}
+\end{problem}
+
+\section{Interview questions}
+
+\begin{interviewq}[$\star$ \iqroles{developer}]\label{iq:pl:messaging-and-event-driven-architecture:1}
+Explain at-most-once, at-least-once and exactly-once delivery.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:messaging-and-event-driven-architecture:2}
+Your consumer applies fills to a database. How do you make sure a crash never double-counts a fill?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:messaging-and-event-driven-architecture:3}
+How do you publish an event whenever a row is inserted in your database, without ever losing or inventing one?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{developer}]\label{iq:pl:messaging-and-event-driven-architecture:4}
+How do you keep the messages of one account in order when a topic has many partitions and many consumers?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{developer}]\label{iq:pl:messaging-and-event-driven-architecture:5}
+Design the event backbone that carries trades, fills and positions between the services of a trading firm.
+\end{interviewq}

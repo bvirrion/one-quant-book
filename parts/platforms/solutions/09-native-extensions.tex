@@ -1,0 +1,111 @@
+\section*{Chapter \ref{ch:pl:native-extensions} --- Native Extensions}
+
+\begin{solution}{exo:pl:native-extensions:1}
+Per element through pybind11: $118 \times 2\times10^8$~ns $= 23.6$~s; in Python: 12.0~s; one call on the whole array at 1.4~ns: 0.28~s.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:2}
+\texttt{ctypes} converts each argument at run time by the declared types, through generic machinery, and builds a C call frame
+dynamically; pybind11's conversions are compiled into the binding for the exact signature. The machine instructions of the kernel are the
+same; the work around them is not.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:3}
+It converts the array into a new float64 array and passes the copy. For \texttt{ewma\_into} the kernel then writes into the copy, which is
+discarded, and the caller's array is unchanged: a silent wrong result.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:4}
+For $n > c_0/(p - c_1) = 118/58.6 \approx 2.0$: from three elements, one call on the whole array beats the Python loop.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:5}
+numpy's lookup is a binary search for each left time, $O(\log m)$ steps each, and each step touches a different part of a larger array
+(more cache misses as it grows); the merge walks both sorted arrays once, forward, a constant cost per element with sequential memory
+access.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:6}
+The array can be freed or reallocated by Python after the call (garbage-collected, resized, replaced), leaving the kernel with a dangling
+pointer: reads of freed memory or writes into someone else's. The rule: a kernel reads and writes the buffers only during the call and keeps
+no pointer afterwards; if data must persist, the caller keeps the array alive and passes it again.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:7}
+All four agree on every one of the 100\,000 indices: $-1$ for the time before the first right time, and 49\,999 (the last index) for the
+time after the last.
+\end{solution}
+
+\begin{solution}{exo:pl:native-extensions:8}
+Converting a list of Python floats into a vector and a new list back is a copy and an object creation per element, the cost native code was
+meant to avoid; a benchmark of ten numbers measures the call's fixed cost, not the per-element cost that matters on real data. Take and
+return numpy arrays through the \omterm{def:pl:native-extensions:buffer}{buffer protocol}, and benchmark on realistic lengths.
+\end{solution}
+
+\begin{solution}{pb:pl:native-extensions:1}
+\begin{enumerate}
+\item It locates the function, checks and converts each argument from a Python object, may release and reacquire the lock, converts the
+result back and checks for errors.
+\item About 60~ns (a Python function), 118~ns (C++ through pybind11) and 337~ns (Rust through \texttt{ctypes}), loop included.
+\item The Python loop around it remains, and each call adds conversions that cost more than the step itself.
+\item Other Python threads run while the native code computes; it is safe only if the native code touches no Python object while the lock
+is released.
+\item The machine-level calling and layout convention; C's is simple, stable and spoken by every language's \omterm{def:pl:native-extensions:ffi}{foreign function interface}.
+\item The argument's type, contiguity and dtype, and it converts or refuses accordingly.
+\item That each array is a numpy array of the right dtype and C-contiguous, and pass its length.
+\item Both refuse it: pybind11 because the argument is \texttt{c\_style} without \texttt{forcecast} and \texttt{noconvert}; the wrapper
+because it checks contiguity.
+\item It would copy silently: an output written into a copy is lost, and a copy of a large array costs what the extension was meant to
+save.
+\item Generated argument checks and conversions for Rust, like pybind11's for C++, and Rust types for Python objects; underneath, the same C
+interface.
+\item About 1.4~ns (C++), 1.5~ns (Rust) and 3.3~ns (numpy's filter).
+\item The filter routine has a fixed cost of several microseconds per call, larger than the bindings', and a slower inner loop.
+\item About 21~ns (numpy), 6~ns (C++) and 6~ns (Rust).
+\item From about a thousand elements.
+\item The lookup: its native version has a better algorithm (a merge instead of a binary search per element), not only a faster loop.
+\item \textbf{Named result.} A call costs about 60~ns as a Python function, 118~ns through pybind11 and 337~ns through \texttt{ctypes}; on
+whole arrays both native averages beat numpy at every length measured and the Rust lookup from about a thousand elements, and moving the
+loop instead of the body turns a 24-second day of per-element calls into 0.3~s.
+\item About 12~s against the Python loop (12.0~s to 0.28~s), 23~s against per-element native calls, and 0.4~s against numpy.
+\item When the computation is already an array operation of a library, when arrays are short and calls are few, or when the gain does
+not pay for building, testing and distributing compiled code on every platform the researchers use.
+\item The kernel keeps no pointer after the call and frees nothing it did not allocate; the caller keeps its arrays alive and unchanged
+during the call.
+\item Around whole arrays: data cross once, loops stay native.
+\end{enumerate}
+\end{solution}
+
+\begin{solution}{iq:pl:native-extensions:1}
+It was called once per element from the Python loop: each call pays a conversion and dispatch cost larger than the arithmetic, and the
+loop stayed in Python. Move the loop into the native function and pass whole arrays.
+\iqlookfor{Per-call cost versus per-element cost.}
+\end{solution}
+
+\begin{solution}{iq:pl:native-extensions:2}
+Through the \omterm{def:pl:native-extensions:buffer}{buffer protocol}: pass the array's pointer, dtype and shape (pybind11's \texttt{array\_t}, or \texttt{ctypes} pointers from
+\texttt{arr.ctypes}). Wrong dtype or strides (read as if contiguous), silent copies (forcecast), writing to a read-only array, and pointers
+kept after the call.
+\iqlookfor{Layout checks and ownership.}
+\end{solution}
+
+\begin{solution}{iq:pl:native-extensions:3}
+pybind11: compiled C++ bindings with type checks, conversions and lock handling, the norm for C++. \texttt{ctypes}: no compilation of a
+binding, works with any C interface, but checks nothing and costs more per call. A Rust generator (PyO3): pybind11's comfort for Rust;
+the C interface with \texttt{ctypes} works without it.
+\iqlookfor{Safety and per-call cost against convenience and build complexity.}
+\end{solution}
+
+\begin{solution}{iq:pl:native-extensions:4}
+So that other Python threads run while it computes. It must not touch any Python object, including reference counts, raise Python
+exceptions, or call back into Python until it has reacquired the lock.
+\iqlookfor{No Python API without the lock.}
+\end{solution}
+
+\begin{solution}{iq:pl:native-extensions:5}
+Kernels chosen by profiling (loops that arrays cannot express, merges, state machines); written in C++ or Rust against plain pointers, tested
+alone; bound once per array with pybind11 (or a C interface), refusing layouts they cannot read in place and releasing the lock; built in
+the continuous-integration pipeline for each supported platform and Python version and distributed as wheels; tested against a Python
+reference on the same data.
+\iqlookfor{Selection by measurement, separation of kernel and binding, reproducible builds.}
+\end{solution}
