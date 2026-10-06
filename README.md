@@ -10,7 +10,7 @@
   <a href="https://github.com/bvirrion/one-quant-book/releases/latest"><img src="https://img.shields.io/github/v/release/bvirrion/one-quant-book?label=latest%20release" alt="Latest release"></a>
   <a href="https://github.com/bvirrion/one-quant-book/releases"><img src="https://img.shields.io/github/downloads/bvirrion/one-quant-book/total?label=PDF%20downloads" alt="PDF downloads"></a>
   <a href="https://github.com/bvirrion/one-quant-book/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/bvirrion/one-quant-book/ci.yml?label=build" alt="Build status"></a>
-  <a href="https://www.one-course.com"><img src="https://img.shields.io/badge/one--course.com-1f6feb" alt="One Course"></a>
+  <a href="https://www.one-course.com/books"><img src="https://img.shields.io/badge/read%20online-one--course.com-1f6feb" alt="Read online"></a>
 </p>
 
 *The One Quant Book to Rule Them All.*
@@ -19,8 +19,9 @@
 > course covering each subject from kindergarten to the end of the
 > bachelor's degree, and here beyond it, into a profession. Discover the
 > whole project at **[www.one-course.com](https://www.one-course.com)**, and
-> see the siblings [One Math Book](https://github.com/bvirrion/one-math-book)
-> and [One Physics Book](https://github.com/bvirrion/one-physics-book).
+> see the siblings [One Math Book](https://github.com/bvirrion/one-math-book),
+> [One Physics Book](https://github.com/bvirrion/one-physics-book) and
+> [One Biology Book](https://github.com/bvirrion/one-biology-book).
 
 A series of eighteen **free books on quantitative finance**, written for
 readers who already code and hold a master's-level mathematics background:
@@ -28,7 +29,8 @@ the markets and their plumbing, the methods, derivatives and risk, the craft
 of research, strategies, microstructure and execution, market making and
 high-frequency trading, machine learning, and low-latency software, then the
 infrastructure, the platforms, the firm, the industry and the interviews.
-**Books 1–13 are written**, in English; Books 14–18 are in preparation.
+**All eighteen books are written**, in English, and every one can be read
+online or downloaded as a PDF.
 
 Every book is built the same way:
 
@@ -43,7 +45,9 @@ Every book is built the same way:
 - **Numbers you can reproduce.** Every chart is drawn from data the book's
   own code generates, and every printed number is asserted by a test.
 - **Practice.** Graded exercises, an end-of-chapter problem and interview
-  questions in every chapter, with full solutions at the end of each book.
+  questions in every chapter of Books 1–17, with full solutions at the end of
+  each book; Book 18 is the interview book itself, a lesson and a bank of
+  solved questions per chapter.
   Thousands of generated hyperlinks send every defined term back to its
   definition.
 
@@ -54,30 +58,31 @@ Every book is built the same way:
 </p>
 <p align="center"><sub>Three pages: discrete hedging error (Book 5), a stop cascade on the exchange simulator (Book 10), the memory hierarchy measured (Book 13).</sub></p>
 
-## Download the PDFs
+## Read online · Download the PDFs
 
-| Book | Chapters | Download PDF |
-|------|---------:|--------------|
-| **1. Markets I** — The Ecosystem and Exchange-Traded Markets | 31 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_01_markets_1.pdf) |
-| **2. Markets II** — Rates, FX and Credit | 31 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_02_markets_2.pdf) |
-| **3. Markets III** — Commodities, Energy and Crypto | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_03_markets_3.pdf) |
-| **4. Quantitative Methods** | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_04_methods.pdf) |
-| **5. Derivatives and Volatility** | 28 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_05_derivatives.pdf) |
-| **6. Rates, Credit, XVA and Risk** | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_06_rates_credit_risk.pdf) |
-| **7. Research Craft** — Predictors, Backtests, Measurement, Portfolios | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_07_research.pdf) |
-| **8. Strategies I** — Equities and Futures | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_08_strategies_1.pdf) |
-| **9. Strategies II** — Volatility, Relative Value, Macro and the Bank Desks | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_09_strategies_2.pdf) |
-| **10. Microstructure and Execution** | 28 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_10_microstructure.pdf) |
-| **11. Market Making and High-Frequency Trading** | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_11_hft.pdf) |
-| **12. Machine Learning for Markets** | 29 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_12_ml.pdf) |
-| **13. Low-Latency Software** | 26 | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_13_low_latency.pdf) |
-| 14. Networks, Hardware and Trading Infrastructure | 29 | 🚧 in preparation |
-| 15. Research, Data and Risk Platforms | 30 | 🚧 in preparation |
-| 16. The Desk and the Firm | 30 | 🚧 in preparation |
-| 17. The Industry: Firms, Roles and Careers | 30 | 🚧 in preparation |
-| 18. The Interview Book | 29 | 🚧 in preparation |
+| Book | Chapters | Read online | Download PDF |
+|------|---------:|-------------|--------------|
+| **1. Markets I** — The Ecosystem and Exchange-Traded Markets | 31 | [EN](https://www.one-course.com/books/quant/1/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_01_markets_1.pdf) |
+| **2. Markets II** — Rates, FX and Credit | 31 | [EN](https://www.one-course.com/books/quant/2/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_02_markets_2.pdf) |
+| **3. Markets III** — Commodities, Energy and Crypto | 29 | [EN](https://www.one-course.com/books/quant/3/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_03_markets_3.pdf) |
+| **4. Quantitative Methods** | 29 | [EN](https://www.one-course.com/books/quant/4/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_04_methods.pdf) |
+| **5. Derivatives and Volatility** | 28 | [EN](https://www.one-course.com/books/quant/5/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_05_derivatives.pdf) |
+| **6. Rates, Credit, XVA and Risk** | 29 | [EN](https://www.one-course.com/books/quant/6/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_06_rates_credit_risk.pdf) |
+| **7. Research Craft** — Predictors, Backtests, Measurement, Portfolios | 29 | [EN](https://www.one-course.com/books/quant/7/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_07_research.pdf) |
+| **8. Strategies I** — Equities and Futures | 29 | [EN](https://www.one-course.com/books/quant/8/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_08_strategies_1.pdf) |
+| **9. Strategies II** — Volatility, Relative Value, Macro and the Bank Desks | 29 | [EN](https://www.one-course.com/books/quant/9/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_09_strategies_2.pdf) |
+| **10. Microstructure and Execution** | 28 | [EN](https://www.one-course.com/books/quant/10/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_10_microstructure.pdf) |
+| **11. Market Making and High-Frequency Trading** | 29 | [EN](https://www.one-course.com/books/quant/11/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_11_hft.pdf) |
+| **12. Machine Learning for Markets** | 29 | [EN](https://www.one-course.com/books/quant/12/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_12_ml.pdf) |
+| **13. Low-Latency Software** | 26 | [EN](https://www.one-course.com/books/quant/13/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_13_low_latency.pdf) |
+| **14. Networks, Hardware and Trading Infrastructure** | 29 | [EN](https://www.one-course.com/books/quant/14/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_14_networks.pdf) |
+| **15. Research, Data and Risk Platforms** | 30 | [EN](https://www.one-course.com/books/quant/15/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_15_platforms.pdf) |
+| **16. The Desk and the Firm** | 30 | [EN](https://www.one-course.com/books/quant/16/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_16_desk.pdf) |
+| **17. The Industry** — Firms, Roles and Careers | 30 | [EN](https://www.one-course.com/books/quant/17/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_17_industry.pdf) |
+| **18. The Interview Book** | 29 | [EN](https://www.one-course.com/books/quant/18/en) | [PDF](https://github.com/bvirrion/one-quant-book/releases/latest/download/one_quant_book_18_interviews.pdf) |
 
-The PDF links always point at the newest release; every release also keeps
+Every book can be read online, chapter by chapter. The PDF links always
+point at the newest release; every release also keeps
 each PDF under a versioned name (e.g. `one_quant_book_05_derivatives_v0.0.4.pdf`).
 Spotted a mistake? Please
 [report an erratum](https://github.com/bvirrion/one-quant-book/issues/new?template=errata.yml) —
@@ -89,7 +94,7 @@ Requirements: a TeX Live installation with `latexmk` (pdfLaTeX; packages
 used: `tcolorbox`, `pgfplots`, `listings`, `cleveref`, `imakeidx`, …).
 
 ```sh
-make            # or just: latexmk — builds all written books
+make            # or just: latexmk — builds all eighteen books
 ```
 
 The PDFs are produced at `build/one_quant_book_<NN>_<slug>.pdf`. To build a
@@ -134,8 +139,7 @@ when you spot a mistake.
 
 ## License
 
-© 2026 Benjamin Virrion.
-
+- **How to credit**: One Quant Book, One Course (one-course.com).
 - **Book content** — the LaTeX sources, figures, and the PDF and HTML editions — is licensed under
   [Creative Commons Attribution-NonCommercial-ShareAlike 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
   (CC BY-NC-SA 4.0): you may share and adapt it, including translating it, with credit to
@@ -146,7 +150,7 @@ when you spot a mistake.
 - **Third-party material** (photographs, public-domain images, bundled fonts) keeps its own licence, as listed in
   the books' image-credit pages.
 - **Names and logos**: "One Course" and "One Quant Book" are not covered by these licences.
-- **Commercial use** (print editions, licences for schools, publishers or companies): contact the author.
+- **Commercial use** (print editions, licences for schools, publishers or companies): contact One Course via [one-course.com/contact](https://one-course.com/contact).
 
 Contributions are accepted under these licences with a signed-off commit — see
 [`CONTRIBUTING.md`](CONTRIBUTING.md#licensing-of-contributions).
