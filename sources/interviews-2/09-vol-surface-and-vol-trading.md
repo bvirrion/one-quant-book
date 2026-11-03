@@ -1,0 +1,14 @@
+# The Vol Surface and Vol Trading: ledger
+
+All surface levels are invented for the arithmetic. Mathematics (Dupire, Gyongy, Hull-White mixing, Lee's moment formula, Hagan's SABR expansion, Parkinson's estimator, Carr-Madan replication) is named as mathematics and tested. External facts are below, each reused with its original access date.
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Prior to the October 1987 crash the S&P index-option volatility surface was fairly flat; since then it has been skewed; the smile appeared after the crash, connected to the discovery that a giant market could drop 20% or more in a day or two; representative pre-1987 data from Rubinstein (1994) | E. Derman, The Volatility Smile, lecture 1 (Columbia, 2008), PDF via pdftotext (row reused from derivatives) | https://emanuelderman.com/wp-content/uploads/2013/09/smile-lecture1.pdf | 2026-09-24 | "Prior to the stock market crash of October 1987, the volatility surface of index options was indeed fairly flat"; "a giant market could drop by 20% or more in a day or two" | Q6 |
+| F2 | Bakshi and Kapadia, "Delta-hedged gains and the negative market volatility risk premium", Review of Financial Studies 16(2) (2003) 527-566; working-paper abstract: on S&P 500 index options the delta-hedged strategy underperforms zero, less so away from the money and more at times of higher volatility; evidence of a negative market volatility risk premium | Crossref records 10.1093/rfs/hhg002 and (abstract) 10.2139/ssrn.267106 (row reused from derivatives) | https://api.crossref.org/works/10.2139/ssrn.267106 | 2026-09-24 | abstract in Crossref (SSRN version) | Q15 |
+| F3 | 5 February 2018: the S&P 500 fell 4% while the VIX jumped 20 points | BIS Quarterly Review, March 2018, box "The equity market turbulence of 5 February" (also Book 1 ch. 25 ledger F3) (row reused from derivatives) | https://www.bis.org/publ/qtrpdf/r_qt1803t.htm | 2026-09-24 | "the S&P 500 index fell 4% while the VIX ... jumped 20 points" | Q15 |
+| F4 | Individual equity options' risk-neutral distributions are far less negatively skewed than the market index's (OEX and 30 stocks), RFS 16(1) (2003) 101-143 | Bakshi, Kapadia, Madan (OUP record) (row reused from derivatives) | https://academic.oup.com/rfs/article-abstract/16/1/101/1615098 | 2026-09-24 | "individual risk-neutral distributions differ from that of the market index by being far less negatively skewed" | Q36 |
+
+## Unverified
+
+That the market's smile tends to move with the stock, and against the local-volatility forecast (Q30), is stated as the common view after Hagan and co-authors; no empirical source has been read for it in this chapter. That most calibrated Heston models fail the Feller condition (Q23) is a commonplace, not sourced here.

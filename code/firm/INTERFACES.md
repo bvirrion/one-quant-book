@@ -551,7 +551,7 @@ the main session wires the two at the reconciliation.
 ## 10. Books 17–18 components (reserved 2026-09-29 at the sync, all new and unique; all **landed** 2026-09-29)
 
 - **Book 17** (`industry`): industrymap profiles lineage formadv teamtenure firmsize bankmix ownercost payband tokencomp filings industrypnl payoffer paydata aftertax roles workload locations careerpath edupipe careerdec
-- **Book 18** (`interviews`): none (answer checkers under `code/interviews/`).
+- **Books 18 to 20** (`interviews-1`, `interviews-2`, `interviews-3`, which replaced the old `interviews` on 2026-11-03): none (answer checkers under `code/interviews-N/`).
 
 Book 17 wraps Book 16's `firmecon`, `podshop`, `ddrules`, `partnership`, `gardenleave`, `moats`, Book 8's
 `multistrat` and others read-only, and never edits them.

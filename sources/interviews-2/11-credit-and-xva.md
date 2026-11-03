@@ -1,0 +1,13 @@
+# Credit and XVA: ledger
+
+Every level is invented for the arithmetic. The mathematics (credit triangle, hazard rates, Merton, one-factor Gaussian copula, expected exposure, CVA integral) is named as mathematics and checked by the tests.
+
+| id | claim | source | URL | accessed | evidence | used in |
+|---|---|---|---|---|---|---|
+| F1 | Big Bang Protocol effective 8 April 2009: North American CDS on investment-grade names trade with a fixed 100 bp coupon, high-yield names with 500 bp, with upfront payments; auction settlement hardwired; determinations committees | Paul, Weiss, "The Big Bang Protocol and a New Structural Framework for Credit Default Swaps", client memo, 24 March 2009 (same source as Book 2, ch. 23, F3) (row reused from rates-credit-risk) | https://www.paulweiss.com/media/hzjjrf1e/24mar09cds.pdf | 2026-09-23 | "CDS on investment grade Reference Entities will stipulate a fixed coupon of 100 basis points ... High-yield Reference Entities will trade on a fixed 500 basis points spread and be quoted in up-front points." | Q5 |
+| F2 | During the financial crisis roughly two-thirds of losses attributed to counterparty credit risk were due to CVA losses and only about one-third to actual defaults; with the CVA risk capital charge, counterparty credit risk capital under Basel III doubles relative to Basel II | BCBS press release, "Capital treatment for bilateral counterparty credit risk finalised by the Basel Committee", 1 June 2011 (row reused from rates-credit-risk) | https://www.bis.org/press/p110601.htm | 2026-09-24 | "roughly two-thirds of losses attributed to counterparty credit risk were due to CVA losses and only about one-third were due to actual defaults"; "will double the level required under Basel II" | Q20 dated box |
+| F3 | Li (2000) applies copula functions (the Gaussian copula) to default correlation | D. X. Li, "On default correlation: a copula function approach", Journal of Fixed Income 9(4), 43-54, 2000 (Crossref metadata; SSRN working paper 1999 titled "On Default Correlation: A Copula Function Approach") (row reused from rates-credit-risk) | https://doi.org/10.3905/jfi.2000.319253 | 2026-09-24 | Crossref records 10.3905/jfi.2000.319253 (JFI 9(4) 43-54, 2000, author Li) and 10.2139/ssrn.187289 (full title) | Q17 |
+
+## Unverified
+
+None of the commonplaces here is cited: that distressed names quote in points up front (Q6), that basis trades get cut when funding tightens (Q7), that master agreements make netting enforceable (Q12), that desks hedge DVA through peer baskets and that capital rules take it out of regulatory capital (Q14), that banks book FVA (Q15), and that real short spreads are well above the Merton figure (Q18). These are said in general terms and carry no number.

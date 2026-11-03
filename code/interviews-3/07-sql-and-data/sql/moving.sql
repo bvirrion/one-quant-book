@@ -1,0 +1,5 @@
+SELECT day, price,
+       AVG(price) OVER (ORDER BY day ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS by_rows,
+       AVG(price) OVER (ORDER BY day RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS by_range
+FROM closes
+ORDER BY day;

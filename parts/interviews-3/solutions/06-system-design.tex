@@ -1,0 +1,548 @@
+\section*{Chapter \ref{ch:iv3:system-design} --- System Design}
+\markboth{\protect\omTocMark{}{Answers: System Design}}{\protect\omTocMark{}{Answers: System Design}}
+
+\begin{solution}{iq:iv3:system-design:1}
+On average 2 are inside, as $50\,000 \times 40 \times 10^{-6} = 2$. At a depth of 200, the average time is $200 / 50\,000 = 4$ ms. This is Little's law, $L = \lambda W$: average number inside equals arrival rate times average time inside.
+
+It assumes only a stable system over a long enough period, so that what goes in comes out. It does not need any assumption about the distribution of arrivals or service times, which is why it is so useful. The test checks it on a simulated queue with random arrivals.
+
+Its use in practice is that you can measure two quantities and get the third. Queue depth is cheap to read in production, while the time inside takes more care. A depth of 200 at a known rate tells you at once that messages are 4 ms old when they get out.
+
+\iqwrong{``The 40 microseconds is a fixed cost, so a depth of 200 changes nothing.'' The time inside includes the wait, and that is what has grown.}
+\iqfollow{Does this apply during a burst?}{Only on average over a long enough window. During a burst, more goes in than comes out, so the stable-system assumption fails for that moment.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:2}
+For 10 backends, $1 - 0.99^{10} = 9.6\%$. For 100 backends, $1 - 0.99^{100} = 63\%$. A request waiting for all is as slow as the slowest, so a rare event at each backend becomes common at the top. A mean hides that, as a small share of slow calls barely moves it.
+
+So the percentile of a single backend is what its users feel, many times over. A published study of large web services gives the same 63\% figure for this arithmetic, at 100 servers.
+
+The remedies come from not waiting for everyone. Send a second copy of a slow request to another replica after a short delay, and take the first answer. Return a partial result if the design allows. Reduce the fan-out, or remove the causes of the slow 1\%, such as collection pauses and background jobs.
+
+Independence is an assumption. If the slowness has a common cause, like a network hiccup, then fewer requests are hit, as the slow calls come together, but on those every backend is slow at once.
+
+\iqwrong{``Each backend meets its 99\% target of 5 ms, so the service does too.'' Targets do not compose across a fan-out.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:3}
+The peak needs $10^6 \times 40 \times 8 = 320$ Mb/s. A day is $200\,000 \times 40 \times 6.5 \times 3600 = 187$ GB, and a year of 252 days is about 47 TB. Size anything that handles live data for the peak, and storage for the average.
+
+A real-time path that falls behind at the peak has failed, whatever its average. So links, handlers and consumers are sized for the peak, with room to spare, since peaks grow over the years and come at the worst moments. Storage and overnight batch jobs care about the total for the day, so they use the average.
+
+Peak measured over which window? A one-second peak hides far sharper bursts at the millisecond level, which is what a buffer sees. So ask for the peak at the finest scale you can get. Over one millisecond, a rate may be several times the one-second figure.
+
+These are raw numbers. Headers add to the link rate, and compression reduces the storage, by a factor that you measure on your own data.
+
+\iqwrong{``The average is 200\,000 a second, so 64 Mb/s is enough.'' A link at that rate would drop or queue through every busy minute.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:4}
+Downtime is $0.001 \times 8760 = 8.76$ hours a year. Needing both gives $0.999^2 = 99.8\%$, about 17.5 hours down. Either one being enough gives $1 - 0.001^2 = 99.9999\%$, about 31.5 seconds down. Independence is the weak point, as real failures share causes.
+
+The two rules are multiplication of up-times in series, and of down-times in parallel. So each added dependency in a chain makes things worse, and redundancy makes them much better, on paper.
+
+Two copies are rarely independent. They share a power feed, a switch, a release with the same bug, a configuration push, or a certificate that expires on the same day. So a single bad release takes both down at once, and the 31 seconds a year is fantasy. Failover also takes time, and failover logic is itself a thing that can break, usually when it is first needed.
+
+A design review should thus look for shared causes rather than count nines. Use separate failure domains, roll changes out to one side at a time, and test the failover.
+
+\iqwrong{``Two replicas give six nines.'' That is only the arithmetic under independence. A shared bug gives one nine.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:5}
+It prints \texttt{2 [100, 100]} and \texttt{1 [100]}. Without a key, the retry is a second order, and you have twice the position you wanted. With a client order ID, the gateway recognises the retry and returns the first reply. The retry becomes safe, which is what idempotent means.
+
+A timeout tells the client nothing about the order: it may never have arrived, or only the reply may be lost. So a client must retry, or else ask, and a key is what makes that safe.
+
+The gateway must remember a key for at least as long as a client might retry it. In trading, that is usually one session or one day, and IDs are unique within it.
+
+The order and the remembered reply must be one atomic write. If the gateway crashes after accepting the order and before storing the key, a retry creates a second order. If it stores the key first, a retry gets a reply for an order that never existed. So both go to the same journal entry or the same transaction.
+
+\iqwrong{``Retry on timeout, and TCP makes sure there are no duplicates.'' TCP removes duplicates within one connection. A retry after reconnecting is a new message.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:6}
+On the hot path: the decision, the risk check, sending the order, and the position update, since the next decision and risk check need the position. Off it: the audit record, the log line and the dashboard. Those must not be able to delay the next order.
+
+The others get their data through a queue, usually a ring buffer: the hot thread writes a small fixed-size binary record, and another thread or process does the work. Even formatting a timestamp or a double is left to that consumer. So the hot path pays for one memory copy and one store.
+
+That has one consequence to be clear about. If the queue fills up, something has to give: do you drop log records, or stop trading? An audit record that is required by a regulator or for your own reconciliation must not be dropped, so a full queue there is a reason to stop sending orders, and an alert. A dashboard feed can simply drop.
+
+The risk check stays on the path, since it must be able to stop the order. It must be kept simple and constant-time.
+
+\iqwrong{``Log it all inline, since logging is cheap.'' The average is cheap, but it can block on a disk or a lock at the worst moment, and that is the tail you will see.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:7}
+Polling costs the server 10\,000 replies a second in both cases. Push costs 20\,000 a second if the price changes twice a second, and about 167 a second if it changes once a minute. Polling's average staleness is half the interval, 0.5 s. Polling is the better choice when changes outrun what clients need.
+
+Polling sets the rate by what the client wants, and pushing sets it by what the data does. So with quiet data, push is far cheaper and fresher. With busy data it can flood the client, unless you conflate. And a polling client that asks once a second sees at worst a price 1 s old, so its load and its freshness are both easy to reason about.
+
+Polling also has practical strengths. It needs no state per client on the server and no open connection, and it recovers from any failure by itself, as the next poll gets the current value. A push system must deal with reconnects and missed updates.
+
+A middle way is a push of a conflated snapshot at a fixed rate, which is often what a price display really wants.
+
+\iqwrong{``Push is always more efficient.'' With a price that changes twice a second, it sent twice as many messages here.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:8}
+The maximum is 500\,000 orders per second. At 400\,000 the load $\rho$ is 0.8, and the mean time in the system is $2 / (1 - 0.8) = 10$ microseconds, of which 8 are waiting. At 100\% load, the queue has no steady state, so waits grow without limit. The test's run at 110\% load shows this.
+
+That formula is for random arrivals and exponential service, so it is only a model of a real thread. It shows the shape, though: latency depends on $1 / (1 - \rho)$, so the last few percent of capacity cost the most.
+
+Arrivals are also bursty. A rate of 400\,000 averaged over a second can contain moments far above 500\,000. Then a queue builds regardless, and it takes spare capacity to drain it. A thread that runs near its maximum on average never drains.
+
+So you plan capacity so that the peak leaves real room, and you watch how the queue behaves, not just the mean rate. The maximum rate is the point at which the system falls over, not one to operate at.
+
+\iqwrong{``It can do 500\,000, so 490\,000 is safe.'' The mean wait there would be about fifty times the service time, under this model.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:9}
+With the modulo rule, about 10/11, or 91\%, of keys move, as nearly every key's remainder changes. With a ring, about 1/11, or 9\%, move, and all of them onto the new node. On our run of 100\,000 keys, the two gave 90.7\% and 9.8\%. \Cref{lst:iv3:sd:ring} is the ring.
+\omcode{code/interviews-3/06-system-design/python/iv_ring.py}{1}{22}{A hash ring.}\label{lst:iv3:sd:ring}
+
+Each node is hashed onto a circle, and a key belongs to the next point clockwise. A new node takes over only the arcs just before its own points, so the other keys stay put. The test checks that every moved key lands on the new node.
+
+With one point per node, arcs have very unequal lengths. In our run, the fullest of 10 nodes held 1.94 times the average. With 100 virtual nodes that fell to 1.11, and with 1000 to 1.04. Virtual nodes also spread a dead node's load across all the others, not onto a single neighbour.
+
+Hash sharding is poor where load is very uneven. Symbols are not equal: a few have far more activity than the rest, and a hash can't see that, so one server may take several busy names. In trading, you often place symbols deliberately by measured load, and keep related instruments together, so that a spread's two legs live on one thread. Stability of assignment during a session matters more than convenience.
+
+\iqwrong{``Hashing distributes load evenly.'' It distributes keys evenly. Load per key is another matter.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:10}
+\Cref{lst:iv3:sd:states} is one answer. A cancel that crosses the last fill is normal: the fill makes the order final, and the later cancel reject must be accepted without complaint. A venue's unasked cancel moves the order to cancelled from any working state. A fill after a cancel ack, or more than the quantity, raises an alarm.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/06-system-design/python/iv_order_states.py}{1}{34}{An order's life.}\label{lst:iv3:sd:states}
+
+The sender's view has pending states since nothing is known until the venue answers. In pending new, the order may or may not exist. In pending cancel, it may still fill, and the code keeps counting fills there. Treat that as working exposure: until the cancel is acknowledged, you can still trade.
+
+A cancel reject in pending cancel returns the order to open. That usually means that it was too late, or that the ID was wrong, so a real system also records the reason.
+
+Unexpected events need an alarm, since they mean your picture of the position or the venue's state may be wrong. A fill after a cancel ack means that one of you is mistaken, and the position may be off. Quietly ignoring it lets the error grow until the end of the day.
+
+Some venues report in ways that differ from this: a fill can overtake the acknowledgement if the two travel on separate channels, and then you would treat the fill as an implicit ack. So read the venue's specification, and write the table for it. The test throws random events at the table: a final state stays final, and no overfill gets through.
+
+\iqwrong{``An order has three states: open, filled, cancelled.'' That leaves no room for not knowing yet, and that's where the losses are.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:11}
+\Cref{lst:iv3:sd:risk} counts open orders into the worst case on each side. A check on the current position alone is wrong, since ten open orders, each small enough on its own, can all fill at once and go far past the limit. Checks sit in-line, on the only path to the venue, at constant cost.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/06-system-design/python/iv_risk.py}{1}{33}{Pre-trade checks.}\label{lst:iv3:sd:risk}
+
+The two sides are kept apart since they do not net until they fill. If you hold no position and have 1000 of open buys and 1000 of open sells, then either could fill alone, so the worst long is 1000 and the worst short is 1000. Netting the buys against the sells would hide this. The test's random streams assert the claim itself after each step: if all open orders filled now, the position would still be inside the limit.
+
+These checks must sit where no order can go around them, between all strategies and the venue. In the US, a broker with market access must have such controls under its own direct and exclusive control. If each strategy keeps its own, then a bug in one strategy is also a bug in its check.
+
+On the hot path, each check is a compare with values already in memory, with no lock, allocation or network. Keep fields in integers, as floating point has no place in a limit. It should cost little, though it's on every order, and you should measure it. Reference prices must be fresh, as a stale one makes the collar wrong, so check for that too. Slower, aggregate risk across strategies runs beside the path, and sets these limits.
+
+\iqwrong{``Check the position after each fill.'' By then the order has traded, and the limit is already broken.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:12}
+A kill switch stops new orders first, then cancels what is open, then tells people. It can be triggered by a person or by an automatic rule. It must not depend on the process being stopped, as a broken process is the very case it exists for. It stops further harm, and does not undo trades.
+
+The order matters. Block new orders at a point every order must pass, such as the gateway or the risk layer. Otherwise, a strategy keeps replacing what you cancel. Then cancel all open orders, using a mass cancel if the venue has one. Closing a session may do it, on a venue with cancel-on-disconnect. Then alert people, and leave the system blocked until a person restarts it.
+
+It should run on its own path, with its own connection, or at least a separate process. A switch inside the strategy shares its bugs. People need a simple way to press it, and must have the right to do so without asking first.
+
+A US enforcement order describes a broker-dealer that lost over \$460 million in about 45 minutes, through orders that an old code path kept sending. It records that the firm had no procedures to halt that system in response to its own alerts. So rehearse it, as a switch never tested may not work on the day.
+
+Useful automatic triggers: loss or position beyond a limit, order or message rates beyond normal, too many rejects, lost market data, and a stale heartbeat. It will not remove the position you already hold, which still needs a plan to close, and it can do harm by itself if cancelling leaves a hedge undone. So you also need a decision on who closes what.
+
+\iqwrong{``The strategy checks its own loss and stops itself.'' The strategy may be exactly what is broken.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:13}
+Buffer updates until a snapshot arrives, then apply only those numbered after it, as \cref{lst:iv3:sd:sync} does. If the snapshot is older than your oldest buffered update, the numbers between them are gone, so wait for a newer snapshot. The guarantee: whenever a book exists, it is correct for its sequence number.
+\omcode{code/interviews-3/06-system-design/python/iv_book_sync.py}{1}{35}{Snapshot and updates.}\label{lst:iv3:sd:sync}
+
+Each update sets a level's size, and a size of 0 removes the level. So applying updates in sequence from a correct starting point gives a correct book. An update at or below the snapshot's number is already included in it and is skipped, which is why the snapshot needs its number. Without one, you cannot join the two streams at all.
+
+A gap, once you are in sync, means that the book is no longer right. You should not keep showing it. Drop it, tell whoever depends on it, and start again from the next snapshot. A book that is quietly wrong is worse than none, as a strategy may trade against prices that don't exist.
+
+The test runs 300 random streams with some loss, and snapshots a little in the past, and asserts after each message that if a book exists, it equals the true book for its sequence. It also covers a snapshot older than the buffer.
+
+Two things in the listing would need work in production. The buffer has no limit while out of sync, and recovery after a gap may take a while. A real handler would also try a retransmission for a small gap first, and take a snapshot only if that fails, and it would keep all instruments' books apart, as one gap may affect only one.
+
+\iqwrong{``Apply the snapshot, then all the buffered updates.'' Old absolute sizes would overwrite newer data in the snapshot, giving a wrong level.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:14}
+\Cref{lst:iv3:sd:conflate} holds one value per symbol, so memory is bounded by the number of symbols. An update replaces the value and keeps the symbol's place in line, so a busy symbol cannot go round again before a quiet one has had its turn. Trades, order acknowledgements and anything else that is a sequence of events must never be conflated.
+\omcode{code/interviews-3/06-system-design/python/iv_conflate.py}{1}{15}{A conflating buffer.}\label{lst:iv3:sd:conflate}
+
+It relies on a Python dict keeping insertion order: replacing a value leaves the key in place, and removing and re-adding sends it to the back. The test checks the delivery order against a plain list of who first went stale. It also checks that the consumer ends with the newest value of everything, whatever the timing.
+
+Conflation trades history for freshness. A consumer that only wants the current price loses nothing that it needs. It would rather have the newest price than work through a backlog of old ones, which is the failure that a plain queue gives: every price it shows is as old as the queue is long.
+
+Data that must not be conflated is any where each item matters by itself. Trades add up to volume, and fills add up to a position. Replacing one with a later one simply loses it. Book updates are a special case: conflating to the current state of each level is fine, as each is an absolute size, but dropping incremental deltas is not. 
+
+\iqwrong{``Use a bounded queue, and drop the oldest.'' That drops whichever symbol was oldest, even when it is the only update for that symbol.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:15}
+The net fill rate is $5000 \times 100 = 0.5$ MB/s, so $16 \times 2^{20} / 500\,000 = 33.6$ seconds. Then the choices are to block the publisher, drop data, conflate, or disconnect the client. Conflate for the dashboard. Disconnect the risk system so it can resync, and alert. A trading engine should never be this slow, and must fall out loudly.
+
+Blocking is the one choice you should rule out. If the publisher waits for one slow client, then all clients are held back, so the slowest consumer sets the speed for all of them. So each client needs its own buffer, and the publisher writes without blocking.
+
+Dropping within a TCP stream breaks whatever framing or sequence the client relies on. So drops should be at a message boundary, with a sequence number that lets the client see the gap.
+
+For a dashboard, a person is looking at a few prices, so a conflated latest value is what it wants, at no loss to anyone. A risk system needs a correct and complete picture, so a silent loss is unacceptable. A disconnect with an alert, then a reconnect and a resync from a snapshot, is honest. A trading engine that lags by 30 seconds should not be trading at all, so the right result is that it stops quoting, and a person is told.
+
+The buffer only delays the problem. If the client is slow on average, a bigger buffer only means older data before it's full.
+
+\iqwrong{``Increase the buffer to 1 GiB.'' It delays the day of reckoning by about half an hour, with data half an hour old by then.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:16}
+Sending everything takes $10^6 \times 100 \times 50 \times 8 = 40$ Gb/s, and watching only 10 prices brings it to 4 Gb/s. At 20\,000 connections a server, that is 50 servers, each with 800 Mb/s at most. Updates reach them from an internal publish-subscribe layer. When a server dies, its clients reconnect to another, and get a fresh snapshot.
+
+The design is in layers. Prices enter a small ingest tier, which computes a current value per instrument and publishes it on an internal bus. Connection servers subscribe, hold the websockets, and fan out. They are stateless, apart from each client's list of subscriptions, so you can add more behind a load balancer.
+
+Batching helps a lot. Rather than one frame per price, send each client one frame per second with its 10 prices, as humans can't read faster. A conflated batch also removes the need to send updates that nobody could see. Per-client buffers are bounded, and a slow client gets the latest value and not a backlog.
+
+On reconnect, all of a dead server's 20\,000 clients come back at once, as a herd. So add a random delay on the client side, and serve a snapshot from a cache and not from the ingest tier. The clients of a displayed price can tolerate small losses, unlike a trading system, and the page must show that a price is stale if updates stop.
+
+A cache of the current snapshot behind a plain web request also serves as a fallback for clients whose networks block websockets.
+
+\iqwrong{``Send each update to each client as it arrives.'' That is the 40 Gb/s design, and it is mostly bytes nobody sees.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:17}
+It need not be a bug. Most likely the two logs do not refer to the same instant: their clocks differ, the timestamps may come from different points in each path, and one client may have been behind. Only comparison by the venue's own sequence number, on packets captured on the same basis, can tell.
+
+The possible causes, starting with the likeliest. The clocks are out by more than the gap you are looking at. One timestamp is taken at the network card, and the other after the feed handler has run. One client was slower through a burst, so its queue held older data. The two take different channels from the venue, such as a fast direct feed and a slower consolidated one. One has a gap it has not yet noticed, or conflates. Or there is a real bug in one book builder.
+
+To find out, align both logs on the venue's sequence number, and not on wall-clock time. If at the same sequence number the two books agree, it was only timing, and you can read off how far one lags. If they disagree there, one book is wrong, and you can replay that client's captured packets through its handler to see where.
+
+So you need raw packet captures, or at least the sequence number and a receive stamp stored with each book change. Without these, you will argue about clocks forever.
+
+\iqwrong{``Same wall-clock time, so they must match.'' Two clocks never agree exactly, and the same instant doesn't mean the same place in the stream.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:18}
+It prints a share of about 0.1, then \texttt{True True}. In our run, the price column is about 10\% of a day's compressed file. The checks say the plan reads only the \texttt{price} column, and only one file of four. A column format lets a query touch only what it needs.
+
+A row store would have to read every field of every row to average one of them. In Parquet, each column chunk is stored contiguously, so a reader can take only the ones it wants, and the footer says where they are. Values of one kind also compress well together. Partition pruning does a similar job on the rows, since the \texttt{date=} directories rule out files before they are opened.
+
+It suits analytics: scans, aggregates and a few columns over many rows. It does not suit fetching whole single rows, or updating in place, as files are immutable, and a change means rewriting.
+
+For a year's layout, partition by date, since most queries name a date range and old days never change. Within a day's file, sort by symbol and then by time, so that each row group's statistics let a query skip the groups outside its symbol. You need not use one file per symbol. Across thousands of symbols, most of them thin, that would mean a very large number of tiny files, and opening a file costs far more than reading a chunk. Keep the raw captures too, as they are the only true record, and everything else can be rebuilt from them.
+
+\iqwrong{``Put it all in a relational table with an index.'' An index finds rows, and a tick store's queries read nearly everything in a date range.}
+\iqfollow{What about a very busy symbol?}{Row group statistics handle it, as a busy symbol just takes several groups.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:19}
+\Cref{lst:iv3:sd:delta} is one codec. 10\,000 timestamps take 20\,007 bytes, against 80\,000 raw: 9 bytes for the first value's delta from zero, then 2 for each of the rest. Neighbouring times are close, so the differences are small, and a small number needs few bytes. Random values get bigger, at about 9 bytes each.
+\omcode{code/interviews-3/06-system-design/python/iv_delta.py}{1}{26}{Deltas and variable-length integers.}\label{lst:iv3:sd:delta}
+
+A difference here is 1000 ns. Zigzag doubles it to 2000, which keeps the sign in the lowest bit, and small negatives stay small. 2000 needs 11 bits, which takes 2 bytes at 7 bits a byte. So the codec went from 8 bytes each to 2 on this data, by knowing its structure, and the test confirms the exact size.
+
+With random values, the differences are as large as the values, zigzag adds a bit, and the 1-bit flag on each byte costs an eighth, so the encoded form is larger than 8 bytes each. The test shows this growth. So no codec helps everything, and this one depends on sorted input.
+
+A store runs this first since a general compressor looks for repeated byte strings, and a sequence of ever-growing 8-byte numbers has few of those. After the delta, the same small value repeats, and a general compressor then does very well. Parquet has an encoding of this family built in, for integer columns.
+
+Real tick times are less regular than this, so the 2 bytes is an upper-end case for compression, and you should measure on your own data.
+
+\iqwrong{``gzip the file, and that is enough.'' It finds less structure than a codec that knows these are sorted times, and it costs more CPU to read back.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:20}
+\Cref{lst:iv3:sd:bitemp} keeps every version with the time it became known, and \texttt{as\_of} picks the latest one known by then. Overwriting destroys what you knew, so a backtest would trade on a correction that it could not have seen, and last month's report could no longer be explained.
+\omcode{code/interviews-3/06-system-design/python/iv_bitemporal.py}{1}{18}{Two times per row.}\label{lst:iv3:sd:bitemp}
+
+The two times answer different questions. The event time says when something happened, and the known time says when you learned this version of it. A price from Monday, corrected on Tuesday, has one event time and two known times. A question like ``what was Monday's price?'' depends on when you ask.
+
+In a backtest, the simulation for Monday afternoon must use what was known on Monday afternoon. If it reads the corrected value, the look-ahead is small but it is systematic, and it flatters: a strategy gets to avoid bad prints that it would really have traded on. The same applies with more force to company results and to index membership, which are revised or backfilled.
+
+For reports, regulators or a client may ask what you believed at the time, and why you acted. With overwrites, nobody can answer. As-of queries also make a past result reproducible.
+
+The listing scans all rows, to keep it plain. A real store sorts by key and known time, and reads only the last version at or before the requested time. The test compares this with replaying all corrections up to each time, on 300 random tables. Storage grows only with the corrections, which are few.
+
+\iqwrong{``Keep a daily copy of the table.'' That gives one-day resolution, and costs a full copy each day. A correction during the day would still be invisible.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:21}
+Net prices sort as B 10.001, A 10.003, C 10.008, so the plan is 150 on B, 100 on A and 50 on C, for 3000.85. \Cref{lst:iv3:sd:route} walks all levels by net price. The answer assumes that the displayed sizes will still be there when the orders arrive, and that is the weak point.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/06-system-design/python/iv_route.py}{1}{19}{A split by net price.}\label{lst:iv3:sd:route}
+
+Each share's cost is its price plus the fee, or minus the rebate. Since costs simply add up with no interaction here, taking the cheapest share each time gives the best total, and the test compares this with trying all splits across three venues.
+
+In a real market, this is a first step. Others can see those prices as well, so a resting order that you target may be gone when you arrive, particularly if you are slow, or if your order to one venue tells others what is coming. Displayed size may also be only part of what is available. So a real router sends orders so that they arrive at the same moment, by timing each venue's latency. It estimates how likely each fill is, not just its price. It then has to decide what to do with the remainder: re-route, or rest it.
+
+A rebate paid to whoever takes a quote also attracts other takers, so that quote may be gone first, and a good net price with a poor chance of a fill may be no bargain. Rules may also matter: US rules require a trading centre to have policies against trading through a better protected quotation elsewhere. The router must also never send more in total than the parent order, unless it accepts that risk.
+
+\iqwrong{``Send it all to the venue with the best price.'' Here that venue has only 150 at that price, and the fee changes the ranking in any case.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:22}
+\Cref{lst:iv3:sd:recon} returns the three differences. \texttt{missing}: the venue has a fill that we never saw. \texttt{extra}: we recorded a fill that the venue does not have. \texttt{differ}: both have it, with different details. \texttt{missing} is the most urgent, as your position is wrong, and your risk checks work from it.
+\omcode{code/interviews-3/06-system-design/python/iv_recon.py}{1}{8}{Fills against the venue's copy.}\label{lst:iv3:sd:recon}
+
+A missing fill means real exposure that the system doesn't know about, so limits and hedges are wrong right now. It can come from a lost session, or from a bug that dropped a message. An extra fill means your position is wrong the other way: possibly a test message that leaked, or a duplicate. A difference in price or quantity may be a bad parse, a bust, or a venue correction, and it affects your P\&L before it affects your risk.
+
+Why during the day? A break found at the close has had hours to grow, and strategies have traded on it. A venue's copy usually comes as a separate feed or file, so you can run this every few minutes, or live. Each one should raise an alert with an owner, and a resolution needs to be recorded.
+
+Keying on execution ID is what makes it exact. Comparing totals only would pass if two errors cancel out. Timing makes a clean difference hard, though: a fill near the edge of the window may be in one side only for now, so a live run must re-check a difference after a short delay before it raises an alarm.
+
+The test deletes, changes and adds random rows, and asserts that each is reported, and in the right list. It also covers two empty sides.
+
+\iqwrong{``The positions match at the end of the day, so all is well.'' Two offsetting errors match too, and intraday risk was wrong regardless.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:23}
+Store entries that add to zero, in one transaction, as in \cref{lst:iv3:sd:ledger}. Money can then be neither lost nor created. Retries are safe due to the \texttt{done} table, and a crash leaves nothing partial. An amount must be positive, or a negative one would pull money out of the target and pass the balance check. The check and the writes live in one transaction, taken as a writer from the first read, or two transfers could both pass the check.
+\omcode{code/interviews-3/06-system-design/python/iv_ledger.py}{1}{38}{A ledger on SQLite.}\label{lst:iv3:sd:ledger}
+
+Entries are history: a balance is derived from them, so it can always be checked, and a dispute can be traced to the rows that caused it. A stored balance column is a cache for speed, kept in the same transaction, and it should be possible to rebuild it from the entries.
+
+The concurrency trap is the gap between reading a balance and writing. With two transfers of 80 out of an account of 100, both could read 100 and both pass. \texttt{BEGIN IMMEDIATE} takes SQLite's write lock before the read, so the second waits and then sees 20. On another database, the same idea is a row lock with \texttt{SELECT FOR UPDATE}, or a suitable isolation level. It isn't automatic, as many databases default to a level that allows this race.
+
+The \texttt{done} row commits with the entries, so a retry after a crash finds either nothing, and runs it, or the first answer. Refusals get stored too, so one request has one answer forever: a later retry of a refused transfer stays refused, and the test checks that. Eight threads in the test pull 30 each from a balance of 70, and exactly two succeed.
+
+SQLite handles one writer at a time, so this is a model, not a sizing. Amounts are integers in the smallest unit, as floating point can't hold cents exactly.
+
+\iqwrong{``Update the balance in place, inside a transaction.'' It works until someone asks why the balance is what it is.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:24}
+One stage's 99th percentile is 100. The total's is 120, and not 300. So you cannot add percentiles. The sum is right only if the stages are slow together, in which case the total's percentile really is 300. \Cref{lst:iv3:sd:budget} computes the distribution exactly, and the test also checks it by simulation.
+\omcode{code/interviews-3/06-system-design/python/iv_budget.py}{1}{21}{The distribution of a sum.}\label{lst:iv3:sd:budget}
+
+With independent stages, the totals are as follows: 30 with probability 94.1\%, 120 with 5.76\%, 210 with 0.12\%, and 300 with 0.0008\%. The 99th percentile falls in the second group. Two slow stages at once are rare, so summing assumes a coincidence that hardly ever happens. The median is 30 and the mean is 35.4.
+
+That cuts both ways. Summing the stages' percentiles overstates the independent case by 2.5 times. But one stage alone is only slow 2\% of the time, while the total has at least one slow stage 5.9\% of the time. So the total's tail is hit far more often than any stage's. A stage can look fine at its own 95th percentile, and still be what the end-to-end 95th percentile is made of.
+
+Means do add, whether or not stages are independent, so a budget of averages is sound. For tails, measure the total, with a stamp at each stage on the same message. In real systems, stages are often slow together, as with a shared cause like a burst, a cache flush or a pause, and independence fails. The test's correlated case gives 300, so real figures lie between these two.
+
+\iqwrong{``The budget is 50 per stage at the 99th percentile, so the total's is 150.'' That holds only if all three are slow on the same messages.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:25}
+The mean time in the system is $1 / (1 - \rho)$: 2, 10 and 100 microseconds. Simulation gives about 1.99 and 9.74, and at 99\% load 79, as 400\,000 samples are too few to settle there. With fixed service, the wait halves, so the time in the system falls to 1.5, 5.5 and about 50. So run a critical thread well below its capacity, and keep service times steady.
+\omcode{code/interviews-3/06-system-design/python/iv_queue.py}{1}{14}{One server, by simulation.}\label{lst:iv3:sd:queue}
+
+The recursion needs no event list. A customer's wait is what the previous one waited, plus the previous service, minus the gap between arrivals, and never below 0. So one line per customer is enough, and this makes a good check on any formula.
+
+The rise is steep. Going from 90\% to 99\% load is 10\% more work and 10 times the delay. A longer run is needed, as the queue at 99\% takes a very long time to forget its past. The result at 400\,000 samples is well below the formula, which is itself a lesson: a short test of a loaded system flatters it. The test states that this case has only reached more than 50, and does not claim 100.
+
+Variation in service matters as well as load. The wait is proportional to $(1 + c^2)$, with $c$ the coefficient of variation of service. So fixed service gives half of exponential, and rare long services, like an occasional slow path, make the wait far worse. Removing those rare slow cases may help more than making the average faster.
+
+The average also hides the tail. At a given load, the 99th percentile of the wait is far above the mean, and tail targets usually force the load lower than average targets do.
+
+\iqwrong{``90\% busy means a 10\% margin.'' In delay terms, the margin is already gone.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:26}
+One flush per order gives at most 500 a second. With group commit, each flush takes everything that has arrived since the last one started. At 10\,000 orders per second that is a batch of 20, and a mean latency of about 3 ms. At 300 per second, each batch is 1, and the latency is the 2 ms flush itself.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/06-system-design/python/iv_group_commit.py}{1}{18}{Group commit.}\label{lst:iv3:sd:group}
+
+Each order waits on average for half a flush to finish, and then for its own flush, so $1 + 2 = 3$ ms. The batch is the arrival rate times the flush time. A batch of 20 multiplies throughput by 20 at a cost of about 1 ms. What is attractive is that it adapts: under light load there is no waiting to form a batch, as in the 300-per-second case, and under heavy load the batch grows by itself. With one flush each at 10\,000 a second, the queue grows without limit, and in the test, the mean latency nearly doubles when the run doubles.
+
+Do not ack until the flush covering that order has finished, as the promise is that the order is on disk. Note that 3 ms is very long for a fast path: this design suits a slower, durable store and is not what a low-latency engine puts in-line.
+
+A latency-sensitive design may replace the flush by replication: an order counts as safe when it is in memory on a standby machine. That costs a network round trip within one site in place of the disk time. It changes what you are protected from: a crash of one machine, and not a loss of power to both. The disk write then happens afterwards, asynchronously. Faster storage would also change these figures, so measure your own.
+
+\iqwrong{``Batching adds latency, so never batch.'' Here, batching is what lets the system stand up at all at this rate.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:27}
+The key needs the exact code version, an exact data version, and all parameters, in a canonical form, as in \cref{lst:iv3:sd:runkey}. The common errors are moving names such as \texttt{latest}, unsorted dictionaries, and parameters left out. A key must also take in library versions and seeds. What it can't capture, however it is built, is what isn't an input at all, such as floating-point differences between processors, or thread timing.
+\omcode{code/interviews-3/06-system-design/python/iv_run_key.py}{1}{11}{A cache key.}\label{lst:iv3:sd:runkey}
+
+The rule is that a key must change whenever the result might. So the code version is a commit hash from a clean tree, and not a branch name, as a branch moves, and uncommitted changes are invisible. The listing refuses the moving name \texttt{latest} for data. A canonical form stops two equal parameter sets from producing different keys, and \texttt{sort\_keys} does that, which the test checks. Floats need care: \texttt{0.1 + 0.2} and \texttt{0.3} are different inputs, so a computed parameter may miss the cache, which is safe, if wasteful.
+
+The dangerous direction is a key that fails to change when the result does. A stale result then looks like a real one, and nobody notices. So include library versions, the environment image, and a seed for anything random, or make them part of the code version through a pinned environment.
+
+Some inputs can't be keyed, though you can guard against them: floating-point differences between processor types, or thread timing in code that isn't deterministic. To check, rerun a sample of cached results now and then, and compare them. A mismatch means that the key is missing something.
+
+\iqwrong{``Hash the function's name and arguments.'' The next code change returns the old result, with no warning.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:28}
+In rough order of likelihood: the data changed, by corrections, backfills or new symbol mapping; the universe or corporate actions changed; an environment or library changed; a random seed wasn't fixed; a config default moved; and the code was not really the same. Design for pinned data versions, pinned environments, and a stored record of every run.
+
+Data is the commonest cause, as vendors revise history, and a table named \texttt{prices} today isn't what it was. So inputs need immutable versions, with new data arriving as a new version, never an overwrite. A run then names exactly what it read.
+
+The environment comes second: a numerical library's default or a dataframe library's behaviour can change between versions without an error. So each run should use a pinned image or lock file, and record it. Code means a commit hash from a clean tree, and notebooks that ran out of order are a common trap.
+
+Each run stores a record: code version, data versions, environment, parameters, seed, machine type and result. Then a rerun can be compared, and any difference can be traced by changing one input at a time. With a pinned input, a different result points to a remaining source of nondeterminism, such as threads or floating-point differences between processors.
+
+So you can reproduce a result when the inputs still exist. That has a storage cost, and deciding how long to retain old data versions is a real policy choice. An explanation is often enough: ``the Sharpe fell by 0.2 since the vendor removed these 40 names, and here is the change.''
+
+\iqwrong{``Reruns differ because markets are random.'' A backtest is a computation over stored data, so a difference has a cause.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:29}
+With one worker, the healthy venue's worst latency is 433 s, and it would keep growing in a longer run. With one worker per venue, it is 10 ms, as if the stalled venue did not exist. The orders in flight at the stalled venue are in an unknown state, so they count as live exposure until proven otherwise.
+\omcode{code/interviews-3/06-system-design/python/iv_bulkhead.py}{1}{13}{One shared worker, or one per venue.}\label{lst:iv3:sd:bulkhead}
+
+This is isolation, sometimes called a bulkhead: a failure in one part must not spread through a shared resource. A queue is the usual shared resource, along with a thread pool, a lock, and a socket buffer. Per-venue workers make the test's healthy venue give exactly the same figures as it does when it runs alone. The model has no bound on the stalled venue's queue, and in a real system one must exist, or memory fills up.
+
+So a router also needs a time limit on each venue's response, and a breaker. After a set number of timeouts or missed heartbeats, mark the venue as down, stop routing to it, and reject or re-route new orders. Re-routing has a sting, though. The stalled venue's open orders may fill at any moment, so if you send the same quantity elsewhere, you might get filled twice. So count those orders in your position limit as if they could fill.
+
+To clear the unknown state, try a cancel if the path allows, use a status request after a reconnect, and read the drop copy if available. Cancel-on-disconnect settings help where offered. Nothing is resolved until the venue says so, and in the end, a person may have to phone the venue.
+
+\iqwrong{``The venue stopped responding, so those orders are dead.'' They may well be live at the venue, and trading.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:30}
+\Cref{lst:iv3:sd:journal} writes a length, a CRC and the bytes, and recovery stops at the first record that does not check out. The length says where the record ends, and the CRC says whether its bytes are what was written. A full replay of 5 billion events at a million a second takes 83 minutes, so you keep snapshots.
+\omcode{code/interviews-3/06-system-design/python/iv_journal.py}{1}{23}{A journal.}\label{lst:iv3:sd:journal}
+
+A crash can leave a torn final record: only part of it reached the disk, or the file has grown over bytes that were never written. The length alone would not expose garbage that happens to fit, and that is what the CRC is for. A tail of zeros needs care: the CRC of nothing is 0, so with a zero seed eight zero bytes would pass as an empty record. A non-zero seed closes that. Recovery then truncates the file at the returned length before appending, or later records would follow the bad bytes and be lost at the next recovery.
+
+The test cuts the file at every single byte, and expects exactly the whole records before the cut. It also appends zeros, and flips random bits, and expects recovery to stop at or before the damaged record, and never to pass it. So corruption can't produce a false record, unless the CRC itself collides, which a 32-bit CRC makes unlikely but possible at this volume. An error in the middle of the file means lost data, not a crash, so a real system should raise that as an alarm, and not quietly truncate.
+
+For recovery, snapshot the state at intervals, tagged with the journal position, then load the latest snapshot and replay what follows. With a snapshot every 5 minutes, the replay is at most 5 minutes of events. If the 5 billion come evenly over a 6.5-hour session, that is about 64 million, a minute's work. Even if events arrived as fast as the replay runs, it would be 300 million, and 5 minutes. Take snapshots on a standby, so that the primary doesn't pause. This format says nothing about durability: that needs a flush before each acknowledgement.
+
+\iqwrong{``Each write is atomic, so a record is either there or not.'' A write to a file can be cut off partway by a crash.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:31}
+With one thread, there are no locks, the order of events is the order of execution, and the same inputs give the same outputs. At 2 microseconds per order, one thread tops out at 500\,000 a second, so you partition by instrument. An order spanning two partitions loses atomicity. Determinism is what makes replication simple.
+
+Locks would cost more than the work, as a match touches several shared structures in order. Each order needs its turn on the book anyway, so there's nothing to run in parallel within one book. A single thread also has no contended cache lines, and a very predictable path. One published design runs its business logic in this way, and keeps all state in memory, with a durable journal of inputs.
+
+Partition by instrument or by instrument group, one thread each. Each book is independent, so this scales with the number of books, and related instruments such as a future and its options can go on one thread if they need to interact. That leaves the busiest single book as the limit, which you have to meet by speeding up the code. Spreading a single book over threads costs more than it gains.
+
+A spread order that crosses partitions needs coordination: a two-step reservation in each partition, a single owner for the spread's books, or a separate spread book that trades by legging into the outright ones. Each costs latency or complexity, which is a reason to place such instruments together.
+
+For replication, a primary and standby need only the same input sequence. With a deterministic engine, they then hold the same state, without any shared memory or two-phase commit. Their outputs can be compared as a check.
+
+\iqwrong{``Use more threads to go faster.'' Inside one book, order is the whole point, so they would mostly wait on each other.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:32}
+Apply-then-record over-counts: a crash between them makes a restart apply that entry again. Record-then-apply under-counts, as a crash between them skips one. One atomic step is exactly right. \Cref{lst:iv3:sd:consumer} models all three, and the random crash test finds the error of both wrong orders.
+\omcode{code/interviews-3/06-system-design/python/iv_consumer.py}{1}{34}{Three ways to consume a log.}\label{lst:iv3:sd:consumer}
+
+The test uses 2000 random logs and crash sets. Atomic always gives the true sum. Apply-first is never below it, and sometimes above. Record-first is never above it, and sometimes below. It asserts that each error really occurs, as a model that can't show an error would prove nothing.
+
+Exactly-once delivery cannot be promised across a network, as a sender can never tell a lost message from a lost reply. What can be had is an exactly-once effect, by at-least-once delivery combined with making the effect idempotent or atomic with the offset. Here, keep the offset in the same transaction as the state: a database row beside the result.
+
+If the state is on a system with no shared transaction, make the apply itself idempotent. Attach the log position or a unique ID to each change, and have the other system refuse one that it has already seen. A bank transfer API with a request key is an example. If it offers neither, then you can only choose which of the two errors you can live with, and then detect the error by reconciling. For a fill feed, you would never choose to under-count silently. For metrics, over-counting a little may be fine.
+
+The model is one consumer with a durable state. It doesn't cover a second consumer that thinks the first one died, and that is the fencing question.
+
+\iqwrong{``My message broker has exactly-once.'' That usually covers its own log and its own transactions, and stops at your database.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:33}
+It prints \texttt{False 250}, then \texttt{True 90}. With fencing, the store refuses the old primary's write. Without it, the stale value 90 overwrites 250. The epoch is a number that goes up with each change of primary, and the resource being written must check it, not the writer, who doesn't know it's stale.
+A timeout cannot tell a dead process from a slow one. A long pause, a network partition or a stalled virtual machine all look like death, and then the process carries on with no sense of the time that passed. So at some moment there can be two primaries, and no amount of heartbeat tuning removes that. A shorter timeout makes false alarms more frequent.
+
+The fix has two parts. An agreed source gives out epochs, such as a consensus service, so that only one exists for each number. And every write carries the epoch, and the store remembers the highest it has seen. So the stale writer's check happens at the point of effect, atomically with the write, and the old primary's belief no longer matters. One consensus algorithm calls this number a term, and describes it as a logical clock that lets servers spot stale leaders.
+
+The harder case is an effect outside your store. A venue does not check your epoch, so an order from the old primary goes through. So you need another fence, closer to the wire. Possible ones are a gateway that checks the epoch, which every order must pass, or having the failover first revoke the old session, on a venue that accepts only one session per login. Otherwise, a cancel-on-disconnect may clear open orders, but only once the venue sees the disconnect. Expect some overlap, and reconcile afterwards.
+
+The listing's model runs in one process, so it shows the rule and not a failure.
+
+\iqwrong{``Set a lease of 10 seconds: the old primary will stop itself.'' A process paused for longer doesn't know that its lease has run out, until after it has written.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:34}
+Waiting for all takes 40 ms, and a majority takes 1 ms. A majority of 3 survives one failure, and waiting for all stops on any failure. If the 1 ms site dies, the commit takes 40 ms. Two majorities must overlap so that a new leader's majority always contains someone who has every committed write.
+\omcode{code/interviews-3/06-system-design/python/iv_quorum.py}{1}{10}{Commit time and majorities.}\label{lst:iv3:sd:quorum}
+
+Commit time is an order statistic: the $k$-th smallest round trip. A majority of 3 is 2, the writer included, so the 40 ms site does not slow a commit, while it does keep a copy eventually. That also means the far site may be behind at any moment. The loss of the near site leaves only the far one to complete a majority, so all commits jump to 40 ms. That is the point to plan for, as it changes your system's speed by 40 times exactly when things are already going wrong.
+
+A majority of $n$ tolerates $(n-1)/2$ failures, rounded down, and so a cluster of five tolerates two. The test checks that any two majorities share a member, for $n$ up to 7, by listing them all.
+
+With fewer than a majority, say one acknowledgement, two sides of a partition can each commit, each thinking it's the only one. After healing, the two histories disagree, and a committed write is lost. Asynchronous replication makes the same trade on purpose: faster commits, with a possible loss of the last few writes on failover. That can be right for some data, if you can reconcile, but it must be a decision, and not an accident.
+
+A trading path often accepts asynchrony across long distances, with synchronous copies only nearby, as nobody can trade through 40 ms for each order. That leaves the state at the far site behind in a disaster, and you should write down how far.
+
+\iqwrong{``Three copies means no data loss.'' Only if the commit waits for them. Copies that are still on their way are not copies.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:35}
+The waste is about $C/T + T/(2M)$, minimised at $T^* = \sqrt{2CM}$. With $C = 60$ s and $M = 86\,400$ s, that gives $T^* = 3220$ s, about 54 minutes, and a waste of 3.7\%. A long simulation, of $10^8$ seconds of work, gives 3.8\% there, and about 8\% at a quarter and at four times that interval. A short run is noisier. Do not bother for a job much shorter than $M$.
+\omcode{code/interviews-3/06-system-design/python/iv_checkpoint.py}{1}{18}{Checkpoints and failures, simulated.\protect\hfil\protect\break}\label{lst:iv3:sd:checkpoint}
+
+The first term is the checkpoint's share of each interval. For the second, a failure loses on average half an interval, and failures come at rate $1/M$, so the lost time per unit time is $T / (2M)$. Setting the derivative to 0 gives $C/T^2 = 1/(2M)$, which gives the formula. At the best point, the two terms are equal, which is a handy check. The minimum is flat: a factor of 2 either way costs only about a quarter more waste. So you need not know $M$ exactly, and this is why a rough value is fine.
+
+At the extremes: as $M$ grows without limit, $T^*$ grows and the waste goes to 0. As the cost $C$ goes to 0, you checkpoint constantly. If $T^*$ is not much smaller than $M$, the approximation fails, as failures then come within an interval, and the simple formula understates the waste. The simulation has no such limit, which is why we run it: on our job, the formula and the simulation agree to within 15\%.
+
+Don't bother when a job is short compared with $M$, and easy to rerun. A 10-minute job on this machine fails about 0.7\% of the time, and a rerun costs less than any checkpoint scheme would. Split work into small independent pieces where possible: that does the job of a checkpoint, with less machinery. The whole-pool failure rate matters as well, since a job over 100 machines fails 100 times as often.
+
+\iqwrong{``Checkpoint as often as possible, for safety.'' Each one costs time, and at a quarter of the best interval, in this example, the waste is about 8\%.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:36}
+An order sent minutes ago must not go out again, as the price may be far from the market by now, and the sender may have given up on it. A gap-fill message takes its place: the number stands, and it carries nothing. A number can't simply be skipped, since the receiver would see a gap and ask again. Afterwards, query each unresolved order's status.
+\omcode{code/interviews-3/06-system-design/python/iv_session.py}{1}{36}{A session that resends.}\label{lst:iv3:sd:session}
+
+Session numbering guarantees that nothing slips by silently. If a number is missed, the receiver stops and asks for a resend. So each number has to be accounted for, even for a message that you decide not to send. A widely used protocol has this feature: a sequence reset in gap-fill mode answers a resend request, and moves the receiver past messages that won't be sent. The listing keeps status messages and sends a gap fill for orders older than \texttt{max\_age}.
+
+Choosing \texttt{max\_age} is a real decision. A resent order may be seconds old and still fine, or dangerous, depending on the market. Many systems go further, and never automatically resend any order after reconnecting: they gap-fill them all, and let the strategy decide.
+
+The test runs 500 random sessions with losses. It asserts that no stale order is accepted, every number is passed, and accepted messages are in order with no repeats. It also covers a message that arrives twice, which the receiver ignores.
+
+So what became of an order that wasn't resent? You can't assume that it never arrived, as only its reply might have been lost. So the order is in an unknown state, and you ask the venue, or read the drop copy, and only then do you know your position. Until then, count it as possibly live.
+
+\iqwrong{``Just start again at a new sequence number on each reconnect.'' Then a lost execution report vanishes, and your position silently goes wrong.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:37}
+Release to one server first, in a mode that changes no behaviour, then widen in steps, with a person watching and a tested way back. Feature flags start off, and go on separately. Never reuse an old flag, as old code can give it the old meaning. Two versions side by side must be able to read each other's messages and state.
+
+Before the open, check that every server in fact has the expected version, by asking each server, and not by trusting the tool that deployed. Compare the configuration too, and send test orders through a test symbol or a venue's test environment. A US enforcement order describes one case: new code went to seven of eight servers, without a second person's check. The eighth still had old, dead code, and the new release reused the old code's flag. That one server sent millions of unintended orders, and the firm lost over \$460 million in about 45 minutes. The lessons are to remove dead code, to verify all servers, and not to reuse flags.
+
+Switch on a new feature for one strategy, one symbol or a small size first, and leave the flag separate from the code release. This keeps ``deploy'' and ``enable'' as two decisions, so turning a thing off is quick and needs no release.
+
+To back out, have a known path, rehearsed. That is harder than it looks if a new version has written state that the old one can't read. So state and message changes go in steps: first make readers tolerate both forms, then change the writers, and then remove the old form later.
+
+Limit the damage with order limits and a kill switch that run independently of the release, and avoid releases in the hours when the market is at its busiest.
+
+\iqwrong{``It passed all tests, so deploy it everywhere at the open.'' The failure in that order was not in the code tested, but in what was actually running.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:38}
+Gateways check each member's orders, a sequencer gives one total order, and that sequence is journaled and replicated. A single-threaded matcher then applies it, and publishes the results. Same log, same state: \cref{lst:iv3:sd:exchange} is the core. 100\,000 orders a second is 10 microseconds each, so a thread per partition can do it if the journal keeps up.
+\omcode{code/interviews-3/06-system-design/python/iv_exchange.py}{1}{32}{The deterministic core of a matching engine.\protect\hfil\protect\break}\label{lst:iv3:sd:exchange}
+
+In order: the gateway authenticates, parses, and applies member-level risk checks and rate limits, each on its own session state, and it adds the member's client order ID. The sequencer assigns the number and a time, and writes the journal, with a copy to a standby in the same site before anything is acknowledged. The matcher reads the log, and emits events, each carrying the input's number. Publishers send order acknowledgements to members and market data to all.
+
+Fairness is the rule that the order of the sequencer is the order of priority. So price-time priority is fair if the paths to the sequencer are equal, and you must publish what you do about those paths: same cable lengths, same processing, and nobody with a private route. Otherwise time priority rewards whoever has the shortest wire.
+
+For an exact standby, every input to the matcher must come from the log, including the time. The test's twin reads a clock inside the engine, and a replay of the same log then gives a different digest. Random numbers, hash ordering and floating point that differs by machine are the same kind of danger. Compare digests between the primary and the standby as a running check.
+
+To recover: find the last journal record, load the last snapshot, and replay. The standby in fact has all of this already, so it may simply take over, on a higher epoch to fence the old one. Lost nothing? The journal holds everything that was acknowledged, since nothing is acknowledged before it's durable. Compare sequence numbers with the gateways and the published stream. Then republish from the sequence the members last saw. Tell members what state the market is in, and reopen with an auction if the rules call for it.
+
+The test asserts no crossed book, quantities that balance, and an unchanged digest after failover at a random point, on 100 random logs. The real thing, with its networking and its timings, was not run.
+
+\iqwrong{``Timestamp at the gateway, and sort by that.'' Clocks differ between gateways, so that order isn't one, and a late arrival would need to rewrite history.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:39}
+Peak output is $2 \times 10^6 \times 64 \times 8 = 1.02$ Gb/s, multicast once, or 307 Gb/s by unicast to all 300, so use multicast internally, with unicast at the edge. A 6.5-hour session at the average rate is about 750 GB raw, and the same rate around the clock would be 2.76 TB. Trading engines take multicast directly, risk takes a conflated stream, research captures all of it, and dashboards take a small conflated feed.
+
+The layout: a pair of feed handlers per venue line, in the same site as the source, each normalising to one internal format and sequence. They publish each instrument group on a multicast group, so a consumer joins only what it needs. Busy groups get their own cores and hardware, and the split should be based on measured rates.
+
+Loss has two layers. From the venue, sequence numbers and line arbitration find a loss, and the venue's recovery repairs it. Internally, each stream has its own sequence, and a replay service keeps the recent stream for retransmission, with a snapshot service for joining late or falling too far behind. A loss rate of 1 in 10\,000 at the peak is 200 messages a second, so a retransmit system needs its own capacity, and a limit, in case a broad network problem makes everyone ask at once.
+
+For failover, run both handlers of each pair live, side by side. Consumers arbitrate between them, or a designated primary publishes and a monitor switches. When a venue line dies, only that venue's data is stale: consumers must be told by an explicit status message, per instrument, since a quiet line looks the same as a quiet market. Heartbeats on every stream tell these apart.
+
+Measure per-line rates, gaps, recovery counts and the stage latency, with stamps at the card and on publish, and the lag of each consumer. Capture raw packets at the entrance, since that's the record to replay after a bug. This sizing rests on the stem's numbers: no system was run, and real latency needs measuring on your hardware.
+
+\iqwrong{``One big message bus for everyone.'' A trading engine and a dashboard have different needs, and on one shared path, the slowest sets the terms for all.}
+\end{solution}
+
+\begin{solution}{iq:iv3:system-design:40}
+Data: 5 GiB $\times$ 252 days $\times$ 10 years $\times$ 25 regions is 315\,000 GiB, about 308 TiB, before versions and copies. Time: 500 $\times$ 3 $\times$ 8 minutes is 12\,000 core-minutes, or about 3.1 hours on 64 cores for one study. Layers: raw, cleaned point-in-time data, features, simulation, results. And a good result must have survived out-of-sample and cost scrutiny.
+
+The raw layer stores what arrived, immutable, partitioned by date and region, in columns. Cleaned data is derived by versioned jobs, and each release gets a version, so corrections arrive as new versions, along with known times. Reference data, such as symbol changes, corporate actions and index membership, is stored by as-of date. It's where survivorship bias comes in, so research reads it through one library, and not by hand.
+
+Simulation runs on a scheduler, one job per strategy-day, which makes retries cheap, as a failed piece is simply rerun. A single study takes 3 hours when the pool is free, and 50 researchers will not all fit, so you need quotas and priorities. If each runs one such study a day, the demand is $50 \times 200$ core-hours, or 10\,000, while the pool gives 1536 in 24 hours, which is why you'd want either a larger pool, spot capacity, or a cache of results, keyed on the exact code version, data version and parameters. The cache often pays first, since most reruns change little.
+
+Costs are a shared library with a versioned model, as a backtest that sets its own costs is not comparable. The fills and queue assumptions must be stated, and the simulator should be tested against live fills.
+
+To prevent an accident, record every run automatically, including the ones that failed, since the number of tries matters when you judge a Sharpe ratio. Hold out recent data, and control access to it. Require the same code path for live and for research, and compare live results with the backtest after launch. This sizing rests on the stem's assumptions.
+
+\iqwrong{``Give each researcher a big machine and a copy of the data.'' Copies drift, results can't be compared, and nobody can tell which number to trust.}
+\end{solution}

@@ -62,7 +62,7 @@ entry-file name and the printed title; directories and label prefixes use a
 stable strand slug.**
 
 ```
-one_quant_book_<NN>_<slug>.tex        entry file, NN = 01…18
+one_quant_book_<NN>_<slug>.tex        entry file, NN = 01…20
 styles/onequant.sty                   the ONLY place packages/macros live
 styles/lang/en.tex                    UI strings (kept for family parity)
 frontmatter/                          title page, colophon, preface, credits
@@ -97,7 +97,9 @@ tools/                                termlink, gates, figure-page finder
 | 15 Research, Data and Risk Platforms | `platforms` | `pl` |
 | 16 The Desk and the Firm | `desk` (not `firm`: `code/firm/` is the running project) | `fm` |
 | 17 The Industry | `industry` | `in` |
-| 18 The Interview Book | `interviews` | `iv` |
+| 18 Interviews I: Maths, Probability and Speed | `interviews-1` | `iv1` |
+| 19 Interviews II: Markets, Trading Games and the Final Round | `interviews-2` | `iv2` |
+| 20 Interviews III: Code | `interviews-3` | `iv3` |
 
 Labels: `<type>:<prefix>:<chapter-slug>:<name>`. Types from the family
 (`ch def thm prop lem cor met ex rem not exo pb`) plus:
@@ -209,16 +211,10 @@ A chapter is ~13 pages all-in (≈ 9.5 body + 3.5 solutions).
 Chapters whose outline title starts "Build:" invert the ratio: lesson 3 pp,
 build 5 pp.
 
-**Book 18 (The Interview Book) anatomy** (user ruling 2026-09-28). New
-questions only; nothing is harvested from Books 1–17. A chapter is: the
-hook; a short method lesson (2–4 pp: the families of questions, the method
-for each, worked examples); **one bank of about 12–15 `interviewq`**, ramped
-★ → ★★★ and tagged with roles and firm type; `omsources`. No `Exercises`,
-weekend problem, tutorial or build sections (a coding chapter may keep a
-short tutorial). Process chapters (Part I) and the behavioural chapter may
-carry 8–12 questions; chapter 29 is six transcribed mock interviews with
-assessor commentary. Every numeric or coding answer is asserted by
-`test_solutions.py`. Budget ~8 pp a chapter all-in.
+**Books 18 to 20 (the interview books) have their own shape and rules** (replaced the old one-volume
+Book 18, 2026-11-03): questions first, long linked answers at the back, no lessons. Everything about them
+is in `sources/INTERVIEW_BOOKS.md`, with chapters and counts in `outline/interviews.md`; this file does
+not apply to them where the two differ.
 
 ## 6. Rules per item
 
@@ -400,8 +396,8 @@ the script in `code/`) · normalisation · known failure modes · sources.
 - 5–8 `interviewq` per chapter, `iq:` label first, tagged with stars and with
   roles. They test the chapter's
   ideas in interview form — they are not recycled exercises. Never attributed
-  to a firm. (Book 18 writes new questions of its own and does not harvest
-  these: user ruling, 2026-09-28.) Roles: `trader, researcher, developer, mle,
+  to a firm. (Books 18 to 20 write new questions of their own and do not reprint
+  these: an originality test checks it.) Roles: `trader, researcher, developer, mle,
   bank, risk`, nothing else.
 - **Solutions file**: opens with the family's `\section*{Chapter \ref{…} ---
   Title}` line; then `\begin{solution}{<key>}` for every `exo:`, the `pb:`,

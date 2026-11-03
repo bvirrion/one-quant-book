@@ -1,0 +1,488 @@
+\section*{Chapter \ref{ch:iv3:sql-and-data} --- SQL and Data}
+\markboth{\protect\omTocMark{}{Answers: SQL and Data}}{\protect\omTocMark{}{Answers: SQL and Data}}
+
+\begin{solution}{iq:iv3:sql-and-data:1}
+\Cref{lst:iv3:sq:vwap} groups by symbol and day and filters the groups with \texttt{HAVING}. It returns one row, AAA on 2 March at 100.75. Only that symbol-day has more than 2 trades.
+\omcode{code/interviews-3/07-sql-and-data/sql/vwap.sql}{1}{4}{Volume-weighted average price, by symbol and day.\protect\hfil\protect\break}\label{lst:iv3:sq:vwap}
+\begin{center}\small
+\begin{tabular}{llr}
+symbol & day & vwap\\\hline
+AAA & 2026-03-02 & 100.75
+\end{tabular}
+\end{center}
+The sum of price times quantity is $20\,000 + 10\,200 + 10\,100 = 40\,300$, and the sum of quantity is 400, so the result is 100.75. \texttt{WHERE} runs on rows before grouping, so it cannot see a count, and SQLite and DuckDB both reject \texttt{COUNT(*)} there. \texttt{HAVING} runs on the groups.
+
+\iqwrong{\texttt{AVG(price)}. It gives 101 here, because it weights the 200-share trade the same as the 100-share ones.}
+\iqfollow{What if a symbol-day's quantities can sum to zero, as with a correction?}{Write \texttt{SUM(price * qty) / NULLIF(SUM(qty), 0)}, which gives NULL there. Without it, SQLite returns NULL, DuckDB returns infinity, or NaN if the numerator is zero too, as with a correction at the same price, and PostgreSQL raises an error, which ends the whole query. Three engines, three behaviours.}
+\iqfollow{And if \texttt{price} were an integer number of ticks?}{Check the division: on SQLite, integer over integer truncates, and the result would be 100.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:2}
+Query A returns only one row, order 1 with 100. Query B returns all three orders, and it is the one you want.
+\begin{center}\small
+\begin{tabular}{rr}
+order\_id & qty\\\hline
+1 & 100\\
+2 & NULL\\
+3 & NULL
+\end{tabular}
+\end{center}
+A left join keeps every row of the left table, filling the right side with NULLs where nothing matches, and then \texttt{WHERE} runs on the result. For orders 2 and 3, \texttt{f.venue} is NULL or Y, and \texttt{NULL = \textquotesingle{}X\textquotesingle{}} is not true, so those rows are dropped: the \texttt{WHERE} has silently turned the outer join into an inner one. In query B the venue test is part of the match, so it decides which fills attach, and it cannot remove an order. Order 2 keeps its row with NULL, as its only fill is on Y.
+
+The rule is that a condition on the right table of a left join belongs in \texttt{ON}.
+
+\iqwrong{Adding \texttt{OR f.venue IS NULL} to query A. It brings back order 3, which has no fills at all, and still loses order 2, since that order's row from the join says Y, not NULL. The query looks patched, and it is wrong for exactly the orders that traded elsewhere.}
+\iqwhy{This bug changes a total without any error. A fill report that misses orders on other venues looks like a smaller, plausible number.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:3}
+It returns no rows at all, because \texttt{blocked} contains a NULL. \Cref{lst:iv3:sq:notexists} is the fix: it returns orders 1 and 3. Whether order 3 belongs depends on what you mean: its trader is unknown, so it is not known to be blocked, and you must decide and say so.
+\omcode{code/interviews-3/07-sql-and-data/sql/not_exists.sql}{1}{3}{The anti-join that NULLs cannot break.}\label{lst:iv3:sq:notexists}
+
+SQL logic has three values. \texttt{\textquotesingle{}ann\textquotesingle{} NOT IN (\textquotesingle{}bob\textquotesingle{}, NULL)} means ann is not bob, and ann is not NULL. The first part is true, and the second is unknown, as nobody knows what NULL stands for. True and unknown is unknown, and \texttt{WHERE} keeps only rows that are true. So one NULL in the list removes every row. SQLite and DuckDB both return that NULL, which you can check by selecting the expression.
+
+\texttt{NOT EXISTS} asks whether a matching row exists, and that always has a yes or no answer. For order 3, \texttt{b.trader = o.trader} never holds, so no row exists, and the order is kept. Order 1 is kept in the same way, and order 2 finds bob and is dropped. To exclude unknown traders as well, add \texttt{AND o.trader IS NOT NULL}. Filtering the subquery with \texttt{WHERE trader IS NOT NULL} instead keeps \texttt{NOT IN} working, and it returns only order 1.
+
+\iqwrong{``It returns order 1.'' That is what the author expected. The NULL in the blocked list is what stops it, and it can appear in production long after the query was tested.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:4}
+The first statement returns 5, 3, 2, 50, 16.67, 10, and the second returns 0. The fifth column, \texttt{AVG(bid)}, is the average of the known bids, 16.67. The sixth treats the unknown bids as zero, and whether that is right depends on what a NULL means here.
+
+\texttt{COUNT(*)} counts rows. \texttt{COUNT(bid)} counts non-NULL values, and \texttt{COUNT(DISTINCT bid)} counts different non-NULL values: 10 and 20. \texttt{SUM} and \texttt{AVG} skip NULLs too, so the sum is 50 and the average is $50 / 3$, while \texttt{SUM(bid) / COUNT(*)} is $50 / 5$. \texttt{AVG(COALESCE(bid, 0))} also gives 10, and it says openly that a NULL counts as zero.
+
+The second statement counts rows where \texttt{bid = NULL}. That comparison is unknown for every row, even the NULL ones, so nothing qualifies. The test for a missing value is \texttt{bid IS NULL}, which counts 2.
+
+\iqwrong{``\texttt{COUNT(DISTINCT bid)} is 3, counting NULL as a value.'' Aggregates skip NULLs, whereas \texttt{SELECT DISTINCT} and \texttt{GROUP BY} treat all NULLs as one value. That difference catches people out.}
+\iqfollow{What does \texttt{SUM} return on a table with no rows, or only NULLs?}{NULL, not 0, so a report wants \texttt{COALESCE(SUM(x), 0)}. \texttt{COUNT} returns 0.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:5}
+SQLite and PostgreSQL return 0. DuckDB returns 0.5. \Cref{lst:iv3:sq:ratiofixed} returns 0.5 on all three, and casting to double does too.
+\omcode{code/interviews-3/07-sql-and-data/sql/fill_ratio_fixed.sql}{1}{1}{The same ratio, with a non-integer in it.\protect\hfil\protect\break}\label{lst:iv3:sq:ratiofixed}
+
+The sums are 75 and 150, both integers. In SQLite and PostgreSQL, integer divided by integer truncates, so $75 / 150$ is 0: PostgreSQL's documentation gives \texttt{5 / 2} as 2. DuckDB's \texttt{/} is floating-point division, and its \texttt{//} is the integer one, so \texttt{7 / 2} is 3.5 there, where SQLite gives 3. The SQLite and DuckDB results were checked by running them, and the PostgreSQL result comes from its manual.
+
+Multiplying by \texttt{1.0} first makes the numerator non-integer, and the order matters: \texttt{1.0 * (a / b)} has already truncated. A query moved between engines keeps running and silently changes its answer, so the portable habit is an explicit cast in every ratio.
+
+\iqwrong{``SQL has one rule for division.'' Each engine has its own. It is the classic reason a query gives a different number after a migration.}
+\iqwhy{A fill ratio of 0 for all but fully filled orders looks like an odd business fact, and it may take days to be traced to the type of a column.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:6}
+IDs 2 and 3 repeat. The copies of 2 agree, and those of 3 do not. With the latest version winning, the totals are AAA 300 and BBB 130. \texttt{SELECT DISTINCT} would give BBB 180, because it keeps both versions of trade 3. \Cref{lst:iv3:sq:dup} has both queries.
+\omcode{code/interviews-3/07-sql-and-data/sql/duplicates.sql}{1}{17}{Finding repeats, then keeping the latest.}\label{lst:iv3:sq:dup}
+\begin{center}\small
+\begin{tabular}{rrr}
+trade\_id & copies & versions\\\hline
+2 & 2 & 1\\
+3 & 2 & 2
+\end{tabular}\qquad
+\begin{tabular}{lr}
+symbol & total\\\hline
+AAA & 300\\
+BBB & 130
+\end{tabular}
+\end{center}
+\texttt{COUNT(DISTINCT qty)} is the useful extra column: a value of 1 means a harmless replay, and more than 1 means a correction or a data fault. \texttt{DISTINCT} removes only rows that match in every selected column, so it handles the replay and not the correction. \texttt{ROW\_NUMBER} over each ID, in descending arrival order, keeps exactly one row per ID: BBB is then $60 + 70$.
+
+\iqwrong{Keeping the first copy, or \texttt{MAX(qty)}. A correction can go either way, so only the arrival order can settle which is current.}
+\iqfollow{And if there is no arrival column?}{Then the table cannot tell you. Rows in SQL have no order of their own, so you go back to the source, or you report the disagreement rather than pick one.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:7}
+SQLite happens to return the right prices, DuckDB rejects the query, and so does PostgreSQL. \Cref{lst:iv3:sq:latest} is correct on all three.
+\omcode{code/interviews-3/07-sql-and-data/sql/latest_portable.sql}{1}{9}{The latest row per group, with a window.\protect\hfil\protect\break}\label{lst:iv3:sq:latest}
+\begin{center}\small
+\begin{tabular}{lrr}
+symbol & ts & price\\\hline
+AAA & 3 & 101.0\\
+BBB & 5 & 50.0
+\end{tabular}
+\end{center}
+In standard SQL, a selected column must be grouped or aggregated. \texttt{price} is neither, so it is a bare column: which row should it come from? DuckDB fails with a binder error, and PostgreSQL's documentation says it refuses too. SQLite has a documented special case: with a single \texttt{MIN} or \texttt{MAX}, bare columns come from the row holding that extreme, which is why it gets this right. With two such aggregates, it no longer says which row. So the query works here by a rule of one engine, and it reads like a portable query.
+
+The window version says what you mean. If two rows tie on the latest time, \texttt{ROW\_NUMBER} picks one arbitrarily, so add a second sort key if that matters. DuckDB also offers shorter forms: \texttt{arg\_max(price, ts)}, and \texttt{QUALIFY} to filter on a window directly. Both return the same here.
+
+\iqwrong{``It takes the price from an arbitrary row in every engine.'' Not on SQLite with one \texttt{MAX}. It is a real rule there, though not one to depend on.}
+\iqfollow{A join to a subquery of \texttt{MAX(ts)} per symbol?}{Also correct and portable. It returns both rows on a tie, which is sometimes what you want.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:8}
+The three functions differ only on ties, and the ties decide who is kept. \Cref{lst:iv3:sq:ranks} gives them side by side. A filter of 2 or less keeps two traders on each desk under \texttt{ROW\_NUMBER}, adds gus under \texttt{RANK}, and adds gus and cid under \texttt{DENSE\_RANK}.
+\omcode{code/interviews-3/07-sql-and-data/sql/ranks.sql}{1}{6}{Three rankings.}\label{lst:iv3:sq:ranks}
+\begin{center}\small
+\begin{tabular}{llrrrr}
+desk & trader & pnl & row\_num & rnk & dense\\\hline
+fx & eve & 70 & 1 & 1 & 1\\
+fx & fay & 60 & 2 & 2 & 2\\
+fx & gus & 60 & 3 & 2 & 2\\
+rates & ann & 50 & 1 & 1 & 1\\
+rates & bob & 50 & 2 & 1 & 1\\
+rates & cid & 40 & 3 & 3 & 2\\
+rates & dan & 30 & 4 & 4 & 3
+\end{tabular}
+\end{center}
+\texttt{ROW\_NUMBER} never repeats. It must break ties somehow, and if the order does not settle them, the choice is arbitrary and can change between runs, so the listing sorts on \texttt{trader} too. \texttt{RANK} gives ties the same number and leaves a gap after them, while \texttt{DENSE\_RANK} leaves no gap, so a tie at the top pulls in a third person.
+
+What must you ask first? What ``top 2'' means when two people tie: exactly two rows, or everyone at the top two places, or at the top two distinct values? For a bonus list, you would hardly drop gus for a coin flip, so \texttt{RANK} is the natural reading. For a page showing two rows, it is \texttt{ROW\_NUMBER}, with a stated tie-break.
+
+\iqwrong{Using \texttt{ROW\_NUMBER} without a tie-break. The result looks fine, and it is not reproducible.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:9}
+The query prints positions of 100, 50, 50, 0, so it misses the breach: the true position after fill 2 is $-50$. \Cref{lst:iv3:sq:posfixed} fixes it by ordering on \texttt{seq} as well.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/position_fixed.sql}{1}{4}{A running total, one row at a time.}\label{lst:iv3:sq:posfixed}
+\begin{center}\small
+\begin{tabular}{rrr}
+seq & printed by the query & true position\\\hline
+1 & 100 & 100\\
+2 & 50 & $-50$\\
+3 & 50 & 50\\
+4 & 0 & 0
+\end{tabular}
+\end{center}
+With \texttt{ORDER BY} and no frame, the default is \texttt{RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW}, and a \texttt{RANGE} frame includes every peer of the current row, meaning all rows with the same \texttt{ts}. So both fills at time 20 are summed together before either is shown, and the dip between them disappears. Sorting on a key that is unique, here \texttt{ts, seq}, leaves no peers. Writing \texttt{ROWS} says so openly, and it also spares the engine from looking for peers.
+
+\iqwrong{Sorting the output by \texttt{seq} and thinking that is enough. The final \texttt{ORDER BY} only arranges the output. The window's own \texttt{ORDER BY} decides what each sum includes.}
+\iqfollow{And if the table has no \texttt{seq}, and two fills share a time?}{Then the order is not in the data, and no query can recover it. A position check needs a sequence number from the source of the fills.}
+\iqwhy{A limit breached for a moment is still breached. Two fills in one millisecond are normal in a fast market, so this comes up.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:10}
+It prints fx 200 and 150, then rates 200 and 100. The filled numbers are right. The rates ordered quantity is wrong: it should be 150, and it is off in two separate ways. \Cref{lst:iv3:sq:fanoutfixed} fixes both.
+\begin{center}\small
+\begin{tabular}{lrr}
+desk & ordered & filled\\\hline
+fx & 200 & 150\\
+rates & 200 & 100
+\end{tabular}
+\end{center}
+A join makes one row per matching pair. Order 1 has two fills, so its quantity of 100 appears twice, and is summed as 200. That is the fan-out\index{fan-out}. Order 2 has no fills, so the inner join loses it, and its 50 is gone. So two errors are at work, and here $100 + 100$ only looks like a plausible total. On other data they could partly cancel, which is worse.
+\omcode{code/interviews-3/07-sql-and-data/sql/fanout_fixed.sql}{1}{9}{Aggregate first, then join.}\label{lst:iv3:sq:fanoutfixed}
+\begin{center}\small
+\begin{tabular}{lrr}
+desk & ordered & filled\\\hline
+fx & 200 & 150\\
+rates & 150 & 100
+\end{tabular}
+\end{center}
+The cure is to bring each table to the grain of the question before joining. With one row per order on each side, the join cannot multiply anything. \texttt{LEFT JOIN} keeps unfilled orders, and \texttt{COALESCE} turns their missing fills into 0.
+
+\iqwrong{\texttt{SUM(DISTINCT o.qty)}. It would make rates $100 + 50$ only if order 2 appeared, and on data where two orders have the same quantity it would drop one of them.}
+\iqfollow{How do you spot a fan-out quickly?}{Compare \texttt{COUNT(*)} before and after a join, and check that the key is unique on the side you expect.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:11}
+The columns differ from the first row after the gap, as the table shows. \texttt{by\_rows} averages the last three observations and \texttt{by\_range} the last three calendar days, so \texttt{by\_range} is the three-day average in the plain sense. Over the weekend, \texttt{by\_rows} is a three-trading-day average.
+\begin{center}\small
+\begin{tabular}{rrrr}
+day & price & by\_rows & by\_range\\\hline
+1 & 10.0 & 10.00 & 10.00\\
+2 & 20.0 & 15.00 & 15.00\\
+3 & 30.0 & 20.00 & 20.00\\
+6 & 60.0 & 36.67 & 60.00\\
+7 & 90.0 & 60.00 & 75.00
+\end{tabular}
+\end{center}
+A \texttt{ROWS} frame counts rows, whatever their days. On day 6 it takes days 2, 3 and 6, and so it gives $(20 + 30 + 60) / 3$. A \texttt{RANGE} frame with a numeric offset works on the value of the sort key: it takes $\text{day} - 2 \le d \le \text{day}$. On day 6 that is days 4 to 6, so only one row qualifies; on day 7 it is days 5 to 7, so it gives $(60 + 90)/2$.
+
+Neither is wrong, but they answer different questions. Trading-day averages use \texttt{ROWS} on a clean calendar. A window in time, such as the last 300 seconds, needs \texttt{RANGE}. In either case, the first rows average fewer than three values, so decide whether to print them or to require a full window with \texttt{COUNT(*) OVER (\dots)}.
+
+\iqwrong{``Three preceding rows is three days.'' A missing row, whether a holiday or a data fault, silently stretches a \texttt{ROWS} window further into the past.}
+\iqfollow{Can \texttt{RANGE} with an offset have several sort keys?}{No. The offset is applied to one numeric or date value, and SQLite's manual states the requirement of a single term.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:12}
+It returns five rows, not two, one per tick. The frame ends at the current row, so \texttt{LAST\_VALUE}, \texttt{MAX} and \texttt{MIN} see only the ticks so far. \Cref{lst:iv3:sq:barsfixed} returns the two bars.
+\begin{center}\small
+\begin{tabular}{rrrrr}
+minute & open & high & low & close\\\hline
+1 & 100.0 & 100.0 & 100.0 & 100.0\\
+1 & 100.0 & 103.0 & 100.0 & 101.0\\
+1 & 100.0 & 103.0 & 100.0 & 103.0\\
+2 & 102.0 & 102.0 & 99.0 & 99.0\\
+2 & 102.0 & 102.0 & 102.0 & 102.0
+\end{tabular}
+\end{center}
+With \texttt{ORDER BY} in a window and no frame, the default frame runs from the start of the partition to the current row. So \texttt{LAST\_VALUE} returns the current row's price, which is rarely what anyone wants, and the running high and low change as you go. Each row then differs, and \texttt{DISTINCT} removes nothing. \texttt{FIRST\_VALUE} is right by luck, since the frame always starts at the beginning.
+\omcode{code/interviews-3/07-sql-and-data/sql/bars_fixed.sql}{1}{9}{The whole partition in the frame.}\label{lst:iv3:sq:barsfixed}
+\begin{center}\small
+\begin{tabular}{rrrrr}
+minute & open & high & low & close\\\hline
+1 & 100.0 & 103.0 & 100.0 & 101.0\\
+2 & 102.0 & 102.0 & 99.0 & 99.0
+\end{tabular}
+\end{center}
+A simpler plan for bars is a \texttt{GROUP BY minute} with \texttt{MIN} and \texttt{MAX}, and with open and close taken by \texttt{ROW\_NUMBER} in each direction, or by \texttt{arg\_min} and \texttt{arg\_max} on DuckDB.
+
+\iqwrong{``It returns two rows, because \texttt{DISTINCT} collapses each minute.'' \texttt{DISTINCT} compares whole rows, after the windows have run.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:13}
+\Cref{lst:iv3:sq:asofc} finds, for each trade, the time of the latest quote in the allowed span, then joins to fetch the quote. Trade 1 has no quote yet, trade 2 uses the quote at 3, trade 3 the quote at 12, and trade 4 none, since 12 is too old. Without an index it costs $O(nm)$ for $n$ trades and $m$ quotes; with one, $O(n \log m)$.
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_correlated.sql}{1}{9}{An as-of lookup with a staleness limit.\protect\hfil\protect\break}\label{lst:iv3:sq:asofc}
+\begin{center}\small
+\begin{tabular}{rrrr}
+trade\_id & quote\_ts & bid & ask\\\hline
+1 & NULL & NULL & NULL\\
+2 & 3 & 99.9 & 100.1\\
+3 & 12 & 100.4 & 100.7\\
+4 & NULL & NULL & NULL
+\end{tabular}
+\end{center}
+This is an as-of join\index{as-of join}: each row takes the latest matching row at or before its time. Three edges are worth saying aloud. A quote at the very time of the trade counts, as with trade 3. The left join keeps trades without a usable quote, rather than dropping them. And a staleness limit stops a trade at 30 from being priced off a quote from 18 seconds ago, which the unlimited version would do. Note also that a quote at the same second may in fact have come after the trade: the data can only say what the timestamps say.
+
+The cost is the subquery, which runs per trade. With no index, SQLite's plan shows a bare \texttt{SEARCH q} for the subquery, which reads all the quotes per trade, and it builds an automatic index for the join back to \texttt{quotes}. With an index on \texttt{ts}, the subquery's plan says \texttt{USING COVERING INDEX} with \texttt{(ts>? AND ts<?)}.
+
+\iqwrong{Joining on \texttt{q.ts <= t.ts} and taking \texttt{MAX(q.bid)}. That gives the highest bid in the past, not the latest bid.}
+\iqfollow{Several quotes share a time?}{Then the join returns several rows per trade, so the quotes need a tie-break, such as a sequence number.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:14}
+\Cref{lst:iv3:sq:gaps} compares each number with the next one and returns the ranges 4 to 5 and 8 to 10. The count alone says 5 are missing, but not where, which is what you need to ask for a replay. No query can see a hole at the start or the end, since those numbers leave no trace in the table.
+\omcode{code/interviews-3/07-sql-and-data/sql/seq_gaps.sql}{1}{4}{Missing ranges, from each row's successor.}\label{lst:iv3:sq:gaps}
+\begin{center}\small
+\begin{tabular}{rr}
+first\_missing & last\_missing\\\hline
+4 & 5\\
+8 & 10
+\end{tabular}
+\end{center}
+\texttt{LEAD} gives each row the next value in order, and a gap is where the difference exceeds 1. The last row has a NULL successor, and \texttt{NULL > x} is not true, so it drops out. The query cost is one sort, and the sequence numbers are usually already in order.
+
+The count formula has a second flaw: duplicates hide holes. On the rows 1, 2, 2, 3, 6, it gives 1, where the truth is 2, because the extra row cancels one of the missing. \texttt{COUNT(DISTINCT seq)} repairs the count. The \texttt{LEAD} query still gives the right range there, because a difference of 0 is not above 1.
+
+\iqwrong{Generating every number from the smallest to the largest, and anti-joining. It works, but it costs memory proportional to the range, and on a feed with a billion messages that matters.}
+\iqfollow{How do you find a hole at the end?}{From outside the table: the feed's heartbeat or the end-of-session message states the last sequence number sent. Compare with that.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:15}
+Rows 3 to 7 come back, for the reasons in the table below. Row 7 is a good quote, flagged only because it returns from the bad print in row 6. To stop that, compare each mid with the median of the preceding rows rather than with the previous row.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/bad_ticks.sql}{1}{16}{One reason per suspect row.}\label{lst:iv3:sq:ticks}
+\begin{center}\small
+\begin{tabular}{rl}
+seq & problem\\\hline
+3 & crossed\\
+4 & size\\
+5 & time\\
+6 & jump\\
+7 & jump
+\end{tabular}
+\end{center}
+\texttt{CASE} returns the first branch that holds, which gives the checking order. \texttt{LAG} needs a subquery because a window cannot appear in \texttt{WHERE}. A NULL from \texttt{LAG} on the first row makes those comparisons unknown, so it passes: the first row has nothing to be compared with. Row 5 is flagged on time, as its 4 is not above row 4's 4.
+
+The rows are compared with whatever came before, good or bad. Row 3 is crossed, yet its mid still enters the comparison for row 4, which can matter if a crossed quote is far away. The median cures both: a single print cannot move a median of five, so on DuckDB, where a window median exists, only row 6 is flagged for a jump, while rows 3, 4 and 5 keep their other reasons. SQLite 3.37 has no such function.
+
+\iqwrong{Dropping every flagged row automatically. Row 7 is real, and a genuine gap on news can look like row 6: so review jumps, or check them against another source, before you delete them.}
+\iqwhy{A strategy trained on data with one crossed quote or one wrong print can learn to trade on it, and the backtest will show a profit no one can earn.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:16}
+\texttt{quantile\_disc} returns 80 and \texttt{quantile\_cont} returns 92, up to rounding: DuckDB 1.5.5 prints 91.99999999999996. \Cref{lst:iv3:sq:rank} gives the nearest-rank value on SQLite: 80. For latency, report a value that really occurred, by a stated rule, because an interpolated number can land where no request ever was.
+\omcode{code/interviews-3/07-sql-and-data/sql/nearest_rank.sql}{1}{6}{The nearest-rank rule.}\label{lst:iv3:sq:rank}
+
+The discrete form returns an actual value: the smallest with at least 90\% of the rows at or below it, which is the 9th of 10. The continuous form treats sorted values as points to interpolate between. Its position is $0.9 \times (10 - 1) = 8.1$, counting from 0, which is a tenth of the way from 80 to 200, so $80 + 0.1 \times 120 = 92$. No request took 92 microseconds: the gap between 80 and 200 is where the distribution has nothing.
+
+In the listing, the test \texttt{pos * 10 >= n * 9} keeps the arithmetic in integers, which is exact, and it avoids \texttt{CEIL}, which not every SQLite build provides. It gives the same 80 on both engines.
+
+The tail is where this matters most. With ten rows, the 90th percentile and the maximum are separated by one observation. A sample that small cannot say anything sure about the tail, and the 99th percentile of ten rows is simply the maximum.
+
+\iqwrong{Averaging percentiles across venues or days. A percentile does not average. To combine, merge the raw data or the histograms, then read off the percentile.}
+\iqfollow{\texttt{NTILE(10)}?}{It splits rows into ten nearly equal groups, and it can place equal values in different groups, so the boundary is not a clean percentile.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:17}
+Query A searches on both columns, with no sort. Query B scans. Query C searches on \texttt{symbol}, and the index supplies the order, so it needs no sort. Query D searches on \texttt{symbol} but needs a sort. Query E scans. The rule is that an index on \texttt{(symbol, ts)} is sorted by symbol and then by time, so it helps only from its leftmost column on, and only on the columns themselves.
+
+SQLite's \texttt{EXPLAIN QUERY PLAN}, read by the test, says:
+\begin{itemize}
+\item A: \texttt{SEARCH trades USING INDEX by\_symbol\_ts (symbol=? AND ts>?)}.
+\item B: \texttt{SCAN trades}. Times are sorted only within each symbol, so a condition on \texttt{ts} alone has no one place to start.
+\item C: \texttt{SEARCH} with \texttt{(symbol=?)}, and no sort step, as the rows for one symbol come out in time order.
+\item D: the same search, then \texttt{USE TEMP B-TREE FOR ORDER BY}.
+\item E: \texttt{SCAN trades}. A function of a column hides it from the index, even when the prefix is fixed. \texttt{symbol >= \textquotesingle{}A\textquotesingle{} AND symbol < \textquotesingle{}B\textquotesingle{}} can use it.
+\end{itemize}
+
+So write the index with the equality column first and the range or sort column next. SQLite can sometimes use an index without its first column, by a skip-scan, but only with statistics from \texttt{ANALYZE} and few distinct first values, so do not plan on it.
+
+\iqfollow{The query reads only \texttt{ts} and \texttt{price}, and it is hot. What else can you do?}{Add \texttt{price} to the index, as \texttt{(symbol, ts, price)}: the plan then says \texttt{COVERING INDEX}, as the table is never visited. Each extra index slows every write.}
+\iqfollow{Would you add one to a column store like DuckDB?}{Usually not at first. It reads column chunks and skips them using each chunk's minimum and maximum, so sorting the data on load often achieves what the index would.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:18}
+\Cref{lst:iv3:sq:islands} returns days 6 to 8, a run of 3. This is the gaps-and-islands\index{gaps and islands} method: a row's position in the whole table, minus its position among the winning rows, is the same for every row of a run.
+\omcode{code/interviews-3/07-sql-and-data/sql/islands.sql}{1}{14}{Islands, from a difference of row numbers.}\label{lst:iv3:sq:islands}
+
+Number all rows by day to get \texttt{pos}. Then keep the winners and number them again. Along a run of winners both numbers rise by 1 per row, so their difference stays fixed. Every losing row skipped raises \texttt{pos} and not the second number, so the difference jumps between runs. Here the winners are at positions 1, 2, 4, 5, 6, 8, the second numbering is 1 to 6, and the differences are 0, 0, 1, 1, 1, 2: three islands, of sizes 2, 3 and 1.
+
+\texttt{pos} has to come from a first step on all rows. Using \texttt{day} itself would count a missing day as a break, whereas the question is about consecutive rows, and days 4 and 5 simply do not exist in this table. The test compares with a plain loop in Python on 100 random tables with holes in the days.
+
+The tie rule goes in the final \texttt{ORDER BY}, and \texttt{LIMIT 1} takes the top. Note that \texttt{LIMIT} is not in every dialect, as some engines use \texttt{FETCH FIRST}.
+
+\iqwrong{Using \texttt{LAG} alone. It tells you where a run starts, but not how long it is. You still need a running count of starts, which is the method of marking starts and summing them, in another form.}
+\iqfollow{The longest run of losses?}{Change the filter. The same numbering of the whole table applies.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:19}
+\Cref{lst:iv3:sq:sessions} marks each event that starts a session, then takes a running sum of the marks as the session number. It returns three sessions for ann and two for bob. A gap of exactly 300 is the case to test because the rule says ``300 or less'' continues a session, and bob's last two events test exactly that.
+\omcode{code/interviews-3/07-sql-and-data/sql/sessions.sql}{1}{15}{Mark the starts, then sum them.}\label{lst:iv3:sq:sessions}
+\begin{center}\small
+\begin{tabular}{lrrrr}
+trader & session & first\_ts & last\_ts & n\\\hline
+ann & 1 & 100 & 200 & 2\\
+ann & 2 & 700 & 800 & 2\\
+ann & 3 & 1500 & 1500 & 1\\
+bob & 1 & 150 & 150 & 1\\
+bob & 2 & 460 & 760 & 2
+\end{tabular}
+\end{center}
+This pattern is worth knowing: turn a condition on neighbouring rows into a 0 or 1 column, and a running sum makes a group number. Partitions keep the two traders apart, so ann's last event has no effect on bob's first. A first event has no predecessor, so \texttt{LAG} gives NULL, the comparison is unknown, and \texttt{CASE} falls to \texttt{ELSE 1}, which correctly starts a session.
+
+Bob's gaps are 310 and 300. The first starts a new session, and the second continues one. Writing \texttt{< 300} would split that last pair, and only a test on the boundary would notice.
+
+\iqwrong{Grouping on \texttt{ts / 300}. Fixed buckets are simple, but two events a second apart can fall in different buckets, and a long session is cut at every multiple of 300.}
+\iqfollow{Can this be a query you run every hour on new data?}{Yes, but a session may span the boundary, so you must reprocess the last open session of each trader rather than start fresh.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:20}
+\Cref{lst:iv3:sq:ffill} makes a group for each known price and spreads that price over its group. It returns NULL, 10, 10, 10, 12, 12. On DuckDB one line is enough: \texttt{LAST\_VALUE(price IGNORE NULLS) OVER (ORDER BY day)}. Filling backwards would put a price from the future into the past, which in a backtest is look-ahead.
+\omcode{code/interviews-3/07-sql-and-data/sql/ffill.sql}{1}{7}{Forward fill with a running count.}\label{lst:iv3:sq:ffill}
+\begin{center}\small
+\begin{tabular}{rr}
+day & filled\\\hline
+1 & NULL\\
+2 & 10.0\\
+3 & 10.0\\
+4 & 10.0\\
+5 & 12.0\\
+6 & 12.0
+\end{tabular}
+\end{center}
+\texttt{COUNT(price)} skips NULLs, so its running value rises only at a known price. The groups by day are 0, 1, 1, 1, 2, 2. Each group holds at most one non-NULL price, so \texttt{MAX} over the group returns exactly that price. Group 0 has none, so day 1 stays NULL, as the question asks.
+
+SQLite rejects the \texttt{IGNORE NULLS} syntax, and the test confirms it, so you need this trick there.
+
+\iqwrong{\texttt{COALESCE(price, LAG(price) OVER (ORDER BY day))}. It fills only one step: day 4's previous value is itself NULL, so it stays NULL.}
+\iqfollow{Fill at most one day, so that a stale price is not carried for ever?}{Also keep \texttt{MAX(CASE WHEN price IS NOT NULL THEN day END) OVER (ORDER BY day)}, the last day with a price, and fill only when \texttt{day} minus that is at most 1. Here day 4 then stays NULL.}
+\iqwhy{A filled price is a stale price, so a return computed across a fill is 0 and then a jump. For volatility and correlation, that can matter more than the gap itself.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:21}
+On DuckDB, use \texttt{ASOF LEFT JOIN} (\cref{lst:iv3:sq:asofd}). The other query merges both tables and uses the running-count trick (\cref{lst:iv3:sq:asofu}). Each sorts, for about $O((n + m) \log(n + m))$, where a correlated lookup with no index costs $O(nm)$.
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_duckdb.sql}{1}{4}{An as-of join on DuckDB.}\label{lst:iv3:sq:asofd}
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_union.sql}{1}{17}{The same with a merged stream.}\label{lst:iv3:sq:asofu}
+\begin{center}\small
+\begin{tabular}{lrr}
+symbol & ts & mid\\\hline
+AAA & 5 & 100.0\\
+AAA & 12 & 101.0\\
+BBB & 1 & NULL\\
+BBB & 7 & 50.0
+\end{tabular}
+\end{center}
+Put quotes and trades in one stream, sorted by symbol, time and \texttt{kind}. Within a symbol, \texttt{COUNT(mid)} rises at each quote and holds at each trade. So a trade shares a group with exactly the latest quote before it, and \texttt{MAX(mid)} over that group is that quote's mid. The last step keeps only the trades, by \texttt{kind = 1}.
+
+\texttt{kind} is where the tie rule lives. Quotes are 0 and trades 1, so at equal times a quote comes first, as the question wants. To exclude a quote at the same moment, swap them.
+
+The tests compare both queries with a brute-force search over 100 random tables. Quotes there have unique times per symbol. With duplicates, this query needs a further sort key, since nothing then says which of the two quotes counts last, and the result depends on the order in which the engine happens to read them.
+
+\iqwrong{``An index would solve it.'' It would cut each lookup to $O(\log m)$, but the question has none, and the merge does not need one.}
+\iqfollow{Which side is the outer?}{In the DuckDB listing, trades are on the left, so a trade with no earlier quote stays, with NULL. A plain \texttt{ASOF JOIN} would drop it.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:22}
+It returns five rows for three trades. The ABC trade on 2024-05-01 appears twice, because \texttt{BETWEEN} includes both ends, which is a fault in the query. The XYZ trade appears twice, because instruments 3 and 4 overlap in \texttt{master}, which is a fault in the data. \Cref{lst:iv3:sq:pitfixed} fixes the first, and \cref{lst:iv3:sq:overlaps} finds the second.
+\begin{center}\small
+\begin{tabular}{llrr}
+ticker & day & qty & inst\_id\\\hline
+XYZ & 2022-07-01 & 30 & 3\\
+XYZ & 2022-07-01 & 30 & 4\\
+ABC & 2024-04-30 & 10 & 1\\
+ABC & 2024-05-01 & 20 & 1\\
+ABC & 2024-05-01 & 20 & 2
+\end{tabular}
+\end{center}
+\omcode{code/interviews-3/07-sql-and-data/sql/pit_fixed.sql}{1}{4}{A half-open join.}\label{lst:iv3:sq:pitfixed}
+\omcode{code/interviews-3/07-sql-and-data/sql/pit_overlaps.sql}{1}{4}{Rows of the master that overlap.}\label{lst:iv3:sq:overlaps}
+
+The dates mean a half-open span, from \texttt{valid\_from} up to but not including \texttt{valid\_to}, and \texttt{BETWEEN} is closed at both ends. On the handover day both ABC rows match, so an inner join multiplies the trade, and a volume report doubles it. The fixed query assigns that trade to instrument 2 only.
+
+No query fix can settle XYZ, as the master itself claims two owners for June to December 2022. Two half-open spans overlap exactly when each starts before the other ends, and that one line is the check. It returns (3, 4), and it should run as a test whenever \texttt{master} is loaded.
+
+ISO dates in text compare correctly as strings, which is why the comparisons work here, on SQLite and DuckDB. Other date formats do not.
+
+\iqwrong{``Use \texttt{DISTINCT} to remove the duplicates.'' That hides the double match, and it leaves one wrong instrument in the result.}
+\iqfollow{Why not join on today's ticker for each instrument?}{History then gets the wrong company, or none at all for a delisted one, which leaves out failed firms. This survivorship is why master data holds dates.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:23}
+\Cref{lst:iv3:sq:rvwap} uses a \texttt{RANGE} frame on \texttt{ts}, returning the table below. The two trades at 420 do see each other, as \texttt{RANGE} includes peers, so they get the same value. With a double \texttt{ts}, the integer shortcut for the open end no longer works.
+\omcode{code/interviews-3/07-sql-and-data/sql/rolling_vwap.sql}{1}{4}{A five-minute window, in time.}\label{lst:iv3:sq:rvwap}
+\begin{center}\small
+\begin{tabular}{rr}
+ts & vwap\\\hline
+0 & 100.000\\
+120 & 100.500\\
+299 & 101.250\\
+300 & 102.000\\
+420 & 100.571\\
+420 & 100.571
+\end{tabular}
+\end{center}
+The window must be open at $t - 300$ and closed at $t$, and a \texttt{RANGE} frame is closed at both ends. With integer seconds, 299 preceding is exactly the same as the open end at 300: a trade at 0 is out of the window for the trade at 300, as the 102.000 shows. It is $(1010 + 2040 + 1030) / 40$, from the trades at 120, 299 and 300. At 420 the sum is over the trades at 299, 300 and both at 420: $7040 / 70 \approx 100.571$.
+
+A running window means one pass over sorted rows, adding and removing as the frame moves, so a good engine does this in about $O(n \log n)$, mostly for the sort. Compare the self-join, which scales with the number of pairs inside the window.
+
+For double times, no finite offset gives an open end exactly, and subtracting a tiny tolerance is a fudge. Convert the time to integer microseconds or nanoseconds first, and the same query is exact. That is also how you should store times.
+
+\iqwrong{\texttt{ROWS BETWEEN 299 PRECEDING AND CURRENT ROW}. It counts 300 trades, not 300 seconds. On a quiet day it reaches back for hours, and on a busy one it covers a fraction of a second.}
+\iqfollow{Why divide two window sums, rather than average?}{The average of price over a window weights each trade equally, where VWAP weights by quantity. A \texttt{WINDOW} clause shows that both sums use the same frame.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:24}
+Lay out all bought shares on one number line, and all sold shares on another: first in, first out means the $k$-th share sold is the $k$-th share bought. So each fill is a span, and the matched quantity is the overlap, as in \cref{lst:iv3:sq:fifo}. Total profit here is 4000, and the query stays right when the position goes short.
+\omcode{code/interviews-3/07-sql-and-data/sql/fifo.sql}{1}{16}{First-in first-out as overlapping spans.}\label{lst:iv3:sq:fifo}
+\begin{center}\small
+\begin{tabular}{rrrr}
+buy\_seq & sell\_seq & qty & pnl\\\hline
+1 & 3 & 100 & 2000\\
+2 & 3 & 20 & 200\\
+2 & 5 & 30 & 600\\
+4 & 5 & 30 & 1200
+\end{tabular}
+\end{center}
+A running sum per side gives each fill its span: buys cover $[0, 100)$, $[100, 150)$ and $[150, 180)$, and sales cover $[0, 120)$ and $[120, 180)$. Two half-open spans overlap when each starts before the other ends, and the shared length is the smaller end minus the larger start. \texttt{CASE} does that, as SQLite's two-argument \texttt{MIN} means something else on DuckDB, where it returns a list, and \texttt{LEAST} is not in SQLite 3.37. The profit per pair is $(\text{sell} - \text{buy}) \times \text{qty}$. The test compares with a queue-based loop in Python on 150 random histories.
+
+For shorts, the same reasoning holds. Whichever way the position crosses zero, first-in first-out on both sides still pairs the $k$-th share bought with the $k$-th share sold. The test confirms this on random histories that do go short. All that changes is how you read a row: when \texttt{sell\_seq} comes before \texttt{buy\_seq}, it is a short sale and its later cover.
+
+Shares bought but not yet sold have no matching span, so they appear in no row. That is the open position, valued by marking to market, not here. With many symbols, add the symbol to the partition and to the join.
+
+\iqwrong{``SQL needs a cursor or recursion, because lots are consumed one by one.'' Thinking of positions on a number line removes the state altogether. The same trick does not work for last-in first-out, where the matching really depends on the path.}
+\iqfollow{And the cost?}{The self-join on inequalities can touch many pairs without an engine that handles such joins well. A two-pointer walk in code is $O(n)$, so use this for a report rather than on a hot path.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:25}
+\Cref{lst:iv3:sq:best} turns the history into versions of each price level, each valid from one step until the next change at that price, and takes the highest live level at each step. It returns the table below. On SQLite it costs $O(n^2)$ for $n$ events, so I would not run it on a day of data: replay in code instead.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/best_bid.sql}{1}{15}{The best bid at every step.}\label{lst:iv3:sq:best}
+\begin{center}\small
+\begin{tabular}{rrr}
+seq & price & qty\\\hline
+1 & 100 & 50\\
+2 & 101 & 20\\
+3 & 101 & 20\\
+4 & 100 & 80\\
+5 & 100 & 80\\
+6 & 99 & 40
+\end{tabular}
+\end{center}
+Per price, the running \texttt{SUM(delta)} is the level's quantity after each of its changes, and \texttt{LEAD(seq)} tells when that version ends. So a version is live over the half-open span from its \texttt{seq} to the next, or to the end if the next is NULL. Joining each step to the versions live then, with positive quantity, gives the book at that step. \texttt{ROW\_NUMBER} by descending price picks the best. The outer left join brings back a step at which the side is empty, with NULLs. The tests compare with a dictionary replay on 100 random histories.
+
+The join is the problem. Its output has about $n \times L$ rows, for $L$ live levels, and on SQLite, with no index for the inequality, finding them compares each step with every version, which is $O(n^2)$. Another engine may plan it better, but a replay in code with an ordered map costs $O(n \log L)$ and streams from disk. On a busy instrument with millions of events, and hundreds of levels, one is a query you run for a morning's sample and the other is what you ship.
+
+\iqwrong{Taking \texttt{MAX(price)} of events with positive \texttt{delta} so far. It forgets that a level can empty out, so after step 4 it would still say 101.}
+\iqfollow{How can you shrink the join?}{A level only matters while it is near the top, so filter to prices within a few ticks of the best so far. Or run the query on a small time slice, per batch. Both help, but a replay is simpler.}
+\end{solution}

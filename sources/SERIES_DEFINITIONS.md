@@ -1,5 +1,8 @@
 # Series definition map (One Quant Books 1–18)
 
+**Note, 2026-11-03.** Books 18 to 20 are now the interview books, which define no terms. The old Book 18's terms
+below (interview process, offers, question methods) left with that book, so nothing owns them now.
+
 Regenerated 2026-09-29 after the Books 17–18 batch (the whole series), from the `\index{}` harvest of
 all eighteen books (first written 2026-09-24 for Books 1–6) (multi-line aware; the same harvest as `tools/gates.sh book`). **A term
 is defined once in the series**: the book and chapter below own it; every other

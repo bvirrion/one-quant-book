@@ -5,12 +5,15 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 `one-quant-book/` — the **One Quant Book** series of the One Course project:
-eighteen English-only LaTeX books covering quantitative finance end to end
+twenty English-only LaTeX books covering quantitative finance end to end
 (markets, methods, derivatives, risk, research, strategies, microstructure,
 HFT, machine learning, low-latency software, networks, platforms, the firm,
 the industry, interviews).
 
-**Status (2026-09-29): all eighteen books are written.** Books 14–16 were written
+**Status (2026-11-03): all twenty books are written.** Books 18, 19 and 20 are the interview books, written 2026-11-02/03
+in one parallel batch of three (one Opus 5.5 agent per book), which replaced the old 220-page Book 18: 1,789 new questions, long
+linked answers at the back, no lessons. Their rules are `sources/INTERVIEW_BOOKS.md`, their chapters `outline/interviews.md`, their
+run file `sources/BATCH_BOOKS_18-20.md`, and their gate `tools/check_interview_book.py`. Books 14–16 were written
 2026-09-28/29 in one parallel batch of three, one agent per book (user rule for Books 14–18: at most three
 books at a time, batches {14, 15, 16} then {17, 18}, both done 2026-09-28/29; `sources/BATCH_BOOKS_14-16.md`, `sources/BATCH_BOOKS_17-18.md`).
 Book 16's slug is `desk`, not `firm` (`code/firm/` is the running project).
@@ -35,14 +38,16 @@ book (`sources/BATCH_BOOKS_3-6.md`; series definition map
 | 8 Strategies I: Equities and Futures | `one_quant_book_08_strategies_1.tex` | `strategies-1` / `s1` | 29 | 330 | 54 | 57 | 13 | 140 | 597 |
 | 9 Strategies II: Vol, RV, Macro, Bank Desks | `one_quant_book_09_strategies_2.tex` | `strategies-2` / `s2` | 29 | 333 | 57 | 59 | 5 | 98 | 262 |
 | 10 Microstructure and Execution | `one_quant_book_10_microstructure.tex` | `microstructure` / `mx` | 28 | 303 | 70 | 55 | 14 | 178 | 720 |
-| 11 Market Making and HFT | `one_quant_book_11_hft.tex` | `hft` / `hf` | 29 | 330 | 68 | 59 | 19 | 118 | 361 |
+| 11 Market Making and HFT | `one_quant_book_11_hft.tex` | `hft` / `hf` | 29 | 329 | 68 | 59 | 19 | 118 | 361 |
 | 12 Machine Learning for Markets | `one_quant_book_12_ml.tex` | `ml` / `ml` | 29 | 348 | 58 | 87 | 3 | 168 | 1,000 |
 | 13 Low-Latency Software | `one_quant_book_13_low_latency.tex` | `low-latency` / `ll` | 26 | 314 | 72 | 80 | 13 | 120 | 606 |
 | 14 Networks, Hardware, Infrastructure | `one_quant_book_14_networks.tex` | `networks` / `nw` | 29 | 349 | 96 | 65 | 40 | 220 | 685 |
 | 15 Research, Data and Risk Platforms | `one_quant_book_15_platforms.tex` | `platforms` / `pl` | 30 | 367 | 110 | 103 | 27 | 122 | 702 |
 | 16 The Desk and the Firm | `one_quant_book_16_desk.tex` | `desk` / `fm` | 30 | 347 | 108 | 40 | 32 | 182 | 854 |
 | 17 The Industry: Firms, Roles and Careers | `one_quant_book_17_industry.tex` | `industry` / `in` | 30 | 339 | 86 | 38 | 52 | 293 | 620 |
-| 18 The Interview Book | `one_quant_book_18_interviews.tex` | `interviews` / `iv` | 29 | 220 | 23 | 55 | 6 | 80 | 56 |
+| 18 Interviews I: Maths, Probability and Speed | `one_quant_book_18_interviews_1.tex` | `interviews-1` / `iv1` | 33 | 393 | 11 | 0 | 2 | 20 | 0 |
+| 19 Interviews II: Markets, Trading Games and the Final Round | `one_quant_book_19_interviews_2.tex` | `interviews-2` / `iv2` | 21 | 348 | 0 | 0 | 11 | 65 | 0 |
+| 20 Interviews III: Code | `one_quant_book_20_interviews_3.tex` | `interviews-3` / `iv3` | 9 | 391 | 0 | 399 | 0 | 239 | 0 |
 
 Books 1–6: gates 0 errors / 0 undefined / 0 overfull, `make gates` green (the
 series-wide "defined twice" check: 1,646 terms, none twice), `make test-code`
@@ -67,7 +72,7 @@ C++20 and Rust) is what Book 6's `riskengine` runs on. The bootstrap:
 `styles/onequant.sty`, `Makefile`, `tools/` (gates, term linker, figure cropper,
 code and CSV checks, `omcode_ends.py`), `.venv` (numpy + pandas; since the Books 10–13 batch also scipy, scikit-learn, LightGBM, statsmodels and PyTorch CPU — user ruling 2026-09-25).
 Versions are pinned in `requirements.txt`, which `make venv` installs. To add a library, install it, run the tests, then re-freeze with `python3 -m pip --python .venv/bin/python freeze`.
-CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `make test-fast`, which skips the tests marked `reference`. Those tests either reproduce the book's exact printed numbers with a full-size run (the heavy chapters), or assert digits that move with the processor's floating-point kernels. Every chapter keeps a small `test_small_runs` or other unmarked test that CI runs (user ruling 2026-09-27: CI tests the code, not the book's digits). A `v*` tag also publishes a GitHub release with all eighteen PDFs, each versioned and under its plain name (job `release`, after `code` and `book` pass); a manual run never releases. Chart regeneration is not in CI: `make reproduce` runs everything, `reference` tests and figdata included, on the machine that wrote the book.
+CI (`.github/workflows/ci.yml`) runs on tags and manual runs only (user ruling 2026-09-26). It uses Python 3.10 with those pins and Rust 1.97.1, and runs one matrix job per code root: `make test-fast`, which skips the tests marked `reference`. Those tests either reproduce the book's exact printed numbers with a full-size run (the heavy chapters), or assert digits that move with the processor's floating-point kernels. Every chapter keeps a small `test_small_runs` or other unmarked test that CI runs (user ruling 2026-09-27: CI tests the code, not the book's digits). A `v*` tag also publishes a GitHub release with all twenty PDFs, each versioned and under its plain name (job `release`, after `code` and `book` pass); a manual run never releases. Chart regeneration is not in CI: `make reproduce` runs everything, `reference` tests and figdata included, on the machine that wrote the book.
 Books 14–16 alone (each checked by the main session): 0/0/0, `tools/gates.sh book` green (3,383 definitions
 over 16 books, none twice), per-book `make test-code` green (Book 14: 122 chapter + 102 firm tests, C++20 twins,
 a Rust crate, SystemVerilog under Verilator 4.038 and Icarus 11, which `make venv` does not install: `apt install
@@ -78,9 +83,12 @@ with a thin space, and 1,853 hand-typed comma thousands in Books 2, 3, 6, 8–12
 Books 17–18 alone (each checked by the main session): 0/0/0, `tools/gates.sh book` green (3,540 definitions over
 18 books, none twice), per-book `make test-code` green (Book 17: 139 chapter + 99 firm tests; public data only as
 small derived tables in `data/industry/` with `LICENSES.md`, firm-level only, pay cells with fewer than ten filings or
-three employers suppressed, no individual's pay; Book 18: 357 new questions in 29 chapters, a lesson plus one bank of
-at most 14 per chapter, no exercises or weekend problems (user ruling), 331 Python tests incl. an originality gate
-against Books 1–17, C++20 ×4, Rust, SQL on DuckDB and SQLite).
+three employers suppressed, no individual's pay).
+Books 18–20 alone (each checked by the main session): 0/0/0, `check_interview_book.py <slug> --final` and `--cross` green, pytest on
+each code root green (753, 620 and 386 tests, each with an originality test against Books 1–17 and the harvest). Book 20 prints what g++ 11.4 does, so its CI job
+installs g++-11; Java, .NET, Rust nightly and the local EVM (`build/iv38/node`) are optional and their tests skip without them.
+Fresh expert readers have read every answer in the three books, in two rounds on 2026-11-03: 252 defects in 1,789 answers (Book 18 69, Book 19 66, Book 20 117), logged as
+fixed. A reader's finding is rechecked by script before it is applied, as some proposed replacement text was itself wrong. `tools/check_omcode.py` does not notice a range that stops inside a block.
 Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 ## Commands
@@ -102,7 +110,7 @@ OQB_BOOK=2 .venv/bin/python tools/figcrop.py "Figure 23.4." out.png   # then REA
 
 1. `../CLAUDE.md` and `../book_style.md` — workspace rules and the family
    style.
-2. `OUTLINE.md` — premises, the eighteen books, the running project, reading
+2. `OUTLINE.md` — premises, the twenty books, the running project, reading
    paths; `outline/*.md` — chapters, summaries, page budgets per book.
 3. `WRITING_A_QUANT_BOOK.md` — **how to write one of the books**: what
    changes from the family style, repo layout and label prefixes, the

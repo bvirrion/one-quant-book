@@ -247,6 +247,9 @@ regulatory disclosures, the firms' own publications, reputable press).
 
 ## One Quant Book 18 — The Interview Book (~240 pp)
 
+**Superseded 2026-11-03.** This book was replaced by Books 18, 19 and 20, the interview books: see
+`outline/interviews.md` and `sources/INTERVIEW_BOOKS.md`. The plan below is kept as history.
+
 Every question has a full solution; each bank is graded one to three stars and
 tagged by role and firm type. No question is attributed to a named firm.
 

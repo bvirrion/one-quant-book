@@ -27,7 +27,6 @@ ENTRY = {
     15: "one_quant_book_15_platforms.tex",
     16: "one_quant_book_16_desk.tex",
     17: "one_quant_book_17_industry.tex",
-    18: "one_quant_book_18_interviews.tex",
 }
 
 LANGS = {
@@ -48,7 +47,6 @@ LANGS = {
     15: ("en",),
     16: ("en",),
     17: ("en",),
-    18: ("en",),
 }
 
 

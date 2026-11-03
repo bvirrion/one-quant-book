@@ -1,0 +1,446 @@
+\section*{Chapter \ref{ch:iv3:low-latency} --- Low Latency}
+\markboth{\protect\omTocMark{}{Answers: Low Latency}}{\protect\omTocMark{}{Answers: Low Latency}}
+
+\begin{solution}{iq:iv3:low-latency:1}
+It prints \texttt{24 16 64 192} on one line and \texttt{16 13} on the next.
+
+On this platform \texttt{double} has alignment 8 and \texttt{int} has alignment 4. In \texttt{A}, \texttt{c} sits at 0, 7 padding bytes put \texttt{d} at 8, \texttt{e} is at 16, 3 more padding bytes put \texttt{i} at 20, and the total is 24. In \texttt{B}, the largest member comes first: \texttt{d} at 0, \texttt{i} at 8, \texttt{c} at 12, \texttt{e} at 13, then padding to a multiple of 8, which gives 16. \texttt{alignas(64)} forces the size of \texttt{C} to a multiple of 64, because each element of an array must be aligned, so three of them take 192.
+
+The standard fixes the order of the members, that \texttt{sizeof(C)} is a multiple of 64, and that \texttt{row} is \texttt{3 * sizeof(C)}. The alignment of \texttt{double} and \texttt{int}, and so the other numbers, belong to the platform.
+
+\iqwhy{The 8 bytes saved mean 4 objects fit in a 64-byte cache line instead of 2, and the padding that wastes them is invisible in the source.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:2}
+The program is undefined, so no output can be promised. On this compiler it printed 0, and the reader did not wait.
+
+Both \texttt{ready} and \texttt{value} are read and written by two threads with no synchronisation, so this is a data race\index{data race}, and C++ calls any data race undefined behaviour. What happened here: at \texttt{-O2}, g++ turns on \texttt{-ffinite-loops}, which lets it assume the loop ends and delete it, so the reader prints \texttt{value} at once. With \texttt{-fno-finite-loops} the test run hung, spinning on a single hoisted read. At \texttt{-O0} it printed 42. All three are observations on g++ 11.4, not promises.
+
+\texttt{volatile bool} printed 42 at \texttt{-O2}, but ThreadSanitizer still reports the race, because \texttt{volatile} creates no ordering between threads and does not make access atomic. The fix is \texttt{std::atomic<bool>}: it printed 42 and ThreadSanitizer stayed silent.
+
+\iqwrong{``It hangs for ever, because the compiler caches the flag.'' That is one possible outcome of undefined behaviour, and not the one this compiler chose at \texttt{-O2}.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:3}
+It prints 8, 16, 8, 8, 8, 16, 16, 24, 24, 1. The three sizes for \texttt{Option<NonZeroU64>}, \texttt{Option<Box<u64>{}>} and \texttt{Option<\&[u8]>} are promised; \texttt{Option<Vec<u8>{}>} and \texttt{Option<bool>} merely come out that way.
+
+\texttt{Option<u64>} needs a tag, because every bit pattern of \texttt{u64} is a valid value, so it takes 16 bytes with alignment 8. A \texttt{Box} and a reference are never null and \texttt{NonZeroU64} is never zero, so \texttt{None} can use that spare pattern. The documentation of \texttt{std::option} guarantees this null pointer optimisation for exactly those families. \texttt{\&[u8]} is a pointer and a length, 16 bytes. \texttt{Vec<u8>} is 24 bytes, and \texttt{bool} has spare patterns too, so the compiler uses them, but neither case is in the guaranteed list.
+
+\iqwhy{An array of \texttt{Option<u64>} is twice the size of an array of \texttt{u64}. A price that can never be zero, stored as \texttt{NonZeroU64}, keeps the array small and the cache footprint low.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:4}
+It no longer compiles: rustc reports error E0373, that the closure may outlive \texttt{main}'s borrow of \texttt{prices}.
+
+\texttt{thread::spawn} requires a closure that is \texttt{\textquotesingle{}static}, because the signature must hold for any caller, and a caller may drop the handle and never join. The borrow checker reads that signature. It does not reason about the \texttt{join} on the next line.
+
+With \texttt{move}, the closure owns the vector, and \texttt{main} can no longer use it. The fix without a reference count is a scoped thread, \cref{lst:iv3:ll:scoped}: the scope joins every thread it started before it returns, so a plain borrow is safe, and that run printed \texttt{300 3}.
+\enlargethispage{-6\baselineskip}%
+\omcode{code/interviews-3/04-low-latency/rust/src/bin/spawn_scoped.rs}{3}{9}{The same work in a scoped thread.\protect\hfil\protect\break}\label{lst:iv3:ll:scoped}
+\iqwrong{``It compiles and fails at run time if the thread outlives \texttt{prices}.'' Safe Rust rejects this before the program exists.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:5}
+The budget is 4000 cycles, or 8000 instructions. Eleven misses take 990 ns and fill it. Five misses take 450 ns, 45\% of the budget, the time of 3600 instructions.
+
+The arithmetic is $1000\text{ ns} \times 4 = 4000$ cycles, and $4000 \times 2 = 8000$ instructions. Then $1000 / 90 \approx 11$ misses, and $5 \times 90 = 450$ ns, which is $450 \times 4 = 1800$ cycles, or 3600 instructions.
+
+The point of the exercise is the comparison. A hot path of a few hundred instructions is cheap, and a handful of cold pointers dominate it, so latency work is largely a matter of how few cache lines a message touches and whether they are already in cache. The figures here are the question's assumptions; measure your own machine before quoting any.
+
+\iqfollow{An order-book update follows a hash table to a level, then to a queue, then to an order: three cold pointers, each a miss. What does that cost?}{$3 \times 90 = 270$ ns, over a quarter of the budget, before any logic has run.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:6}
+This is false sharing\index{false sharing}. The eight 8-byte counters sit on one or two 64-byte cache lines, so every increment drags a line away from whichever core had it. Give each counter its own line, as in \cref{lst:iv3:ll:padded}; the struct grows from 64 to 512 bytes.
+\omcode{code/interviews-3/04-low-latency/cpp/counters.cpp}{19}{25}{Each counter on its own line.}\label{lst:iv3:ll:padded}
+
+Cache coherence works per line, not per variable. A locked increment needs its core to own the line exclusively, so the line moves between cores on nearly every operation, even though the threads share no data. Measured once here, as an illustration, on an Intel Core Ultra 7 155H under WSL2 with g++ 11.4 and 4 unpinned threads: about 60 ns per increment on the shared line, about 5 ns each on its own line.
+
+The fix costs eight times the memory and eight lines of cache footprint, and a reader who sums all the counters now takes up to eight misses instead of one. On some Intel processors a spatial prefetcher pulls pairs of lines, so some libraries pad to 128 bytes. To confirm, compare the two versions as threads are added, and on hardware that supports it use \texttt{perf c2c}, which reports the contended lines. A VM may not expose those counters.
+
+\iqfollow{With one writer per counter, do you need the locked increment at all?}{No. A relaxed load then a relaxed store is enough, and on x86-64 each is a plain move. The line still moves when someone reads it, so padding is still useful. A non-atomic per-thread counter, published now and then, is cheaper again.}
+\iqfollow{Can \texttt{std::hardware\_destructive\_interference\_size} give the 64?}{Not on g++ 11.4: the test found its feature macro undefined there.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:7}
+All three loads, the relaxed and release stores, and \texttt{++plain} are ordinary instructions (\texttt{movq}, or an unlocked add). The sequentially consistent store is \texttt{xchgq}, and the relaxed \texttt{fetch\_add} is a \texttt{lock}-prefixed add.
+
+Two separate needs explain the pattern. Atomicity: a read-modify-write has to hold the line for the whole operation, so it is locked whatever order you ask for, and ``relaxed'' does not make it cheap. Ordering: x86-64 only lets a later load overtake an earlier buffered store, so only a sequentially consistent store must do more, and \texttt{xchg} is implicitly locked and drains the store buffer. Acquire and release need no instruction at all. Their remaining job is to stop the compiler moving things.
+
+On a weakly ordered processor those orders do cost instructions. The published mapping for ARMv7 turns a load-acquire into \texttt{ldr; dmb ish} and a store-release into \texttt{dmb ish; str}, and POWER uses \texttt{isync} and \texttt{lwsync} forms.
+
+\iqwrong{``Relaxed means no cost.'' It removes ordering, not atomicity. On this listing \texttt{fetch\_add(1, relaxed)} carries the \texttt{lock} prefix all the same.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:8}
+List \texttt{a} visits memory in address order, while \texttt{b} visits it in random order, so nearly every step of \texttt{b} is a cache miss.
+
+Nodes of \texttt{a} are allocated in list order, so neighbours sit next to each other and the prefetcher keeps up. \texttt{b} allocates nodes in shuffled order, and \texttt{sort} only relinks them. It does not move them. So the list order is sorted while the addresses are shuffled.
+
+There are two checks that need no counters. First, measure how often successive nodes are within 64 bytes of each other: the listing's program found a share of 1.0000 for \texttt{a} and 0.0000 for \texttt{b}. Second, shrink the list and watch the gap close as it starts to fit in cache. Measured once here on an Intel Core Ultra 7 155H under WSL2, with g++ 11.4, in ns per node for \texttt{a} and \texttt{b}: about 1.2 and 2.5 at $n = 2000$, 1.3 and 5.5 at $20\,000$, 3 and 18 at $200\,000$, 3 and 150 at two million.
+
+The change is to sort a \texttt{std::vector}, which moves the values, or to rebuild the list after sorting if a list is really needed.
+
+\iqwrong{``Sorting makes the list slower.'' The same values in the same order cost different amounts only because of where the nodes sit.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:9}
+The counts are: string 15, 0; string 16, 1; push 1000, 11; reserved, 1; function 16, 0; function 24, 1; shared new, 2; make\_shared, 1; map 10, 10.
+
+The string uses its small-string buffer up to 15 characters here. The vector doubles from capacity 1 to 1024, so that is 11 allocations, and \texttt{reserve} replaces them with one. \texttt{std::function} keeps a small trivially copyable callable inside itself, which holds the 16-byte lambda but not the 24-byte one. \texttt{shared\_ptr<long>(new long(1))} allocates the object, then a control block, and \texttt{make\_shared} puts both in one allocation. A map allocates one node per element.
+
+The standard leaves all of these sizes to the library: the small-string capacity, the \texttt{std::function} buffer and the growth factor. A different library can print different numbers. The per-node map count and the two allocations for \texttt{shared\_ptr<long>(new long(1))} follow from what those types must do on any common implementation, but neither is a promise, and the standard even allows a compiler to merge or remove \texttt{new} calls. This compiler did neither here.
+
+\iqfollow{How do you stop allocations creeping back into a hot path?}{In a test build, make a counting \texttt{operator new} fail if a flag says the hot path is running, then replay a day of messages under it.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:10}
+\texttt{ts\_copy} is correct and \texttt{ts\_cast} is undefined behaviour, yet at \texttt{-O2} both compile to the same single instruction, \texttt{movq 8(\%rdi), \%rax}, with no call.
+
+\texttt{ts\_cast} fails on alignment. \texttt{Header} has alignment 8 and the address is 3 bytes past an 8-aligned one, so no \texttt{Header} can live there, even under C++20's rule that a byte array implicitly creates objects where that would make a program defined. So the read goes through a type the storage does not hold, which the type-accessibility rule makes undefined. Building with \texttt{-fsanitize=alignment} reports a misaligned address on line 12 and nothing on the \texttt{memcpy} line.
+
+It seems to work because x86-64 tolerates an unaligned \texttt{mov} and the compiler happened to use one. Nothing obliges it to: once the code is undefined, the compiler may assume alignment when it optimises, including when it vectorises a loop over such pointers.
+
+\texttt{memcpy} of a known small size costs nothing, as the identical instruction shows, so there is no performance reason to prefer the cast.
+
+\iqfollow{Does C++23 \texttt{std::start\_lifetime\_as} solve it?}{It solves the missing object, not the alignment: its pointer must still be suitably aligned, and here it is not.}
+\iqwhy{Every feed handler parses headers out of byte buffers at arbitrary offsets, and this cast is the classic line that passes every test on x86-64.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:11}
+The compiler deleted the work. The result of \texttt{work} is unused and the function has no side effects, so \texttt{main} contains no call to it and no loop. What remains is the time between two clock readings: 67 to 69 ns in our runs.
+
+\Cref{lst:iv3:ll:benchgood} forces the work to happen: \texttt{noinline} stops the call disappearing, the empty \texttt{asm} statements hide the input and keep the result, and \texttt{main}'s code then does contain the call.
+\omcode{code/interviews-3/04-low-latency/cpp/bench_good.cpp}{7}{33}{The same measurement, kept alive.}\label{lst:iv3:ll:benchgood}
+
+The other faults: one run gives no distribution, so collect many and report median, tail and maximum. The first run is cold. A latency benchmark that loops tightly also warms caches and branch predictors in a way that a real message arriving rarely will not. The thread is unpinned. On our machine this version printed a median near 65 microseconds and a maximum several times higher, for 100\,000 iterations.
+
+\texttt{rdtsc} is not serialising: it can read the counter before earlier instructions finish, and later ones can start before the read. So the usual pairing is \texttt{lfence; rdtsc} at the start, and \texttt{rdtscp; lfence} at the end. You must also convert ticks to time, which needs the counter's rate, so confirm that rate is constant on your processor.
+
+\iqwrong{``The clock must be broken.'' The clock is the only code left.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:12}
+It is not correct. There is a data race on \texttt{payload}, so the behaviour is undefined, however many runs print 42. On ARM or POWER the wrong order is also allowed by the hardware.
+
+A relaxed store and load make the flag itself atomic, but create no happens-before\index{happens-before} between the threads, so the plain write and the plain read of \texttt{payload} conflict. ThreadSanitizer reports it. On x86-64 the hardware does keep two stores in order, and two loads in order, which is why the runs look fine. Even there, the compiler may still reorder the plain write and the relaxed store, since nothing forbids it. On ARM and POWER this message-passing shape can really be observed out of order without barriers.
+
+The fix is \texttt{store(true, release)} in the writer and \texttt{load(acquire)} in the reader. The release store synchronises with the acquire load that reads it, so the write of \texttt{payload} happens before the read. With those two changes ThreadSanitizer is silent and the program prints 42. On x86-64 the machine code gains no fence, as acquire and release are plain moves there.
+
+\iqwrong{``x86 is strongly ordered, so relaxed is fine there.'' The language rules apply first: they bind the compiler on every processor.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:13}
+The correctness fault: \texttt{lock} and \texttt{unlock} use relaxed order, so they protect nothing under the C++ rules. The performance fault: the waiters spin on \texttt{exchange}, a write, so the lock's cache line bounces between them.
+
+A lock must make the previous holder's critical section happen before the next one's. Relaxed orders give no such edge, so the increments of \texttt{counter} race. ThreadSanitizer reports it, even though the total printed 80\,000 on x86-64, where \texttt{exchange} is a locked instruction and the compiler made no harmful move this time. The fix: acquire on the successful \texttt{exchange}, release on the store in \texttt{unlock}.
+
+Under contention each failed \texttt{exchange} demands the line in exclusive state, so waiters slow the holder too. The usual cure is to spin on a relaxed load, which lets all waiters share the line, and try the \texttt{exchange} only when the lock looks free, with \texttt{pause} in the wait loop. \Cref{lst:iv3:ll:ttas} is that version: it prints 80\,000 and ThreadSanitizer is silent. \texttt{pause} tells the processor this is a spin-wait, which avoids a severe penalty on leaving the loop and saves power.
+\omcode{code/interviews-3/04-low-latency/cpp/spinlock_ttas.cpp}{7}{18}{Spinning on a read.}\label{lst:iv3:ll:ttas}
+\iqfollow{Why is a spinlock risky on a machine with more runnable threads than cores?}{If the holder is descheduled, waiters burn a whole time slice each and no one progresses. A spinlock assumes the holder is running.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:14}
+It means that every operation on the 16- and 24-byte types is a call into libatomic, with no promise of progress, so neither belongs on a hot path. The program prints \texttt{1 1}, \texttt{0 0}, \texttt{0 0}, then \texttt{99.5 100.5}.
+
+For \texttt{Quote}, the binary has undefined symbols \texttt{\_\_atomic\_load\_16} and \texttt{\_\_atomic\_store\_16}, and without \texttt{-latomic} the link fails on them. So every read is a function call, and \texttt{is\_lock\_free()} returning 0 says you have no promise of progress. libatomic has a fallback built on a table of mutexes hashed by address, so a reader could wait behind a descheduled thread. Even when the 16-byte compare-and-swap is used, that instruction always performs a write cycle on its target, so a 16-byte load done that way would take the line exclusively, and readers would contend with each other.
+
+Instead, make the quote fit in 8 bytes: two 32-bit prices in integer ticks, and one plain move publishes both. If it cannot fit, use a sequence lock, or publish a pointer to an immutable snapshot.
+
+\iqwrong{``The processor has \texttt{cmpxchg16b}, so it is lock-free.'' The compiler did not inline it here, and the run-time report says 0.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:15}
+Here is the table, checked by compiling every combination with rustc 1.97.
+
+\begin{center}\small
+\begin{tabular}{lcc}
+Type & \texttt{Send} & \texttt{Sync}\\\hline
+\texttt{Rc<u64>} & no & no\\
+\texttt{Arc<u64>} & yes & yes\\
+\texttt{Arc<Cell<u64>{}>} & no & no\\
+\texttt{Cell<u64>}, \texttt{RefCell<u64>} & yes & no\\
+\texttt{Mutex<Cell<u64>{}>} & yes & yes\\
+\texttt{Mutex<Rc<u64>{}>} & no & no\\
+\texttt{\&\textquotesingle{}static Cell<u64>} & no & no\\
+\texttt{*mut u64} & no & no\\
+\texttt{MutexGuard<\textquotesingle{}static, u64>} & no & yes\\
+\texttt{AtomicU64} & yes & yes
+\end{tabular}
+\end{center}
+
+The rule is that \texttt{T} is \texttt{Sync} exactly when \texttt{\&T} is \texttt{Send}. \texttt{Rc} has an unsynchronised count, so it is neither. \texttt{Cell} and \texttt{RefCell} may move to another thread, since ownership is exclusive, but cannot be shared. \texttt{Arc<T>} needs \texttt{T: Send + Sync}, so \texttt{Arc<Cell>} fails. \texttt{Mutex} supplies \texttt{Sync} from \texttt{Send}, so it rescues \texttt{Cell}, but it cannot rescue \texttt{Rc}, whose clones may live outside the mutex. A reference to a \texttt{Cell} is not \texttt{Send}, because \texttt{Cell} is not \texttt{Sync}. Raw pointers opt out by default. \texttt{MutexGuard} must unlock on the thread that locked, so it is not \texttt{Send}, while sharing a reference to it is harmless.
+
+\iqwrong{``\texttt{Arc} makes anything thread-safe.'' It makes the count thread-safe. The contents still have to qualify.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:16}
+It can print any value from 2 up to 4\,000\,000, and in practice a value far below 4\,000\,000: between about one and 1.35 million in our runs. There is no data race and no undefined behaviour. This is a race condition, which safe Rust does not prevent.
+
+Each \texttt{load} and each \texttt{store} is atomic, so no access tears and the outcome is defined. But the read and the write are separate operations, so an increment by another thread between them is overwritten. That is the difference: a data race is an unsynchronised conflicting access, and Rust excludes those; a lost update is a logic error, and it does not.
+
+The lower bound is 2. Take the last store to \texttt{COUNT} in its modification order, made by thread $T$. It was $T$'s final iteration, and $T$ had already stored once, so coherence forbids its read from seeing the initial 0; every other stored value is at least 1. So the final value is at least 2. An exhaustive search over interleavings for small cases confirms that 2 is reached.
+
+The fix is one call, \texttt{COUNT.fetch\_add(1, Relaxed)}, which printed exactly 4\,000\,000.
+
+\iqwhy{A single-writer counter is the legitimate use of this load-then-store pattern, and it avoids a locked instruction. Add a second writer and it silently breaks with no warning from the compiler.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:17}
+\texttt{Vec::new} 0, \texttt{with\_capacity(8)} 1, \texttt{String::new} 0, \texttt{to\_string} 1, \texttt{Box<()>} 0, \texttt{Box<u64>} 1, 1000 pushes 9, clear and refill 0, \texttt{Arc::clone} 0.
+
+The documentation promises several of these. \texttt{Vec::new} does not allocate until elements are pushed. \texttt{Box::new} does not allocate for a zero-sized type. \texttt{clear} leaves the capacity alone, and a thousand elements fit in the capacity reserved earlier. \texttt{Arc::clone} only bumps a count.
+
+The 9 is not promised. It comes from one allocation for capacity 4 and eight reallocations up to 1024, but \texttt{Vec} explicitly gives no guarantee about its growth strategy, only amortised constant-time \texttt{push}. \texttt{to\_string} on an integer needs a heap \texttt{String}, so that 1 is what you should expect, without being a contract about the count.
+
+\iqfollow{How do you enforce no allocation in a hot path?}{Install a counting allocator like this one in the test build, and check that the count stays put across a replay. Reuse buffers with \texttt{clear}, and pass in \texttt{\&mut} scratch space instead of returning new values.}
+\iqwhy{\texttt{to\_string} and \texttt{format!} are the ones that slip into log lines on a hot path. The count makes them visible.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:18}
+\texttt{sum\_b} and \texttt{pick\_f} still have a bounds check. \texttt{sum\_c} and \texttt{sum\_d} have one check at the start, from the slice and the \texttt{assert!}, and none in the loop. \texttt{sum\_a}, \texttt{diff\_e} and \texttt{pick\_g} have no panic check at all. None of it is guaranteed.
+
+The optimiser removes a check only when it can prove the index in range. In \texttt{sum\_a} the range is the slice's own length. In \texttt{sum\_b}, nothing relates \texttt{n} to the length, so the check stays, and the loop must panic at the right element. In \texttt{sum\_c} the reslice makes the length exactly \texttt{n}. In \texttt{sum\_d}, the \texttt{assert!} tells the optimiser that the bound holds. In \texttt{diff\_e} both $i$ and $i - 1$ are provably in range. \texttt{pick\_f} masks to 0 through 7, but the slice could be shorter than 8, so its check remains, while \texttt{pick\_g} takes an array of exactly 8, so the mask proves it.
+
+These results come from reading the assembly of rustc 1.97 with \texttt{-C opt-level=3}. Bounds-check elimination is an optimisation, not a language feature, so another version could differ. Check by reading the output when it matters.
+
+\iqwrong{``Rust always checks, so use \texttt{get\_unchecked}.'' A slice or an assert up front is safe, and it gave the same check-free loop here.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:19}
+With 4 KiB pages the TLB covers 8 MiB, the miss rate is about 99.9\%, and translation costs about 30 ns per read. With 2 MiB pages it covers 4 GiB, the miss rate is 50\%, and the cost is 15 ns. The last-level entries take 16 MiB and 32 KiB respectively.
+
+The working: $2048 \times 4\text{ KiB} = 8$ MiB, against 8 GiB, so a random read hits only about once in a thousand, and $0.999 \times 30 \approx 30$ ns. At 2 MiB, $2048 \times 2\text{ MiB} = 4$ GiB, half the table, so $0.5 \times 30 = 15$ ns. The table has $2^{21}$ pages at 4 KiB, which is 16 MiB of entries, and only 4096 at 2 MiB, 32 KiB. So the entries themselves fit in cache far more easily, and the real walk gets cheaper than the question's flat 30 ns assumes.
+
+The catches: explicitly reserved huge pages (the \texttt{hugetlb} pool) are best reserved at boot, as later reservations can fail when memory is fragmented. Mapping them needs privileges or configuration. Transparent huge pages avoid the reservation, but a fault can stall on compaction if the mode allows it, and a kernel daemon collapses pages in the background at times you do not choose. And a 2 MiB page means whole-page granularity for protection and for placement on a NUMA node.
+
+\iqfollow{If you have 1 GiB pages?}{Eight entries cover the table, so with this model translation misses disappear once they are loaded.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:20}
+In (a) and (b), both registers can end at 0, in C++20 and on x86-64. In (c) they cannot. Acquire and release are no help here, and the instruction that makes the difference is the \texttt{xchg} in the sequentially consistent store.
+
+In any interleaving of the four operations that respects each thread's order, the last operation is a load, and by then both stores have run, so it reads 1; a small enumeration confirms it. That is what (c) promises. Release and acquire only order a release with an acquire that reads its value. Here each load reads a value the other thread has not yet stored, so no synchronisation arises, and the language allows both zeros.
+
+The hardware does it too. On x86-64 each store can wait in a FIFO store buffer\index{store buffer} while the following load, from the other variable, goes to memory. A locked instruction such as \texttt{xchg} drains the buffer first.
+
+To show it, run the pair in a tight loop with a release of both threads per round, and count double zeros. Our run, on an Intel Core Ultra 7 155H under WSL2 with g++ 11.4 at \texttt{-O2}, gave about 3600 for relaxed and 4400 for acquire-release, in 200\,000 rounds, and 0 for sequentially consistent. The count varies by run; the rule does not.
+
+\iqfollow{Two writers set \texttt{x} and \texttt{y}; two readers read them in opposite orders. Can the readers disagree on which write came first?}{Under C++ anything weaker than sequential consistency allows it. x86-TSO forbids it, and it is allowed on POWER. Sequential consistency forbids it, and the enumeration confirms that.}
+\iqwhy{This is the pattern of ``set my flag, then look at yours'', the core of mutual exclusion by flags and of hazard pointers. Writing it with release and acquire is the classic bug that tests on x86 sometimes catch and sometimes do not.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:21}
+\Cref{lst:iv3:ll:spsc} is the ring buffer. Each side owns one index: load your own with relaxed, load the other's with acquire, write the slot, then publish your index with release.
+\omcode{code/interviews-3/04-low-latency/cpp/spsc.cpp}{7}{29}{A single-producer single-consumer ring.}\label{lst:iv3:ll:spsc}
+
+The defence, each point confirmed by relaxing that one order and running ThreadSanitizer, which then reports a race:
+\begin{itemize}
+\item \texttt{tail\_.store(release)} in \texttt{push}: publishes the slot. Relaxed, the consumer may read the slot before the write is visible.
+\item \texttt{tail\_.load(acquire)} in \texttt{pop}: pairs with that release. Relaxed, the consumer's read of the slot is not ordered after the producer's write.
+\item \texttt{head\_.store(release)} in \texttt{pop}: hands the slot back. Relaxed, the producer may overwrite the slot while the consumer's read is still unfinished.
+\item \texttt{head\_.load(acquire)} in \texttt{push}: pairs with that one.
+\end{itemize}
+A thread's load of its own index can be relaxed, as no other thread writes it. No read-modify-write is needed, as each index has a single writer, so x86-64 pays no locked instruction at all. The indices run freely and are masked only to pick a slot, so all $N$ slots are usable (the test pushes 8 into an 8-slot ring, and the ninth fails) and \texttt{t - h} stays correct across wrap-around.
+
+\iqwrong{``Sequentially consistent everywhere, to be safe.'' It is correct, but each store becomes a locked \texttt{xchg} on x86-64, for an ordering this algorithm never uses.}
+\iqfollow{Why must this not be used by two producers?}{Two producers would read the same \texttt{tail\_} and write the same slot. A second producer needs a claim step, which is a different and harder structure.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:22}
+The two mechanisms are false sharing between the indices and needless reads of the other side's index. The further change gives each side a private copy of the other's index, as in \cref{lst:iv3:ll:cached}.
+\omcode{code/interviews-3/04-low-latency/cpp/spsc_layout.cpp}{52}{79}{Each side caches the other's index.}\label{lst:iv3:ll:cached}
+
+In the listing, \texttt{head}, \texttt{tail} and the first slots share one line, so every store by one thread takes that line from the other, which needs it for its next load. Padding gives each index its own line. But each operation still reads the other side's index, and because that line is written constantly, each read is a miss. With a private copy, the producer rereads \texttt{head} only when the queue looks full, and the consumer rereads \texttt{tail} only when it looks empty. The copy lives on the owner's line, written only by the owner, so it costs nothing to keep.
+
+The cost is small: a few more lines of code, and one more branch. A stale copy can only make the queue look fuller or emptier than it is, and the slow path then checks the truth, so the memory orders and the correctness are unchanged (ThreadSanitizer is silent on all three).
+
+Measured a few times here, as an illustration, on an Intel Core Ultra 7 155H under WSL2 with g++ 11.4, in unpinned threads and with a noisy result: adjacent 13 to 24 ns per item, padded about 9.5, cached about 3. To confirm, run all three on pinned cores and compare, and use \texttt{perf c2c} where the hardware allows it.
+
+\iqfollow{When does caching help least?}{When the queue stays nearly empty, as a low-latency queue should. Then the consumer rereads \texttt{tail} on almost every poll. The slot lines also bounce, and only batching helps those.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:23}
+It can first go wrong after about 72 minutes, when \texttt{tail} wraps past $2^{32}$, and only if more than 296 items are in the queue across that moment. \texttt{tail - head} is fine. The smallest fix is a power-of-two capacity, such as 1024.
+
+Unsigned arithmetic wraps cleanly, so \texttt{tail - head} is right across the wrap, and 72 minutes is $2^{32} / 10^6$ seconds. The bug is in the slot index. $2^{32} \bmod 1000 = 296$, so the index goes $\dots, 2^{32} - 1$ to 0 while \texttt{\% capacity} jumps from slot 295 to slot 0, skipping 704 slots. If the items straddling the jump number more than 296, the new items land on slots still in use. The program in the file holds 500 across the jump, 400 before and 100 after, and reports \texttt{100 wrong of 500}.
+
+With capacity 1024, $2^{32}$ is a multiple of the capacity, so the slot sequence is continuous, and the same run gives 0 wrong. So does using 64-bit indices with capacity 1000: they would take about 584 years to wrap at a billion messages a second.
+
+This passes tests because it takes hours to reach, and at most moments the queue is short, so the condition is rarely met even then.
+
+\iqwrong{``Unsigned overflow is undefined.'' That is signed overflow. Unsigned wrap is defined, and the subtraction relies on it.}
+\iqfollow{How do you test such a thing without waiting for hours?}{Start the indices just below the wrap, as the file does. Then the test takes microseconds.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:24}
+Use a log-linear histogram\index{log-linear histogram}: 64 buckets per doubling, 1600 buckets in all, 12\,800 bytes at 8 bytes each, with a relative error of at most $1/64 \approx 1.6\%$.
+
+From 128 up, each power-of-two range is divided into 64 equal parts, so a bucket's width over its lower bound is at most $1/64$. Below 128, there is one bucket per value. That gives 2\% with an easy power of two to spare; 32 parts would give 3.1\%, too coarse. Values up to $2^{30}$, about 1.07 s, need $(30 - 6 + 1) \times 64 = 1600$ buckets. One bucket per nanosecond would need $2^{30}$ counters, 8 GiB.
+\omcode{code/interviews-3/04-low-latency/cpp/hist.cpp}{8}{28}{Indexing by bit width, in constant time.}\label{lst:iv3:ll:hist}
+
+The largest relative error found over a dense sweep of values was 1.53\%. Recording the values 1 to one million and reading the 99th percentile gave 983\,040 against a true 990\,000, which is 0.70\% low, because a percentile is reported as its bucket's lower bound.
+
+The work per record is constant: one bit-width, a shift and an increment, with no loop. The array is fixed, so there is no allocation.
+
+\iqfollow{A second thread must read the histogram while it is written. What changes?}{Make the counters atomic and write them with a relaxed load and a relaxed store, as there is one writer. On x86-64 that compiles to plain moves. The reader sees a slightly inconsistent snapshot, which is fine for a percentile.}
+\iqfollow{Can you average the 99th percentiles of ten servers?}{No, a percentile does not average. Add the histograms bucket by bucket, then read the percentile of the sum.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:25}
+Our run printed \texttt{malloc 1, first pass 16383, second pass 0} and then \texttt{vector 16385, first pass 0}. So \texttt{malloc} barely touches memory, the first touch of each page faults, and the vector's faults all happen in its constructor, which zeroes the memory.
+
+64 MiB is 16\,384 pages of 4 KiB. A large \texttt{malloc} obtains address space and no physical memory. Each page gets a minor fault on first touch, so the first pass pays them all and the second pays none. Building the vector value-initialises every byte, which touches every page, so the faults move there.
+
+So the first messages to reach a cold buffer each take a page fault, on top of cold caches. At start-up: map memory with \texttt{MAP\_POPULATE} or touch every page yourself, call \texttt{mlockall} with \texttt{MCL\_CURRENT | MCL\_FUTURE} to keep it there, and run some fake messages through the path to warm it.
+
+On two sockets, the default policy allocates a page on the node of the processor that first faults it, at fault time. So the vector built in \texttt{main} sits on \texttt{main}'s node, and the pinned thread on the other socket pays a remote access on every read, unless automatic NUMA balancing later migrates the pages, at a cost of its own and at a time you do not choose. Construct and touch the data on the pinned thread.
+
+\iqwrong{``\texttt{malloc} is the slow part.'' It returned after one fault. The bill comes later, in the hot path.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:26}
+The tool reports about 1 ms for both percentiles and about 1 s for the maximum. A client on schedule sees 99th percentile near 500 ms and 99.9th near 950 ms. Believe the second: the tool's own stall hid the delays. This error is known as coordinated omission\index{coordinated omission}.
+
+The tool: it sends 500 requests a second, so 50\,000 in 100 s, minus the 500 it never sent while waiting, which leaves 49\,500 samples. One of them took about 1 s, and the rest took 1 ms. One sample in 49\,500 is beyond the 99.9th percentile.
+
+The client on schedule: when the freeze ends, 500 requests are queued, with waits from 1 s down to nearly 0. The server then drains at a net 500 a second, $1000 - 500$, so the backlog clears in another second, during which 500 more requests arrive and wait. In all, 1000 requests in 50\,000, or 2\%, wait for between 0 and 1 s, roughly uniformly. The worst 1\% is the upper half of those, so the 99th percentile is near 500 ms, and the worst 0.1\% is the top 50, near 950 ms. The mean rises from about 1.02 ms to about 11 ms. A simulation of both clients agrees.
+
+The fix is to measure from the scheduled send time, and to keep to the schedule on its own thread whatever the server does, so that a stall is charged to every request it delays.
+
+\iqwhy{The same trap catches an internal loop that timestamps each message on dequeue: a stall in the loop makes few samples, all of them looking normal.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:27}
+You get 67.2 ns per packet, about 202 cycles at 3 GHz, at 14.88 million packets a second. One call per packet handles 1.5 million a second, about a tenth of the need; one call per 32 packets handles about 6 million. For this constraint, choose \texttt{AF\_XDP}.
+
+Each frame takes $84 \times 8 = 672$ bits on the wire, so $10^{10} / 672 \approx 14.88$ million frames a second. One call per packet costs $500 + 150 = 650$ ns. Batching spreads the 500 ns over 32 packets, $15.6 + 150 = 165.6$ ns, or 6.04 million a second. Under these assumptions, the per-packet stack cost is what stops any socket path, however large the batch. Real feeds do not run at minimum-size line rate all the time, but bursts set the queue depth, so this is the right worst case.
+
+The choices:
+\begin{itemize}
+\item Sockets with \texttt{SO\_BUSY\_POLL}: nothing changes in your tools, and it can cut wake-up latency at the price of more processor time and power, but the stack cost stays. It helps latency, not this throughput.
+\item \texttt{AF\_XDP}: an XDP program redirects chosen frames into a user-space ring and returns everything else to the kernel, so management traffic keeps working on the same port. Zero-copy needs driver support and falls back to copy mode otherwise.
+\item DPDK: poll-mode drivers read descriptors directly on a dedicated core with no interrupts. Most devices must first be unbound from their kernel driver, so ordinary kernel tools and traffic no longer see that port without a separate arrangement. It fits a dedicated port, not this one.
+\end{itemize}
+
+\iqfollow{And at 25 Gb/s with the same frames?}{About 37.2 million packets a second, under 27 ns each. One core will not do it, and you would need several receive queues.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:28}
+Removing a core from the scheduler stops other tasks running there, and little else: interrupts, the timer tick, kernel housekeeping, flushes requested by other threads and firmware can all still take the core. Check them in that order, measure first, and change one thing at a time.
+
+Start with a tool that attributes the noise. The \texttt{osnoise} tracer runs a sampling loop per processor and counts lost time by source: NMI, interrupt, softirq, thread, or hardware if nothing in the kernel explains it. In a VM, the host's interference appears as hardware noise. Then:
+\begin{itemize}
+\item Interrupts: read \texttt{/proc/interrupts} over time for the core, and steer devices away. The \texttt{managed\_irq} flag of \texttt{isolcpus} helps only on a best-effort basis.
+\item The tick: \texttt{isolcpus} does not stop it. \texttt{nohz\_full} avoids the tick on a core with one runnable task, though about one per second can remain, and one other core must keep ticking.
+\item Kernel housekeeping: \texttt{nohz\_full} requires RCU callbacks to be offloaded with \texttt{rcu\_nocbs}, and those threads should be pinned elsewhere.
+\item Your own process: on x86, a \texttt{munmap} in another thread makes the kernel flush translations on every processor running that process, including the isolated core, so avoid it after start-up. Lock memory, or a page fault will land in the loop.
+\item Firmware: system-management interrupts are invisible to the kernel and can take milliseconds. The \texttt{hwlat} tracer finds them by spinning with interrupts off and looking for gaps. That would fit the one-millisecond outliers, and the remedy, if there is one, lies in the firmware settings.
+\end{itemize}
+
+\iqwrong{``It is isolated, so nothing can touch it.'' The word covers the scheduler's load balancing. It does not cover the other sources.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:29}
+The first two lines are \texttt{16 12} and \texttt{16 24}. The sizes of \texttt{Wire}, \texttt{Packed} and \texttt{Fixed} are fixed by their \texttt{repr}; the 16 for \texttt{Free} is not promised. \texttt{ts\_cast} is undefined behaviour: the debug build aborts with ``misaligned pointer dereference'', and the release build printed the value the correct code gives.
+
+\texttt{repr(C)} lays fields out in declaration order, so \texttt{Fixed} has padding around its \texttt{u64} and takes 24. The default representation may reorder fields, and here it got \texttt{Free} down to 16, but the only promises for it concern alignment and non-overlap. \texttt{repr(C, packed)} removes padding, so \texttt{Packed} takes 12.
+
+\texttt{ts\_cast} reads a \texttt{u64} through a pointer that is not aligned for it. Rust's debug build inserts a check that caught this; the release build has no such check, and the printed value proves nothing.
+
+\texttt{\{ p.ts \}} makes a copy, and the compiler knows that a packed field needs an unaligned read. \texttt{\&p.ts} would create a reference that may be misaligned, which is undefined however it is used, so it is rejected as error E0793, and \texttt{unsafe} does not help.
+
+Write \texttt{ts\_cast} as \texttt{ts\_read} is written: \texttt{u64::from\_le\_bytes} on a byte range, which also states the wire byte order. Or use \texttt{read\_unaligned} on a raw pointer.
+
+\iqwhy{This bug survives every release-build test on x86-64, and the debug check finds it for free. Run the parser tests in debug as well.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:30}
+There are two soundness holes and two ways to lose a value. The bound on \texttt{Sync} is missing, so non-thread-safe types can cross. \texttt{put} and \texttt{take} take \texttt{\&self}, so two threads can race on the slot. A value left in the box is never dropped, and a value put into a full box is dropped.
+
+First hole. \texttt{unsafe impl<T> Sync} promises sharing is safe for every \texttt{T}, including \texttt{Rc}. The listing's \texttt{main}, with no \texttt{unsafe} in it, sends an \texttt{Rc} to another thread, and both threads clone it. ThreadSanitizer on the nightly compiler reports a race inside \texttt{Rc}'s count. With \texttt{unsafe impl<T: Send> Sync}, the same \texttt{main} fails to compile with E0277.
+
+Second hole. Nothing limits who calls \texttt{put}. Two threads can both see \texttt{full} false and both write the slot; two callers of \texttt{take} can both read the same value, a double drop for a type that owns memory. A test with two threads calling both methods gets a ThreadSanitizer race in \texttt{Mailbox}. The fix is either a compare-and-swap claim on a three-state flag, or the type-level way: split the mailbox into a sender and a receiver whose methods take \texttt{\&mut self}.
+
+The leak: \texttt{MaybeUninit} never runs a destructor, so a value still inside when the mailbox is dropped is lost. A drop counter stays at 0. That is safe, as leaking is not undefined behaviour, and the fix is an \texttt{impl Drop} that checks \texttt{full}.
+
+The lost value: \texttt{put} takes the value by move, and on a full box drops it and returns \texttt{false}, so the caller has nothing left to retry with. A value with a printing destructor prints its drop before the \texttt{false} comes back. Return \texttt{Result<(), T>} instead.
+
+\iqwrong{``The \texttt{unsafe} blocks are correct, so it is sound.'' Soundness is a property of the whole API: safe callers must be unable to break what the \texttt{unsafe} blocks assume.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:31}
+It is not correct. The data race on \texttt{data\_} makes it undefined, even though a torn copy would be thrown away, and two reorderings are allowed that x86-64 happens to hide. \Cref{lst:iv3:ll:seqfixed} is the rewrite: the fields become relaxed atomics, with a release fence after the writer's first store and an acquire fence before the reader's second load.
+\omcode{code/interviews-3/04-low-latency/cpp/seqlock_fixed.cpp}{11}{36}{The sequence lock under C++20 rules.}\label{lst:iv3:ll:seqfixed}
+
+The three faults. First, a plain read overlapping a plain write is a data race\index{data race}, whatever you do with the result; ThreadSanitizer reports it on line 17. Second, in the writer, a release store orders what came before it, and says nothing of what follows, so the data write may become visible before the odd value. Third, in the reader, an acquire load orders what comes after it, and so does not stop the data reads sinking below the second load. On x86-64 the hardware keeps stores in order and loads in order, so only the compiler can do this there.
+
+The defence of the rewrite. If the reader's data load sees a value written after the writer's release fence, the fence pair synchronises, and its second load then cannot miss the odd value, so \texttt{s1 != s2}. If the first acquire load reads the even value of a finished write, it sees all of that write's data. The fields must be atomic words: the compiler may not tear or invent reads of those. The test ran the rewrite with 0 torn reads and no ThreadSanitizer report. That report only checks for data races, however: GCC's manual says ThreadSanitizer does not support \texttt{atomic\_thread\_fence}, so the fences rest on this argument.
+
+The costs. The writer never waits, and on x86-64 its \texttt{write} compiles to plain stores with no locked instruction. Readers write nothing, so they do not contend with each other, where a mutex would have each of them write its lock word. They do still cost the writer cache misses: each read takes the lines into shared state, and the writer's next store must take them back. And a reader can retry for as long as the writer keeps writing. The payload must be safe to copy word by word, and more than one writer needs a lock of its own.
+
+\iqfollow{Why not \texttt{memcpy} the quote inside the retry loop?}{\texttt{memcpy} is not atomic, so it is still a data race under C++20, whatever the machine does. That is why the listing copies atomic words.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:32}
+The two faults are a use-after-free on line 23 and the ABA problem\index{ABA problem}. The first occurs because \texttt{pop} reads \texttt{n->next} while another thread may already have deleted \texttt{n}. The second occurs because the compare-and-swap checks an address, not the history behind it.
+
+Use-after-free. Threads 1 and 2 both load the same head. Thread 2 wins, pops it and calls \texttt{delete}. Thread 1 now evaluates \texttt{n->next} on freed memory, which can fault if the page has gone. Under stress with four threads, AddressSanitizer reports a heap-use-after-free on that line, and ThreadSanitizer, depending on the schedule, a race between the read and the \texttt{delete} or the use after free itself.
+
+ABA. The stack is A, B, C. Thread 1 reads head A and next B, and stops. Thread 2 pops A, pops B and frees it, then pushes A back, its address reused. Thread 1's compare-and-swap sees A, succeeds, and sets the head to B, which is free. \Cref{lst:iv3:ll:aba} replays exactly that without threads, and it prints that the swap succeeded, the head is 1 (B) and its in-use flag is 0.
+\omcode{code/interviews-3/04-low-latency/cpp/aba_replay.cpp}{32}{43}{The schedule, replayed by hand over a pool.\protect\hfil\protect\break}\label{lst:iv3:ll:aba}
+
+The fixes, with costs:
+\begin{itemize}
+\item A pool of nodes that are never returned to the system, indexed, with a counter beside the index in one 64-bit word. This cures both faults, as the read stays in valid memory and the tag changes on every update, provided \texttt{next} is itself an atomic, read relaxed: a stale read is then harmless, as the tag makes that swap fail. In the same replay the swap fails. The cost is a fixed pool, and a 32-bit tag can come round again: at 10 million updates a second it wraps every 430 seconds, though a stale swap then needs the exact count.
+\item Hazard pointers: each thread publishes what it is about to read, and a node is freed only when no one has published it. The cost is an ordered store and load on every read, and a periodic scan.
+\item Epochs: nodes are freed once every thread has passed a grace period. Reads are cheap, but one stalled thread blocks all reclamation.
+\item Avoid the structure: on a hot path, give each thread its own pool, which is usually what one should do.
+\end{itemize}
+
+\iqwrong{``The compare-and-swap is atomic, so \texttt{pop} is safe.'' The swap is atomic. The read of \texttt{next} before it is not protected by anything.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:33}
+Not if completing an operation means delivering an item. While that producer is stalled, other producers can fill whatever slots remain, 7 if the queue was otherwise empty. Once consumers have taken everything ahead of the stalled position, every \texttt{try\_pop} returns empty, even though completed pushes are waiting behind the stalled slot. A consumer's wait is as long as the suspension.
+
+The replay in the file claims position 0 and does not commit. A second producer then succeeds 7 more times and is told the queue is full. A consumer gets empty, because position 0's \texttt{seq} says not ready, and consumers take positions in order. When the first producer resumes and commits, the consumer gets its value at once, and the rest then flow. Under stress the code is sound: ThreadSanitizer is silent, and the sum over two producers and two consumers came out exact.
+
+Read narrowly, each \texttt{try} call does return, which is why the word gets used. But reporting ``empty'' after other pushes have finished is not the pop a queue promises, and no call can deliver an item until that one thread runs again, whichever other threads are running. A blocking pop built on this would wait for it. Calling such a queue lock-free because it holds no mutex is common, and misleading.
+
+The worst case is therefore unbounded by the queue: it is whatever the operating system does to that thread, and the mutex's classic flaw is back without the mutex. To tighten it, keep producers from being preempted, with pinned threads on isolated cores, which reduces the chance, not the possibility. Or redesign: give each producer its own single-producer ring, and let the consumer poll them round-robin. A stalled producer then delays only its own items. The cost is global order: you merge by timestamp or sequence if order across producers matters, and the consumer does more work per poll.
+
+\iqfollow{How is this better than a mutex at all?}{The common case has no system call, and readers and writers on different slots do not touch a shared lock word. Under no stalls it is fast. Its failure mode is the same kind as a mutex held by a descheduled thread.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:34}
+Split the queue into a \texttt{Producer} and a \texttt{Consumer}, neither of them \texttt{Clone}, whose methods take \texttt{\&mut self}. \texttt{peek} returns a guard that borrows the consumer mutably, and the \texttt{Sync} impl on the shared state is bounded by \texttt{T: Send}. \Cref{lst:iv3:ll:split,lst:iv3:ll:peek} give the core.
+\omcode{code/interviews-3/04-low-latency/rust/src/spsc_split.rs}{8}{41}{Shared state, handles and push.}\label{lst:iv3:ll:split}
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/04-low-latency/rust/src/spsc_split.rs}{53}{73}{A zero-copy peek.}\label{lst:iv3:ll:peek}
+
+Each of the three mistakes was compiled, and each fails. Cloning a \texttt{Producer} gives E0599, since no such method exists. Putting one in an \texttt{Arc} and calling \texttt{push} gives E0596, as you cannot get \texttt{\&mut} through a shared handle. Calling \texttt{pop} while a \texttt{Peek} is alive gives E0499, a second mutable borrow. Sending a \texttt{Producer<Rc<u64>{}>} to a thread gives E0277.
+
+Only the \texttt{Sync} line is needed, because \texttt{UnsafeCell} is not \texttt{Sync}, which is what blocks sharing. \texttt{Send} follows automatically from \texttt{T: Send}. The promise that makes the line correct is that each slot is accessed by one side at a time. The bound \texttt{T: Send} is required, as items really do cross threads. \texttt{T: Sync} is not needed by the queue itself, which hands items over whole. But \texttt{peek} gives out \texttt{\&T}, so \texttt{Peek} carries a \texttt{PhantomData<\&\textquotesingle a T>}, and a \texttt{Peek} can reach another thread only when \texttt{T: Sync}. Without that field, safe code shares one \texttt{Peek<Cell<u64>{}>} between two threads and races on the cell. With it, the same code gives E0277.
+
+What the compiler will not catch: the memory orders. Change \texttt{Release} to \texttt{Relaxed}, and it compiles. The same goes for an off-by-one in the indices, and for failing to drop unread items, which here is the \texttt{Drop} impl on \texttt{Shared}, tested to drop each unread item exactly once. A stress run under ThreadSanitizer on the nightly compiler gives no report in this module, though with a precompiled standard library it must ignore reports from \texttt{Arc}'s own final drop, which uses a fence the tool cannot see. Also, masking the index does not remove the bounds check on \texttt{slots}, as the assembly of \texttt{push} shows, because the slice's length is known only at run time.
+
+\iqwhy{In C++ ``exactly one producer'' is a comment. Here it is checked at every call site, and the checks themselves cost nothing at run time.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:35}
+\texttt{Clone}'s \texttt{Relaxed} is correct, and \texttt{Drop}'s is not. The decrement must be \texttt{Release}, and the thread that frees must perform an \texttt{Acquire} first, as in \cref{lst:iv3:ll:arcdrop}. This is the same pattern as in the standard library's \texttt{Arc}.
+\omcode{code/interviews-3/04-low-latency/rust/src/my_arc.rs}{35}{43}{The decrement that can free.}\label{lst:iv3:ll:arcdrop}
+
+\texttt{Clone} is safe because a thread can only clone a handle it can already reach, and however it got that handle already carried the necessary synchronisation, so the count cannot be falling to zero meanwhile. No ordering on the increment is needed.
+
+What goes wrong. Thread A reads the value through its handle, then decrements to 1. Thread B decrements to 0 and frees. With relaxed decrements, nothing makes A's read happen before B's free, so they conflict: this is a data race, and undefined. A stress program with a heap-allocated value gets a ThreadSanitizer report naming this code, on the nightly compiler.
+
+Why both sides. The \texttt{Release} on every decrement makes that thread's uses happen before its decrement. The \texttt{Acquire} before the free joins all of them into the freeing thread. The fence is only taken by the last owner, so other decrements pay nothing extra. ThreadSanitizer does not model fences, so the test replaces the fence by an acquire load of the count, which the standard library does in the same situation, and that form is clean. The fence version rests on the argument above and on the standard library's own use of it.
+
+The bounds. \texttt{T: Sync}, because handles on many threads hand out \texttt{\&T}. \texttt{T: Send}, because the last drop may run on any thread, which moves ownership of \texttt{T} there. Sending a \texttt{MyArc<Rc<u64>{}>} to a thread fails with E0277.
+
+The cost on x86-64: the decrement is a locked instruction whatever its order, and an acquire needs no instruction, so the fix adds nothing there beyond what the compiler may no longer move. On a weakly ordered processor the release and the acquire each need a stronger instruction or a barrier. Using a fence only on the last decrement saves the acquire on the others.
+
+\iqwrong{``\texttt{AcqRel} on every decrement is simpler.'' It is correct too, but it pays for an acquire on every decrement, when only the last one needs it.}
+\end{solution}

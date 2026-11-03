@@ -10,7 +10,7 @@ lists, titles and page counts are proposals.
   master's-level mathematical culture (measure, linear algebra, analysis,
   basic probability and statistics). The series teaches only the
   quant-specific layer on top.
-- **Goal:** a reader who finishes all eighteen books and does every tutorial
+- **Goal:** a reader who finishes all twenty books and does every tutorial
   and build knows what is publicly knowable about the trade — every market,
   HFT and MFT, bank side and asset-manager side, operational and strategic,
   quant and software.
@@ -52,7 +52,7 @@ order-book ML model served at low latency (12), position and P&L services
 **Code gate (new, on top of the One Course gates):** no listing is printed
 unless it is included from a file that CI compiles and tests.
 
-## The eighteen books
+## The twenty books
 
 Every title starts with **One Quant Book N** so the series reads as one work;
 the cover's book line carries it the same way.
@@ -72,16 +72,18 @@ about 20 pages of front and back matter per book.
 | 8 | One Quant Book 8 — Strategies I: Equities and Futures | 29 | 330 (written) | `outline/research-strategies.md` |
 | 9 | One Quant Book 9 — Strategies II: Volatility, Relative Value, Macro and the Bank Desks | 29 | 333 (written) | `outline/research-strategies.md` |
 | 10 | One Quant Book 10 — Microstructure and Execution | 28 | 303 (written) | `outline/microstructure-hft-ml.md` |
-| 11 | One Quant Book 11 — Market Making and High-Frequency Trading | 29 | 330 (written) | `outline/microstructure-hft-ml.md` |
+| 11 | One Quant Book 11 — Market Making and High-Frequency Trading | 29 | 329 (written) | `outline/microstructure-hft-ml.md` |
 | 12 | One Quant Book 12 — Machine Learning for Markets | 29 | 348 (written) | `outline/microstructure-hft-ml.md` |
 | 13 | One Quant Book 13 — Low-Latency Software | 26 | 314 (written) | `outline/engineering-firm-interviews.md` |
 | 14 | One Quant Book 14 — Networks, Hardware and Trading Infrastructure | 29 | 349 (written) | `outline/engineering-firm-interviews.md` |
 | 15 | One Quant Book 15 — Research, Data and Risk Platforms | 30 | 367 (written) | `outline/engineering-firm-interviews.md` |
 | 16 | One Quant Book 16 — The Desk and the Firm | 30 | 347 (written) | `outline/engineering-firm-interviews.md` |
 | 17 | One Quant Book 17 — The Industry: Firms, Roles and Careers | 30 | 339 (written) | `outline/engineering-firm-interviews.md` |
-| 18 | One Quant Book 18 — The Interview Book | 29 | 220 (written; new-questions-only shape) | `outline/engineering-firm-interviews.md` |
+| 18 | One Quant Book 18 — Interviews I: Maths, Probability and Speed | 33 | 393 (written) | `outline/interviews.md` |
+| 19 | One Quant Book 19 — Interviews II: Markets, Trading Games and the Final Round | 21 | 348 (written) | `outline/interviews.md` |
+| 20 | One Quant Book 20 — Interviews III: Code | 9 | 391 (written) | `outline/interviews.md` |
 
-Total: 524 chapters, about 7,070 pages, and about 300 strategy files
+Total: 558 chapters, about 6,900 pages, and about 300 strategy files
 (231 in Books 8–9, 75 in Book 11). Books 6 and 13 have the most headroom;
 Books 1, 2 and 18 run slightly over 400.
 
@@ -93,8 +95,8 @@ figures above overstate by 1–3 pages wherever they exceed 12, so the series
 total will land nearer 6,200 than 7,070.
 
 Measured (2026-09-29): Books 14–16, written in one parallel batch of three, 1,063 pages against the
-outline's 1,182 for them (−10 %). Books 17–18: 559 pages against 632 (−12 %). **The series is complete: 18
-books, 524 chapters, 6,007 pages.**
+outline's 1,182 for them (−10 %). Books 17–18: 559 pages against 632 (−12 %). The interview books replaced the old 220-page Book 18 on 2026-11-03. **The series is complete: 20
+books, 558 chapters, 6,918 pages.**
 
 ## Reading paths
 
@@ -116,11 +118,11 @@ books, 524 chapters, 6,007 pages.**
 
 ## Proposed writing order
 
-1 → 2 → 3 → 4 → 10 → 5 → 7 → 11 → 13 → 14 → 8 → 6 → 9 → 12 → 15 → 16 → 17 → 18.
+1 → 2 → 3 → 4 → 10 → 5 → 7 → 11 → 13 → 14 → 8 → 6 → 9 → 12 → 15 → 16 → 17 → 18 → 19 → 20.
 The three Markets books fix the vocabulary; Book 10 comes early because
-it builds the exchange simulator every later tutorial runs on; Book 18 is
-last because its interview banks sit on top of every other book (it writes new
-questions only and does not harvest the per-chapter ones: user ruling, 2026-09-28).
+it builds the exchange simulator every later tutorial runs on; Books 18 to 20
+come last because they train for interviews on what the others teach (new questions
+only, checked by an originality test). They can also be read alone, by role.
 
 ## The access layer (added 2026-09-18)
 

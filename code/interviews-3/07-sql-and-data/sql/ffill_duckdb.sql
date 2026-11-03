@@ -1,0 +1,3 @@
+SELECT day, LAST_VALUE(price IGNORE NULLS) OVER (ORDER BY day) AS filled
+FROM closes
+ORDER BY day;

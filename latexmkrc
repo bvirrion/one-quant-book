@@ -19,7 +19,9 @@ $out_dir = 'build';
     'one_quant_book_15_platforms.tex',
     'one_quant_book_16_desk.tex',
     'one_quant_book_17_industry.tex',
-    'one_quant_book_18_interviews.tex',
+    'one_quant_book_18_interviews_1.tex',
+    'one_quant_book_19_interviews_2.tex',
+    'one_quant_book_20_interviews_3.tex',
 );
 # Many TikZ/pgfplots figures exceed pdfTeX's default main memory.
 $pdflatex = 'pdflatex -cnf-line=main_memory=12000000 -cnf-line=extra_mem_top=6000000 -cnf-line=extra_mem_bot=6000000 -interaction=nonstopmode -halt-on-error %O %S';

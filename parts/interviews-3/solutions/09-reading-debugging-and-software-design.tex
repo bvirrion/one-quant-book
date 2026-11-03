@@ -1,0 +1,682 @@
+\section*{Chapter \ref{ch:iv3:reading-debugging-and-software-design} --- Reading, Debugging and Software Design}
+\markboth{\protect\omTocMark{}{Answers: Reading, Debugging and Software Design}}{\protect\omTocMark{}{Answers: Reading, Debugging and Software Design}}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:1}
+It prints \texttt{more bids than asks}, then \texttt{18446744073709551615}. Nothing is undefined. The fix is to compare the sizes directly: \texttt{bids.size() > asks.size()}.
+
+\texttt{size()} returns \texttt{std::size\_t}, an unsigned type of 64 bits here. The standard defines unsigned arithmetic modulo $2^{64}$, so $2 - 3$ gives $2^{64} - 1$, which is the second line of output. An unsigned value is never negative, so \texttt{> 0} is true for every pair of sizes that differ, whichever is larger. Under \texttt{-Wall -Wextra -Werror} the listing compiles without a word, because \texttt{> 0} on an unsigned value is a sensible test in general.
+
+If you do need the signed difference, C++20 has \texttt{std::ssize}. Subtracting two of those and testing \texttt{> 0} also gives the right branch.
+
+\iqwrong{``Overflow is undefined behaviour, so anything can happen.'' That is true of signed types. Unsigned arithmetic wraps by definition, so this program is perfectly defined and perfectly wrong.}
+
+\iqfollow{What does \texttt{for (std::size\_t i = v.size() - 1; i >= 0; -{}-i)} do?}{It never ends, because \texttt{i >= 0} is always true: after 0 it wraps to the largest value and indexes far out of bounds. Here \texttt{-Wextra} does catch it, as \texttt{-Wtype-limits}. An empty \texttt{v} goes wrong even earlier, on the first iteration.}
+
+\iqwhy{Quantity and level arithmetic is full of sizes. This bug passes every test where the first container happens to be the larger one.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:2}
+It prints \texttt{[30, 30, 30]}. To get \texttt{[10, 20, 30]}, bind the value when the function is created: \texttt{lambda x, k=k: k * x}. A list comprehension does not help.
+
+A closure in Python captures the variable, not its value. All three lambdas refer to the same \texttt{k} in the scope of \texttt{make\_scalers}, and they look it up when called. By then the loop has finished and \texttt{k} is 3. Default arguments are evaluated when the function is defined, which is why \texttt{k=k} takes a snapshot. \texttt{functools.partial} does the same and leaves no extra parameter that a caller could pass by accident.
+
+\iqwrong{``Use a comprehension, since it has its own scope.'' It does, but only one scope for the whole comprehension. \texttt{[lambda x: k * x for k in [1, 2, 3]]} also gives \texttt{[30, 30, 30]}: the test runs it.}
+
+\iqwhy{Building a list of callbacks or scalers in a loop is everyday research code, and the failure is silent: every instrument gets the last instrument's parameters.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:3}
+On this compiler it prints \texttt{10 0 20}, one zero survives, and the program is undefined. With a zero in last place it runs off the end of the vector. Use \texttt{std::erase(qty, 0L)}.
+
+\texttt{erase} invalidates every iterator at or after the erased element, so \texttt{it} may no longer be used, and \texttt{++it} is already undefined. What happened in the run: the elements slid left, so \texttt{it} pointed at the second zero, and \texttt{++it} stepped over it. That is why one zero survives.
+
+Now make the input \texttt{\{10, 0\}}. The erase leaves \texttt{it} equal to \texttt{end()}, the \texttt{++it} moves past it, and the test \texttt{it != qty.end()} never becomes false. AddressSanitizer reports a heap-buffer-overflow on that input. The libstdc++ debug mode, \texttt{-D\_GLIBCXX\_DEBUG}\index{debug mode, libstdc++}, stops even the first input, with a message about a singular iterator.
+
+C++20's \texttt{std::erase} does the job in one pass. Before C++20 you would write the erase-remove idiom. The manual loop can be repaired with \texttt{it = qty.erase(it)} and no increment on that branch, but each erase shifts the tail, so it costs $O(n^2)$ where \texttt{std::erase} costs $O(n)$.
+
+\iqwrong{``It removes all the zeros, since \texttt{erase} returns normally.'' Reading the loop on \texttt{\{10, 0, 0, 20\}} step by step shows the skip at once. Do that aloud in the interview.}
+
+\iqwhy{Removing while iterating is the classic reading question, and the follow-up about the last element is where candidates show whether they see the undefined behaviour or only the wrong output.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:4}
+It prints \texttt{1}, \texttt{1}, \texttt{2}. The wrong answer: a symbol with no limit is allowed. The side effect: asking about \texttt{BBB} inserts it, so the map grows from one entry to two.
+
+\texttt{std::map::operator[]} is defined as \texttt{try\_emplace(x).first->second}: if the key is absent, it inserts a value-initialised entry, here 0, and returns a reference to it. So \texttt{limits[\textquotedbl{}BBB\textquotedbl{}]} creates a limit of 0, and $0 \le 0$ passes. A risk check that says yes to an instrument it has never heard of should fail closed.
+
+To make the compiler catch it, make the map \texttt{const}, or take it by \texttt{const\&}. \texttt{operator[]} has no const overload, so the code stops compiling: the test does this. Then write the lookup with \texttt{find}:
+
+\texttt{const auto it = limits.find(symbol);}
+
+\texttt{return it != limits.end() \&\& qty <= it->second;}
+
+That prints \texttt{1}, \texttt{0}, \texttt{1}. \texttt{at} is the other choice, and it throws on a missing key.
+
+\iqfollow{Why does the side effect matter if the wrong answer is fixed some other way?}{Because the map is written during what looks like a read. Two threads calling \texttt{allowed} now race, even though neither thinks it is a writer. Memory also grows with every misspelt symbol.}
+
+\iqwhy{This is the shortest example of a read that writes, and such a line appears in real risk checks.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:5}
+It prints \texttt{start base}, then \texttt{run momentum}. During \texttt{Strategy}'s constructor the object is a \texttt{Strategy}, so the call goes to \texttt{Strategy::name}.
+
+The standard says that a virtual function called from a constructor resolves to the final overrider in the constructor's own class, not in a more-derived one. The reason is sound: \texttt{Momentum}'s members do not exist yet, and an override might use them. Once construction ends, \texttt{m.name()} sees \texttt{Momentum} as expected.
+
+If \texttt{name} is pure and the constructor calls it directly, the compiler can complain. Through a helper it cannot see the problem. That call is undefined, and at \texttt{-O0} the test run aborts with \texttt{pure virtual method called}.
+
+To get what the author wanted, separate construction from starting. Either have a factory that builds the object and then calls \texttt{start()} on it, or pass the name up through the constructor: \texttt{Strategy(const char* name)}.
+
+\iqwrong{``Virtual calls always go to the most-derived class.'' Not during construction or destruction. The same holds in a destructor, where the derived part has already gone.}
+
+\iqwhy{Logging or registering in a base-class constructor is a natural thing to write, and it is the usual way this bug appears: a strategy registers itself under the wrong name.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:6}
+It prints \texttt{0.0 101.0 0.0}. This is object slicing\index{object slicing}. Store pointers in the vector, usually \texttt{unique\_ptr}, and delete the base class's copy constructor to make the mistake fail to compile.
+
+A vector of \texttt{Instrument} holds objects of exactly that type, each with room for an \texttt{Instrument} only. \texttt{push\_back(Bond(99.5))} copies only the \texttt{Instrument} part, so the price is gone and the virtual table pointer is \texttt{Instrument}'s: \texttt{book[0].value()} is 0.0. \texttt{copy} is the same thing written out: \texttt{Instrument copy = b}. Only \texttt{ref} is still a \texttt{Bond}, so it gives 101.0.
+
+With the vector of \texttt{unique\_ptr}, the first number becomes 99.5. Add \texttt{Instrument(const Instrument\&) = delete;}, together with a defaulted default constructor, and both slicing lines stop compiling. That is the usual rule for a class meant to be used through a base pointer: no public copying. If you do need copies, add a virtual \texttt{clone}.
+
+\iqfollow{Is there a way to keep the instruments side by side in memory?}{Yes, if the set of types is closed: \texttt{std::vector<std::variant<Bond, Swap>{}>} stores each value in place with no slicing and no extra allocation. The cost is that adding a type means changing that line.}
+
+\iqwhy{A bank's pricing code is full of instrument hierarchies, and a slice gives a plausible number with no error at all.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:7}
+Under \texttt{cargo run} it panics, and the message is \texttt{attempt to subtract with overflow}. With \texttt{-{}-release} it prints $2^{64} - 1$ in full. Neither is unsafe in Rust's sense. Use \texttt{abs\_diff} for the size of the gap, or a signed result if the sign matters.
+
+\texttt{len()} returns \texttt{usize}, and $2 - 3$ does not fit. The Rust Reference calls arithmetic overflow a programmer's error, but it is not undefined behaviour. With debug assertions on, the compiler must insert a check that panics. In a release build the default is to wrap, as the test confirms. The program stays memory safe either way: the wrong number comes out, or the process stops, and no invariant of the language is broken. You can keep the checks in release builds with \texttt{overflow-checks = true} in the Cargo profile, and the test confirms that an optimised build then panics too.
+
+The fix depends on the caller. \texttt{bids.len().abs\_diff(asks.len())} gives 1 here if only the size of the gap matters. \texttt{checked\_sub} returns \texttt{None} if a negative result means ``this should not happen''. \texttt{a as i64 - b as i64} gives $-1$ if the caller wants the sign.
+
+\iqwrong{``Rust catches overflow.'' Only with the checks on. The same code ships a different behaviour from what you tested, so the release run in the test matters.}
+
+\iqwhy{Crypto and market-making firms using Rust ask this to check that you know what safe does and does not promise.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:8}
+It prints \texttt{False 0}, then \texttt{2.67 0 2 2}. Tell your colleague to key the levels by an integer number of ticks.
+
+$0.1 + 0.2$ is \texttt{0.30000000000000004} in binary floating point, and the literal \texttt{0.3} is a different double. Dict lookup uses exact equality, so the entry exists under one key and the lookup asks for another, and the fill appears to vanish. Two prices that print the same can differ in the last bit if they came by different arithmetic.
+
+The second line shows two more traps in \texttt{round}. \texttt{2.675} is stored slightly below that value, as \texttt{2.67499999\dots}, so it rounds down, and the Python documentation says so itself. Halves go to the even neighbour: \texttt{round(0.5)} is 0, \texttt{round(1.5)} and \texttt{round(2.5)} are both 2. Rounding to the tick's decimals does give one canonical double, so \texttt{round(0.1 + 0.2, 2) == 0.3}, but it works only while the error stays far below half a tick, and each writer must remember to do it. Integer ticks need no such care.
+
+They solve it completely: at a tick of 0.001, the keys 100 and 200 add to exactly 300. \texttt{Decimal(\textquotedbl{}0.1\textquotedbl{}) + Decimal(\textquotedbl{}0.2\textquotedbl{})} also equals \texttt{Decimal(\textquotedbl{}0.3\textquotedbl{})}, which suits reports and money, at a cost in speed.
+
+\iqwrong{``Compare with a tolerance.'' You cannot look up a dict with a tolerance, and tolerance is not transitive, so you cannot build a consistent key from it either.}
+
+\iqwhy{Prices as floats are the most common design fault in candidates' order books, and many firms check for it in the first minute.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:9}
+It prints \texttt{true false true} and \texttt{true false true}. The language promises every result here except \texttt{c == d}: only that false belongs to this JVM.
+
+\texttt{==} on references asks whether they are the same object. The Java Language Specification says that boxing an integer between $-128$ and 127 twice gives the same object, so \texttt{a == b} is always true. Beyond that range nothing is promised either way. The specification adds that less memory-limited implementations might cache more, up to $\pm$32K for \texttt{int}. OpenJDK 11 with default settings gives two objects for 128, so \texttt{c == d} is false.
+
+For strings, the specification says literals are interned, so \texttt{s == t} is true. \texttt{new String(\textquotedbl{}AAA\textquotedbl{})} is a new object by definition, so \texttt{s == u} is false, while \texttt{equals} compares contents.
+
+The rule is short: use \texttt{equals} on objects, and \texttt{==} only on primitives. This bug is nasty because it passes every test with small quantities.
+
+\iqwrong{``\texttt{==} on \texttt{Integer} compares values.'' It would, if one side were a primitive \texttt{int}, because the other side is then unboxed. With two \texttt{Integer} variables it compares references.}
+
+\iqwhy{Bank systems are full of boxed values in collections. A check like \texttt{qty == limit} works in every small test case and breaks at 128.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:10}
+It prints \texttt{100}, then \texttt{\textasciitilde{}Order}, and \texttt{\textasciitilde{}LimitOrder} never runs. The program is undefined: deleting a \texttt{LimitOrder} through an \texttt{Order*} needs a virtual destructor. AddressSanitizer stops it. With \texttt{std::make\_shared<LimitOrder>} it is defined, and both destructors run.
+
+The standard says that in a single-object delete, if the static type differs from the dynamic type, the static type must have a virtual destructor, or the behaviour is undefined. \texttt{qty} is virtual, so the class is polymorphic, but the destructor is not. In this run, \texttt{tag} is never destroyed and its heap buffer is lost.
+
+ASan reports \texttt{new-delete-type-mismatch}: the allocated type has 40 bytes and the deallocated one 8. With that check turned off, it reports the leak of the string instead. The test shows both.
+
+Why was there no warning? g++ has \texttt{-Wdelete-non-virtual-dtor}, which \texttt{-Wall} turns on, but the \texttt{delete} expression here is inside \texttt{unique\_ptr}, in a system header, where warnings are suppressed. Write \texttt{delete p} on a raw pointer and the compile fails under the same flags, as the test confirms. So do not trust the silence.
+
+The fix is one word: \texttt{virtual \textasciitilde{}Order()}. It then prints \texttt{\textasciitilde{}LimitOrder}, then \texttt{\textasciitilde{}Order}, and ASan is silent.
+
+\iqfollow{Why does \texttt{std::make\_shared<LimitOrder>} work without the virtual destructor?}{The shared pointer's control block records how to destroy the object it was created with, the real \texttt{LimitOrder}, so the deleter does not go through \texttt{Order}. The test prints both destructor messages, and ASan is silent. It is guaranteed, but only for this pointer type: add the virtual destructor anyway, since the next person uses \texttt{unique\_ptr}.}
+
+\iqwhy{This is the classic C++ interview question, and the twist is that the usual smart pointer hides the warning.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:11}
+It leaks one \texttt{Order} every time \texttt{validate} throws. Here that is one object of 40 bytes, plus nothing else, because the short tag fits in the string's own buffer. LeakSanitizer finds it. Use \texttt{std::make\_unique}. Do not accept the \texttt{catch}.
+
+The path is the \texttt{-1} order. \texttt{new} succeeds, \texttt{validate} throws, the stack unwinds, and the raw pointer \texttt{o} is destroyed without touching what it points to. So \texttt{delete} never runs. The total is still right, 300, because the leak has nothing to do with the arithmetic, which is why it could run for months: a few bytes per rejected order.
+
+ASan's leak check reports \texttt{Direct leak of 40 byte(s) in 1 object(s)}, allocated in \texttt{handle}. With \texttt{auto o = std::make\_unique<Order>(\dots)} and no \texttt{delete}, the destructor runs during unwinding. The test confirms it: same output, nothing in the report.
+
+The colleague's version does work for one pointer. But it duplicates the cleanup on two paths. It gets worse with each new resource, because a second allocation needs nested handlers. And the next person to add an early \texttt{return} forgets it. This is why the rule is that every resource has an owning object whose destructor releases it. Here, in fact, you need no heap at all: \texttt{const Order o\{qty, \textquotedbl{}tag\textquotedbl{}\};} is the simplest correct code.
+
+\iqwrong{``It is only 40 bytes.'' It is 40 bytes each time, and it grows with the rate of rejects, which spike exactly when the market or a client goes wrong.}
+
+\iqwhy{Reading for the path that throws, not the path that runs, is the habit this question tests.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:12}
+The listing is undefined in C++20, and ASan reports \texttt{stack-use-after-scope}. The version with the public member is defined and gives 600. C++23 makes the first version defined too.
+
+A range-for is defined as \texttt{auto\&\& range = \textit{initializer};} followed by a loop. Binding a reference to a temporary extends the life of that temporary, but only if the reference binds to it, or to a subobject of it. Here it binds to whatever \texttt{levels()} returns. That function returns a reference, and the compiler cannot see that it points into the temporary \texttt{Snapshot}. So the \texttt{Snapshot} dies at the end of the initialiser, before the loop starts, and the loop walks a destroyed vector.
+
+\texttt{latest().levels\_} names a subobject of the temporary directly, so the extension applies to the whole \texttt{Snapshot}. The test runs it clean under ASan. So the same-looking line is safe through a data member and unsafe through a getter.
+
+C++23 added a rule to \texttt{[class.temporary]}: a temporary created in a range-for's initialiser lives as long as the range reference. g++ 11.4 in C++20 mode does not do this, as the ASan report shows.
+
+For C++20, keep the object in a named variable. Write \texttt{const Snapshot snap = latest();} first, then loop over \texttt{snap.levels()}. To make the compiler reject it, add reference qualifiers: \texttt{levels() const\&} plus a deleted \texttt{levels() const\&\&}. The test shows the listing then fails to compile.
+
+\iqwrong{``Temporaries live to the end of the statement, and the loop is one statement.'' The temporary lives to the end of the full expression that initialises the range, which ends before the body runs.}
+
+\iqwhy{A getter on a function's return value inside a loop is a shape every C++ code base has. It often seems to work, because the freed memory is still there.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:13}
+The line \texttt{std::lock\_guard<std::mutex>\{m\};} creates a temporary, which locks and unlocks at the semicolon. So \texttt{total += n} runs unprotected and there is a data race. Give the guard a name: \texttt{std::lock\_guard<std::mutex> lock\{m\};}.
+
+The object has no name, so its life ends with its full expression, before the next line. The compiler sees a legal expression with a constructor and destructor that have side effects, and gives no warning, even under \texttt{-Wall -Wextra -Werror}. ThreadSanitizer reports \texttt{data race} at once on \texttt{total}. Without it, the total may or may not come out right, depending on how the threads interleave. With the name added, TSan is silent and the program prints 200000.
+
+With parentheses, \texttt{std::lock\_guard<std::mutex>(m);} parses as a declaration of a variable called \texttt{m} of type \texttt{lock\_guard}, with no initialiser. The extra parentheses around a declarator are allowed. Since \texttt{lock\_guard} has no default constructor, it does not compile here, by luck: the test confirms it. For a type with a default constructor it would compile and hide the global \texttt{m}.
+
+\iqfollow{Does \texttt{std::scoped\_lock} make this safer?}{Not by itself. \texttt{std::scoped\_lock lock;} with no mutex at all compiles, since the template takes any number of mutexes including none, and it locks nothing. TSan still reports the race on that version. Name the guard, and name the mutex in it.}
+
+\iqwhy{This is a one-token bug that no compiler warning catches, and spotting a nameless guard is a fair test of having really read lock code.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:14}
+\texttt{transfer(x, y)} locks \texttt{x} then \texttt{y}, and \texttt{transfer(y, x)} locks \texttt{y} then \texttt{x}. If two such calls overlap, each can hold one mutex and wait for the other for ever. TSan does report it on this run, as \texttt{lock-order-inversion}. Use \texttt{std::scoped\_lock lock(from.m, to.m);}.
+
+This run cannot deadlock, because the first thread is joined before the second starts. That is the point of the question: you cannot catch this with a test that happens to pass. TSan does not need the deadlock to occur. It builds a graph of which mutex was held when another was acquired, and reports a cycle. Here it prints \texttt{Cycle in lock order graph}, on a run that printed the right answer.
+
+\texttt{std::scoped\_lock} with two mutexes uses \texttt{std::lock}, which the standard says does not result in deadlock. The usual technique is to lock one and try the others, backing off on failure. Another fix is a fixed global order, say by address or by account id. That also lets you see the rule in the code, and it costs no retries.
+
+The self-transfer is the trap. With \texttt{from} and \texttt{to} the same account, \texttt{scoped\_lock} tries to lock one mutex twice, and a \texttt{std::mutex} locked twice by one thread is undefined. In the test it hung until the timeout. So add a guard at the top: \texttt{if (\&from == \&to) return;}, or the equivalent rule for your domain.
+
+\iqwrong{``Always lock in the order of the arguments.'' That is the bug. The order must be a property of the mutexes, not of the call.}
+
+\iqwhy{Two locks taken in opposite orders on different code paths is the classic deadlock. A good answer mentions the tool, the fix, and the edge case the fix creates.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:15}
+The bug is the \texttt{if}: after \texttt{wait} returns, nothing checks that the queue still has an item. Use the predicate form, \texttt{cv.wait(lock, [] \{ return !q.empty(); \});}. \texttt{notify\_one} alone would not fix it.
+
+Here is how it fails. Both consumers wait. \texttt{push(7)} calls \texttt{notify\_all}, so both wake and compete for the mutex. The first takes 7. The second then gets the mutex, returns from \texttt{wait}, and goes straight to \texttt{q.front()} on an empty deque. That call is undefined. With no checks on, nothing stops the read, nor the \texttt{pop\_front} after it, and this may pass unnoticed for a long while.
+
+To make it loud, build with \texttt{-D\_GLIBCXX\_ASSERTIONS}, which turns on the library's precondition checks. The test run aborts with SIGABRT at \texttt{front}. With the predicate the same build prints both values, and TSan is silent.
+
+\texttt{notify\_one} wakes one thread, which looks enough. It still leaves two ways to fail. First, \texttt{wait} is allowed to return with no notify at all: the standard's wording includes ``or spuriously''. Second, between the notify and the woken thread getting the mutex, a third thread calling \texttt{pop} can take the item, because it finds the queue non-empty and does not wait.
+
+The rule is short: a condition variable never tells you the condition is true, only that it is worth checking again. So always wait in a loop or use the predicate form, which is that loop.
+
+\iqwrong{``\texttt{if} is fine because \texttt{push} always adds an item before notifying.'' That is true, but the item may be gone by the time this thread holds the lock.}
+
+\iqwhy{This appears in nearly every queue that candidates write at a whiteboard. Interviewers look for the loop, and then ask why.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:16}
+It prints \texttt{copies 1, moves 1}. The parameter is \texttt{const Tracked}, and \texttt{std::move} of a const object gives a const rvalue, which binds to the copy constructor. Drop the \texttt{const} and it prints \texttt{copies 0, moves 2}.
+
+\texttt{std::move} moves nothing. It is a cast to an rvalue reference, and it keeps \texttt{const}. Overload resolution then has two candidates: \texttt{Tracked(Tracked\&\&)} needs a non-const argument, so it does not fit, and \texttt{Tracked(const Tracked\&)} does. So the compiler quietly copies, with no warning. The one move is the outer one, from \texttt{t} into the parameter. The one copy is from the parameter into \texttt{item\_}.
+
+The \texttt{const} on a by-value parameter looks harmless and even virtuous, since it does not change the function's signature. For a parameter you intend to move from, it is exactly wrong. The same goes for a \texttt{const} local variable that you later \texttt{std::move}.
+
+In \texttt{std::vector}, growth has to give the strong exception guarantee: if something throws while relocating, the old buffer must still be intact. A move that throws would have destroyed the old elements. So the vector uses \texttt{std::move\_if\_noexcept}: it moves only if the move constructor is \texttt{noexcept}, or if the type cannot be copied. The test shows it: two \texttt{emplace\_back} calls print \texttt{copies 0, moves 1} with \texttt{noexcept}, and \texttt{copies 1, moves 0} without it.
+
+\iqwrong{``\texttt{std::move} forces a move.'' It only makes one possible. Counting with a tracked type, as here, is how you check.}
+
+\iqwhy{Unnoticed copies of large messages in a hot path come from exactly these two lines. They give no compile error and no test failure, only a slower program.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:17}
+It is not correct: the second \texttt{publish} calls a lambda holding a dangling \texttt{this}, and it writes to freed memory. ASan reports \texttt{heap-use-after-free} at \texttt{total\_ += v}. The fix gives the subscription an owner, so the destructor unsubscribes.
+
+The feed stores the \texttt{std::function}, which stores the raw \texttt{this}. The feed knows nothing about the strategy's lifetime. After \texttt{s.reset()}, the strategy is gone, but its lambda is still in \texttt{subs\_}. Built normally, the write lands on freed memory and nothing shows, so you see \texttt{1}, \texttt{done}. In production the same write lands in whatever was allocated there next, and the symptom appears somewhere else entirely.
+
+The fix in \cref{lst:iv3:rd:callbackfixed} makes \texttt{subscribe} return a handle, stored in the strategy, and the destructor gives it back. A list keeps iterators valid while other subscribers come and go. It runs clean under ASan.
+
+There is a second bug to prevent. The default copy constructor would copy \texttt{slot\_} but leave the lambda pointing at the original object, and both destructors would erase the same slot. So the class must delete copying, as here. The test shows that copying then does not compile.
+
+Another common design uses \texttt{std::shared\_ptr} for the strategy and captures a \texttt{std::weak\_ptr} in the lambda. The feed locks it on every call, and an expired one is skipped. That is simpler with several threads, and it costs an atomic operation per call.
+
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/cpp/callback_fixed.cpp}{8}{45}{The subscription has an owner.\protect\hfil\protect\break}\label{lst:iv3:rd:callbackfixed}
+
+\iqfollow{What if a callback unsubscribes itself during \texttt{publish}?}{This version then erases the element the range-for is standing on, which is undefined. The usual answer is to mark it dead and remove it after the loop, or to loop over a copy.}
+
+\iqwhy{Callbacks are how feeds reach strategies. Getting the order of destruction right is daily work in a trading system.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:18}
+It prints \texttt{False 1 True}: the order is in the set, and \texttt{in} cannot find it. Hash on \texttt{oid} alone, the part that never changes, and have \texttt{\_\_eq\_\_} agree. If you delete \texttt{\_\_hash\_\_}, \texttt{book.add(o)} raises a \texttt{TypeError}.
+
+A set stores each item in a slot chosen from its hash at the time of insertion. Changing \texttt{qty} changes the hash that \texttt{\_\_hash\_\_} now computes, so the lookup looks in a different slot. It finds nothing, and it never compares. The item is still there, as the last two values show: \texttt{len} is 1, and a scan by identity finds it. You now have an order that you can neither find nor remove.
+
+The Python data model warns against this directly: a class that defines mutable objects and implements \texttt{\_\_eq\_\_} should not implement \texttt{\_\_hash\_\_}, since a key's hash value must be immutable. The language enforces half of this. A class that defines \texttt{\_\_eq\_\_} without \texttt{\_\_hash\_\_} has its hash set to \texttt{None}, so instances are unhashable. The test shows that error.
+
+With \texttt{hash(self.oid)} and equality on \texttt{oid}, the line prints \texttt{True 1 True}. But note what that changes: two orders with the same id are now equal whatever their quantity. That is what you want for identity in a book. It is not what you want if you are comparing two snapshots. A cleaner design separates them: a dict from id to order keeps the identity in the key and leaves the order free to change.
+
+\iqwrong{``Sets compare with \texttt{==}, so it will find it.'' They compare only within a slot chosen by the hash, so the comparison never happens.}
+
+\iqwhy{Hashing a mutable field is an easy mistake with a nasty symptom: items that are there and yet are not.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:19}
+It prints \texttt{150.0} and \texttt{False}: after \texttt{del p} and a full collection, the pricer is still alive. The cache keeps it alive, along with its million-element curve. Give each instance its own cache.
+
+\texttt{@lru\_cache} on a method wraps the function once, at class level. Its key contains all the arguments, and the first of them is \texttt{self}. So the class-level cache holds a strong reference to every instance that ever called it. The Python FAQ says the same of \texttt{lru\_cache} on methods: ``it creates a reference to the instance''. With \texttt{maxsize=None} it never evicts, so each new \texttt{Pricer} and its curve stay until the process ends. That is the memory growth. Linters flag this pattern too: ruff's rule B019 reports this very line.
+
+To keep the caching, create the cache in the constructor:
+
+\texttt{self.price = lru\_cache(maxsize=None)(self.\_price)}
+
+The cache then belongs to the instance. There is now a reference cycle (instance to cache to bound method to instance), so the object is freed by the cycle collector rather than at once. The test prints \texttt{True} after \texttt{gc.collect()}. Bounding \texttt{maxsize} is sensible too: with the class-level form it limits the damage but does not cure it, because a few big instances can stay pinned.
+
+\iqfollow{Is there another bug waiting in this class?}{Yes. The cache key does not include \texttt{self.curve}'s contents. If someone updates the curve in place, the cache returns stale prices. A cache should be keyed on everything the result depends on, or the input should be immutable.}
+
+\iqwhy{Caching in a pricer is natural, and this is the commonest real memory leak in Python research and pricing services.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:20}
+It prints \texttt{1 day, 0:00:00}, then \texttt{23:00:00}. The second is true: on 8 March 2026 New York moved its clocks forward, so that day had 23 hours.
+
+The Python documentation states the rule: if both datetimes are aware and have the same \texttt{tzinfo} attribute, the \texttt{tzinfo} attributes are ignored and no time zone adjustment is done. Here both use the same \texttt{ny} object, so the subtraction works on wall-clock fields, midnight to midnight, and gives one day. Converted to UTC, the two carry different offsets: the test shows $-5$ hours just before the change and $-4$ after. The subtraction then gives the elapsed time. The same trap runs the other way on 1 November 2026, a day of 25 hours.
+
+Anything that divides by elapsed time goes wrong silently with the first form. Volume per hour, or a time-weighted average spread for that day, is off by about 4\%, as 24 hours is used for a 23-hour day. A timeout or a session schedule computed by adding hours to a local time can be off by an hour. An annualisation or a time-to-expiry computed on local timestamps can pick up the same error.
+
+The rule at trading firms: store and compute in UTC, or in integer nanoseconds since the epoch, and convert to local time only to display, or to apply exchange session rules, which are themselves defined in local time.
+
+\iqwrong{``\texttt{zoneinfo} handles daylight saving.'' It does give the right offsets, but the subtraction ignores them when both sides have the same \texttt{tzinfo}, as here.}
+
+\iqwhy{Two days a year, this is an hour of wrong data, an hour early or late at the open. It usually surfaces first in production, because few tests use those dates.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:21}
+It prints \texttt{2 2} and nothing more. You never see \texttt{drop a} or \texttt{drop b}, because the two nodes own each other and neither count reaches zero. By Rust's rules that is not a safety bug. Change \texttt{Rc} to \texttt{Weak} in the \texttt{next} field.
+
+Each node starts with one strong reference from its local variable, and the other node adds one, hence \texttt{2 2}. At the end of \texttt{main}, the two local variables go away and each count drops to 1. Nothing further can drop them, since each is kept alive by the other. So the memory is never freed and the destructors never run.
+
+The standard library says so plainly: a cycle between \texttt{Rc} pointers will never be deallocated, and \texttt{Weak} is there to break cycles. The Rust Reference lists leaks of memory under behaviour that is not considered unsafe, along with deadlocks. So never rely on \texttt{Drop} to release a limit or close a position.
+
+With \texttt{RefCell<Weak<Node>{}>} and \texttt{Rc::downgrade}, the fixed version prints \texttt{1 1}, then \texttt{a} (the upgrade from \texttt{b} still succeeds), then \texttt{drop b}, \texttt{drop a}. A \texttt{Weak} does not keep the value alive, so \texttt{upgrade} returns an \texttt{Option}, and you must handle \texttt{None}.
+
+\iqwrong{``Rust prevents memory leaks.'' It prevents use-after-free and data races in safe code. A leak is memory safe.}
+
+\iqfollow{Which pointer should be weak in a tree?}{The one from child to parent. A parent owns its children, and a child only needs to reach its parent while the parent exists.}
+
+\iqwhy{Graph-shaped state, such as orders pointing at their levels and levels at orders, tempts people into cycles in Rust as in any language with reference counts.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:22}
+On rustc 1.97 it hangs for ever. The guard from the first \texttt{lock()} lives until the end of the \texttt{match}, and the arm tries to lock the same mutex again. The 2024 edition does not change this. Add a \texttt{let} first: \texttt{let item = queue.lock().unwrap().pop();}, then \texttt{match item \{}.
+
+\texttt{queue.lock().unwrap()} creates a temporary \texttt{MutexGuard}, and \texttt{pop()} borrows from it only briefly. You might expect the guard to go once \texttt{pop} returns. But the Rust Reference notes that the scrutinee of a \texttt{match} is not a temporary scope, so temporaries in the scrutinee can be dropped after the \texttt{match} expression. The guard is still alive through the arms. The second \texttt{lock()} on the same thread then waits for a lock that it holds itself. The documentation of \texttt{Mutex::lock} says this call might panic. Here it hung, and the test sees the timeout, so do not rely on the panic.
+
+The 2024 edition changes two scopes, and neither is this one. Temporaries in an \texttt{if let} scrutinee now drop before the \texttt{else} branch, but not before the body, and tail expression temporaries drop earlier. The test builds this \texttt{match} and the \texttt{if let} form under edition 2024, and both still hang, since the second lock is in the body.
+
+With the \texttt{let}, the statement ends at its semicolon, the guard drops, and the program prints \texttt{requeued 3}, then \texttt{done}.
+
+\iqwrong{``The borrow checker prevents deadlocks.'' It prevents data races. The Rust Reference lists deadlocks as not considered unsafe.}
+
+\iqwhy{Nothing in the text shows the guard, let alone how long it lives. Reading for that scope is the skill, and it is the one that finds this deadlock before production does.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:23}
+It prints \texttt{true}, then \texttt{null}. \texttt{Key} overrides \texttt{equals} but not \texttt{hashCode}, so two equal keys have different hash codes, and the map does not find the entry. Add \texttt{hashCode}, which returns \texttt{symbol.hashCode()}.
+
+The \texttt{Object} documentation states the contract: if two objects are equal according to \texttt{equals}, calling \texttt{hashCode} on each must produce the same integer result, so it is generally necessary to override \texttt{hashCode} whenever \texttt{equals} is overridden. The default \texttt{hashCode} is not based on the fields, so equal keys almost always have different hashes. \texttt{HashMap.get} compares the stored hash first, and calls \texttt{equals} only if they match, so even a key in the same bucket is not found. So the lookup returns \texttt{null} without ever calling your \texttt{equals}. With the override the program prints \texttt{true} and \texttt{1000}.
+
+The compiler says nothing, because both methods are optional. A \texttt{null} from \texttt{get} also looks like ``no limit set''. That is the dangerous part. In a limit check, unboxing the \texttt{null} into a \texttt{long} gives a \texttt{NullPointerException} at best. At worst it reads as ``no limit, so allow''.
+
+Another way to break it: keep both methods, but use a mutable field in them, and change the field after inserting. The hash now differs from the stored one, and the same lookup returns \texttt{null}. This is why key classes should be immutable. Here \texttt{symbol} is \texttt{final}, and the class is \texttt{final} too, so a subclass cannot change what equality means. The test runs this mutable variant too.
+
+\iqwrong{``It prints 1000, because the keys are equal.'' \texttt{HashMap} never reaches the equality check.}
+
+\iqwhy{This is the first question on a Java interview at a bank, because every position and limit map depends on it.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:24}
+It prints a number far below 400000, about 130000 in two runs here with four threads, and it changes from run to run. The map is thread-safe call by call, but \texttt{get} followed by \texttt{put} is two calls, so updates get lost between them. Replace both lines by \texttt{position.merge(symbol, qty, Long::sum);}.
+
+Each operation of \texttt{ConcurrentHashMap} is safe, and the map's internals are never corrupted. But thread A can read 5, thread B can read 5, both compute 6, and both write 6. One increment is gone. This is a check-then-act race, and no choice of collection saves you from it while the logic stays spread over two calls.
+
+\texttt{merge} does the read, the computation and the write as one step on that key. The documentation states that the entire method invocation is performed atomically, and that update operations by other threads may be blocked meanwhile. So keep the function short, and do not touch the map from inside it. The test prints exactly 400000 with this line.
+
+\texttt{compute} does the same with a more general function, and \texttt{putIfAbsent} covers the first-time case. Here, \texttt{Long::sum} is all that is needed.
+
+For a counter hit by many threads and read rarely, use \texttt{LongAdder}. It keeps one or more variables that grow in number under contention, and adds them up on read. Its Javadoc calls it usually preferable to \texttt{AtomicLong} for such sums, at the expense of more space. \texttt{map.computeIfAbsent(symbol, s -> new LongAdder()).add(qty)} is the usual form.
+
+\iqwrong{``Make the map a \texttt{Hashtable} or wrap it in \texttt{synchronizedMap}.'' Those lock each call, so the race between the two calls is still there.}
+
+\iqwhy{Position keeping in a concurrent service is exactly this code. A number that drifts low is one of the worst kinds of bug, since nothing throws.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:25}
+It prints \texttt{True}: the strategy survives the collection. The event in \texttt{feed} holds a delegate that holds the strategy. Many short-lived strategies would therefore pile up, each still receiving ticks. Unsubscribe with \texttt{-=}, normally in \texttt{Dispose}.
+
+\texttt{feed.Tick += OnTick} creates a delegate whose target is the \texttt{Strategy} instance, and adds it to the feed's list. Garbage collection follows references, so a live \texttt{feed} keeps the delegate alive, which keeps the strategy alive. Microsoft's programming guide says this in nearly those words: as long as the publishing object holds that reference, garbage collection will not delete your subscriber object, so you should unsubscribe before you dispose of the subscriber.
+
+The listing is built with care to show this honestly. \texttt{NoInlining} on \texttt{Make} and the Release build mean that no local variable keeps the strategy alive by accident. \texttt{GC.KeepAlive(feed)} keeps the feed alive through the check. So the only path left is the event.
+
+Short-lived subscribers on a long-lived publisher are the bad shape: an instrument's view subscribing to a global feed, say, for the length of a screen. Memory grows, and so does CPU, because each dead strategy still runs \texttt{OnTick} on every tick, doing work for nothing. That second symptom is often the one you notice first.
+
+With \texttt{IDisposable} and \texttt{feed.Tick -= OnTick} in \texttt{Dispose}, and \texttt{using var s} in \texttt{Make}, the program prints \texttt{False}.
+
+\iqwrong{``C\# has a garbage collector, so it cannot leak.'' The collector frees what is unreachable. This is reachable, which is a leak in everything but name.}
+
+\iqfollow{Does the strategy holding a reference to the feed cause the same problem?}{No. That reference runs the other way: a strategy that is otherwise unreachable can be collected along with its reference. Only publisher to subscriber keeps a subscriber alive.}
+
+\iqwhy{Long-running desktop and pricing applications at banks often hit this one.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:26}
+Only the first can ever fail on a wrong number, and it cannot catch the bug. \texttt{vwap} ignores the quantities and takes a simple mean. Test with unequal quantities, and use \texttt{pytest.raises} and a bare \texttt{assert}.
+
+Go through them. \texttt{test\_two\_trades} uses equal quantities, 50 and 50, and for those the simple and weighted means agree: 101 either way. \texttt{test\_empty} has no \texttt{assert} and swallows the exception it hopes for, so it passes if the call raises that and passes if it returns. \texttt{test\_one\_trade} asserts a two-element tuple. A non-empty tuple is always true, so it can never fail, even though it compares against a wrong value, 99. Python itself warns at compile time: \texttt{assertion is always true}. The test captures that warning. pytest happily counts \texttt{3 passed}.
+
+The right function is the sum of $p \times q$ divided by the sum of $q$. Rewrite:
+
+\texttt{assert vwap([(100.0, 10), (102.0, 30)]) == 101.5}
+
+On the current function that gives 101, and it fails. Hand-compute your expected value, and do not paste it from a run.
+
+\texttt{with pytest.raises(ValueError):} then \texttt{vwap([])}, which fails if nothing raises. Then \texttt{assert vwap([(100.0, 7)]) == 100.0}.
+
+Add properties, which catch whole families of bugs: the result lies between the lowest and highest price, and multiplying every quantity by 3 changes nothing. The test runs both on 200 random lists.
+
+To check the tests themselves, break the code on purpose and see that a test fails. This is the idea behind mutation testing\index{mutation testing}, and here it would have exposed all three at once.
+
+\iqwrong{``Coverage is 100\%, so it is tested.'' Every line runs. Nothing is checked.}
+
+\iqwhy{Firms read your tests as closely as your code. Tests that cannot fail are worse than none, because they give confidence.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:27}
+Give each quantity its own type: \texttt{struct Price \{ long ticks; \};} and \texttt{struct Qty \{ long lots; \};}. \texttt{send(qty, price)} then does not compile. In the machine code, expect no difference at all from plain \texttt{long}.
+
+\Cref{lst:iv3:rd:strong} is the result. It compiles at the same flags, prints the right thing, and swapping the arguments is now an error: the test confirms it. For the cost, it compares two functions:
+
+\texttt{long cost\_raw(long, long)} and \texttt{long cost\_typed(Price, Qty)}.
+
+Under g++ 11.4 at \texttt{-O2} on x86-64 Linux, both compile to the same instructions, \texttt{movq}, \texttt{imulq}, \texttt{ret} (plus an \texttt{endbr64} on Ubuntu's default flags). The test compares them line by line. The reason lies in the System V calling convention: a small struct of one integer goes in a register exactly as the integer does. A wrapper has no run-time existence, and all of it happens in the type checker.
+
+Add only the operations that make sense. Price minus price is a price difference, and quantity times price is a notional. Price plus price has no meaning, so leave it out, and the compiler now stops that too. Conversions from \texttt{long} should be explicit, or the protection goes away.
+
+There is one hole in this listing. These are aggregates, so \texttt{send(\{500\}, \{101\})} still compiles and still swaps. If that worries you, add an \texttt{explicit} constructor.
+
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/cpp/strong_types.cpp}{3}{18}{The same order with types.\protect\hfil\protect\break}\label{lst:iv3:rd:strong}
+
+\iqwrong{``Comment the parameters, or use named variables.'' The listing does name its variables, and that is how it fails.}
+
+\iqwhy{A swapped price and quantity is a fat-finger bug made by a programmer. Type wrappers are one of the very few tools that remove a class of bug at no run-time cost.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:28}
+The plain bisect needs 10 runs, $2^{10} = 1024$, so 60 minutes. With the flaky test you need 24 runs per commit, and the worst case is 24 hours.
+
+The \texttt{git bisect} command is a binary search: each test halves the range, so 1024 commits take 10 steps. That assumes one good commit and one later bad commit, with one change from good to bad between them.
+
+With the flaky test, a failure is conclusive, since a commit without the bug never fails. A pass is not. A bad commit passes $r$ runs in a row with probability $(3/4)^r$. In that case the search takes a bad commit for a good one, and goes the wrong way for good. On the worst path, all 10 commits tested are bad, and you need them all to be judged correctly:
+\[
+\left(1 - (3/4)^r\right)^{10} \ge 0.99.
+\]
+Taking the tenth root, $(3/4)^r \le 1 - 0.99^{1/10} \approx 0.001$, so $r \ge \ln(0.001) / \ln(0.75) \approx 24$. Indeed $r = 24$ gives 0.9900 and $r = 23$ gives 0.987. So each bad commit needs a miss rate of about $1/1000$.
+
+For the time, the worst case is 10 commits at 24 runs each: 240 runs, or 24 hours. Every good commit costs all 24 runs, because it has to pass them all. A bad commit stops at its first failure, after about 4 runs on average. A typical path meets 5 of each, so $5 \times 24 + 5 \times 4 = 140$ runs, or 14 hours. A simulation of 4000 searches in the test finds the right commit more than 99\% of the time.
+
+In practice, first make the test less flaky, or run it on many machines at once. With 24 runs in parallel, each step takes 6 minutes and the whole search an hour.
+
+\iqwrong{``Run it three or four times, since it fails one time in four.'' Four runs still miss with probability 32\%, and over ten steps the search is more likely to be wrong than right.}
+
+\iqwhy{Finding when a rare fault came in is a routine task at a firm, and the arithmetic decides whether it is an afternoon's work or a waste of a week.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:29}
+I would ask for a change. \texttt{ReplayBook} breaks what \texttt{Book} promises, since any code handed a \texttt{Book} may call \texttt{add}, and here that raises. Split the interface: a read-only view with \texttt{total}, and a mutable \texttt{Book} built on top of it.
+
+The test for inheritance is whether the subclass can stand in everywhere the base is used. This is the Liskov substitution principle\index{Liskov substitution principle}, and \texttt{top\_up} shows the failure: with a \texttt{Book} it returns a total, and with a \texttt{ReplayBook} it raises. Nothing in the types warns the author of \texttt{top\_up}, so the failure shows up at run time, probably in the path nobody tests, and only for replayed books.
+
+The direction of the hierarchy is wrong too. Read-only is the smaller interface, so it should be the base. \texttt{ReadableBook} has \texttt{total}; \texttt{Book} adds \texttt{add}. \texttt{ReplayBook} is then a \texttt{ReadableBook}, and \texttt{top\_up} declares that it needs a \texttt{Book}. With a static checker or a C++ compiler, handing it a replayed book is an error at the point of the mistake. In Python you would state this with \texttt{typing.Protocol} and let a type checker enforce it.
+
+Often you should go further and drop inheritance. Replay needs a loader that fills a book and then hands out a read-only view. Composition gives you that with no new class of books at all, and the same \texttt{Book} implementation stays the only one to test.
+
+There is a case for accepting the subclass: a short-lived script, one caller, under a deadline. Say why, and leave a note. I would also accept it if the base class's contract already declares the operation optional, and callers are written to expect that. But then that contract is the design to question.
+
+\iqwrong{``It is fine, because \texttt{NotImplementedError} tells you exactly what went wrong.'' It tells you at run time, on the replay path. A type would tell you before anything runs.}
+
+\iqwhy{Interviewers want to hear a reason and a trade-off, not the name of a principle. A design answer that says when you would not bother is more convincing.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:30}
+\texttt{new Stats} leaves \texttt{count} and \texttt{sum} uninitialised, and reading them is undefined. Tests pass because fresh heap memory happens to be zero. Run with \texttt{MALLOC\_PERTURB\_=165}: it then prints 1. Write \texttt{new Stats\{\}}.
+
+\texttt{Stats} has no constructor, so \texttt{new Stats} does default initialisation, which for a plain struct does nothing. \texttt{new Stats\{\}} does value initialisation, which zeroes it. The two differ by two characters, and neither gets a warning under \texttt{-Wall -Wextra -Werror}, since the allocation and the use are in different functions.
+
+Why does the test pass? In a short-lived process, the allocator hands out memory fresh from the operating system, and that is zeroed. In a long-lived process, the allocator reuses blocks that were freed, so you see old contents, which is the nonsense in production. So the unit test and production really do have different initial conditions.
+
+glibc gives you a way to expose this with no recompile. The man page for \texttt{mallopt} describes \texttt{M\_PERTURB}: bytes of allocated memory are initialised to the complement of the value's low byte. Setting the environment variable \texttt{MALLOC\_PERTURB\_=165} fills allocations that come from the main allocator with \texttt{0x5a}, and the program then prints 1: both fields start at the same huge value, and adding 600 and 3 hardly changes the ratio. With \texttt{new Stats\{\}}, the same run prints 200. On glibc 2.35, a block reused from the per-thread cache keeps what it had, so to catch every one also set \texttt{GLIBC\_TUNABLES=glibc.malloc.tcache\_count=0}. The check needs no rebuild, so it can run in every test job.
+
+Other tools exist. g++ 11.4 rejects \texttt{-fsanitize=memory}, as the test confirms. Clang's MemorySanitizer is the sanitizer built for this, and it needs a rebuild under Clang. Valgrind's Memcheck reports the use of uninitialised values too. Neither was run for this answer.
+
+\iqwrong{``Set the fields to zero in a constructor everywhere.'' That works, but default member initialisers, \texttt{long count = 0;}, are shorter and cannot be forgotten in a new constructor.}
+
+\iqwhy{``It works on my machine and in tests'' is what this bug looks like, and a developer who can force it to reproduce in one command is who you want to have around.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:31}
+The memory is still reachable: \texttt{done} is a global that points to every order. LeakSanitizer reports only memory with no live pointer left at exit, so it says nothing. The three causes are a true leak, unbounded growth of live data, and allocator retention or fragmentation.
+
+The test shows the difference. The listing, run under ASan with 100000 orders, reports nothing. Replace the map insert by a bare \texttt{new Order} whose pointer is thrown away, and it reports the leak at once. The tool answers one exact question, ``is anything unreachable?'', and here it is correct. The fault lies in the design: this is what people call a logical leak.
+
+Tell them apart in this order. First, record the allocator's own view over time alongside the resident size. glibc's \texttt{mallinfo2} reports allocated space and free space. Add \texttt{uordblks} and \texttt{hblkhd} for the allocated bytes, since large blocks are mapped directly and counted apart.
+
+If allocated bytes grow with resident memory, you have real growth in use, a leak or a grow-only structure. A heap profiler then gives you the allocation sites, ranked by bytes still live. A site that keeps climbing is your suspect, and you read what holds it. If LeakSanitizer is silent, it is reachable, so look for maps, caches, queues and logs with no bound.
+
+If allocated bytes are flat and resident memory grows, there are two cases. Either free space inside the allocator is growing, or the memory never came through \texttt{malloc}: direct mappings, thread stacks and libraries with their own allocators do not appear at all, so check \texttt{/proc/PID/smaps}. In the first case the allocator is holding freed pages it cannot return, usually because of a mix of sizes that fragments its arenas, or many threads with separate arenas. Look at the free-space figure, and test with another allocator or a bounded arena.
+
+For this code: each entry costs 136 bytes of payload (8 for the key and 128 for the order), plus the tree node's overhead. Two million fills a day is at least 272 MB a day, which matches the growth. Write the audit to disk, keep only the session's records in memory, and add a metric for the map's size.
+
+\iqwrong{``ASan says no leaks, so it must be fragmentation.'' That skips the likeliest cause. Reachable growth is much more common.}
+
+\iqwhy{Trading processes run for days with no restart, and a growth problem is a routine investigation. Interviewers want an ordered method, not a list of tools.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:32}
+It is not correct. The first read of \texttt{instance} is unsynchronised against the write in another thread, so this is a data race and undefined behaviour. x86-64 does not save it. The simple correct version is a function-local static. Keeping the double check needs \texttt{std::atomic} with acquire and release.
+
+The classic failure: thread A runs \texttt{new Config}, which is three steps, allocate, construct, assign. Nothing stops the assignment from becoming visible to thread B before the construction, so B sees a non-null pointer and reads a \texttt{limit} that is not yet set. B never takes the lock, so the lock cannot help.
+
+The strong hardware memory model of x86-64 keeps stores in order, but the language's rules bind the compiler, and it is entitled to reorder a non-atomic write, or to assume no other thread is looking. And the program is undefined regardless of what the machine does. TSan reports \texttt{data race} on this listing in the test.
+
+The simplest fix, also from the test:
+
+\texttt{Config* get() \{ static Config instance; return \&instance; \}}
+
+The standard guarantees this: if control enters the declaration concurrently while the variable is being initialised, the other threads wait for it to finish. g++ does it with a guard variable that is checked on every call and \texttt{\_\_cxa\_guard\_acquire} on the slow path, so it is itself a double check, written for you. TSan is silent.
+
+To keep the pattern, use \texttt{std::atomic<Config*>}. The fast path does an acquire load. The slow path holds the mutex, reloads with relaxed order, constructs, and does a release store. Then a thread that sees the pointer also sees the object, and TSan is silent on this version too. \texttt{std::call\_once} is the library form.
+
+In Java, the same pattern works if the field is \texttt{volatile}: the Java Language Specification says that a write to a volatile field happens-before every subsequent read of it. Without \texttt{volatile} it is broken in the same way. That rests on the specification, since no test here can force the reordering on a JVM.
+
+\iqwrong{``x86 has a strong memory model, so it is fine in practice.'' The compiler is what reorders here, and a passing test proves little about a race.}
+
+\iqwhy{This pattern still appears in old C++ and Java code, and it separates people who remember the recipe from those who can say what goes wrong.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:33}
+With the object files in the order main, rates, limits, it prints 1000. With main, limits, rates, it prints 0. This is the static initialisation order problem\index{static initialisation order}. Use a function-local static, and mark a global \texttt{constinit} to make it a compile error.
+
+Both globals need a call or a read at start-up, so they have dynamic initialisation. Within one file, the order is the order of definition. Across files the standard leaves it indeterminately sequenced, so the order is up to the implementation, and with g++ and GNU ld here it followed the link line.
+
+Before any dynamic initialisation runs, all globals are zero-initialised. So when \texttt{limits} runs first, it reads \texttt{base\_rate} as 0, and computes $0 \times 10$. Nothing is uninitialised, no sanitizer complains, and the risk limit is simply zero. Later \texttt{base\_rate} becomes 100, as it should, and the wrong value stays in \texttt{limit}. It can get worse: a change in a build script far from either file can flip it.
+
+The fix turns the global into a function:
+
+\texttt{long\& base\_rate() \{ static long v = compute\_base(); return v; \}}
+
+The first caller triggers the initialisation, whichever file it is in, and the test prints 1000 for both link orders.
+
+\texttt{constinit} is the other tool, new in C++20. It requires that a variable be initialised at compile time, and the standard makes the program ill-formed if it has dynamic initialisation. \texttt{constinit long limit = base\_rate * 10;} fails to compile, which is what you want: it turns a silent ordering bet into an error. It does not fix anything by itself. It tells you which variables to rewrite.
+
+The most robust design has no such globals. Read the configuration once in \texttt{main}, build the objects in order, and pass them where they are needed. That makes the order a line of code that you can read.
+
+\iqwrong{``Put \texttt{limits.o} after \texttt{rates.o} and leave a comment.'' It works on this toolchain, and the standard promises nothing. A static library or a new linker can change it.}
+
+\iqfollow{Is the function-local version safe with threads?}{Yes, the initialisation is thread-safe since C++11. There is one remaining catch: destruction order at exit, if another global's destructor uses it after it has gone. Here it is a \texttt{long}, so this does not arise.}
+
+\iqwhy{Limits and configuration held in globals are real, and a zero limit found in production is a very bad day.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:34}
+\texttt{by\_virtual} and \texttt{by\_variant} contain an indirect call or jump. \texttt{by\_final} and \texttt{by\_template} inline to two lines (plus an \texttt{endbr64} on Ubuntu's default flags), and \texttt{by\_switch} is compares and branches, with no indirect call. The surprise is \texttt{by\_variant}: many people assume \texttt{std::visit} avoids an indirect call.
+
+\texttt{by\_virtual} loads the virtual table and ends in \texttt{jmp *}: the compiler cannot know the type. \texttt{by\_final} takes a \texttt{Momentum}, which is \texttt{final}, so there is no override to look for, and it inlines. \texttt{by\_template} knows the type at compile time, and the test finds identical code to \texttt{by\_final}.
+
+On libstdc++ 11, \texttt{std::visit} builds a table of function pointers indexed by the alternative, then uses \texttt{call *(\%rdx,\%rax,8)}. The test reads this out of the assembly. So in this version it is a virtual call in other clothes, plus a check for the valueless state. \texttt{by\_switch} tests the index with \texttt{std::get\_if}, and everything inlines into two compares and two branches, with a cold path that throws. A later library may compile \texttt{std::visit} differently, so read your own compiler's output, as this test does, before believing either claim.
+
+For speed, the instruction itself is rarely the main cost. The larger loss is that the compiler cannot inline through an indirect call or optimise across it. Measure it in place.
+
+Other things usually decide the design:
+
+Who can add a type? If strategies arrive from other teams and plugins, the set is open, and virtual is the right tool. Adding a type then touches no existing code. If the set is closed and known, a variant lets the compiler check that every operation handles every type.
+
+Where does it live? A variant is as big as its largest alternative, stored in place with no allocation. That suits a vector of messages. Virtual objects mostly need the heap, and pointer chasing costs more than the call.
+
+Templates give the best code when the type is fixed at build time. But they spread through headers, slow the build and cannot be chosen by a configuration file at run time.
+
+\iqwrong{``Variants are always faster than virtual calls.'' As this compiler shows, it is not even a different kind of call.}
+
+\iqwhy{Low-latency interviews ask this to see whether you reach for the assembly, and whether you can argue the design beyond the nanoseconds.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:35}
+It prints 40. It should print 70, since the resend is the same fill. Make \texttt{on\_fill} idempotent by remembering the highest sequence number applied per session, and skip anything at or below it. A gap must stop the keeper.
+
+The fault is that \texttt{on\_fill} treats every message as a new event. On any connection that resends after a reconnect, delivery is at least once, not exactly once, so the receiver must make repeats harmless. \Cref{lst:iv3:rd:replayfixed} has the shape.
+
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/python/rd_replay_fixed.py}{1}{12}{A keeper that ignores repeats and stops on gaps.\protect\hfil\protect\break}\label{lst:iv3:rd:replayfixed}
+
+Three decisions matter here. First, the sequence is per session, so the state is a map, and the test confirms that two sessions do not interfere. Second, a gap raises an error. Silently applying fill 4 after fill 2 hides a missing fill, and the position is then wrong in a way nobody notices. A trading system should stop quoting and ask for the missing range. Third, the check and the update go together, so the state moves only when a fill is applied.
+
+A high-water mark needs the fills to arrive in order on each session, and it stores one number. If order is not guaranteed, or sequence numbers restart, key on a unique execution id instead and remember the ids you have seen. That set grows, so it needs trimming, say at the end of the session. Whichever you use, the mark has to survive a restart along with the position. Save both together, in one atomic write, or rebuild both from the log. If you save the position without the mark, the first resend after a restart counts twice again.
+
+For the tests, take a random fill sequence and deliver it with random resends of the last few messages between new ones. The final position must equal the plain sum of the fills, whatever the resend pattern. The test runs that 200 times. Add a test for a gap, and a test that restarts in the middle.
+
+\iqwrong{``Reconcile with the exchange at the end of the day.'' You should, but a position that is wrong for hours can breach a limit in the meantime, in either direction.}
+
+\iqwhy{Reconnects happen daily, and a double-counted fill means you trade on a wrong position. This is one of the most common real faults in a position keeper.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:36}
+It sends one order. It should send five, since the ticks are 2 seconds apart in market time. The strategy reads the machine's clock. Inject the clock and the gateway, so the strategy never finds out which world it is in.
+
+\texttt{time.time()} is hidden input. During a replay, all five ticks arrive within microseconds of wall-clock time, so the 1-second throttle blocks the other four. Live, the same code sends all five. A backtest of this would be wrong in a way that is hard to see, because it runs fine and gives numbers. It would also change with the speed of the machine.
+
+\Cref{lst:iv3:rd:strategyfixed} has the same logic, except that it asks \texttt{self.clock.now()}, and it sends through whatever gateway it is given. In a backtest, the replay loop sets the simulated clock to each event's timestamp before delivering the event. Live, the clock wraps the system clock and the gateway sends real orders. The test replays the same ticks and gets all five orders, twice, identically.
+
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/python/rd_strategy_fixed.py}{1}{22}{The clock and the gateway are given to it.\protect\hfil\protect\break}\label{lst:iv3:rd:strategyfixed}
+
+Note the fixed version's start value too: \texttt{self.last} is minus infinity. In the original it was 0.0, which works only because \texttt{time.time()} is a large number. A simulated clock starting at 0 would have blocked the first order, and that bug appears only with the new design.
+
+Other hidden inputs break repetition: random numbers without a saved seed; iteration over a Python \texttt{set}, whose order for strings changes between runs; threads, whose interleaving changes the order of events; reading the current date, or a file that changes, or a price from a live service. Order of events with equal timestamps needs a stable rule too.
+
+The test of the whole design is simple: run the same input twice and compare every output, byte for byte. Make that a standing test. In C++, the injection can be a template parameter, so the live path pays nothing for it.
+
+\iqwrong{``Sleep in the replay so that time passes correctly.'' Then a year of data takes a year, and it is still not deterministic.}
+
+\iqwhy{``The same code in research and production'' is a goal at nearly every firm. Time is where it usually fails first.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:37}
+Generate random adds and cancels, keep a plain model of the live orders beside the book, check invariants after every step, and shrink a failure by deleting operations. It comes down to two operations: add order 5 at price 100, then cancel order 5. The bug: \texttt{cancel} leaves a level at quantity 0, so \texttt{best} returns a price nobody is quoting.
+
+\Cref{lst:iv3:rd:propcheck} is all of it, in plain Python with \texttt{random}. It uses no library. Each run draws 30 operations over a small range of ids and prices, because small ranges make collisions likely, and collisions are where bugs live. The model is a dict of live orders. It is simple enough to be obviously right, and that is the point. After each step, two facts must hold: the best price equals the highest price among live orders, and the sum over the levels equals the sum over the live orders.
+
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/python/rd_prop_check.py}{3}{41}{A random test and a simple shrinker.\protect\hfil\protect\break}\label{lst:iv3:rd:propcheck}
+
+Shrinking is simple too: try removing each operation in turn, and keep the removal if the failure survives. That turned 30 operations into the 2 quoted above, which you can read in one glance. Fixing it means deleting the level when it reaches zero. After that, 1000 runs find nothing. The seed is fixed, so a failure can always be replayed.
+
+The generator skips adds of a live id, so it says nothing about that case, and \texttt{Book} mishandles it: \texttt{add(1, 100, 5)}, \texttt{add(1, 101, 5)} leaves 5 lots stranded at 100. Either reject a duplicate id, or let the test generate one and specify the result.
+
+Why did the unit tests miss it? \texttt{test\_cancel\_lower} cancels the lower of two prices, and only the best is checked, so an empty lower level does not show. Its author tested what they had thought of. A random test has no such preference.
+
+The hard part is choosing the invariants, not generating the inputs. Good ones: compare with a slow model, check that a round trip restores the state, and check conservation of quantity. A library such as Hypothesis\index{Hypothesis} does the generation and shrinking better for you, and a firm that already has it should use it. In an interview, showing that you can write the 30-line version counts for more.
+
+\iqwrong{``Add a test for cancelling the best.'' That catches this bug, and it is good to keep as a regression test. It does nothing for the next one you did not think of.}
+
+\iqwhy{Order books have many states and few simple inputs, which is the ideal case for random testing. A candidate who proposes it unprompted stands out.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:38}
+Add the field as optional with a default, and upgrade every reader first, then the writers. Retire the old field in the reverse order: stop all readers from needing it, stop the writers from sending it, and then mark its number as never to be reused. Keep decoders for old recordings for as long as you keep the recordings.
+
+Order matters because you cannot flip everything at once, so at each step every reader must handle every message then on the bus. Rollout for adding:
+\begin{itemize}
+\item Change the schema, and give the new field a default that means ``not known''.
+\item Deploy all six readers. They accept old and new messages, and use the default when the field is absent.
+\item Deploy the writers, which start filling the field.
+\item Only then write logic that relies on the field being there.
+\end{itemize}
+For removal, run it backwards: readers stop using the field, then writers stop sending it, then the schema marks it retired.
+
+The format must let an old reader skip what it does not know, and a new reader find out what is absent. A tagged format gives you this directly. The Protobuf documentation states that old binaries simply ignore a new field when parsing, and that removing a field is safe as long as its number is not used again. That is the rule that matters: reusing a number makes decoding ambiguous, and its best-practice guide says to reserve deleted numbers and never to add a required field.
+
+Formats with a fixed layout, common on latency-sensitive paths, need more care. A field can only be added at the end of a block, because anywhere else it moves the offset of every later field. The message header then needs a version, or a length so that readers can skip what they do not understand. The field's meaning and units are part of the contract too. Changing cents to ticks under the same field is the worst case, since every decoder keeps working and every number is wrong. Add a new field for that instead.
+
+Tests to add. Keep a set of recorded messages from each past version in the repository, and decode them in every build. Have the build compare the schema with the previous one, and fail on an incompatible change. During the rollout, run old and new decoders side by side on live traffic and compare their outputs.
+
+Recorded data changes the time horizon. A replay in five years must still read today's messages. So schemas are never deleted, the version travels with the data, and a change that seems safe for live traffic can still break research.
+
+\iqwrong{``Bump a version and deploy everything over the weekend.'' Recorded data still has the old version, a rollback brings it back, and six teams are rarely ready at the same moment.}
+
+\iqwhy{Firms live with their formats for years. Knowing the order of the rollout separates people who have done this from people who have only read about it.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:39}
+There are four bugs: a dangling pointer after a second order at a level, an erase inside a range-for, the wrong end of the book for bids, and a cancel that leaves its level behind. ASan catches only the first. The second is a memory bug that it misses, and the last two are logic that no memory tool can see.
+
+\textbf{Dangling pointer.} \texttt{index\_} stores \texttt{\&level.back()}, a pointer into a \texttt{std::vector}, and the next \texttt{push\_back} at that level may reallocate. Sequence: \texttt{add(100, 1, 5)}, \texttt{add(100, 2, 5)}, \texttt{cancel(1)}. ASan reports \texttt{heap-use-after-free} in \texttt{cancel}.
+
+\textbf{Erase inside the loop.} \texttt{take} erases the level from \texttt{levels\_} inside the range-for that walks \texttt{levels\_}, so the loop's iterator is invalid when it steps. Sequence: \texttt{add(100, 1, 5)}, \texttt{add(101, 2, 5)}, \texttt{take(7)}. Here ASan says nothing: the step is in \texttt{\_Rb\_tree\_increment}, compiled inside the uninstrumented \texttt{libstdc++.so}, and the freed node still holds good pointers. It prints the right fill. \texttt{-D\_GLIBCXX\_DEBUG} stops it, with a message about a singular iterator. So one tool is never enough.
+
+\textbf{Wrong side.} The map orders prices upward, so \texttt{begin()} is the lowest. For asks that is the best. For bids it is the worst. Sequence on a bid side: \texttt{add(100, 1, 5)}, \texttt{add(101, 2, 5)}, \texttt{take(3)}. It fills at 100 and not at the bid of 101. No tool finds this: only a test with an expected answer does. The comment on the class is the clue.
+
+\textbf{Stale level.} \texttt{cancel} sets the quantity to zero and leaves the entry. After \texttt{add(100, 1, 5)}, \texttt{cancel(1)}, \texttt{best()} returns 100 with nothing there. A \texttt{take} erases each spent level it visits, so empty entries pile up only deeper in the book, where no \texttt{take} reaches, and there they use memory for good.
+
+\Cref{lst:iv3:rd:bookfixed} fixes all four. A \texttt{std::list} per level keeps iterators stable. Each index entry stores its price and iterator, so a cancel is $O(1)$ plus the level lookup. The side is a template parameter, so a bid side uses \texttt{std::greater}. \texttt{take} advances with the iterator that \texttt{erase} returns. The test checks it under ASan on 30 random scripts for each side, against a slow Python model.
+
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/cpp/book_fixed.hpp}{9}{48}{The corrected side.\protect\hfil\protect\break}\label{lst:iv3:rd:bookfixed}
+
+On design, I would say four more things. A \texttt{long} for both price and quantity allows them to be swapped, so use types. There is no check on duplicate ids or non-positive quantities. A list allocates on every order, so a hot path would use a pool or an intrusive list. And a real book needs an interface for a fill's details, not only how much was filled.
+
+\iqwrong{``It passes under ASan, so the memory handling is right.'' The second bug passes under ASan on every input you try. Each tool sees only what it instruments.}
+
+\iqwhy{This is the take-home review in its purest form. Interviewers count bugs, but they also watch whether you can show each one with a short sequence.}
+\end{solution}
+
+\begin{solution}{iq:iv3:reading-debugging-and-software-design:40}
+Most serious first: a hidden global that mixes files, one bad row killing the whole run, a crash on zero quantity, floats for money, and a file never closed. The mutable default looks bad, but it is harmless here. Accept a pure function over parsed trades, plus a thin file wrapper.
+
+\textbf{Global state.} \texttt{totals} survives between calls. Load day 1 (10 at 100 and 30 at 102, VWAP 101.5), then day 2 (10 at 200), and \texttt{vwap(\textquotedbl{}AAA\textquotedbl{})} gives 121.2, mixing the two days. No error appears. This is the worst fault, because the number looks plausible. It also means the function cannot be tested without clearing a global first.
+
+\textbf{No handling of bad rows.} One row with \texttt{price} equal to \texttt{oops} raises \texttt{ValueError}, and the file is lost at that row. So a single bad print loses a day. Worse, the earlier rows are already in \texttt{totals}, so a caller who catches the error sees partial totals. Decide on a policy: count and report the bad rows.
+
+\textbf{Zero quantity.} Rows of \texttt{+10} and \texttt{-10}, as in a correction, give \texttt{ZeroDivisionError} in \texttt{vwap}.
+
+\textbf{Floats.} \texttt{sum([0.1] * 10)} is not 1.0, so small errors build up over millions of rows, and then \texttt{round} adds half-to-even behaviour in the report. Prices arrive as exact text, so keep them exact, as \texttt{Fraction}, \texttt{Decimal} or integer ticks.
+
+\textbf{The file is never closed.} \texttt{open} has no \texttt{with}. CPython closes the file when the object is collected, and raises a \texttt{ResourceWarning}, as the test confirms. Nothing in the language promises when that happens. The file handle is a resource, so say when it ends.
+
+\textbf{Mutable default.} \texttt{symbols=[]} is never changed, so it does no harm here, and saying so shows you read it rather than matched a pattern. Still, ask for \texttt{None} or a tuple. \texttt{in} on a list is also linear, so a set would be better. The way it is written, an empty list means ``everything'', which is a surprising rule to leave undocumented.
+
+\textbf{Structure.} \texttt{load} opens, parses, filters and accumulates, and \texttt{report} prints. Nothing can be used alone.
+
+\Cref{lst:iv3:rd:reviewfixed} separates these: \texttt{parse} turns rows into trades and collects errors, \texttt{vwaps} is a pure function, and \texttt{report} only handles the file. The tests cover both days giving their own answers, bad rows counted with their row numbers, whether a word for a price, a short row or a price of \texttt{1/0}, \texttt{None} for zero quantity, ten trades at 0.1 averaging exactly 0.1, and, on random trades, that shuffling the input and calling a second time change nothing.
+
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/09-reading-debugging-and-software-design/python/rd_review_fixed.py}{1}{33}{The version to accept.\protect\hfil\protect\break}\label{lst:iv3:rd:reviewfixed}
+
+The fixed version keeps one running pair per symbol, so memory stays small. It does not check for duplicate trades, and in an interview I would ask what the file guarantees before adding that. A NUL byte still stops the \texttt{csv} reader itself on Python 3.10: treat that as a corrupt file, not a bad row.
+
+\iqwrong{``Leading with the mutable default.'' It is the first thing a pattern-matcher sees and the least harmful thing here. Order your review by what can cost money.}
+
+\iqwhy{Reviewing is a large part of the job, and a take-home review tests judgement: what you put first, and whether you can show each problem with an input.}
+\end{solution}

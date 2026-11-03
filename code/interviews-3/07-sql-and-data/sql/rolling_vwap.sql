@@ -1,0 +1,4 @@
+SELECT ts, SUM(price * qty) OVER w / SUM(qty) OVER w AS vwap
+FROM trades
+WINDOW w AS (ORDER BY ts RANGE BETWEEN 299 PRECEDING AND CURRENT ROW)
+ORDER BY ts, price;
