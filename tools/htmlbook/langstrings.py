@@ -52,6 +52,7 @@ AR_CREF_PLURALS = {
 
 QUANT_NAMES = {
     "interviewq": ("Interview question", "Interview questions"),
+    "question": ("Question", "Questions"),
     "listing": ("Listing", "Listings"),
     "table": ("Table", "Tables"),
     "dated": ("Box", "Boxes"),
@@ -153,13 +154,24 @@ class LangStrings:
         self.aside_names = {
             kind: _typo(cmds[f"omname{macro}"])
             for kind, macro in (("recall", "Recall"),
+                                ("inthefield", "InTheField"),
                                 ("inthelab", "InTheLab"),
                                 ("history", "History"),
                                 ("safety", "Safety"))
             if f"omname{macro}" in cmds}
         self.iq_lookfor = "What the interviewer is looking for:"
+        self.iv_answer = "Answer"
+        self.iv_answer_of = "Answer to"
+        self.iv_stop = ("Stop. Write your answer before you read below this "
+                        "line.")
         self.sources_head = "Sources and further reading"
         self.as_of = "As of"
+        # Earth books: the dated box title and the year's unit symbol, from
+        # the lang file (only those define them; French prints "an")
+        self.dated_name = _typo(cmds.get("omnameDated", ""))
+        self.vertical_exaggeration = _typo(cmds.get("omnameVE", ""))
+        if "omunitYear" in cmds:
+            self.si_phrases["year"] = cmds["omunitYear"]
         # Back-reference (\cref) names: same as the headings except in
         # Arabic, where cleveref prints the definite forms. The list
         # separators mirror cleveref's conjunctions: Arabic و is a bound
