@@ -1,0 +1,324 @@
+\chapter{Données crypto et infrastructure}\label{ch:m3:crypto-data-and-infrastructure}
+
+Un historique acheté d'un carnet d'ordres crypto montre, un après-midi calme, le meilleur cours acheteur au-dessus du meilleur cours vendeur
+pendant deux secondes. Rien ne s'était passé sur le marché. Une mise à jour du flux websocket de la plateforme a été perdue
+en chemin vers l'enregistreur, qui a appliqué malgré tout les suivantes, et chaque système en aval, un backtest,
+un notebook de recherche, un modèle entraîné sur ces données, a traité le carnet croisé comme réel. Les données crypto semblent faciles
+à obtenir~: les plateformes publient leurs carnets gratuitement, les chaînes sont publiques. Il est difficile de bien les exploiter. Ce
+chapitre traite des deux sources de données d'une société de trading crypto, les chaînes et les plateformes~: faire tourner des nœuds et
+lire ce qu'émettent les contrats, reconstruire les carnets des plateformes à partir d'instantanés et de deltas, et les vérifier,
+comprendre ce que mesure chaque horodatage, et savoir où se trouvent physiquement les moteurs d'appariement.
+
+\section{Faire tourner des nœuds}
+
+\begin{definition}[Nœud complet, nœud d'archive, endpoint RPC]\label{def:m3:crypto-data-and-infrastructure:node}
+Un \emph{nœud complet}\index{nœud complet} est un programme qui télécharge et vérifie chaque bloc d'une chaîne et conserve son état courant,
+l'historique récent nécessaire pour le servir. Un \emph{nœud d'archive}\index{nœud d'archive} est un nœud complet qui conserve aussi
+chaque état historique, afin de pouvoir répondre à des questions sur n'importe quel bloc passé. Un \emph{endpoint RPC}\index{endpoint RPC} désigne
+l'interface par laquelle un programme interroge un nœud et lui soumet des transactions.
+\end{definition}
+
+Une société de trading lit la chaîne à travers des nœuds~: les siens ou ceux d'un fournisseur. Ses propres nœuds coûtent du matériel et de l'exploitation mais lui donnent
+les données de la chaîne dès que son nœud les voit, sans \omterm{def:m3:centralised-exchanges:ratelimit}{limite de débit} ni dépendance envers un tiers~; les endpoints d'un fournisseur sont
+pratiques, partagés avec tout le monde, bridés, et un intermédiaire de plus entre la société et la chaîne. Pour les travaux sensibles à la latence
+décrits au \cref{ch:m3:maximal-extractable-value}, la société fait tourner ses propres nœuds, à proximité des autres nœuds dont elle doit recevoir les données en premier.
+
+\begin{dated}{2026-09}{Nœuds Ethereum}\label{dat:m3:crypto-data-and-infrastructure:nodes}
+La documentation développeur d'Ethereum indique que les \omterm{def:m3:crypto-data-and-infrastructure:node}{nœuds complets} vérifient chaque bloc mais ne conservent que l'état relativement récent (typiquement les
+128 derniers blocs), en régénérant les données plus anciennes à la demande~; que les \omterm{def:m3:crypto-data-and-infrastructure:node}{nœuds d'archive} ne suppriment jamais les données téléchargées et représentent des téraoctets de
+stockage~; et qu'un seul client, Erigon, peut réaliser une synchronisation d'archive complète en utilisant environ 2~To de disque en moins de trois jours. Elle recense cinq
+clients d'exécution (Geth, Nethermind, Besu, Erigon, Reth) écrits dans quatre langages.
+\end{dated}
+
+\section{Données on-chain~: journaux et indexeurs}
+
+\begin{definition}[Journal d'événements, indexeur]\label{def:m3:crypto-data-and-infrastructure:log}
+Un \emph{journal d'événements}\index{journal d'événements} est un enregistrement qu'un \omterm{def:m3:blockchains-for-traders:contract}{smart contract} émet au cours d'une transaction (un swap, un transfert, une liquidation),
+stocké dans le reçu de la transaction, avec des champs indexés que l'on peut consulter. Un \emph{indexeur}\index{indexeur} est un système qui lit
+chaque bloc issu d'un nœud, décode les journaux et les changements d'état des contrats qui l'intéressent, et les stocke dans une base de données qui peut
+être interrogée par date, par adresse ou par type d'événement.
+\end{definition}
+
+La chaîne est une base de données à l'interface peu commode~: elle répond à « qu'en est-il de l'état actuel » et à « que s'est-il passé dans le bloc $n$ », mais pas à
+« tous les swaps de ce pool le mois dernier ». L'\omterm{def:m3:crypto-data-and-infrastructure:log}{indexeur} de la société transforme l'un en l'autre. Ses pièges sont ceux de n'importe quel pipeline de données avec
+une particularité~: des blocs peuvent être écartés par une réorganisation décrite au \cref{ch:m3:blockchains-for-traders}, de sorte que les données récentes doivent porter leur hash de bloc et être révisées
+lorsqu'une réorganisation survient~; les mises à niveau des contrats changent le sens des journaux~; et les décimales d'un \omterm{def:m3:blockchains-for-traders:key}{jeton}, non son journal, indiquent
+ce que vaut un montant brut.
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,
+  s/.style={draw,thick,rounded corners=2pt,align=center,minimum height=0.9cm,text width=2.3cm},
+  arr/.style={-{Stealth[length=2.2mm]},thick}]
+\node[s,draw=omDef,fill=omDef!8] (ch) at (0,1.1) {chaîne\\(nœuds propres)};
+\node[s,draw=omThm,fill=omThm!8] (ix) at (3.2,1.1) {indexeur~:\\journaux, état};
+\node[s,draw=omDef,fill=omDef!8] (vx) at (0,-1.1) {plateformes\\websockets};
+\node[s,draw=omThm,fill=omThm!8] (bb) at (3.2,-1.1) {constructeur de carnet~:\\identifiants, sommes de contrôle};
+\node[s,draw=omProp,fill=omProp!8] (st) at (6.6,0) {entrepôt\\normalisé, deux\\horodatages};
+\node[s,draw=omExo,fill=omExo!8] (us) at (9.8,0) {stratégies,\\recherche, risque};
+\draw[arr] (ch) -- (ix); \draw[arr] (vx) -- (bb); \draw[arr] (ix) -- (st); \draw[arr] (bb) -- (st); \draw[arr] (st) -- (us);
+\end{tikzpicture}
+
+\omcaption{Les deux pipelines de données d'une société de trading crypto~: les blocs issus de ses propres nœuds passant par un \omterm{def:m3:crypto-data-and-infrastructure:log}{indexeur}, et les flux des plateformes passant par un constructeur de carnet
+qui contrôle la séquence et les sommes de contrôle, les deux alimentant un même entrepôt normalisé qui conserve l'horodatage de la source et l'heure de réception.
+Schéma de principe.}\label{fig:m3:crypto-data-and-infrastructure:pipes}
+\end{omfigure}
+
+\section{Données de marché des plateformes~: instantanés, deltas et sommes de contrôle}
+
+\begin{definition}[Flux instantané plus deltas, somme de contrôle du carnet]\label{def:m3:crypto-data-and-infrastructure:feed}
+Un \emph{flux instantané plus deltas}\index{flux instantané plus deltas} publie le carnet market-by-price d'une plateforme (livre~1, chapitre~28)
+sous la forme d'un instantané de tous les niveaux, accompagné d'un identifiant de mise à jour, suivi d'un flux de modifications des niveaux individuels numérotées avec les mêmes
+identifiants. Une \emph{somme de contrôle du carnet}\index{somme de contrôle du carnet} est une valeur que la plateforme calcule sur les meilleurs niveaux de son carnet après chaque modification
+et publie avec elle, afin qu'un client puisse vérifier que sa copie est identique.
+\end{definition}
+
+\begin{dated}{2026-09}{Reconstruire un carnet~: la procédure d'une plateforme}\label{dat:m3:crypto-data-and-infrastructure:binance}
+La documentation de Binance pour un carnet d'ordres local demande au client de mettre en mémoire tampon le flux de profondeur, de récupérer un instantané, d'écarter les événements mis en tampon
+dont le dernier identifiant de mise à jour $u$ est au plus égal au \texttt{lastUpdateId} de l'instantané, puis, pour chaque événement~: l'ignorer si $u$ est inférieur à l'identifiant du carnet~;
+si son premier identifiant de mise à jour $U$ dépasse l'identifiant du carnet plus un, écarter le carnet et repartir de zéro, puisque des événements ont été manqués~; sinon, fixer chaque niveau à
+sa nouvelle quantité, en le retirant si la quantité est nulle, et fixer l'identifiant du carnet à $u$. Une seule connexion websocket est valable 24 heures, et le
+serveur envoie un ping toutes les 20 secondes.
+\end{dated}
+
+\begin{dated}{2026-09}{Une somme de contrôle de carnet}\label{dat:m3:crypto-data-and-infrastructure:kraken}
+La documentation de Kraken pour son carnet websocket version 2 calcule la somme de contrôle sur les 10 premiers niveaux de prix, quelle que soit la profondeur souscrite~: pour les cours vendeurs
+du plus bas au plus haut, puis les cours acheteurs du plus haut au plus bas, chaque prix et chaque quantité sont écrits sans leur point décimal ni leurs zéros de tête, les chaînes de caractères sont
+concaténées, et le CRC32 du résultat, traité comme un entier non signé sur 32~bits, est comparé au champ de somme de contrôle du message. La vérification est facultative.
+OKX a fait le choix inverse~: le 23 juin 2026, elle a déprécié la somme de contrôle de ses canaux de carnet d'ordres, encore envoyée mais fixée à zéro, et a demandé aux clients de vérifier
+la continuité avec les identifiants de séquence des messages à la place.
+\end{dated}
+
+\begin{omfigure}
+\centering
+\begin{tikzpicture}[font=\small,
+  s/.style={draw,thick,rounded corners=2pt,align=center,minimum height=0.9cm,text width=2.4cm},
+  arr/.style={-{Stealth[length=2.2mm]},thick}]
+\node[s,draw=omDef,fill=omDef!8] (a) at (0,0) {1.\ souscrire,\\mettre les deltas en tampon};
+\node[s,draw=omThm,fill=omThm!8] (b) at (3.1,0) {2.\ récupérer l'instantané\\(id $n$)};
+\node[s,draw=omProp,fill=omProp!8] (c) at (6.2,0) {3.\ écarter les deltas tamponnés\\avec $u \le n$};
+\node[s,draw=omExo,fill=omExo!8] (d) at (9.3,0) {4.\ appliquer dans l'ordre~;\\l'id devient $u$};
+\node[s,draw=gray,fill=gray!8] (e) at (9.3,-2.0) {trou~: prochain $U > \text{id} + 1$};
+\draw[arr] (a) -- (b); \draw[arr] (b) -- (c); \draw[arr] (c) -- (d); \draw[arr] (d) -- (e);
+\draw[arr,dashed] (e.west) -| node[below,pos=0.25,font=\footnotesize,align=center] {écarter le carnet, marquer comme périmé,\\resynchroniser} (b.south);
+\end{tikzpicture}
+
+\omcaption{Reconstruction d'un carnet à partir d'un \omterm{def:m3:crypto-data-and-infrastructure:feed}{flux instantané plus deltas}, selon la procédure présentée dans l'\cref{dat:m3:crypto-data-and-infrastructure:binance}~: mise en tampon, instantané,
+écarter ce que contient déjà l'instantané, appliquer dans l'ordre, et revenir à l'instantané en cas de trou. Le carnet est marqué comme périmé depuis le trou jusqu'à ce que le nouvel instantané
+soit appliqué. Schéma de principe.}\label{fig:m3:crypto-data-and-infrastructure:sync}
+\end{omfigure}
+
+Les identifiants de mise à jour détectent les pertes sur une plateforme qui les publie~; les sommes de contrôle détectent ce que les identifiants ne peuvent pas détecter, comme une erreur du client dans l'application
+d'une modification, et constituent la seule protection sur un flux qui n'a pas d'identifiants.
+
+\begin{proposition}[Ce que coûte un message perdu]\label{prop:m3:crypto-data-and-infrastructure:loss}
+Soit un carnet de $K$ niveaux actifs qui évolue par des mises à jour en quantité absolue, chacune touchant un niveau choisi uniformément, et soit chaque message perdu avec
+probabilité $p$, indépendamment. Un client qui applique ce qu'il reçoit sans vérification se trompe après une perte jusqu'à la prochaine mise à jour du niveau perdu~:
+un nombre géométrique de messages, de moyenne environ $K$, de sorte qu'il est silencieusement faux une fraction d'environ $pK$ du temps pour $p$ petit. Un client qui détecte
+le trou et qui a besoin de $R$ messages pour se resynchroniser n'est jamais silencieusement faux et est sciemment périmé une fraction d'environ $pR$ du temps.
+\end{proposition}
+
+\begin{proof}
+Chaque message ultérieur met à jour le niveau perdu avec probabilité $1/K$, donc l'attente suit une loi géométrique de moyenne $K$. Les pertes arrivent au taux $p$ par message et, pour
+$p$ petit, se chevauchent rarement, de sorte que les fractions sont le taux multiplié par les durées.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xmode=log,ymode=log,
+  xlabel={taux de perte de messages, \%},ylabel={part du temps, \%},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0.008,xmax=1.25,ymin=0.08,ymax=50,grid=major,grid style={gray!25},
+  xtick={0.01,0.1,1},xticklabels={0.01,0.1,1},ytick={0.1,1,10},yticklabels={0.1,1,10},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.5pt] table[x=p,y=silent]{figdata/markets-3/26-crypto-data-and-infrastructure/loss.csv};\addlegendentry{silencieusement faux (sans contrôles)}
+\addplot[omDef,very thick,dashed,mark=square*,mark size=1.5pt] table[x=p,y=stale]{figdata/markets-3/26-crypto-data-and-infrastructure/loss.csv};\addlegendentry{périmé connu (détection de trou, resynchronisation)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Un carnet construit localement, de 20 niveaux actifs, face à la perte de messages (\cref{prop:m3:crypto-data-and-infrastructure:loss}). Sans contrôles, il est faux
+à son insu environ $20p$ du temps~; avec la détection de trou, il n'est jamais silencieusement faux, mais passe environ $50p$ du temps à se resynchroniser lorsqu'un instantané
+met 50 messages à arriver. Flux simulé de 100\,000 messages. Données~: le tutoriel du chapitre.}\label{fig:m3:crypto-data-and-infrastructure:loss}
+\end{omfigure}
+
+Le client prudent est périmé plus souvent que le client négligent n'est faux, et c'est là l'essentiel~: un carnet périmé qui sait qu'il l'est peut retirer ses cotations
+et marquer ses données comme manquantes~; un carnet faux négocie et enregistre des faussetés. Les historiques achetés doivent être vérifiés de la même façon~: un jeu de données
+de mises à jour incrémentales du carnet ne vaut que ce que vaut le traitement des trous par son enregistreur, et un carnet croisé ou verrouillé dans les données en est le premier signe.
+
+\section{Horodatages et ce qu'ils signifient}
+
+Chaque enregistrement de données de crypto-actifs devrait porter deux heures~: celle de la plateforme (horodatage de la bourse) et celle de la société (horodatage de réception), comme dans le livre~1, chapitre~28.
+
+\begin{dated}{2026-09}{Horodatages dans les données d'un fournisseur}\label{dat:m3:crypto-data-and-infrastructure:tardis}
+Les jeux de données téléchargeables de Tardis.dev donnent à chaque enregistrement un \texttt{timestamp}, fourni par la bourse en microsecondes depuis l'époque (avec l'heure locale comme
+solution de repli lorsque la bourse n'en fournit aucun), et un \texttt{local\_timestamp}, l'heure d'arrivée du message~; ses données de carnet incrémentales sont collectées à partir des
+flux websocket temps réel des bourses, et les fichiers peuvent commencer par des mises à jour qui précèdent le premier instantané, lesquelles doivent être écartées.
+\end{dated}
+
+L'horodatage de la bourse indique quand la plateforme dit que l'événement s'est produit, à la résolution de son horloge, et parfois à l'instant où le message a été envoyé plutôt qu'à celui où le
+carnet a changé. L'horodatage de réception indique quand la société en a eu connaissance, y compris le trajet dans le réseau. Leur différence est la latence du flux, qui varie avec la
+localisation de la société et la charge de la plateforme, et qui augmente précisément lorsque le marché est le plus actif. La recherche doit utiliser l'horodatage de réception pour décider de ce qu'une stratégie pouvait
+savoir, et l'horodatage de la bourse pour aligner les plateformes~; un backtest qui utilise les horodatages de la bourse pour ses décisions suppose que la société se trouvait à l'intérieur du moteur d'appariement. Sur
+les chaînes, il existe un troisième temps, celui du bloc, et un quatrième, celui où le nœud de la société a vu la transaction dans le \omterm{def:m3:blockchains-for-traders:mempool}{mempool}.
+
+\section{Où se trouvent les moteurs d'appariement}
+
+\begin{definition}[Région cloud]\label{def:m3:crypto-data-and-infrastructure:region}
+Une \emph{région cloud}\index{région cloud} est une zone géographique dans laquelle un fournisseur de cloud exploite un ensemble de centres de données, à l'intérieur de laquelle la latence du réseau entre
+machines est faible.
+\end{definition}
+
+Contrairement aux bourses du livre~1, certaines plateformes de crypto-actifs font tourner leurs systèmes dans des clouds publics plutôt que dans leurs propres centres de données (la
+documentation d'une plateforme mentionne un endpoint d'API portant le nom d'un fournisseur de cloud, voir l'\cref{dat:m3:getting-access-crypto-venues:endpoints}), et une société qui veut être proche d'une telle
+plateforme loue des machines dans la même région et, lorsque le fournisseur le permet, dans la même zone de disponibilité. La latence vers une plateforme devient une question de savoir dans quelle
+région elle tourne, information parfois publiée et parfois déduite en mesurant les temps d'aller-retour depuis chaque région~; et une société qui négocie sur plusieurs plateformes
+situées dans des régions différentes fait face à la même géographie que les sociétés multi-plateformes des marchés actions et des marchés à terme, avec des distances entre régions au lieu de distances entre
+bâtiments.
+
+\begin{dated}{2026-09}{La région d'une plateforme}\label{dat:m3:crypto-data-and-infrastructure:region}
+Les travaux de recherche de Glassnode, rapportés par CoinDesk le 30 mars 2026, ont montré que les 24 \omterm{def:m3:blockchains-for-traders:pow}{validateurs} de Hyperliquid étaient regroupés dans la région de Tokyo d'Amazon Web Services, sur
+plusieurs zones de disponibilité, de sorte que les ordres émis depuis Tokyo leur parvenaient en 2 à 3 millisecondes et ceux émis depuis l'Europe en plus de 200.
+\end{dated}
+
+\section{Tutoriel~: reconstruire un carnet et perdre un message}\label{tut:m3:crypto-data-and-infrastructure:book}
+
+\begin{tutorial}
+\textbf{Objectif.} Reconstruire un carnet d'ordres à partir d'un instantané et d'un flux de deltas numérotés par identifiant de mise à jour, détecter les trous et se resynchroniser, vérifier le carnet par une
+somme de contrôle CRC32, et mesurer ce que coûte la perte de messages. \textbf{État final~:} \cref{fig:m3:crypto-data-and-infrastructure:loss} et les chiffres du problème du week-end.
+\begin{tutsteps}
+\item \textbf{La règle de mise à jour.} Ignorer les anciens événements, détecter les trous, appliquer les quantités absolues.
+\omcode{code/firm/wsbook/cpp/firm_wsbook.hpp}{37}{48}{La règle de mise à jour en C++20~: ignorer, détecter un trou ou appliquer.}\label{lst:m3:crypto-data-and-infrastructure:apply}
+\item \textbf{La somme de contrôle.} Dix meilleurs cours vendeurs, puis dix meilleurs cours acheteurs, sous forme de chaînes d'entiers~; CRC32.
+\omcode{code/firm/wsbook/rust/src/lib.rs}{65}{74}{La somme de contrôle en Rust sur le haut du carnet.}\label{lst:m3:crypto-data-and-infrastructure:checksum}
+\item \textbf{Exécuter} \texttt{simulate(p)} pour des taux de perte de 0.01~\% à 1~\% et \texttt{fig\_data.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une politique de somme de contrôle (détecter une divergence au message suivant, puis resynchroniser) et la comparer à la détection de trous~; faire arriver les pertes
+par rafales plutôt que de façon indépendante~; rejouer un fichier d'un fournisseur et compter les carnets croisés.
+\end{tutorial}
+
+\section{Construction~: le constructeur de carnet websocket}\label{bld:m3:crypto-data-and-infrastructure:wsbook}
+
+\begin{build}
+\bfield{Rôle} Chaque prix que la petite société utilise sur une plateforme de crypto-actifs provient d'un carnet qu'elle a construit elle-même à partir du flux de la plateforme~; le constructeur ne doit jamais présenter
+un carnet faux comme juste, et doit signaler quand il est périmé. Il alimente le scanner d'arbitrage du \cref{ch:m3:spot-markets}.
+\bfield{Interface} \texttt{Book} avec \texttt{snapshot(update\_id, bids, asks)}, \texttt{apply(first, last, bids, asks)} renvoyant ignored, applied ou gap,
+\texttt{top(n)} et \texttt{checksum()}~; \texttt{crc32}. En-tête C++20 \texttt{firm\_wsbook.hpp}, crate Rust \texttt{firm\_wsbook}, référence en Python.
+\bfield{Règles} Ticks et lots entiers~; un trou laisse le carnet désynchronisé jusqu'à un instantané~; la somme de contrôle calculée exactement comme le fait la plateforme~; chaque mise à jour conserve les deux
+horodatages.
+\bfield{Tests d'acceptation} \texttt{code/firm/wsbook/tests/}, \texttt{cpp/firm\_wsbook\_test.cpp} et les tests du crate Rust~: ignorer, appliquer et détecter les
+trous~; rester désynchronisé~; la somme de contrôle comparée au CRC32 de zlib et à la valeur de contrôle standard.
+\bfield{Pour aller plus loin} Adaptateurs de plateformes (chaînes décimales, limites de profondeur des instantanés)~; resynchronisation tamponnée sans perte d'événements~; test de perte par rafales~; une
+publication sans verrou du carnet aux stratégies.
+\end{build}
+
+\begin{omsources}
+\item Documentation pour développeurs d'Ethereum.org, «~Nodes and clients~» (dépôt ethereum/ethereum-org-website). Consulté en septembre 2026.
+\item Binance, documentation des flux WebSocket spot (dépôt binance/binance-spot-api-docs)~; Kraken, guide de la somme de contrôle du carnet WebSocket v2. Consulté en septembre 2026.
+\item Tardis.dev, fichiers CSV téléchargeables~: types de données. Consulté en septembre 2026.
+\item OKX, journal des modifications de l'API v5, entrée du 23 juin 2026~; CoinDesk, «~Hyperliquid traders in Tokyo get 200-millisecond edge, Glassnode research shows~», 30 mars 2026.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:1}
+Que fait le client des événements $(U, u) = (95, 99)$, $(101, 103)$ puis $(105, 106)$, pour un carnet dont l'identifiant est 100~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:2}
+Quand une société a-t-elle besoin d'un \omterm{def:m3:crypto-data-and-infrastructure:node}{nœud d'archive} plutôt que d'un \omterm{def:m3:crypto-data-and-infrastructure:node}{nœud complet}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m3:crypto-data-and-infrastructure:3}
+Écrire la chaîne de la somme de contrôle pour les cours vendeurs (1001, 4), (1002, 6) et les cours acheteurs (999, 5), (998, 7).
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:4}
+Un flux perd un message sur 1\,000 et le carnet compte 20 niveaux actifs. Pour quelle part du temps un carnet non vérifié est-il faux~? Quelle est la durée typique d'une erreur~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:5}
+Pourquoi la recherche doit-elle utiliser les horodatages de réception pour déterminer ce qu'une stratégie savait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m3:crypto-data-and-infrastructure:6}
+Que doit faire un \omterm{def:m3:crypto-data-and-infrastructure:log}{indexeur} lorsque la chaîne se réorganise sur deux blocs~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:crypto-data-and-infrastructure:7}
+\emph{Programmation.} Avec \texttt{simulate}, trouver le temps de resynchronisation pour lequel le client prudent est désynchronisé aussi souvent que le client négligent est dans l'erreur, à un taux de perte de
+0.1~\%.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m3:crypto-data-and-infrastructure:8}
+\emph{Repérer le défaut.} «~Notre fournisseur de données enregistre le flux de chaque bourse, donc ses carnets d'ordres sont corrects.~»
+\end{exercise}
+
+\section{Problème~: le delta manquant}
+
+\begin{problem}[{Problème du week-end --- à quel point un carnet ayant perdu un message est-il faux~?}]\label{pb:m3:crypto-data-and-infrastructure:1}
+Une société construit ses carnets à partir du flux d'une plateforme comportant 20 niveaux actifs près du meilleur cours. Elle perd un message sur 1\,000. Une resynchronisation à partir d'un instantané prend environ 50
+messages.
+
+\medskip\noindent\textbf{Partie I --- Le client négligent.}
+\begin{enumerate}
+\item Pour quelle part des messages son carnet est-il faux~?
+\item Combien de temps dure en moyenne une erreur, en nombre de messages~?
+\item Pourquoi cette durée est-elle proche du nombre de niveaux~?
+\item Que peut un carnet faux faire à une stratégie de cotation~?
+\item Pourquoi une suppression perdue pourrait-elle être pire qu'une perte de changement de quantité~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le client prudent.}
+\begin{enumerate}[resume]
+\item Pour quelle part des messages son carnet est-il signalé comme désynchronisé~?
+\item Pourquoi cette part est-elle supérieure à la part d'erreur du client négligent~?
+\item Que fait la stratégie pendant que le carnet est désynchronisé~?
+\item Comment la mise en tampon des événements pendant la resynchronisation raccourcirait-elle la durée de désynchronisation~?
+\item Qu'apporteraient les sommes de contrôle sur une plateforme qui publie des identifiants de mise à jour~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les données pour la recherche.}
+\begin{enumerate}[resume]
+\item Comment détecteriez-vous les messages perdus dans un jeu de données acheté~?
+\item Que signale un carnet croisé dans les données~?
+\item Quel horodatage un backtest doit-il utiliser pour les décisions~?
+\item Comment alignez-vous dans le temps les carnets de deux plateformes~?
+\item Que doit enregistrer le jeu de données au sujet des resynchronisations~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Un carnet désynchronisé vaut-il mieux qu'un carnet faux~?
+\item Quand le nœud d'un fournisseur suffit-il, et quand une société doit-elle en faire tourner un propre~?
+\item Qu'est-ce qui rend les données crypto plus difficiles que les données actions, et qu'est-ce qui les rend plus faciles~?
+\item Énoncer le \emph{résultat nommé}~: la part du temps où le carnet est faux sans contrôle et désynchronisé avec resynchronisation, ainsi que la durée moyenne d'une erreur.
+\item En une phrase~: qu'est-ce qu'un carnet d'ordres local~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:m3:crypto-data-and-infrastructure:1}
+Décrivez comment maintenir un carnet d'ordres local à partir d'un instantané et d'un flux de deltas.
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur}]\label{iq:m3:crypto-data-and-infrastructure:2}
+Quelle est la différence entre un horodatage de la bourse et un horodatage de réception, et quand utilisez-vous chacun~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:m3:crypto-data-and-infrastructure:3}
+Comment concevriez-vous un \omterm{def:m3:crypto-data-and-infrastructure:log}{indexeur} pour chaque swap sur une \omterm{def:m3:automated-market-makers:amm}{plateforme décentralisée}, robuste aux réorganisations de la chaîne~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:m3:crypto-data-and-infrastructure:4}
+Votre \omterm{def:m3:crypto-data-and-infrastructure:feed}{somme de contrôle du carnet} échoue une fois par heure sur une plateforme. Comment découvririez-vous pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:m3:crypto-data-and-infrastructure:5}
+Comment mesureriez-vous la latence du flux d'une plateforme qui tourne dans un cloud public~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:m3:crypto-data-and-infrastructure:6}
+Concevez la couche de données de marché pour une société qui négocie sur dix plateformes crypto et trois chaînes.
+\end{interviewq}

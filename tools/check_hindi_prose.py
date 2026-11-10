@@ -1,0 +1,1265 @@
+#!/usr/bin/env python3
+"""Hindi-specific hygiene gate for a translated tree.
+
+check_translation.sh proves *structure*: same files, same labels, same
+environment census. Its two prose gates are Latin-oriented and score nothing
+on Devanagari -- gate 6 looks for TeX accent escapes (\\'e), which Hindi never
+writes, and the drafty-"..." gate is script-agnostic. So a Hindi tree can be
+structurally perfect and still be raw machine translation.
+
+These are the failure classes the 2026-07-24 Hindi machine translation left
+behind, each of which this script detects:
+
+  1. residual English in visible text  -- \\text{ thousands}, TikZ nodes
+     reading {tens} {units}, English chapter titles, English \\index keys.
+     137 of 177 math bodies and 29 of 35 physics bodies carried these.
+  2. transliterated English function words -- "द" for *the*, "ए" for *a*,
+     "ऑफ", "एंड". A Hindi sentence never needs an article.
+  3. Latin full stop where Hindi ends a sentence with a danda (।). The MT
+     output mixed both, sometimes inside one paragraph.
+  4. MT-injected spaces inside inline math -- "$P $ और $ Q $", which changes
+     spacing in the output and is never what the English source wrote.
+  5. a thin space splitting a number away from its noun -- the MT produced
+     \\chapter{10 तक की संख्या\\,000} from "Numbers up to 10\\,000".
+
+Usage:
+    python3 tools/check_hindi_prose.py parts/grade-3/hi parts/grade-3/solutions/hi
+    python3 tools/check_hindi_prose.py --quiet <dir> ...
+
+Exit status is 1 if anything was flagged. Called by check_translation.sh for
+lang == hi; safe to run by hand on a single directory while translating.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+
+DEVANAGARI = r"\u0900-\u097F"
+DEV_CHAR = re.compile(f"[{DEVANAGARI}]")
+
+# ---------------------------------------------------------------------------
+# What is allowed to stay in Latin script inside visible Hindi text.
+# ---------------------------------------------------------------------------
+# Brand, markup names the prose legitimately mentions, and SI/unit symbols
+# that Hindi textbooks print in Latin. Proper nouns are deliberately NOT
+# whitelisted: a Hindi edition transliterates them (Fourier -> फूरिये).
+ALLOWED_WORDS = {
+    "one", "course", "com", "www", "http", "https",
+    "tex", "latex", "pdf", "html",
+    "si", "iso", "atp", "dna", "rna", "led", "usb", "gps", "ph",
+    # Latin binomials. Scientific nomenclature is international: a Devanagari
+    # or Arabic biology text writes "Homo sapiens" in Latin script exactly as
+    # every other edition does, so these are correct visible Latin, not
+    # residual English. Listed word by word (the gate tokenises), and only the
+    # ones the canon actually uses -- grep the English bodies again if a later
+    # book adds species.
+    "homo", "sapiens", "habilis", "erectus", "australopithecus", "afarensis",
+    "escherichia", "coli", "staphylococcus", "aureus", "aequorea", "victoria",
+}
+
+# --- appended 2026-09-05 by the Biology Book 2 `hi` agent -------------------
+# REASON: the block above says outright to grep the English bodies again when a
+# later book adds species, and Book 2 (grades 10-12) adds these. Every one is a
+# genus or species epithet the canon prints in italic Latin, which a Devanagari
+# edition keeps in Latin exactly as the Latin-script editions do -- they are
+# international nomenclature, not residual English. `sry` is the mouse gene
+# symbol \emph{Sry}: gene symbols are Latin in every edition too, and the
+# lowercase-with-capital form falls through the <= 4-letter acronym escape.
+ALLOWED_WORDS |= {
+    "heidelbergensis", "paranthropus", "africanus",
+    "euglena", "chlorella", "archaeopteryx", "sry",
+    # RNA species abbreviations, the same three letters in every edition and
+    # exactly the kind of token "dna"/"rna"/"atp" are already whitelisted for.
+    # Their mixed case (mRNA) defeats both the <= 4-letter acronym escape and
+    # CHEM_FORMULA.
+    "mrna", "trna", "rrna",
+}
+
+# 2026-09-05, biology Book 2 `hi`: the title of a CC BY work must be reproduced
+# as published for the licence's attribution to be valid, so the image credit
+# in parts/grade-12 keeps the Latin title *Anatomy & Physiology* (OpenStax).
+# These two words are only ever the title of that book in this edition.
+ALLOWED_WORDS |= {"anatomy", "physiology"}
+
+# --- appended 2026-09-06 by the Biology Book 3 `hi` agent ---------------------
+# REASON: the block above says outright to grep the English bodies again when a
+# later book adds species, and Book 3 (university year 1) adds these. Every one
+# is a genus or species epithet the canon prints in italic Latin, which a
+# Devanagari edition keeps in Latin exactly as the Latin-script editions do:
+# international nomenclature, not residual English. Enumerated from the canon,
+# word by word (the gate tokenises), and only the ones it actually uses:
+#   Escherichia coli, Paramecium aurelia, Paris japonica, Quercus robur,
+#   Felis catus, Canis lupus (abbreviated F.~catus / C.~lupus), Dryas,
+#   Mytilus, Pisaster, Rhizobium, Trypanosoma, Lynx (as a genus in ch. 25).
+ALLOWED_WORDS |= {
+    "aurelia", "japonica", "robur", "catus", "lupus",
+    "paramecium", "paris", "quercus", "felis", "canis", "dryas",
+    "mytilus", "pisaster", "rhizobium", "trypanosoma",
+    "caudatum", "bursaria",
+    # ch. 29 prints the type binomial of our own species, \emph{Homo sapiens},
+    # in the same italic Latin as every other binomial in the book.
+    "homo", "sapiens",
+    # `lac` and `trp` are OPERON/GENE symbols, printed lowercase italic Latin in
+    # every edition of every language -- the same case `sry` was whitelisted for
+    # by the Book 2 agent. Their three lowercase letters defeat the <= 4-letter
+    # UPPERCASE acronym escape. 12 sites in ch. 20 and its solutions.
+    "lac", "trp", "laci", "lacz", "lacy", "laca",
+    # `RuBisCO` and `cyt` are international abbreviations printed the same
+    # way in every edition: the enzyme ribulose-bisphosphate
+    # carboxylase/oxygenase, and the standard short form of cytochrome
+    # (cyt $b_6f$, cyt $c$). Wave 1 of this run ruled explicitly that `cyt`
+    # is not an English residue. Their mixed case defeats both the
+    # uppercase-acronym escape and CHEM_FORMULA.
+    "rubisco", "cyt",
+    # `Alu` is the name of the human repeat element (after the AluI site),
+    # a Latin-script symbol in every edition; mixed case, three letters.
+    "alu",
+    # `X-gal` is the trade name of the chromogenic galactoside used as the
+    # lacZ reporter; the same string in every edition.
+    "x-gal",
+    # Two Latin quotations the canon prints as such: Virchow's dictum
+    # `omnis cellula e cellula` (ch. 5) and the title of Hooke's
+    # *Micrographia* (ch. 5). A title and a quotation are reproduced, not
+    # translated, in every edition.
+    "omnis", "cellula", "micrographia",
+}
+
+
+# --- appended 2026-09-16 by the Biology Book 4 `hi` agent ---------------------
+# REASON: the first ALLOWED_WORDS block says outright to grep the English bodies
+# again when a later book adds species, and Book 4 (university year 2) adds the
+# list below. DATA ONLY -- no rule, no reduction helper and no regex is touched,
+# so tools/check_indonesian_prose.py, which imports the LaTeX reduction from
+# this file, is bit-for-bit unaffected (verified on both of its controls).
+#
+# (a) Genus, species and strain names the canon prints in italic Latin. A
+#     Devanagari biology text keeps international nomenclature in Latin exactly
+#     as the Latin-script editions do. Enumerated from parts/bachelor-2, word by
+#     word (the gate tokenises), and only the ones the canon actually uses.
+ALLOWED_WORDS |= {
+    "acetabularia", "aegilops", "tauschii", "urartu", "amoeba", "proteus",
+    "anabaena", "arabidopsis", "archaeopteryx", "azotobacter", "bacillus",
+    "beggiatoa", "chlamydomonas", "clostridium", "daphnia", "desulfovibrio",
+    "drosophila", "melanogaster", "eudorina", "frankia", "fucus", "gonium",
+    "kalanchoe", "neurospora", "nitrobacter", "nitrosomonas", "ophioglossum",
+    "reticulatum", "pandorina", "paracoccus", "phytophthora", "infestans",
+    "plasmodium", "pleodorina", "posidonia", "pseudomonas", "sordaria",
+    "thiobacillus", "thiomargarita", "namibiensis", "tiktaalik", "trichoderma",
+    "vibrio", "fischeri", "volvox", "carteri",
+}
+# (b) Gene, allele and protein SYMBOLS. Printed in Latin script in every
+#     edition of every language, exactly the case `sry`, `lac` and `trp` were
+#     whitelisted for by the Book 2 and Book 3 `hi` agents. Their mixed case
+#     (MyoD, Shh, Hox) or their length (WUSCHEL, CLAVATA) defeats both the
+#     <= 4-letter uppercase acronym escape and CHEM_FORMULA.
+#     `flowering` and `locus` are here ONLY because the two florigen genes are
+#     named FLOWERING LOCUS T / FLOWERING LOCUS C in full; they are the one
+#     concession in this block that costs coverage, and chapter 14 and its
+#     solutions were re-read by eye for those two words as ordinary English.
+ALLOWED_WORDS |= {
+    "myod", "myf", "myogenin", "shh", "hox", "hoxa", "hoxd", "tbx", "wnt",
+    "sox", "pax", "wus", "wuschel", "clavata", "flowering", "locus", "flc",
+    "hfr", "hcg", "gal", "thr", "sonic", "hedgehog", "cdna", "clv", "myf", "pin", "pfr",
+    # seen whole once LATIN_WORD learned Latin-1 (it used to split into fragments)
+    "krüppel",
+}
+
+# (c) Chemistry nomenclature, 2026-10-04 (One Chemistry Book). IUPAC
+#     stereodescriptors and locant prefixes (cis/trans, syn/anti, meso,
+#     ortho/meta/para, tert, endo/exo), the systematic-name affixes a
+#     nomenclature lesson quotes as such ("the suffix -ene"), and the
+#     analytical acronyms longer than the 4-letter uppercase escape. All are
+#     printed in Latin script in Devanagari and Arabic chemistry texts alike.
+#     Proper names (Dean--Stark, Haber--Bosch) are NOT here: transliterate them.
+ALLOWED_WORDS |= {
+    "cis", "trans", "syn", "anti", "meso", "ortho", "meta", "para", "tert",
+    "endo", "exo", "ene", "yne", "ane", "oic", "iupac", "vsepr", "lcao",
+    "lumo", "hplc", "tlc", "nmr", "pka", "pkb", "pke", "pks",
+}
+
+# (d) Licence identifiers, 2026-10-04 (One Chemistry Book 1, `hi` agent).
+#     A photograph credit prints its Creative Commons licence code as is
+#     ("CC BY-SA 3.0"): a licence name is a legal identifier, the same in every
+#     script, and the 4-letter uppercase escape above passes "BY" but not the
+#     5-character "BY-SA". Not prose; never translated.
+ALLOWED_WORDS |= {"by-sa", "by-nc-sa"}
+
+# Unit and symbol strings that may appear bare in a table cell or node.
+ALLOWED_UNITS = {
+    "m", "s", "kg", "g", "mg", "km", "cm", "mm", "nm", "um",
+    "dm", "dam", "hm",
+    "n", "j", "w", "hz", "pa", "mol", "cd", "k", "a", "v", "c", "t",
+    "wb", "f", "ev", "min", "h", "l", "ml", "rad", "sr", "bq", "gy", "sv",
+    "kwh", "kj", "mj", "gpa", "mpa", "kpa", "khz", "mhz", "ghz",
+}
+# (c) Unit symbols Book 4 prints bare, outside \qty{}/\unit{}, exactly as the
+#     English canon does (a TikZ node "net $+10$ mmHg", a parenthesis
+#     "($95 - 5$ mmHg, ...)"). mmHg is a unit SYMBOL, not English: it stays
+#     Latin in Devanagari as it does in every other script, so the fix belongs
+#     here and not in the prose. DATA ONLY, and ALLOWED_UNITS is not among the
+#     four names tools/check_indonesian_prose.py imports.
+ALLOWED_UNITS |= {"mmhg", "torr", "atm",
+                  "mmol", "nmol", "pmol", "umol", "kmol",
+                  "ppm", "ppb"}
+# (d) Two second-messenger SYMBOLS whose lower-case first letter defeats both
+#     the <= 4-letter uppercase acronym escape and CHEM_FORMULA. They are
+#     printed cAMP / cGMP in every language. "camp" is an ordinary English
+#     word, so this entry does cost coverage: parts/bachelor-2 was grepped
+#     for camp/camps/camped as English and has none.
+ALLOWED_WORDS |= {"camp", "cgmp"}
+
+
+# ---------------------------------------------------------------------------
+# Biology Book 5 (`hi`, 2026-09-17). DATA ONLY -- appended, nothing above is
+# touched, and `check_indonesian_prose.py` imports only the LaTeX reduction
+# (LATIN_WORD, _locate, strip_comments, visible_text), never ALLOWED_WORDS, so
+# this block cannot move the Indonesian gate.
+#
+# Year-3 biology names every molecule it discusses by its INTERNATIONAL symbol,
+# and a Devanagari textbook prints those in Latin exactly as every other
+# edition does -- transliterating Cdk1 or Su(var) would destroy the reference.
+# Four families, each read off the flagged list one by one against the English
+# twin:
+#   * gene and protein symbols, including the italic Drosophila and C. elegans
+#     gene names the canon sets in \emph{} (bicoid, hunchback, even-skipped,
+#     fushi tarazu, knirps, engrailed, wingless, doublesex, transformer,
+#     Sex-lethal, Distal-less, Ultrabithorax, yellow, giant, hairy, let, lin,
+#     unc, ced, egl, dsx, tra, abi, msl, src, var, sulA, recA, uvrA/uvrB) --
+#     these READ as ordinary English words and are not;
+#   * enzyme, complex and pathway names (GTPase, ATPase, RNase, EcoRI, Taq,
+#     Cre-lox, loxP, CRISPR--Cas, JAK--STAT, Raf--MEK--ERK, cGAS--STING);
+#   * RNA and nucleic-acid classes (siRNA, piRNA, miRNA, lncRNA, shRNA, snRNA,
+#     ncRNA, dsRNA, dsDNA, ssDNA, pri-miRNA, pre-miRNA) and the sequence
+#     strings an answer quotes (A-CAT, A-ATS, b--C, D-Ala-D-Ala, Asn-X-Ser);
+#   * genus and species epithets of the binomials the canon uses -- the same
+#     policy as the first ALLOWED_WORDS block; these are Book 5's additions.
+# Plus osm/mosm, the international osmole symbol of U_osm, P_osm and mOsm/L,
+# which Hindi clinical writing keeps in Latin like any unit.
+#
+# GATE BUG, reported rather than worked around: font, right, log and sin are
+# NOT prose. They are TikZ/pgfplots OPTION keys and pgf math that
+# visible_text() lets through -- node[right, font=\tiny],
+# label={[font=\tiny]right:...} and at ({2.4*sin(40)},...). The reduction is
+# the part shared with the Indonesian gate, so it is not touched here; the four
+# tokens are parked in this data block instead, and the reduction should learn
+# to drop a node's option list the way it already drops a macro's.
+ALLOWED_WORDS |= {
+    "a--cdk", "a-ats", "a-cat", "abi", "acta", "aeruginosa", "agrobacterium",
+    "akt", "antennapedia", "anthracis", "apaf", "aplysia", "aquaticus", "arf",
+    "arp", "asn-x-ser", "aspergillus", "atpase", "aux", "b--c", "b--cdk",
+    "bacteroidetes", "bad", "bak", "bax", "bcl", "bcl-xl", "bcr--abl",
+    "bicoid", "bid", "bim", "bithorax", "botrytis", "buchnera",
+    "burkholderia", "c-myc", "caenorhabditis", "californica", "car-t", "cas",
+    "caudal", "cdc", "cdk", "cdkn", "ced", "cgas", "cgas--sting", "chip-seq",
+    "chk", "ciona", "clock--bmal", "clostridioides", "contagium", "cre",
+    "cre-er", "cre-lox", "crispr--cas", "cry", "d--cdk", "d-ala",
+    "d-ala-d-ala", "dgtp", "difficile", "distal-less", "dna-pkcs",
+    "doublesex", "dscam", "dsdna", "dsrna", "dsx", "e--cdk", "ecori", "egl",
+    "eif", "elegans", "engrailed", "eve", "even-skipped", "fas", "fasl",
+    "firmicutes", "flg", "flp", "fls", "fluidum", "font", "foxp", "fushi",
+    "giant", "groel", "groes", "gtpase", "haemophilus", "hairy",
+    "helicobacter", "hnrnp", "hoxb", "hoxc", "hsp", "hunchback", "hydra",
+    "igf", "influenzae", "inos", "jak--stat", "k--akt--mtor", "klebsiella",
+    "klf", "kni", "knirps", "let", "lexa", "lgr", "lin", "listeria", "lncrna",
+    "log", "loxp", "luxi", "luxr", "macroh", "mad", "mcl", "mirna",
+    "monocytogenes", "mosm", "msl", "mtor", "muth", "mutl", "muts", "myc",
+    "nag", "nanog", "nanos", "ncrna", "neisseria", "nocardia", "notch",
+    "noxa", "oct", "oskar", "osm", "paulinella", "peg", "per", "period",
+    "pfam", "philanthus", "pirna", "pitx", "piwi", "pol", "ppel", "pre-mirna",
+    "pri-mirna", "psc", "puma", "pylori", "pyogenes", "qpcr", "rab", "rac",
+    "raf", "raf--mek--erk", "ras", "ras--gtp", "ras--mapk", "reca", "rev",
+    "rho", "rhoa", "riftia", "rig-i", "right", "rnase", "rpos", "ruvc",
+    "salmonella", "sar", "sars-cov", "sclerotinia", "sec", "serratia",
+    "sex-lethal", "shrna", "sin", "sirna", "snrna", "src", "ssdna", "start",
+    "streptococcus", "subtilis", "sula", "sxl", "symbiodiniaceae", "t-dna",
+    "t-snare", "taq", "tarazu", "thaliana", "thermus", "tra", "transformer",
+    "tumefaciens", "ubx", "ultrabithorax", "unc", "uvra", "uvrb", "v-snare",
+    "var", "vivum", "wee", "wingless", "wolbachia", "xist", "yellow",
+}
+
+# ---------------------------------------------------------------------------
+# One Chemistry Book 2 (`hi`, 2026-10-04). DATA ONLY, appended.
+#
+# GATE BUG, reported rather than worked around: these xcolor names are NOT
+# prose. Book 2's crystal-cell figures (ch. 6) draw every ion as
+#   \node[aX={green!55!black}{6.5mm}] at (0,0,0) {};
+# and TIKZ_NODE's lazy [^{;]*? stops at the first "{", which is INSIDE the
+# node's option list, so the colour argument of the aX style is captured as
+# the node's label (166 hits on a file whose node labels are all empty).
+# The drawing code must stay byte-identical to English, so no translation can
+# satisfy the gate. The reduction is shared with the Indonesian gate, so it is
+# not touched here; the fix is for TIKZ_NODE to skip a balanced [...] option
+# list before looking for the label. Cost of this entry: an untranslated
+# colour word in Hindi visible text would pass -- the `hi` Book 2 agent greps
+# its own tree for these words outside node options instead.
+ALLOWED_WORDS |= {"green", "black", "gray", "orange", "violet", "blue"}
+# p-function NOTATION of Book 2's existence diagrams (ch. 11-12): pCl, pAg,
+# pBr are -log[Cl-], -log[Ag+], -log[Br-], written in Latin in every script
+# exactly as pH is; they are symbols, not English words (hi Book 2, 2026-10-04).
+ALLOWED_WORDS |= {"pcl", "pag", "pbr", "pnh"}   # pNH3 = -log[NH3], ch. 12
+# The generic couple Ox/Red (ch. 13-14): "Red" is the SYMBOL of the reductant,
+# printed in prose exactly as in the half-equation's \mathrm{Red}; it is not
+# the colour (hi Book 2, 2026-10-04). Cost: an untranslated colour "red"
+# would pass -- the hi Book 2 agent greps its tree for colour words instead.
+ALLOWED_WORDS |= {"red"}
+
+# Latin-1 letters included (2026-10-04): an ASCII-only class split "Léon Péan"
+# into "L" + "on" and "P" + "an", and check_indonesian_prose.py (which imports
+# this) then reported the lowercase halves as English words on a proper name
+# (Indonesian chemistry Book 1 agent).
+LATIN_WORD = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'\-]{1,}")
+
+# Short English that the >=3-letter rule below cannot see. A blanket lower
+# threshold is not an option: one- and two-letter Latin tokens are usually
+# legitimate symbols (x_{\text{m}}, R_{\text{s}}, the dioptre \text{D}), so
+# only a named list is safe. The Physics 2 agent found 19 of these hiding
+# under the threshold after the 100 visible ones were fixed.
+SHORT_ENGLISH = {
+    "so", "in", "of", "to", "is", "at", "by", "an", "or", "if", "no",
+    "we", "it", "as", "be", "do", "on", "up", "and", "the", "for",
+    "ie", "eg", "cf", "vs", "eq", "nc", "wrt", "resp",
+}
+# "th" is deliberately absent: it collides with the element symbol Th
+# (thorium) and with coin-outcome labels like TH. Matched lowercase-only for
+# the same reason -- capitalised short tokens are symbols, not words.
+
+# "i.e." / "e.g." never match LATIN_WORD: the dot splits them into single
+# letters, which are skipped as symbols.
+DOTTED_ABBREV = re.compile(r"\b(?:i\.e\.|e\.g\.|etc\.|cf\.|viz\.)")
+
+# ---------------------------------------------------------------------------
+# Macros whose arguments are technical and must not be read as prose.
+# ---------------------------------------------------------------------------
+# name -> number of braced arguments to drop wholesale.
+TECHNICAL_MACROS = {
+    "label": 1, "ref": 1, "cref": 1, "Cref": 1, "crefrange": 2,
+    "Crefrange": 2, "eqref": 1, "pageref": 1, "nameref": 1, "autoref": 1,
+    "input": 1, "include": 1, "includegraphics": 1, "usepackage": 1,
+    "documentclass": 1, "bibliography": 1, "bibliographystyle": 1,
+    "ominput": 2, "ominputsol": 2, "omsollink": 1,
+    "qty": 2, "unit": 1, "num": 1, "ang": 1, "SI": 2, "si": 1,
+    # 2026-09-06, biology Book 3 `hi`: the siunitx FAMILY, not just \qty.
+    # \qtylist{1;2;5;10;20}{mmol/L} left "mmol" in visible text and was
+    # reported as residual English -- a defect no translator can remove,
+    # because the unit argument is mathematics in every language. Invisible
+    # until now because the gate fires on the English canon anyway. The
+    # whole family takes fixed argument counts: qtyrange/SIrange 3,
+    # qtylist/numrange 2, numlist 1.
+    "qtyrange": 3, "qtylist": 2, "numlist": 1, "numrange": 2,
+    "SIrange": 3, "SIlist": 2, "unitlist": 1,
+    # Chemistry (2026-10-04): a formula, a drawing, a pictogram code and the
+    # code arguments of the chemistry macros are never prose in any language;
+    # without these every \\ce{NaOH(aq)} reported "aq" as residual English.
+    # \\arrow is deliberately NOT here: a scheme arrow's word label
+    # (\\arrow{->[slow]}) is visible text and must be translated.
+    "ce": 1, "chemfig": 1, "ghs": 1, "chemmove": 1, "omorbs": 1,
+    "setchemfig": 1, "polymerdelim": 2, "cip": 1, "tdplotsetmaincoords": 2,
+    "newcommand": 2, "renewcommand": 2, "providecommand": 2,
+    "color": 1, "textcolor": 1, "definecolor": 3, "pgfplotsset": 1,
+    "hypersetup": 1, "setlength": 2, "addtolength": 2, "url": 1,
+    # Earth series (2026-10-24): a weather icon name (\omwx{suncloud}), a
+    # lithology swatch's TikZ style (\omlith{limestone}) and the number of
+    # \omve{5} are code, identical in every edition; left in, every
+    # \omwx{rain} in a translated grade-1 page reported "rain" as English.
+    "omwx": 1, "omlith": 1, "omve": 1,
+    # pgfmath expressions printed through a node (grade-3/01:
+    # {\pgfmathparse{int(\x/10)}\pgfmathresult\,cm}) are code: "int"
+    # was reported as English (Earth Book 1 hi agent, 2026-10-25).
+    "pgfmathparse": 1, "pgfmathsetmacro": 2, "pgfmathtruncatemacro": 2,
+}
+
+# \omterm{def:label}{visible display} -- first arg technical, second is prose.
+# \href{url}{text} likewise.
+SPLIT_MACROS = {"omterm": (1, 1), "href": (1, 1), "hyperref": (1, 1),
+                # \\irpanel{file}{title}, \\nmrpanel{file}{title}{xmax}{ymax}
+                "irpanel": (1, 1), "nmrpanel": (1, 1)}
+
+# The mirror image: \texorpdfstring{<typeset>}{<PDF bookmark>} keeps its FIRST
+# argument and drops its second. The bookmark is a plain-text fallback that no
+# reader sees on the page, and it is deliberately ASCII -- PDF outlines cannot
+# carry math. Reading it as prose makes \texorpdfstring{$SO(3)$}{SO(3)} report
+# "SO" as residual English. Used in 11 chapters, in every language edition.
+KEEP_DROP_MACROS = {"texorpdfstring": (1, 1)}
+
+# Environments whose optional argument is a visible title (so it IS prose).
+TITLED_ENVS = {
+    "definition", "theorem", "proposition", "lemma", "corollary", "example",
+    "remark", "method", "notation", "exercise", "problem", "proof",
+    "omfigure", "figure", "table", "solution",
+}
+
+# Environments whose body is drawing code, not prose. Node text and axis
+# labels are pulled out of them separately.
+# MOdiagram (modiagram: \atom{left}{1s = {0;up}}) is drawing code and omchartable
+# (a character table) is mathematics; both first met in chemistry Books 3-4,
+# where the hi/ar/id gates fired on "left", "pair", "up" (2026-10-06).
+DRAWING_ENVS = {"tikzpicture", "axis", "semilogxaxis", "semilogyaxis",
+                "loglogaxis", "groupplot", "scope", "circuitikz", "MOdiagram"}
+
+MATH_ENVS = {"omchartable", "equation", "equation*", "align", "align*", "gather", "gather*",
+             "multline", "multline*", "eqnarray", "eqnarray*", "array",
+             "cases", "split", "aligned", "gathered", "pmatrix", "bmatrix",
+             "vmatrix", "matrix", "smallmatrix"}
+
+MATH_PLACEHOLDER = "\x00"
+SIUNITX_QUANTITIES = {"ang", "qty", "num", "SI", "qtyrange", "numrange",
+                      "qtylist", "numlist", "SIrange", "SIlist"}
+
+# A chemical formula's letters: two or more element symbols run together, each
+# a capital optionally followed by one lower-case letter (MgF, NaCl, GaAs, AsH).
+# Mixed case means the acronym rule above cannot catch them, and they are not
+# English in any script -- without this the Book 4 Hindi agent had to write
+# "Mg{}F" with an empty group to silence the gate, which is a source wart of
+# exactly the kind this project refuses elsewhere.
+CHEM_FORMULA = re.compile(r"(?:[A-Z][a-z]?){2,}")
+
+# --- appended 2026-09-05 by the Biology Book 2 `hi` agent -------------------
+# REASON: a biology book prints nucleotide strands and residue chains, and
+# both reach the `english` class as false positives that no translator can
+# remove, because they are data and are identical in every language edition.
+#
+#   \texttt{5'-ATGGCTTAC-3'}  ->  LATIN_WORD is greedy over "-", so the token
+#       tested is 'ATGGCTTAC-', which no longer fullmatches CHEM_FORMULA (the
+#       bare 'ATGGCTTAC' does). 8 sites in parts/grade-10/03-universal-dna.
+#   Met--Lys--Gly--Trp        ->  a chain of three-letter amino-acid codes; the
+#       hyphens defeat CHEM_FORMULA. 20+ sites in grade-11/04-gene-expression.
+#
+# Deliberately narrow, so nothing English can hide behind either rule:
+#   * the strand rule is UPPERCASE-only and needs 5+ letters, so the ordinary
+#     words spelled from A/C/G/T/U (cat, act, tag, tact, gut) stay gated, and
+#     the existing "uppercase and <= 4 chars" acronym escape already covers
+#     the three-letter codon spellings;
+#   * the residue rule needs at least TWO codes joined by hyphens and matches
+#     the exact Xxx casing, so a lone 'His' or 'Met' -- and lowercase 'his',
+#     'met', 'leu' -- are still reported. A chain that still contains an
+#     English word (Met--Pro--stop) is still reported, which is the point.
+AMINO_CODES = {"ala", "arg", "asn", "asp", "cys", "gln", "glu", "gly", "his",
+               "ile", "leu", "lys", "met", "phe", "pro", "ser", "thr", "trp",
+               "tyr", "val"}
+NUCLEOTIDE_STRAND = re.compile(r"[ACGTU]{5,}")
+AMINO_CHAIN = re.compile(r"[A-Z][a-z]{2}(?:-+[A-Z][a-z]{2})+")
+
+
+SINGLE_RESIDUE = re.compile(r"[A-Z][a-z]{2}")
+
+# A bond drawn between element symbols in running prose: H--O--H, C--C,
+# Ca--O, N--H. Deliberately narrow -- every part must be a bare element
+# symbol (a capital, optionally one lower-case letter), there must be at
+# least two parts and at most four, so no English hyphenated compound can
+# hide behind it. 2026-09-06, biology Book 3 `hi`.
+ELEMENT_CHAIN = re.compile(r"[A-Z][a-z]?(?:-{1,2}[A-Z][a-z]?){1,3}")
+
+
+def is_biochemical_token(word: str) -> bool:
+    """A printed nucleotide strand or amino-acid residue chain -- not prose."""
+    core = word.strip("-'")
+    if NUCLEOTIDE_STRAND.fullmatch(core):
+        return True
+    # A LONE three-letter residue code, in its exact Xxx casing. The genetic
+    # code table of parts/grade-11/04-gene-expression prints all twenty of
+    # them, one per cell (64 sites), and every Hindi biology textbook keeps
+    # them in Latin exactly as this one does. Cost of the escape: capitalised
+    # 'His', 'Met' and 'Pro' can no longer be reported on their own -- an
+    # acceptable blind spot, because an untranslated English sentence
+    # containing one of them carries several other words this class still
+    # catches, and the lowercase forms stay gated.
+    if SINGLE_RESIDUE.fullmatch(core) and core.lower() in AMINO_CODES:
+        return True
+    if not AMINO_CHAIN.fullmatch(core):
+        return False
+    return all(p.lower() in AMINO_CODES for p in re.split(r"-+", core) if p)
+
+
+# Environments taking a column specification ({c|ccc}) before their body.
+COLSPEC_ENVS = {"tabular", "tabular*", "tabularx", "array", "longtable"}
+
+# Text-bearing keys inside a drawing environment.
+TIKZ_TEXT_KEYS = re.compile(
+    r"\b(?:xlabel|ylabel|zlabel|title|legend\s+entries|label)\s*=\s*"
+    r"(\{[^{}]*\}|[^,\]\n]+)"
+)
+# A node's braced group is its visible label -- but "node" also occurs inside
+# pgfplots STYLE KEYS, as in "every node near coord/.append style={font=\small}",
+# where the following group is formatting, not text. Exclude a "node" preceded
+# by "every", or with a "/." key path before its group.
+# A node's [options] may hold braces of their own -- \node[aX={green!55!black}]
+# -- and the old `[^{;]*?` then stopped INSIDE the options and read the colour
+# as the node's label (reported by the Hindi and Indonesian chemistry Book 2
+# agents, 2026-10-04, who had to allow-list colour names). Skip a balanced
+# [...] group before looking for the label.
+TIKZ_NODE = re.compile(
+    r"(?<!every\s)\bnode\b(?![^{;]*/\.)"
+    r"(?:\[(?:[^\[\]{}]|\{[^{}]*\})*\]|[^{;\[])*?"
+    r"(\{(?:[^{}]|\{[^{}]*\})*\})"
+)
+
+# pgfplots' \legend{...} and \addlegendentry{...} MACROS. The key form, "legend entries={...}", is
+# matched by TIKZ_TEXT_KEYS above; the macro form has no "=" and was therefore
+# invisible to every prose gate in the project. Book 4 carries 18 of them and
+# the SHIPPED Hindi and Arabic Book 2 editions each ship six untranslated
+# English legends ("without friction, with friction", "undamped, damped", ...)
+# behind a green gate run. Two levels of nesting are allowed: a legend entry
+# may hold $\operatorname{Re}(...)$.
+TIKZ_LEGEND = re.compile(
+    r"\\(?:legend|addlegendentry)\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
+)
+
+
+def strip_comments(text: str) -> str:
+    out = []
+    for line in text.split("\n"):
+        i, esc = 0, False
+        cut = len(line)
+        while i < len(line):
+            ch = line[i]
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "%":
+                cut = i
+                break
+            i += 1
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
+def match_group(text: str, start: int, open_ch: str, close_ch: str):
+    """Return (inner, end_index) for a balanced group starting at text[start]."""
+    if start >= len(text) or text[start] != open_ch:
+        return None, start
+    depth, i, esc = 0, start, False
+    while i < len(text):
+        ch = text[i]
+        if esc:
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i], i + 1
+        i += 1
+    return None, start
+
+
+# Text-mode macros used INSIDE math. Their argument is prose a reader sees, so
+# it must be Hindi -- "$x \text{ metres}$" is as much residual English as a bare
+# sentence. Blanking math wholesale hid 19 of these across 7 files that every
+# other gate called finished. \operatorname and \mathrm are deliberately absent:
+# their arguments are operator names (sin, det, d) and stay Latin.
+MATH_TEXT_MACRO = re.compile(
+    r"\\(?:text|textrm|textbf|textit|textsf|textnormal|mbox|hbox)\s*\{")
+
+
+def extract_math_text(body: str) -> str:
+    """Pull \\text{...} arguments out of a math span so they get scanned."""
+    out = []
+    for m in MATH_TEXT_MACRO.finditer(body):
+        inner, _ = match_group(body, m.end() - 1, "{", "}")
+        if inner:
+            out.append(inner)
+    return " ".join(out)
+
+
+def blank_math(text: str, findings: list, path: str) -> str:
+    """Replace math spans with a placeholder, flagging MT spacing damage.
+
+    The argument of a text-mode macro inside the span is kept: it is prose.
+    """
+    out, i = [], 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in "[(":
+                closer = "\\]" if nxt == "[" else "\\)"
+                j = text.find(closer, i + 2)
+                j = n if j < 0 else j + 2
+                out.append(MATH_PLACEHOLDER)
+                out.append(" " + extract_math_text(text[i + 2:j]) + " " + MATH_PLACEHOLDER)
+                i = j
+                continue
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch == "$":
+            dollars = 2 if text.startswith("$$", i) else 1
+            delim = "$" * dollars
+            j = i + dollars
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text.startswith(delim, j):
+                    break
+                j += 1
+            body = text[i + dollars:j]
+            # A trailing space that terminates a control word ("$\star $") is
+            # ordinary TeX and appears in the English sources too; only a
+            # leading space, or a trailing one after an ordinary token, is the
+            # MT fingerprint we are after ("$P $ और $ Q $").
+            #
+            # A trailing RELATION or BINARY OPERATOR is the same kind of
+            # exemption, and it was missing. The canon's own idiom closes the
+            # math on the operator and lets the operand follow outside it as
+            # text or a macro -- "$\lambda_{\max}T = $ const",
+            # "$k_BT\ln n(h) + mgh = $ const", "$\Delta^{++} = $ uuu". Six
+            # such spans exist in the Book 5 ENGLISH source (four files), so
+            # the rule fired on prose no translator may touch: id_apply's math
+            # census requires the span byte-identical to English, and gate 7
+            # demanded it change. That is a hard conflict between two gates,
+            # not a defect -- found by the Hindi Book 5 agent, 2026-09-03,
+            # and confirmed by running this gate over the English canon
+            # (6 hits in 4 files, 0 after this change).
+            #
+            # It cannot mask the fingerprint it is looking for: MT spacing
+            # damage leaves the space after an ordinary TOKEN ("$P $"), never
+            # after a dangling relation, which no machine translator emits.
+            bad_lead = bool(body) and body[0] == " "
+            bad_trail = (bool(body) and body[-1] == " "
+                         and not re.search(r"\\[A-Za-z]+\s*$", body)
+                         and not re.search(r"[=+\-<>*/~]\s*$", body))
+            if dollars == 1 and (bad_lead or bad_trail):
+                findings.append(
+                    (path, line_of(text, i), "math-space",
+                     f"MT space inside inline math: ${body[:40]}$"))
+            out.append(MATH_PLACEHOLDER)
+            out.append(" " + extract_math_text(body) + " " + MATH_PLACEHOLDER)
+            i = min(j + dollars, n)
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+MAX_NESTING = 4
+
+
+def nested_text(fragment: str, depth: int) -> str:
+    """Reduce a fragment that is itself LaTeX.
+
+    A node label, an environment's optional title and an \\omterm display are
+    all markup, not plain strings: "{size (\\unit{m})}" must not report *unit*
+    as residual English, and a generated \\omterm inside a weekend-problem
+    title must not leak its label into the prose stream. Findings are
+    discarded here -- the caller's own scan of the reduced text reports them,
+    with the line numbers of the enclosing file.
+    """
+    if depth >= MAX_NESTING or not fragment or "\\" not in fragment:
+        return fragment
+    return visible_text(fragment, [], "<nested>", depth + 1)
+
+
+def _unwrap_braces(s: str) -> str:
+    """Strip ONE outer brace pair, and only when it is genuinely balanced.
+
+    `s.strip("{}")` is wrong and cost two editions a workaround in their
+    SOURCES: a node whose whole body is one macro, `node {\\qty{1}{atm}}`, is
+    captured as `\\qty{1}{atm}` and strip() eats the macro's own closing brace,
+    leaving `\\qty{1}{atm` -- so the unit leaked out of the macro and was
+    reported as residual English. Both the Hindi and the Arabic Book 3 agents
+    hit it on the same figure and patched the .tex rather than the tool.
+    """
+    s = s.strip()
+    while len(s) >= 2 and s[0] == "{" and s[-1] == "}":
+        depth = 0
+        for i, ch in enumerate(s):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    return s          # the leading brace closes early: keep all
+        s = s[1:-1].strip()
+    return s
+
+
+def extract_drawing_text(body: str, depth: int = 0) -> str:
+    """Pull the visible strings out of tikz/pgfplots/circuitikz drawing code."""
+    pieces = [m.group(1) for m in TIKZ_NODE.finditer(body)]
+    pieces += [m.group(1) for m in TIKZ_TEXT_KEYS.finditer(body)]
+    pieces += [m.group(1) for m in TIKZ_LEGEND.finditer(body)]
+    return " \n ".join(nested_text(_unwrap_braces(p), depth) for p in pieces)
+
+
+def visible_text(text: str, findings: list, path: str, depth: int = 0) -> str:
+    """Reduce a LaTeX body to the text a reader actually sees."""
+    text = blank_math(text, findings, path)
+    out, i, n = [], 0, len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if ch != "\\":
+            if ch in "{}":
+                out.append(" ")
+            else:
+                out.append(ch)
+            i += 1
+            continue
+
+        m = re.match(r"\\([A-Za-z@]+)\*?", text[i:])
+        if not m:
+            # A non-alphabetic control sequence. The SPACING ones -- \, \; \:
+            # \! \<space> \/ and \\ -- separate two words on the page, so
+            # deleting them WELDS the words together and the welded token is
+            # then reported as residual English: `\num{8800} kcal\,m$^{-2}$`
+            # in a tikz node became the single word "kcalm" and fired the
+            # `english` rule on a unit no translator may touch (Hindi Book 3,
+            # 2026-09-06). Emit a space for them; every other escape
+            # (\%, \&, \_, \$, \#) is a literal character and is dropped
+            # as before.
+            if i + 1 < n and text[i + 1] in ",;:! /\\":
+                out.append(" ")
+            i += 2 if i + 1 < n else 1
+            continue
+        name = m.group(1)
+        j = i + m.end()
+
+        if name == "begin":
+            env, j = match_group(text, skip_ws(text, j), "{", "}")
+            env = (env or "").strip()
+            if env in DRAWING_ENVS or env in MATH_ENVS:
+                end_tag = "\\end{" + env + "}"
+                k = text.find(end_tag, j)
+                k = n if k < 0 else k
+                if env in DRAWING_ENVS:
+                    out.append(" " + extract_drawing_text(text[j:k], depth) + " ")
+                else:
+                    out.append(MATH_PLACEHOLDER)
+                    out.append(" " + extract_math_text(text[j:k]) + " " + MATH_PLACEHOLDER)
+                i = min(k + len(end_tag), n)
+                continue
+            j = skip_ws(text, j)
+            if text[j:j + 1] == "[":
+                inner, j = match_group(text, j, "[", "]")
+                if env in TITLED_ENVS and inner:
+                    out.append(" " + nested_text(inner, depth) + " ")
+            # solution's {key} and tabular's {c|ccc} arguments are technical
+            j2 = skip_ws(text, j)
+            if (env == "solution" or env in COLSPEC_ENVS) and text[j2:j2 + 1] == "{":
+                _, j = match_group(text, j2, "{", "}")
+            i = j
+            continue
+
+        if name == "end":
+            _, j = match_group(text, skip_ws(text, j), "{", "}")
+            i = j
+            continue
+
+        if name in ("tikz", "tikzset"):
+            # \tikzset{name/.pic={...}} outside a tikzpicture (grade-7/05) is
+            # drawing code too: only node text inside it is visible (hi agent
+            # report, 2026-10-25; "ellipse (0.13 and 0.085)" fired "and").
+            # An inline \tikz[...]{...} or \tikz[...] ... ; is drawing code
+            # (a legend swatch inside a node: \tikz\fill[...] (0,0) circle
+            # (2.2pt);). Treat it like a tikzpicture body: only its node text
+            # is visible. Before, "circle" was reported as English (Earth
+            # Book 1 grade-6/01, hi agent, 2026-10-25).
+            j = skip_ws(text, j)
+            if text[j:j + 1] == "[":
+                _, j = match_group(text, j, "[", "]")
+                j = skip_ws(text, j)
+            if text[j:j + 1] == "{":
+                inner, j = match_group(text, j, "{", "}")
+                body_ = inner or ""
+            else:
+                k = text.find(";", j)
+                k = n if k < 0 else k
+                body_, j = text[j:k], min(k + 1, n)
+            out.append(" " + extract_drawing_text(body_, depth) + " ")
+            i = j
+            continue
+
+        if name in KEEP_DROP_MACROS:
+            keep, drop = KEEP_DROP_MACROS[name]
+            for _ in range(keep):
+                inner, j = match_group(text, skip_ws(text, j), "{", "}")
+                if inner:
+                    out.append(" " + nested_text(inner, depth) + " ")
+            for _ in range(drop):
+                _, j = match_group(text, skip_ws(text, j), "{", "}")
+            i = j
+            continue
+
+        if name in SPLIT_MACROS:
+            drop, keep = SPLIT_MACROS[name]
+            for _ in range(drop):
+                _, j = match_group(text, skip_ws(text, j), "{", "}")
+            for _ in range(keep):
+                inner, j = match_group(text, skip_ws(text, j), "{", "}")
+                if inner:
+                    out.append(" " + nested_text(inner, depth) + " ")
+            i = j
+            continue
+
+        if name in TECHNICAL_MACROS:
+            j = skip_ws(text, j)
+            if text[j:j + 1] == "[":
+                _, j = match_group(text, j, "[", "]")
+            for _ in range(TECHNICAL_MACROS[name]):
+                _, j = match_group(text, skip_ws(text, j), "{", "}")
+            if name in SIUNITX_QUANTITIES:
+                # A printed quantity is a number on the page: leave the math
+                # placeholder, so "\ang{30}~द" reads as a coordinate to the
+                # compass-letter rule below (hi agent, Earth Book 1, 2026-10-25).
+                out.append(" " + MATH_PLACEHOLDER + " ")
+            i = j
+            continue
+
+        if name == "index":
+            inner, j = match_group(text, skip_ws(text, j), "{", "}")
+            if inner:
+                # `key@display` is makeindex's SORT KEY followed by what is
+                # actually printed. The sort key is deliberately ASCII -- it is
+                # how a non-Latin or accent-initial entry is filed in the right
+                # place -- and no reader ever sees it, so reading it as visible
+                # text reports the canon's own `\index{pKa@p$K_a$}` as residual
+                # English. Keep the display half of every `!` level.
+                # 2026-09-06, biology Book 3 `hi`.
+                # makeindex ENCAP: "key|see{target}" prints the language's own
+                # "see" word (babel's \seename) and the target; "key|textbf"
+                # prints nothing extra. The encap name is never visible text, so
+                # an Arabic/Hindi \index{A|see{B}} was rejected for "see" and the
+                # Book 4 ar agent had to drop the see-reference. Keep the key and
+                # the target only. Coordinator, 2026-10-30 (lenient).
+                if "|" in inner:
+                    inner, encap = inner.split("|", 1)
+                    m_enc = re.match(r"(?:see|seealso)\{(.*)\}$", encap, re.S)
+                    if m_enc:
+                        inner = inner + " " + m_enc.group(1)
+                levels = [lvl.split("@", 1)[-1] for lvl in inner.split("!")]
+                out.append(" " + nested_text(" ".join(levels), depth) + " ")
+            i = j
+            continue
+
+        if name == "item":
+            j = skip_ws(text, j)
+            if text[j:j + 1] == "[":
+                _, j = match_group(text, j, "[", "]")
+            out.append(" ")
+            i = j
+            continue
+
+        # Any other macro: drop the control word and the bracket options it
+        # may carry (those are keys, not prose), keep braced groups as text.
+        j = skip_ws(text, j)
+        if text[j:j + 1] == "[":
+            _, j = match_group(text, j, "[", "]")
+        out.append(" ")
+        i = j
+
+    return "".join(out)
+
+
+def skip_ws(text: str, i: int) -> int:
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    return i
+
+
+# Transliterated English function words. Hindi has no articles, so "द"/"ए"
+# standing alone are always the MT leaving *the*/*a* behind.
+#
+# "इन" is deliberately NOT here: it is the ordinary Hindi oblique demonstrative
+# ("इन संख्याओं में" = among these numbers), not transliterated English *in*.
+# Listing it forced agents to write "उन" instead and shift the meaning.
+TRANSLITERATED_ARTICLES = {
+    "द": "the", "ए": "a/an", "ऑफ": "of", "एंड": "and", "इज": "is",
+    "आर": "are", "फॉर": "for", "विद": "with", "टू": "to",
+}
+
+
+def _locate(body: str, token: str, seen_before: dict) -> int:
+    """Line of `token` in the ORIGINAL file.
+
+    Findings are detected in the reduced stream, whose line numbers do not
+    survive the reduction: a multi-line math span collapses to one placeholder
+    character, so every later line number drifts. Map back by finding the
+    n-th occurrence of the token in the source, n being how many times this
+    token has already been reported for this file.
+    """
+    n = seen_before.get(token, 0)
+    seen_before[token] = n + 1
+    start = 0
+    for _ in range(n + 1):
+        idx = body.find(token, start)
+        if idx < 0:
+            break
+        start = idx + 1
+    else:
+        return body.count("\n", 0, idx) + 1
+    return body.count("\n", 0, max(idx, 0)) + 1 if idx >= 0 else 1
+
+
+# A photograph or data credit is copied as printed: "फ़ोटो: Olga Ernst, Wikimedia
+# Commons, CC BY-SA 4.0." The run after a credit lead-in and its colon, up to
+# the first Devanagari character or closing brace, is skipped. A span holding
+# any Hindi stops there, so "चित्र: हर कटक ..." (a figure description) is still
+# read in full. Earth and space Book 3 hi, 2026-10-27; this replaces about
+# forty credit-only words (global, public, survey, ...) that had been allowed
+# book-wide.
+CREDIT_SPAN = re.compile(
+    r"(?:फ़ोटो|फोटो|छायाचित्र|चित्र|आँकड़े|आंकड़े|डेटा|स्रोत|श्रेय|तटरेखाएँ)\s*:\s*[^\u0900-\u097F}]+")
+# A credit in parentheses that names a licence, "(Broodt, CC BY-SA 4.0)", all Latin.
+CREDIT_PAREN = re.compile(
+    r"\([^()\u0900-\u097F]*(?:CC[ ~]BY|CC0|[Pp]ublic [Dd]omain)[^()\u0900-\u097F]*\)")
+# Names inside credits that a Devanagari sentence surrounds ("... Even Neuhaus
+# द्वारा", "... और Seton और अन्य (2020)"). Matched as whole phrases, so the
+# English words "even" and "natural" are still caught anywhere else.
+CREDIT_PHRASES = ("Even Neuhaus", "Natural Earth", "Seton", "Sandwell",
+                  "Þingvellir", "Smithsonian Global Volcanism Program",
+                  "Bird (2003)", "Wikimedia Commons",
+                  "Radiogenic")  # Book 3 hi, ch25: Wikimedia user name in a photo credit
+# Book 4 hi (Earth and space, 2026-10-30): author and team names inside data and
+# photo credits that a Devanagari sentence surrounds ("Bergin और Tafalla (2007)",
+# "NASA, ESA और Hubble Heritage Team"). Names only, matched as whole phrases.
+CREDIT_PHRASES = CREDIT_PHRASES + (
+    "Tafalla", "Hubble Heritage Team", "Haisch, Lada", "Lada (2001)",
+    "Youdin", "Lodders", "Gail", "Lugaro", "Chiang",  # ch02 data credits
+    "McDonough", "Sun (1995)", "Rudnick", "और Gao", "Gale", "Budahn",  # ch03
+    "Villa और अन्य", "White का पाठ", "Kendall और Caldwell", "Caldwell (1998)", "Edwards", "Mattey",  # ch04
+    "Iacovino और Till", "Giordano, Russell और Dingwell", "Moore और अन्य",  # ch05
+    "Mastin और अन्य (2009)", "Aubry और अन्य (2023)", "Biass, Bonadonna और", "Houghton (2019)", "Newhall और Self",  # ch06
+    "Raymo 2005", "Jouzel और अन्य", "Bereiter और अन्य",  # ch24 data credit (NOAA NCEI Paleoclimatology)
+    "Loutre (1991)",  # ch25 data credit "Berger और Loutre (1991)"
+    "Moring (2008)",  # ch29 data credit "Singer, Berger और Moring (2008), USGS"
+    "Pugmire (2014)", "Advanced Chemistry Basins Project (2004)",  # ch30 data credit
+    "Siems (2002)",  # ch31 data credit "Taggart और Siems (2002), USGS"
+)
+
+
+def check_file(path: pathlib.Path, findings: list) -> None:
+    raw = path.read_text(encoding="utf-8")
+    rel = str(path)
+    body = strip_comments(raw)
+    seen = visible_text(body, findings, rel)
+    seen = CREDIT_SPAN.sub(" ", seen)
+    seen = CREDIT_PAREN.sub(" ", seen)
+    for phrase in CREDIT_PHRASES:
+        seen = seen.replace(phrase, " ")
+    _occ: dict = {}
+
+    # 1. residual English in visible text
+    for m in LATIN_WORD.finditer(seen):
+        word = m.group(0)
+        # LATIN_WORD accepts an apostrophe inside a token so that English
+        # possessives ("Gauss's") are still caught -- but the sources quote with
+        # LaTeX's ``...'' , and the closing pair welds itself to the last word
+        # ("the pH of a cell''"). Strip only the OUTER apostrophes, so an
+        # internal one is still tested. 2026-09-06, biology Book 3 `hi`.
+        # The OUTER hyphens go the same way, and for the same reason: the
+        # sources write `$5'$-ACGT-$3'$` and `DNA--protein`, where blanking the
+        # math leaves the token `ACGT-` / `DNA--`. An internal hyphen is kept,
+        # so `Well-Being` is still reported.
+        word = word.strip("-'") or m.group(0)
+        low = word.lower()
+        if low in ALLOWED_WORDS or low in ALLOWED_UNITS:
+            continue
+        if word.islower() and low in SHORT_ENGLISH:
+            findings.append((rel, _locate(body, word, _occ),
+                             "english", f"English in visible text: {word!r}"))
+            continue
+        if word.isupper() and len(word) <= 4:
+            continue        # acronyms printed in Latin (SI, ATP)
+        if CHEM_FORMULA.fullmatch(word):
+            continue        # MgF(2), NaCl, GaAs, AsH(3): element symbols, not
+                            # English, and they stay Latin in every script
+        if is_biochemical_token(word):
+            continue        # 5'-ATGGCTTAC-3', Met--Lys--Gly--Trp: see the
+                            # note beside is_biochemical_token above
+        if ELEMENT_CHAIN.fullmatch(word):
+            continue        # H--O--H, C--C, Ca--O: a bond drawn between element
+                            # symbols. Identical in every edition, and the
+                            # <= 4-character uppercase escape above already
+                            # passes the two-symbol forms (O--H, S--S), so
+                            # only the longer chains were being reported.
+        if len(word) < 3:
+            continue        # stray single symbols
+        findings.append((rel, _locate(body, word, _occ),
+                         "english", f"English in visible text: {word!r}"))
+
+    for m in DOTTED_ABBREV.finditer(seen):
+        findings.append((rel, _locate(body, m.group(0), _occ),
+                         "english",
+                         f"English abbreviation in visible text: {m.group(0)!r}"))
+
+    # 2. transliterated English function words
+    for token, gloss in TRANSLITERATED_ARTICLES.items():
+        # A Devanagari compound joined by a HYPHEN is one word, and the
+        # hyphen is not in the DEVANAGARI range, so the bare lookarounds cut
+        # it: "आर-पार" (across, an ordinary Hindi word, 18 uses in biology
+        # Book 5 hi) was reported 18 times as transliterated *are*. Excluding
+        # "-" on either side is the same boundary rule the English scan above
+        # already applies when it strips outer hyphens. 2026-09-17.
+        for m in re.finditer(rf"(?<![{DEVANAGARI}-]){token}(?![{DEVANAGARI}-])", seen):
+            # The bare letter द is also the compass letter for South
+            # (\omnameCompassS in Earth & space, "$30^\circ$\,द", the legend
+            # "द = दक्षिण"). Beside a number, a math span or a degree sign,
+            # or before "=", it is that letter, not transliterated "the"
+            # (Earth Book 1 hi agent, 2026-10-25).
+            if token == "आर" and seen[m.end():].lstrip().startswith("पार"):
+                continue    # "आर पार" (across), spaced form of आर-पार (Earth Book 1 hi)
+            if token == "द":
+                before = seen[:m.start()].rstrip(" \t\n~")[-1:]
+                after = seen[m.end():].lstrip(" \t\n~")[:1]
+                if (before and (before.isdigit() or before in MATH_PLACEHOLDER + "°")) \
+                        or after == "=" or (after and after.isdigit()) \
+                        or (before == "(" and after == ")"):
+                    # "(द)": the abbreviation printed after "दक्षिण"
+                    continue
+            findings.append((rel, _locate(body, token, _occ),
+                             "translit",
+                             f"transliterated English {gloss!r}: {token!r}"))
+
+    # 3. Latin full stop closing a Devanagari sentence (use danda ।)
+    for m in re.finditer(rf"[{DEVANAGARI}][)\"'\s]*\.(?=\s|$)", seen):
+        findings.append((rel, seen[:m.start()].count("\n") + 1,
+                         "danda",
+                         "sentence ends with '.' after Devanagari (use ।)"))
+
+    # 5. thin space splitting a number from its noun
+    for m in re.finditer(rf"[{DEVANAGARI}]\s*\\,\s*\d", body):
+        findings.append((rel, body[:m.start()].count("\n") + 1,
+                         "split-number",
+                         "\\, between Devanagari and digits (split number?)"))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("dirs", nargs="+", help="directories of .tex files")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only the per-class summary")
+    ap.add_argument("--max-detail", type=int, default=8,
+                    help="detail lines to show per class (default 8)")
+    args = ap.parse_args()
+
+    findings: list = []
+    files = 0
+    for d in args.dirs:
+        p = pathlib.Path(d)
+        # A PATH THAT IS NOT A DIRECTORY USED TO BE SKIPPED IN SILENCE, so the
+        # gate handed a single .tex file printed "OK (0 files)" and exited 0 --
+        # a clean pass that had checked nothing. That is how 561 residual-English
+        # hits survived per-file checking during the Biology Book 5 run. Accept a
+        # file, and refuse a path that is neither. Found by the Arabic Book 5
+        # agent, 2026-09-17; fixed in all three script gates at once.
+        if p.is_file():
+            files += 1
+            check_file(p, findings)
+            continue
+        if not p.is_dir():
+            sys.stderr.write("  ERROR: not a file or directory: %s\n" % d)
+            return 2
+        for f in sorted(p.glob("*.tex")):
+            files += 1
+            check_file(f, findings)
+
+    if not findings:
+        print(f"  hindi prose gate: OK ({files} files)")
+        return 0
+
+    by_class: dict = {}
+    for rel, line, cls, msg in findings:
+        by_class.setdefault(cls, []).append((rel, line, msg))
+
+    print(f"  hindi prose gate: {len(findings)} issue(s) in {files} files")
+    for cls in sorted(by_class):
+        hits = by_class[cls]
+        bad_files = len({h[0] for h in hits})
+        print(f"    {cls:<14} {len(hits):>5} hit(s) in {bad_files} file(s)")
+        if not args.quiet:
+            for rel, line, msg in hits[:args.max_detail]:
+                print(f"        {rel}:{line}: {msg}")
+            if len(hits) > args.max_detail:
+                print(f"        ... {len(hits) - args.max_detail} more")
+    return 1
+
+
+# chemfig's \schemestart[<angle>][<anchor>] takes a TikZ anchor ("west",
+# chemistry Book 3 ch. 21) that this gate reads as visible text; it is an
+# option, never printed (hi Book 3 agent, 2026-10-06).
+ALLOWED_WORDS |= {"west"}
+# DIBAL-H (diisobutylaluminium hydride, Book 3 ch. 24): a reagent acronym
+# printed in Latin in every script, like HPLC; too long for the 4-letter
+# uppercase escape (hi Book 3 agent, 2026-10-06).
+ALLOWED_WORDS |= {"dibal-h"}
+# ICP-OES / ICP-MS (Book 3 ch. 32): instrument acronyms, Latin in every script;
+# the hyphen welds them past the 4-letter uppercase escape (hi Book 3 agent).
+ALLOWED_WORDS |= {"icp-oes", "icp-ms"}
+# pgf math, not prose: Book 4 ch. 20's ferrocene drawing places ring atoms at
+# ({cos(\a)},{1.0+0.3*sin(\a)}) inside a \foreach body that must stay
+# byte-identical to English; the reduction reads the braced coordinate as
+# visible text. Same gate bug as "sin" above, its missing twin (hi Book 4
+# agent, 2026-10-06).
+ALLOWED_WORDS |= {"cos"}
+# Baldwin's ring-closure descriptors (Book 4 ch. 27): tet/trig/dig and the
+# hyphenated 4-exo-tet, 5-endo-trig, 5-exo-dig... are international notation,
+# printed in Latin in every script exactly as the bare "exo"/"endo" this gate
+# already lets through; the hyphen welds them into tokens it reads as English
+# (hi Book 4 agent, 2026-10-07).
+ALLOWED_WORDS |= {"tet", "trig", "dig", "exo-tet", "exo-trig", "exo-dig",
+                  "endo-tet", "endo-trig", "endo-dig"}
+# qNMR (quantitative NMR, Book 4 ch. 33): an instrument-method acronym printed
+# in Latin in every script, like HRMS and ICP-MS; its lowercase "q" defeats the
+# uppercase-acronym escape (hi Book 4 agent, 2026-10-07).
+ALLOWED_WORDS |= {"qnmr"}
+
+# Figure-local macros whose FIRST argument is a file key (Earth Book 1):
+# grade-5/02 \gfivechart{phoenix}{<title>} picks figdata/out/...-phoenix.dat,
+# grade-6/03 \gsixrock{g6-granite.jpg}{<caption>} an image file. The key must
+# stay byte-identical to English, so "phoenix", "granite" were reported as
+# residual English; the second argument is visible prose (Earth Book 1 hi
+# agent, 2026-10-25).
+SPLIT_MACROS.update({"gfivechart": (1, 1), "gsixrock": (1, 1)})
+
+# Earth Book 1 grade-6/01 (hi agent, 2026-10-25), three more code-as-prose
+# leaks, all identical in the English canon:
+#  - \pgfplotstableread{figdata/out/grade-6-planets-sizes.dat}\gsixsizes
+#    reads a data FILE ("figdata", "planets-sizes", "dat" were reported);
+#  - "bar" is the pressure-unit SYMBOL (92~bar, 0.01~bar), Latin in every
+#    script like atm and torr;
+#  - an inline \tikz\fill[...] (0,0) circle (2.2pt); legend swatch inside a
+#    node's text leaked the TikZ path keyword "circle". The agent's allow-list
+#    entry for "circle" was SUPERSEDED by the coordinator: visible_text() now
+#    reduces an inline \tikz like a tikzpicture, so the word keeps its coverage.
+TECHNICAL_MACROS["pgfplotstableread"] = 1
+ALLOWED_UNITS |= {"bar"}
+
+
+# Earth Book 1 grade-7/05 (hi agent, 2026-10-25): a \tikzset{trilo/.pic={...},
+# ammo/.pic={...}} block sits in the omfigure OUTSIDE any tikzpicture, so its
+# path code ("trilo", "pic", "ammo", "ellipse (0.13 and 0.085)", "circle")
+# was read as visible English. \tikzset's argument is always style code,
+# identical to the English canon: drop it like any technical macro.
+# SUPERSEDED by the coordinator: visible_text() now reduces \tikzset{...} as
+# drawing code (node text stays visible), so the argument is no longer dropped.
+
+# Earth Book 1 grade-8/01 (hi agent, 2026-10-25): "hPa", the hectopascal
+# SYMBOL weather services use, is printed bare in prose, axis labels and the
+# table rows ("(hPa)", "$10^3$~hPa"), identical to English. It is a unit symbol,
+# Latin in every script like mmHg and bar, and not an English word.
+ALLOWED_UNITS |= {"hpa"}
+
+# Earth Book 2 grade-11/06 (hi agent, 2026-10-26): "NNR-MORVEL56", the name
+# of the published plate-velocity model (Argus, Gordon and DeMets 2011) cited
+# in a data credit, identical to English, like PB2002 and ETOPO1. A dataset
+# name, not an English word (Book 2 hi).
+ALLOWED_WORDS |= {"nnr-morvel"}
+
+# Earth Book 2 grade-11/07 (hi agent, 2026-10-26): "webmineral.com", the
+# Mineralogy Database website cited as the source of formulas and densities in
+# a table note and a caption, printed as its address, identical to English
+# (Book 2 hi).
+ALLOWED_WORDS |= {"webmineral"}
+
+# Earth and space Book 3 hi (2026-10-27): the title of William Smith's 1815
+# map, "A Delineation of the Strata of England and Wales, with part of
+# Scotland", stays in English as every edition prints it (a title is never
+# translated; the gloss, if any, is Hindi). Its words are listed here only
+# for that title. Narrow this list if a later edition can carry the title in
+# a form the gate does not read.
+ALLOWED_WORDS |= {"delineation", "strata", "england", "wales", "scotland",
+                  "the", "of", "and", "with", "part",
+                  # Book 3 hi, ch. 5: Hutton's Theory of the Earth (1788/1795)
+                  # and the Transactions in which it was printed, kept English.
+                  "theory", "earth", "transactions",
+                  # Book 3 hi, ch. 5: the trigonometric name in the pgfmath
+                  # coordinates of the dipping-layer figure, e.g. (\X,{-\X*tan(\d)}),
+                  # which the drawing reduction does not blank (canon line, identical).
+                  "tan",
+                  # Book 3 hi, ch. 7: the float placement specifier of the
+                  # table environment, \begin{table}[htbp], is LaTeX syntax
+                  # that the gate reads as visible text (identical in the canon).
+                  "htbp",
+                  # Book 3 hi, ch. 8: the colour space name in the Michel-Levy
+                  # chart's caption and the Les minéraux des roches title (1888,
+                  # kept as printed), and the photographer's user name.
+                  "srgb", "les", "minéraux", "des", "roches", "chmee"}
+# Earth and space Book 3 hi, ch. 9: the photographer of the Lehmann portrait
+# credit (Even Neuhaus), copied as printed.
+# Book 3 hi, ch. 9: the English word in the label head-wave (the label is
+# not prose; the gate reads it here, and the label itself must stay English).
+ALLOWED_WORDS |= {"head"}
+
+# Book 3 hi, ch. 11: the photographer's user name in a credit (Broodt, CC BY-SA
+# 4.0), copied as printed.
+
+# Book 3 hi, ch. 12: the data credit "Natural Earth" (coastlines) and the
+# photographer's user name in a credit (Alpsdake, CC BY-SA 4.0), copied as printed.
+
+# Book 3 hi, ch. 13: the credits of the Thingvellir and Galapagos photographs
+# (Olga Ernst, Wikimedia Commons; NOAA Okeanos Explorer Program), and the name of
+# Thingvellir, copied as printed.
+
+# Book 3 hi, ch. 14: the data and photograph credits of the active-margins figures
+# (Scripps Institution of Oceanography and Sandwell, marine gravity; Smithsonian
+# Global Volcanism Program; Bird; USGS; NASA; Natural Earth; Wikimedia Commons;
+# public domain), copied as printed.
+
+# Book 3 hi, ch. 15: the photograph credits of the Kilauea lava fountain (G. E. Ulrich,
+# U.S. Geological Survey) and of the Deccan Traps (Nicholas, user name Nichalp), copied as printed.
+
+# Book 3 hi, ch. 16: the photograph credit of the triaxial cell (Darryl Peroni, copied as
+# printed); the pgfplots/TikZ keyword "angle" of a \pic (drawing code the reduction
+# does not blank, identical in the canon); and the English words inside cross-reference
+# keys and the method label of the slip test (faults-folds-fabrics, stress-strain,
+# slip-test), which are not prose.
+ALLOWED_WORDS |= {"angle", "fault", "faults", "fabrics", "folds", "slip"}
+
+# Book 3 hi, ch. 17: the title of Anderson's 1905 book, "The Dynamics of Faulting and
+# Dyke Formation", kept in English as the run rule has it (a title is not translated).
+ALLOWED_WORDS |= {"dynamics", "faulting", "dyke", "formation"}
+
+ALLOWED_WORDS |= {"cal", "intcal", "IntCal"}  # Book 3 hi, ch25: the calendar-age unit "cal BP" and the IntCal20 curve name
+
+# Earth Book 4 hi, ch. 11: "P--T--t path" (pressure--temperature--time) is international
+# notation printed in Latin in every script, like "P--T" (which passes the uppercase
+# escape); the lowercase t defeats that escape (hi Book 4 agent, 2026-10-30).
+ALLOWED_WORDS |= {"p--t--t"}
+
+# Earth Book 4 hi, ch. 30: "Easy%Ro" is the name of a published vitrinite-reflectance model,
+# printed in Latin in every edition like an acronym (hi Book 4 agent, 2026-10-30).
+ALLOWED_WORDS |= {"easyro", "EasyRo"}
+
+# Earth Book 4 hi, ch. 31: the roman sub-item label "(iii)" (two-letter "ii"/"iv" already pass
+# the length floor) and the count-rate unit "kcps" (kilo-counts per second), printed in Latin
+# in every edition like a unit symbol (hi Book 4 agent, 2026-10-30).
+ALLOWED_WORDS |= {"iii", "kcps"}
+
+# Earth & space Book 4 hi, coordinator, 2026-10-30: a licence credit in parentheses
+# whose stock words are in Hindi, as Book 3 hi writes them: "(James St.~John,
+# CC~BY~2.0, विकिमीडिया कॉमन्स के माध्यम से।)", "(Lawson Smith, ... (सार्वजनिक डोमेन))".
+# Only these two exact Hindi phrases may sit inside the otherwise all-Latin
+# parenthesis, and it must still name a licence; English words elsewhere still fire.
+_HI_CREDIT_STOCK = r"(?:[^()\u0900-\u097F]|सार्वजनिक\s+डोमेन|विकिमीडिया\s+कॉमन्स\s+के\s+माध्यम\s+से।?)"
+CREDIT_PAREN = re.compile(r"\(" + _HI_CREDIT_STOCK + r"*(?:CC[ ~]BY|CC0|[Pp]ublic [Dd]omain|सार्वजनिक\s+डोमेन)"
+                          + _HI_CREDIT_STOCK + r"*\)")
+
+# Earth & space Book 5 hi, pilot edition coordinator, 2026-11-04. Unit symbols the English canon prints as literal
+# \\qty units and axis units (kyr, Myr, kpc, mag): they stay Latin in every script. "Irr" is the Hubble type symbol of an
+# irregular galaxy, printed in Latin like "Im". Names in credits and source citations stay Latin (series rule); matched as
+# whole phrases or surnames, so the English words themselves still fire anywhere else.
+ALLOWED_UNITS |= {"kyr", "myr", "kpc", "mag"}
+ALLOWED_WORDS |= {"irr"}
+CREDIT_PHRASES = tuple(CREDIT_PHRASES) + (
+    "NCEP--NCAR", "NASA/JPL-Caltech", "Borchert", "Mikenorton", "Ken Lund", "Jim Peaco", "NASA Center for Climate Simulation",
+    "Goddard Space Flight Center", "Journal of Marine Research", "ETOPO1 Ice Surface", "ECOSTRESS Spectral Library",
+    "Jet Propulsion Laboratory", "California Institute of Technology", "Geological Survey", "Wicks", "Roddy", "FU Berlin",
+    "Carter", "Pagan", "Zeng", "Brunier", "Eilers", "Pouliasis", "Hubble, heic0602", "Asplund", "Amarsi", "Grevesse", "Hester",
+    "Loll", "Levan", "Tanvir", "Fruchter", "Fox",
+)
+
+if __name__ == "__main__":
+    sys.exit(main())

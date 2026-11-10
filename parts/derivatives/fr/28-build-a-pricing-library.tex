@@ -1,0 +1,325 @@
+\chapter{Construction~: une bibliothèque de valorisation}\label{ch:dv:build-a-pricing-library}
+
+Un responsable des risques demande la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du portefeuille à un nœud de la \omterm{def:dv:implied-volatility-and-its-surface:surface}{surface de volatilité}~: celui à un an et au strike de 90~\%. Le portefeuille détient un call vanille, un
+put américain, un knock-out, un \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{swap de variance} et un \omterm{def:dv:autocallables:autocallable}{autocallable}. Chacun a été valorisé dans le chapitre qui l'a introduit, avec ses propres entrées~: une volatilité
+ici, un taux là, une grille de trajectoires ailleurs. Aucun d'eux ne lit la surface comme un objet auquel on peut appliquer un bump en un seul nœud. La réponse exige que chaque
+pricer prenne le même \omterm{def:dv:build-a-pricing-library:snapshot}{instantané de données de marché}, applique le même bump, puis reprice. Avec un pricer Monte Carlo dans le livre, il faut aussi que les calculs avec et sans bump
+utilisent les mêmes nombres aléatoires, faute de quoi la réponse n'est que du bruit. Ce chapitre construit la bibliothèque qui réduit la question à un seul appel~: instruments,
+modèles et moteurs derrière une même interface, données de marché sous la forme d'un instantané immuable, \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} et scénarios par \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice}, et les tests qui permettent
+aux autres livres de lui faire confiance. Sur le portefeuille de ce chapitre, la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du nœud vaut 2\,072 par point de volatilité. Sa part Monte Carlo a un écart-type de 51 avec
+des nombres aléatoires communs, contre 217 sans.
+
+\section{Instruments, modèles et moteurs}
+
+Une bibliothèque de valorisation sépare trois éléments qu'un script mélange. Le \emph{instrument} est le contrat~: ses termes et rien d'autre. Le \emph{modèle} est un
+ensemble d'hypothèses sur la dynamique, avec ses paramètres. Le troisième est la méthode numérique.
+
+\begin{definition}[Moteur de valorisation]\label{def:dv:build-a-pricing-library:engine}
+Un \emph{moteur de valorisation}\index{moteur de valorisation} est le composant qui calcule la valeur d'un instrument sous un modèle à partir d'un \omterm{def:dv:build-a-pricing-library:snapshot}{instantané de données de marché} par une
+méthode numérique donnée (formules fermées, arbre, différences finies, Monte Carlo, Fourier)~; plusieurs moteurs peuvent prendre en charge le même instrument et le même modèle, et un
+registre choisit le moteur par défaut.
+\end{definition}
+
+La séparation se révèle utile à trois égards. Un nouvel instrument n'a besoin que de ses termes et d'un moteur. Une nouvelle méthode, comme un Monte Carlo sur GPU, valorise chaque instrument
+qu'elle prend en charge sans les modifier. Deux moteurs sur un même instrument se contrôlent mutuellement. QuantLib, la bibliothèque open source, est construite ainsi~: sa
+classe abstraite \texttt{Instrument} reçoit un \omterm{def:dv:build-a-pricing-library:engine}{moteur de valorisation} via \texttt{setPricingEngine} et renvoie sa valeur via \texttt{NPV}. L'Open Source
+Risk Engine étend cette classe avec d'autres modèles, instruments et moteurs, et lit les transactions et les données de marché au format XML.
+
+\begin{center}\small
+\begin{tabular}{lrrrr}
+\toprule
+option à un an (surface avec skew) & Analytique & Arbre & EDP & Monte Carlo\\
+\midrule
+call, strike 100 & 8.5437 & 8.5437 & 8.5413 & 8.5415\\
+put américain, strike 95 & --- & 5.0731 & 5.0702 & ---\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le registre renvoie tous les moteurs qui prennent en charge une paire, et les tests valorisent avec chacun d'eux~: les moteurs analytique et arbre concordent à $2\times10^{-6}$ sur le
+call. La grille à 200 nœuds laisse un écart de 0.0024, et l'erreur d'une simulation Monte Carlo est de l'ordre de son erreur type. Pour l'ensemble de la bibliothèque, les moteurs sont les
+formules fermées des chapitres 3, 15 et 16, les arbres du chapitre 2, les différences finies du chapitre 22, le Monte Carlo du chapitre 23, le pricer de Fourier du
+chapitre 24 et la grille des \omterm{def:dv:convertibles-and-the-credit-equity-link:cb}{obligations convertibles} du chapitre 21 (voir la \cref{fig:dv:build-a-pricing-library:arch}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,box/.style={draw,rounded corners,align=center,minimum height=0.9cm,inner sep=4pt},>=stealth]
+\node[box,fill=omDef!15,text width=3.2cm] (inst) at (0,2.2) {Instrument\\{\footnotesize termes uniquement, JSON}};
+\node[box,fill=omThm!15,text width=3.2cm] (model) at (0,0) {Modèle\\{\footnotesize Black--Scholes, Heston, crédit}};
+\node[box,fill=omProp!15,text width=3.4cm] (md) at (0,-2.2) {Instantané de données de marché\\{\footnotesize immuable~; \texttt{apply(bump)}}};
+\node[box,text width=2.6cm] (reg) at (4.4,1.1) {Registre\\{\footnotesize (instrument, modèle) $\to$ moteurs}};
+\node[box,fill=gray!10,text width=3.3cm] (eng) at (4.4,-1.1) {Moteur\\{\footnotesize formule fermée, arbre, EDP, Monte Carlo, Fourier}};
+\node[box,text width=3.3cm] (calls) at (9.0,0) {\texttt{price}, \texttt{greeks}, \texttt{sensitivities}, \texttt{bucketed\_vega}, \texttt{reprice}, \texttt{price\_batch}};
+\draw[->] (inst) -- (reg);
+\draw[->] (model) -- (reg);
+\draw[->] (reg) -- (eng);
+\draw[->] (md) -- (eng);
+\draw[->] (eng) -- (calls);
+\draw[->,dashed] (calls.south) |- node[pos=0.75,below,font=\footnotesize]{instantanés avec bump} (md.east);
+\end{tikzpicture}
+
+\omcaption{Structure de la bibliothèque~: un instrument et un modèle sélectionnent un moteur via le registre~; chaque moteur lit le même instantané immuable~; les
+appels de premier niveau produisent les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques}, les sensibilités et les scénarios en revalorisant des copies de l'instantané soumises à un bump.}\label{fig:dv:build-a-pricing-library:arch}
+\end{omfigure}
+
+\section{Données de marché sous forme d'instantané immuable}
+
+\begin{definition}[Instantané de données de marché]\label{def:dv:build-a-pricing-library:snapshot}
+Un \emph{instantané de données de marché}\index{instantané de données de marché} est l'ensemble complet et immuable des entrées de marché d'une valorisation à un instant donné (spots, courbes,
+dividendes, \omterm{def:dv:implied-volatility-and-its-surface:surface}{surfaces de volatilité}, corrélations, fixings, taux de change), adressable par des identifiants de facteurs de risque~; un bump ou un changement de date renvoie un nouvel
+instantané et ne modifie jamais l'ancien.
+\end{definition}
+
+Les instruments de QuantLib mettent en cache leur dernier résultat et observent leurs entrées, en recalculant lorsqu'une entrée change. Cette conception convient à un écran de trading qui
+revalorise à chaque variation des cotations. Un moteur de risque revalorise le même portefeuille sous des milliers de marchés décalés, souvent en parallèle, et demande l'inverse~: une valorisation comme
+une fonction pure d'un instrument et d'un instantané, sans état à invalider. L'instantané de la bibliothèque possède une méthode \texttt{apply(bump)} qui renvoie un nouvel
+instantané. Les bumps sont indexés par les identifiants de facteurs de risque que partage le moteur de risque du livre~6~: \texttt{SPOT:ABC}, \texttt{VOL:ABC} (parallèle),
+\texttt{VOL:ABC:2027-09-24:90} (un nœud), \texttt{CURVE:USD}, \texttt{CORR:ABC|XYZ}, \texttt{TIME}. Une surface qui a des nœuds les expose comme facteurs de risque,
+et une surface qui n'en possède pas est d'abord échantillonnée sur une grille.
+
+L'immuabilité est ce qui rend le reste simple. Une grecque correspond à deux prix sur deux instantanés, un scénario à un prix sur un instantané, et un lot est une matrice
+d'instantanés par transaction. Chaque moteur, ancien ou nouveau, obtient les trois sans effort supplémentaire, car aucun ne sait que les bumps existent.
+
+\section{Grecques, bumps et scénarios}
+
+Le \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice} est la grecque universelle~: plus lent que les dérivées propres à un moteur, mais disponible pour tout moteur et cohérent d'un moteur à l'autre. Son ennemi
+est le bruit Monte Carlo. Deux simulations indépendantes, chacune avec une erreur type de quelques dixièmes, diffèrent d'autant, et un bump d'un point de volatilité divise
+la différence par 0.01. La règle d'appariement de la bibliothèque l'élimine. Chaque prix Monte Carlo d'un instrument utilise la même graine, dérivée
+de l'identifiant de l'instrument par une somme de contrôle, et la même grille de temps. Les calculs avec bump et de base partagent leurs nombres aléatoires, et le bruit de la différence n'est
+que celui de la sensibilité elle-même.
+
+\begin{example}[La vega que personne ne savait calculer]\label{ex:dv:build-a-pricing-library:node}
+Le portefeuille, sur une surface avec 20~\% à la monnaie et un skew~: long de 1\,000 calls à un an de strike 100, short de 500 puts américains à un an de strike 95, long de 800 calls à un an de strike 100
+knock-out à 80 (surveillance quotidienne), short d'un \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{swap de variance} à un an, de strike 21, sur un \omterm{def:dv:variance-swaps-and-volatility-derivatives:veganot}{notionnel vega} de 50\,000, et short de 1\,000\,000 d'un
+\omterm{def:dv:autocallables:autocallable}{autocallable} à trois ans. Sa valeur est $-928\,523$. La \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} au nœud (un an, 90), par point de volatilité, vaut $-88$ due au put, dont le strike est interpolé à mi-chemin
+du nœud, $-90$ du strip du \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{swap de variance} et $+2\,249$ de l'\omterm{def:dv:autocallables:autocallable}{autocallable}, que le moteur Monte Carlo valorise sur la variance totale au
+point médian de son knock-in (80) et de sa barrière de rappel (100)~: 2\,072 au total. Le call et le
+knock-out, de strike 100, n'ont aucune part. Sur vingt graines, la contribution de l'\omterm{def:dv:autocallables:autocallable}{autocallable} a un écart-type de 51 avec des nombres aléatoires communs, contre 217
+sans, soit 4.3 fois plus (voir la \cref{fig:dv:build-a-pricing-library:crn}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xlabel={graine},ylabel={vega (1 an, 90) (milliers par point)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=21,ymin=1.8,ymax=2.7,grid=major,grid style={gray!25},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omThm,only marks,mark=*,mark size=1.8pt] table[x=seed,y=with]{figdata/derivatives/28-build-a-pricing-library/crn.csv};
+\addplot[omProp,only marks,mark=triangle*,mark size=2pt] table[x=seed,y=without]{figdata/derivatives/28-build-a-pricing-library/crn.csv};
+\legend{nombres aléatoires communs,nombres aléatoires renouvelés pour chaque instantané}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} de l'\omterm{def:dv:autocallables:autocallable}{autocallable} au nœud 90 à un an, obtenu par \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice}, à partir de vingt graines~: avec les calculs bumpés et de base partageant leurs
+nombres aléatoires, et avec des instantanés tirant de nouveaux nombres à chaque fois. Données~: le tutoriel.}\label{fig:dv:build-a-pricing-library:crn}
+\end{omfigure}
+
+La grille de nœuds donne l'ensemble du profil (la \cref{fig:dv:build-a-pricing-library:vega}). Sommé sur ses 35 nœuds, le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du portefeuille vaut 6\,747 par point, contre
+6\,706 pour un bump parallèle. L'écart provient de l'interpolation, qui répartit le bump d'un nœud sur ses voisins de manière inégale.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
+  width=6.6cm,height=5cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[ybar,bar width=10pt,xlabel={échéance (mois)},ylabel={vega (milliers par point)},xtick=data,ymin=-0.5,ymax=3.5,title={\small par échéance}]
+\addplot[omDef,fill=omDef!40] table[x=months,y=vega]{figdata/derivatives/28-build-a-pricing-library/vega_expiry.csv};
+\nextgroupplot[ybar,bar width=10pt,xlabel={strike},xtick=data,ymin=-0.5,ymax=3.5,title={\small à un an, par strike}]
+\addplot[omThm,fill=omThm!40] table[x=strike,y=vega]{figdata/derivatives/28-build-a-pricing-library/vega_1y.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par compartiments du portefeuille obtenu par \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice} en chaque nœud de la surface~: par échéance (à gauche) et sur la tranche à un an (à droite), où le nœud 90
+porte l'exposition de l'\omterm{def:dv:autocallables:autocallable}{autocallable}. Données~: le tutoriel.}\label{fig:dv:build-a-pricing-library:vega}
+\end{omfigure}
+
+Les scénarios sont des bumps combinés. Un scénario est un nom et un tuple de bumps, sérialisable, afin que les générateurs de scénarios du livre~6 puissent les construire et que la
+bibliothèque puisse les appliquer. La grille de dix scénarios du portefeuille (la \cref{fig:dv:build-a-pricing-library:scen}) la montre longue de volatilité,
+longue d'un krach par l'intermédiaire de l'\omterm{def:dv:autocallables:autocallable}{autocallable} vendu, et perdante lors d'un rallye.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=6cm,xbar,bar width=7pt,xlabel={P\&L du portefeuille (milliers)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=-50,xmax=175,ymin=-0.6,ymax=9.6,ytick={0,1,2,3,4,5,6,7,8,9},
+  yticklabels={spot $-20\%$,spot $-10\%$,spot $-5\%$,spot $+5\%$,spot $+10\%$,vol $-5$,vol $+5$,taux $+100$\,pb,krach~: $-20\%$ et vol $+10$,un mois plus tard},
+  y dir=reverse,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omProp,fill=omProp!40] table[x=pnl,y=i]{figdata/derivatives/28-build-a-pricing-library/scenarios.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le portefeuille réévalué sous dix scénarios en un seul appel. Données~: le tutoriel.}\label{fig:dv:build-a-pricing-library:scen}
+\end{omfigure}
+
+\section{Tester un pricer}
+
+Un pricer inspire confiance grâce à ses tests, et une bibliothèque ne vaut que ce que valent les tests de son moteur le plus faible.
+
+\begin{definition}[Pricer de référence]\label{def:dv:build-a-pricing-library:reference}
+Un \emph{pricer de référence}\index{pricer de référence} est une implémentation indépendante, lente et précise d'une valorisation, réservée à tester les moteurs de production~:
+une formule fermée lorsqu'elle existe, sinon une grille convergée ou une simulation de grande taille, dont la précision est connue.
+\end{definition}
+
+Les tests de la bibliothèque se répartissent en cinq types. \textbf{Valeurs de référence}~: chaque moteur contre une formule fermée ou un \omterm{def:dv:build-a-pricing-library:reference}{pricer de référence} (formule de Black, intégrale de Gauss--Legendre
+de Lewis du chapitre 24, arbre à 2\,001 pas). \textbf{Inter-moteurs}~: chaque moteur qui supporte un instrument contre les autres, à leurs erreurs connues
+près. \textbf{Identités}~: la somme d'un knock-in et d'un knock-out égale l'option vanille, un call digital plus un put digital vaut le facteur d'actualisation, un panier à un seul actif égale
+l'option vanille, un TARF sans effet de levier ni cible égale un strip de puts, une corrélation plus élevée rend moins cher un put worst-of. \textbf{Propriétés}~: les instantanés sont inchangés par
+les bumps, le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par compartiments somme au \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} parallèle, la graine est la même dans chaque processus, chaque instrument fait l'aller-retour en JSON. \textbf{Jumeaux}~: les cœurs C++20 et Rust
+reproduisent les moteurs Python à $10^{-9}$.
+
+
+\section{Tutoriel~: un seul appel pour tout le portefeuille}\label{tut:dv:build-a-pricing-library:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Relier les composants du portefeuille dans une seule bibliothèque, valoriser un petit portefeuille par un seul appel, calculer le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par compartiments avec des nombres aléatoires communs, et lancer une
+grille à dix scénarios. \textbf{État final~:} les quatre figures, le tableau des moteurs et les chiffres du problème du week-end.
+\begin{tutsteps}
+\item \textbf{Le registre}~: moteurs par type d'instrument et de modèle, le premier qui le supporte étant celui par défaut~:
+\omcode{code/firm/pricing/firm_pricing.py}{506}{521}{Le registre des moteurs.}\label{lst:dv:build-a-pricing-library:registry}
+\item \textbf{Nombres aléatoires communs}~: la graine dérivée de l'identifiant, et trajectoires dont la dérive est ajustée aux forwards de l'instantané~:
+\omcode{code/firm/pricing/firm_pricing.py}{1002}{1030}{Graines et trajectoires du moteur Monte Carlo.}\label{lst:dv:build-a-pricing-library:mc}
+\item \textbf{Le jumeau C++20} du moteur aux différences finies~:
+\omcode{code/firm/pricing/cpp/pricing.hpp}{246}{258}{Le moteur aux EDP en C++20.}\label{lst:dv:build-a-pricing-library:cpp}
+\item \textbf{Exécuter} \texttt{dv\_library.book\_prices()}, \texttt{engine\_table()}, \texttt{node\_vega()}, \texttt{crn\_noise()}, \texttt{bucket\_profile()},
+\texttt{scenario\_grid()} et \texttt{fig\_library.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Valoriser l'\omterm{def:dv:autocallables:autocallable}{autocallable} sous Heston en ajoutant un moteur Monte Carlo de Heston~; enregistrer un second moteur Monte Carlo à un million de trajectoires comme
+un \omterm{def:dv:build-a-pricing-library:reference}{pricer de référence}~; chronométrer \texttt{price\_batch} sur une centaine d'instantanés.
+\end{tutorial}
+
+\section{Construction~: la bibliothèque}\label{bld:dv:build-a-pricing-library:pricing}
+
+\begin{build}
+\bfield{Rôle} La bibliothèque de valorisation de la firme miniature~: chaque instrument du livre~5 derrière une seule interface, celle que consomme le moteur de risque du livre~6.
+\bfield{Interface} Telle qu'elle a été figée pour le livre~6 (\texttt{code/firm/INTERFACES.md}, section 1)~: \texttt{MarketData} avec \texttt{apply},
+\texttt{rolled}, \texttt{risk\_factors}~; \texttt{Instrument} et \texttt{instrument\_from\_dict}~; \texttt{Model}, \texttt{Engine}, \texttt{register}~; \texttt{price},
+\texttt{greeks}, \texttt{sensitivities}, \texttt{bucketed\_vega}, \texttt{reprice}, \texttt{price\_batch}~; \texttt{seed\_for}. Ajoutés ici~: les instruments
+\texttt{DigitalOption}, \texttt{BarrierOption}, \texttt{AsianOption}, \texttt{ForwardStart}, \texttt{Cliquet}, \texttt{VarianceSwap}, \texttt{BasketOption},
+\texttt{WorstOf}, \texttt{Autocallable}, \texttt{TARF}, \texttt{ConvertibleBond}~; modèles \texttt{HestonModel}, \texttt{CreditBlackScholes}~; moteurs
+\texttt{ClosedFormEngine}, \texttt{MonteCarloEngine(n\_paths, seed\_offset, crn)}, \texttt{PDEEngine} (avec \texttt{fd\_vanilla}), \texttt{FourierEngine},
+\texttt{ConvertibleEngine}~; \texttt{engines\_for(inst, model)}. Le jumeau C++20 \texttt{cpp/pricing.hpp} et le crate Rust \texttt{rust/} contiennent les types centraux
+avec les moteurs analytiques et aux différences finies, et les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} du desk.
+\bfield{Règles} La valorisation est une fonction pure de l'instrument, du modèle et de l'instantané~; les graines Monte Carlo proviennent de l'identifiant de l'instrument~; chaque moteur lit son
+marché uniquement dans l'instantané~; les ajouts ne renomment ni ne suppriment jamais.
+\bfield{Tests d'acceptation} \texttt{code/firm/pricing/tests/} (les quatorze tests du cœur et les cinq catégories ci-dessus)~; \texttt{cpp/pricing\_test.cpp} et
+\texttt{rust/src/lib.rs} contre les valeurs Python.
+\bfield{Pour aller plus loin} \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Grecques} propres aux moteurs (pathwise et adjointes, chapitre 23) derrière la surcharge \texttt{greeks}~; Monte Carlo à \omterm{def:dv:local-volatility:model}{volatilité locale} et stochastique~; transactions
+déjà entamées et dépendantes de la trajectoire, à partir des fixings~; un service enveloppe qui valorise des lots en processus parallèles.
+\end{build}
+
+\begin{dated}{2026-09}{Normes de représentation des transactions}\label{dat:dv:build-a-pricing-library:standards}
+FpML, la norme XML pour la négociation et le traitement électroniques des dérivés, est à la version 5.13 en tant que Recommandation, la version 5.14 étant un Last Call Working Draft
+daté du 24 août 2026. Le Common Domain Model, un modèle des produits financiers, des transactions et de leurs événements de cycle de vie publié sous forme de code dans plusieurs langages, est open source
+chez FINOS depuis février 2023, en partenariat avec ISDA, ICMA et ISLA. Une bibliothèque de production fait correspondre ses instruments à ces représentations à sa périphérie,
+et non à l'intérieur de ses moteurs.
+\end{dated}
+
+\begin{omsources}
+\item QuantLib reference documentation, classe \texttt{QuantLib::Instrument} (version 1.43), quantlib.org.
+\item Open Source Risk Engine, dépôt README, github.com/OpenSourceRisk/Engine.
+\item FINOS, Common Domain Model, github.com/finos/common-domain-model.
+\item FpML, fpml.org.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:1}
+Pourquoi la graine de Monte Carlo doit-elle provenir d'une somme de contrôle de l'identifiant et non de \texttt{hash()} de Python~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:2}
+Pourquoi l'option d'achat et le knock-out, tous deux de strike 100, n'ont-ils aucune \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} au nœud (un an, 90)~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:build-a-pricing-library:3}
+Nommer l'identité que vérifie chacun de ces tests~: knock-in plus knock-out~; call digital plus put digital~; un TARF sans effet de levier et sans cible.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:4}
+L'écart type de la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du nœud vaut 51 avec des nombres aléatoires communs. D'où vient ce bruit résiduel, et comment le réduire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:5}
+Pourquoi la somme des \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} nodales (6\,747) diffère-t-elle de la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} parallèle (6\,706)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:build-a-pricing-library:6}
+Que se passe-t-il si un moteur lit une volatilité dans une variable globale au lieu de la lire dans l'instantané~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:build-a-pricing-library:7}
+\emph{Codage.} Enregistrer un moteur Monte Carlo à 400\,000 trajectoires et calculer la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} nodale de l'\omterm{def:dv:autocallables:autocallable}{autocallable} sur vingt graines avec des nombres aléatoires communs. Comment
+l'écart type évolue-t-il avec le nombre de trajectoires~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:build-a-pricing-library:8}
+\emph{Trouver le défaut.} «~Notre nouveau moteur concorde avec l'ancien à huit décimales sur chaque transaction, donc il est correct.~»
+\end{exercise}
+
+=\section{Problème~: La vega que personne ne savait calculer}
+
+=\begin{problem}[{Problème du week-end --- un nœud, cinq pricers}]\label{pb:dv:build-a-pricing-library:1}
+Le gestionnaire des risques de l'ouverture veut la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du portefeuille au nœud 90~\% à un an, aujourd'hui et chaque jour.
+
+\medskip\noindent\textbf{Partie I --- La bibliothèque.}
+\begin{enumerate}
+\item Quel moteur valorise chacune des cinq positions par défaut, et pourquoi celui-là~?
+\item Quelle est la valeur du portefeuille~?
+\item Quel écart existe entre les moteurs sur le call à un an, et qu'est-ce qui l'explique~?
+\item Que doit faire chaque moteur pour que le bump du nœud l'atteigne~?
+\item Que fait le registre lorsqu'aucun moteur ne prend en charge une paire~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le nœud.}
+\begin{enumerate}[resume]
+\item Donner la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} de chaque position au nœud.
+\item Pourquoi la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} de l'\omterm{def:dv:autocallables:autocallable}{autocallable} est-elle la plus grande, et pourquoi son signe est-il positif pour la banque~?
+\item Comment le strike de 95 du put lui donne-t-il la moitié de son exposition au nœud 90~?
+\item Qu'apporte le strip du \omterm{def:dv:variance-swaps-and-volatility-derivatives:vs}{swap de variance}, et pourquoi à chaque nœud~?
+\item Quelle est la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} totale du portefeuille par échéance~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le bruit.}
+\begin{enumerate}[resume]
+\item Donner l'écart type de la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} nodale sur vingt graines, avec et sans nombres aléatoires communs.
+\item Pourquoi le partage des nombres aléatoires la divise-t-il par un facteur 4.3~?
+\item Quel serait l'écart type avec quatre fois plus de trajectoires~?
+\item Pourquoi la règle contraignante lie-t-elle la graine à l'instrument et non au portefeuille~?
+\item Que dit la grille de dix scénarios sur le portefeuille~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Faut-il présenter la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} nodale à l'unité près ou à la centaine près~?
+\item Que faudrait-il ajouter avant que le moteur de risque du livre~6 n'exécute la bibliothèque chaque nuit~?
+\item Quel test aurait détecté un pricer qui lit une surface périmée~?
+\item Énoncer le \emph{résultat nommé}~: la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par nœud du portefeuille au strike de 90~\% à un an, et le bruit de Monte Carlo qui l'affecte avec et sans nombres aléatoires communs.
+\item En une phrase~: qu'est-ce qui rend une grecque calculable pour chaque pricer~?
+\end{enumerate}
+\end{problem}
+
+=\section{Questions d'entretien}
+
+=\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:dv:build-a-pricing-library:1}
+Pourquoi séparer les instruments, les modèles et les moteurs~?
+\end{interviewq}
+
+=\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:dv:build-a-pricing-library:2}
+Vos \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} de Monte Carlo sont bruitées. Quelle règle de conception corrige l'essentiel du problème~?
+\end{interviewq}
+
+=\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:dv:build-a-pricing-library:3}
+Des objets de marché mutables avec observateurs, ou des instantanés immuables~? Argumentez en faveur de l'un des deux.
+\end{interviewq}
+
+=\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:dv:build-a-pricing-library:4}
+Comment testez-vous un nouveau \omterm{def:dv:build-a-pricing-library:engine}{moteur de valorisation}~?
+\end{interviewq}
+
+=\begin{interviewq}[$\star\star$ \iqroles{risque}]\label{iq:dv:build-a-pricing-library:5}
+Comment calculeriez-vous la \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par nœud d'un portefeuille valorisé avec différents modèles et moteurs~?
+\end{interviewq}
+
+=\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:dv:build-a-pricing-library:6}
+Vous devez réécrire en C++ le cœur de la bibliothèque Python sans modifier aucun chiffre. Comment procédez-vous~?
+\end{interviewq}

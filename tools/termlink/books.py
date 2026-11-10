@@ -29,25 +29,11 @@ ENTRY = {
     17: "one_quant_book_17_industry.tex",
 }
 
-LANGS = {
-    1: ("en",),
-    2: ("en",),
-    3: ("en",),
-    4: ("en",),
-    5: ("en",),
-    6: ("en",),
-    7: ("en",),
-    8: ("en",),
-    9: ("en",),
-    10: ("en",),
-    11: ("en",),
-    12: ("en",),
-    13: ("en",),
-    14: ("en",),
-    15: ("en",),
-    16: ("en",),
-    17: ("en",),
-}
+LANGS = {n: ("en",) for n in range(1, 18)}
+# Books 1-5 ship a French pilot edition (2026-11-09). A translation adds its code here
+# (and its tools/term_config/book<N>_<lang>.py).
+for _n in (1, 2, 3, 4, 5):
+    LANGS[_n] = ("en", "fr")
 
 
 def years(book):

@@ -1,4 +1,4 @@
-# latexmk configuration for the One Quant Book series (pdfLaTeX only).
+# latexmk configuration for the One Quant Book series (pdfLaTeX only; English plus French Books 1-5).
 $pdf_mode = 1;
 $out_dir = 'build';
 @default_files = (
@@ -22,6 +22,12 @@ $out_dir = 'build';
     'one_quant_book_18_interviews_1.tex',
     'one_quant_book_19_interviews_2.tex',
     'one_quant_book_20_interviews_3.tex',
+    # French pilot editions (2026-11-09)
+    'one_quant_book_01_markets_1_fr.tex',
+    'one_quant_book_02_markets_2_fr.tex',
+    'one_quant_book_03_markets_3_fr.tex',
+    'one_quant_book_04_methods_fr.tex',
+    'one_quant_book_05_derivatives_fr.tex',
 );
 # Many TikZ/pgfplots figures exceed pdfTeX's default main memory.
 $pdflatex = 'pdflatex -cnf-line=main_memory=12000000 -cnf-line=extra_mem_top=6000000 -cnf-line=extra_mem_bot=6000000 -interaction=nonstopmode -halt-on-error %O %S';

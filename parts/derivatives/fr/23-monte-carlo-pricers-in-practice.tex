@@ -1,0 +1,391 @@
+\chapter{Pricers de Monte-Carlo en pratique}\label{ch:dv:monte-carlo-pricers-in-practice}
+
+Une option bermudéenne sur le meilleur de cinq actions n'a aucune grille aux différences finies qui tienne en mémoire~: cent points par
+dimension, soit dix milliards de nœuds. Un moteur de Monte-Carlo la price en quelques secondes, mais il se trompe par construction
+sur la décision d'exercice. Il estime la valeur de l'attente par une régression sur les trajectoires simulées, ce qui n'est
+qu'une approximation de la vraie valeur de continuation, si bien que la politique d'exercice suivie est sous-optimale et que son prix
+est une borne inférieure. Un bon desk publie donc deux nombres, une borne inférieure issue de la politique et une borne supérieure issue d'une méthode duale, et l'écart entre
+les deux mesure ce que la régression laisse encore passer. Ce chapitre construit l'outillage qui entoure la méthode
+de Monte-Carlo du livre~4~: simulation des modèles, exercice anticipé par régression et sa borne duale, trois façons de calculer les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques},
+nombres à discrépance faible avec le pont brownien, et l'ingénierie qui en fait un pricer.
+
+\section{Simulation des modèles}
+
+Les actifs lognormaux se simulent exactement, date après date. Tout autre modèle est discrétisé, et l'erreur du schéma est un
+biais qui s'ajoute à l'erreur statistique et ne s'annule pas en moyennant. La variance de Heston est le cas difficile classique. Un pas d'Euler
+peut rendre la variance négative, et la tronquer à zéro laisse un biais qui ne décroît que lentement avec le pas de temps. Andersen
+a conçu un schéma qui reproduit les deux premiers moments de la transition exacte de la variance.
+
+\begin{definition}[Schéma quadratique-exponentiel]\label{def:dv:monte-carlo-pricers-in-practice:qe}
+Le \emph{schéma quadratique-exponentiel}\index{schéma quadratique-exponentiel} (quadratic-exponential scheme, QE) simule la variance de Heston sur un pas en égalant
+la moyenne $m$ et la variance $s^2$ de sa loi conditionnelle exacte~: lorsque $\psi=s^2/m^2$ est petit, il tire $a(b+Z)^2$, un
+carré non central, mis à l'échelle, d'une loi normale~; lorsque $\psi$ est grand, un mélange d'une masse en zéro et d'une loi exponentielle. Le log-prix utilise alors la
+variance intégrée implicite des variances initiale et finale.
+\end{definition}
+
+\begin{example}[Euler contre QE]\label{ex:dv:monte-carlo-pricers-in-practice:qe}
+Une option d'achat à la monnaie d'un an dans le \omterm{def:dv:stochastic-volatility:heston}{modèle de Heston} de base du chapitre 10 ($v_0=\bar v=0.04$, $\kappa=1.5$, $\eta=0.6$, $\rho=-0.7$) vaut 6.751 par
+inversion de Fourier. Avec 400\,000 trajectoires et un Euler à troncature complète, le biais vaut 0.857 avec 4 pas par an, 0.373 avec 8, 0.140 avec 16 et
+0.041 avec 32. Avec QE, le prix est à moins d'une erreur type (0.014) de la valeur exacte pour tous les nombres de pas, dès 4 pas par an
+(\cref{fig:dv:monte-carlo-pricers-in-practice:heston}). QE permet de diviser par dix au moins le nombre de pas, donc le temps de calcul.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xmode=log,ymode=log,log basis x=2,
+  xlabel={pas de temps par an},ylabel={biais absolu},
+  tick label style={font=\small},label style={font=\small},
+  xmin=3,xmax=40,ymin=1e-4,ymax=2,grid=major,grid style={gray!25},
+  xtick={4,8,16,32},xticklabels={4,8,16,32},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.6pt] table[x=steps,y=euler]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.6pt] table[x=steps,y=qe]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\addplot[gray,thick,dashed] table[x=steps,y=se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/heston_bias.csv};
+\legend{Euler à troncature complète,schéma quadratique-exponentiel,erreur type}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Biais d'un call à la monnaie d'un an dans un \omterm{def:dv:stochastic-volatility:heston}{modèle de Heston} dont la variance peut atteindre zéro, par pas de temps, par rapport au prix de Fourier
+(400\,000 trajectoires). Le biais d'Euler décroît lentement~; celui de QE reste dans l'erreur statistique à chaque nombre de pas. Données~: le
+tutoriel.}\label{fig:dv:monte-carlo-pricers-in-practice:heston}
+\end{omfigure}
+
+\section{Exercice anticipé par régression}
+
+Le chapitre 6 évaluait à rebours les options bermudéennes et américaines sur un arbre, où la valeur de continuation à chaque nœud est une moyenne sur ses
+nœuds suivants. Une simulation avance dans le temps et ne dispose d'aucune moyenne de ce type. Longstaff et Schwartz l'ont estimée par régression.
+
+\begin{definition}[Méthode de Longstaff--Schwartz]\label{def:dv:monte-carlo-pricers-in-practice:lsm}
+La \emph{méthode de Longstaff--Schwartz}\index{méthode de Longstaff--Schwartz} (Longstaff--Schwartz method) évalue une option bermudéenne par simulation~: en remontant les
+dates d'exercice, elle régresse les flux actualisés que chaque trajectoire réalise à partir de la date suivante, sur un jeu de fonctions de base de la
+variable d'état, en ne retenant que les trajectoires dans la monnaie, et exerce lorsque la valeur d'exercice dépasse la valeur de continuation ajustée~; la politique est alors
+appliquée à des trajectoires indépendantes pour fournir une borne inférieure.
+\end{definition}
+
+Le prix issu d'une politique estimée est biaisé à la baisse, car aucune politique ne fait mieux que la politique optimale. Ajuster et évaluer sur les mêmes trajectoires ajoute un
+biais à la hausse, car la régression a déjà vu les trajectoires qu'elle évalue ensuite. La construction ajuste sur un premier jeu de trajectoires et évalue sur un autre, ce qui garde au résultat son
+caractère de borne inférieure. Son niveau dépend de la base retenue. Une régression incapable de représenter la valeur de continuation conduit à exercer au
+mauvais moments.
+
+\begin{definition}[Borne supérieure duale]\label{def:dv:monte-carlo-pricers-in-practice:dual}
+La \emph{borne supérieure duale}\index{borne supérieure duale} (dual upper bound) d'une option bermudéenne est $\E\bigl[\max_j(h_j-M_j)\bigr]$ pour une martingale $M$ avec $M_0=0$
+et des valeurs d'exercice actualisées $h_j$~; elle dépasse le prix pour toute martingale et lui est égale pour la partie martingale
+du processus de valeur. L'algorithme d'Andersen--Broadie construit $M$ à partir d'une politique de borne inférieure par simulation emboîtée, de sorte que les
+bornes inférieure et supérieure donnent ensemble un intervalle pour le prix.
+\end{definition}
+
+Dans la construction, la valeur de continuation de la politique $Q_j$ est estimée à chaque nœud externe par des trajectoires internes qui suivent la politique. Avec $L_j$ la
+valeur d'exercice actualisée là où la politique exerce et $Q_j$ là où elle continue, les accroissements de la martingale valent $L_j-Q_{j-1}$. Les
+estimations internes sont bruitées, et le maximum dans la borne transforme le bruit en biais à la hausse. La borne est valide pour un nombre quelconque de trajectoires internes, mais serrée seulement
+pour un grand nombre.
+
+\begin{example}[Le biais d'un nombre trop faible de trajectoires internes]\label{ex:dv:monte-carlo-pricers-in-practice:inner}
+Un put bermudéen d'un an à dix dates d'exercice (spot et strike 100, 5~\%, 20~\%) vaut 6.0326 sur l'arbre du chapitre 6. La \omterm{def:dv:monte-carlo-pricers-in-practice:lsm}{méthode de Longstaff--Schwartz} avec une
+base cubique donne 6.0325 (erreur type 0.023). La borne duale sur 1\,000 trajectoires externes vaut 6.134 avec 100 trajectoires internes par nœud, 6.054 avec 400 et
+6.037 avec 1\,600 (\cref{fig:dv:monte-carlo-pricers-in-practice:bounds}, à droite).
+\end{example}
+
+\begin{example}[Un max-call bermudéen à trois actifs]\label{ex:dv:monte-carlo-pricers-in-practice:maxcall}
+Un call sur le meilleur de trois actions indépendantes (chacune à 100, strike 100, volatilité 20~\%, rendement de dividende 10~\%, taux 5~\%), exerçable à neuf dates
+sur trois ans. La base de la régression est un ensemble de polynômes en les deux plus grands prix, leur produit, le produit des trois et la
+valeur intrinsèque. Avec cette base, Longstaff--Schwartz sur 200\,000 trajectoires fraîches donne 18.649 (erreur type 0.039), et la borne duale (1\,000 trajectoires externes,
+1\,000 trajectoires internes) donne 18.713 (0.019). L'écart vaut 0.064, soit 0.3~\% du prix. Avec une base réduite au plus grand prix et à son carré, la borne inférieure
+tombe à 18.137 et la borne supérieure monte à 18.805, soit un écart de 0.668, dix fois plus large
+(\cref{fig:dv:monte-carlo-pricers-in-practice:bounds}, à gauche).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.6cm},
+  width=6.6cm,height=5cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xlabel={base de régression},ylabel={prix},xmin=-0.6,xmax=1.6,ymin=18.0,ymax=18.95,
+  xtick={0,1},xticklabels={riche,réduite},title={\small bornes du max-call},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omDef,only marks,mark=square*,mark size=2.4pt,error bars/.cd,y dir=both,y explicit] table[x=i,y=lower,y error=lower_se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bounds.csv};
+\addplot[omThm,only marks,mark=triangle*,mark size=2.8pt,error bars/.cd,y dir=both,y explicit] table[x=i,y=upper,y error=upper_se]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bounds.csv};
+\legend{Longstaff--Schwartz (inférieure),duale (supérieure)}
+\nextgroupplot[xmode=log,log basis x=2,xlabel={trajectoires internes par nœud},ylabel={borne supérieure duale},xmin=70,xmax=2200,ymin=6.0,ymax=6.16,
+  xtick={100,400,1600},xticklabels={100,400,1\,600},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},title={\small put bermudéen},
+  legend columns=1,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none}]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=inner,y=upper]{figdata/derivatives/23-monte-carlo-pricers-in-practice/inner_bias.csv};
+\addplot[black,dashed] table[x=inner,y=tree]{figdata/derivatives/23-monte-carlo-pricers-in-practice/inner_bias.csv};
+\legend{borne duale,valeur sur l'arbre}
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{À gauche~: bornes inférieure et supérieure (barres d'une erreur type) pour un max-call bermudéen à trois actifs, avec une base de régression riche et une base de régression réduite~:
+l'écart est le prix d'une base pauvre. À droite~: la borne duale d'un put bermudéen à un actif, en fonction du nombre de trajectoires internes par nœud, qui se rapproche
+de la valeur sur l'arbre par le haut. Données~: le tutoriel.}\label{fig:dv:monte-carlo-pricers-in-practice:bounds}
+\end{omfigure}
+
+\section{Grecques~: trajectorielle, par rapport de vraisemblance, adjointe}
+
+Le \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice} d'un prix Monte-Carlo fournit des \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} dont la variance est celle d'une différence de deux nombres bruités. Les nombres aléatoires communs rendent la
+différence beaucoup moins bruitée. Deux méthodes directes, dues à Broadie et Glasserman, évitent entièrement le bump et donnent des \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} à partir des mêmes trajectoires que le
+prix.
+
+\begin{definition}[Grecque trajectorielle]\label{def:dv:monte-carlo-pricers-in-practice:pathwise}
+Une \emph{grecque trajectorielle}\index{grecque trajectorielle} dérive le paiement actualisé le long de chaque trajectoire simulée par rapport au paramètre, en gardant
+les nombres aléatoires fixés, puis en calcule la moyenne~; elle exige que le paiement soit continu en fonction du paramètre (presque sûrement dérivable), et échoue pour
+les digitales et les options à barrière.
+\end{definition}
+
+\begin{definition}[Grecque par rapport de vraisemblance]\label{def:dv:monte-carlo-pricers-in-practice:lr}
+Une \emph{grecque par rapport de vraisemblance}\index{grecque par rapport de vraisemblance} dérive la densité de l'état simulé au lieu du paiement~: elle moyenne le
+paiement actualisé multiplié par le score, c'est-à-dire la dérivée de la log-densité par rapport au paramètre~; elle fonctionne pour les paiements discontinus, au prix
+d'une variance plus élevée.
+\end{definition}
+
+Le tableau compare les deux méthodes sur des options à la monnaie d'un an (cours au comptant et strike 100, taux 5~\%, volatilité 20~\%) avec 200\,000 trajectoires, erreurs types
+entre crochets. La dernière colonne applique la méthode trajectorielle à la digitale lissée en un call spread.
+
+\begin{center}\small
+\begin{tabular}{lrrrr}
+\toprule
+un an & exact & trajectorielle & rapport de vraisemblance & lissée\\
+\midrule
+delta du call & 0.6368 & 0.6384 (0.0013) & 0.6413 (0.0033) & ---\\
+\omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du call & 37.52 & 37.72 (0.17) & 38.24 (0.62) & ---\\
+delta de la digitale & 0.01876 & 0 (faux) & 0.01883 (0.00006) & 0.01895 (0.00021)\\
+\omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} de la digitale & $-0.657$ & 0 (faux) & $-0.648$ (0.010) & $-0.663$ (0.007)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Pour le call, la variance de l'estimateur trajectoriel est 6.5 fois plus faible pour le delta et 13 fois plus faible pour le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega}. Pour la digitale, il renvoie zéro, puisque la
+dérivée du paiement est nulle presque partout. Le rapport de vraisemblance donne le bon résultat. Le lissage de la digitale en un call spread de demi-largeur un rétablit
+une estimation trajectorielle, au prix d'un biais propre au call spread.
+
+La méthode trajectorielle dispose d'une implémentation efficace, qui compte surtout pour les grands portefeuilles. La méthode adjointe de Giles et Glasserman
+parcourt en sens inverse, le long de chaque trajectoire, le même calcul trajectoriel~: elle donne les mêmes valeurs, et son avantage croît avec le nombre
+d'entrées, comme les points d'une \omterm{def:dv:implied-volatility-and-its-surface:surface}{surface de volatilité}.
+
+\begin{example}[Douze vegas pour le prix de trois passes]\label{ex:dv:monte-carlo-pricers-in-practice:adjoint}
+Une \omterm{def:dv:asians-lookbacks-cliquets-and-forward-starts:asian}{option asiatique} arithmétique (un an, 48 pas, strike 100, 20~\%) est évaluée avec sa sensibilité à la volatilité dans chacun des douze compartiments mensuels.
+Le mode direct demanderait une passe par compartiment. La passe adjointe (inverse) du livre~4, chapitre~28, parcourt une fois en sens inverse chaque trajectoire stockée
+et accumule la dérivée du paiement par rapport à l'état et à la volatilité de chaque pas. Elle restitue les douze \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} et le delta pour un coût de
+quelques passes directes. Le prix vaut 5.901 et le delta 0.593. Le \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} du premier mois vaut 5.064, alors que le bump de la volatilité de ce mois avec
+les mêmes tirages donne 5.065, et les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} tombent à 0.016 pour le dernier mois (\cref{fig:dv:monte-carlo-pricers-in-practice:adjoint}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=4.6cm,ybar,bar width=12pt,
+  xlabel={compartiment de volatilité (mois)},ylabel={vega (par unité de volatilité)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0.3,xmax=12.7,ymin=0,ymax=5.6,grid=major,grid style={gray!25},xtick={1,2,3,4,5,6,7,8,9,10,11,12},
+  table/col sep=comma]
+\addplot[omThm,fill=omThm!40] table[x=month,y=vega]{figdata/derivatives/23-monte-carlo-pricers-in-practice/bucket_vega.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{Vegas} par compartiment d'une \omterm{def:dv:asians-lookbacks-cliquets-and-forward-starts:asian}{option asiatique} arithmétique d'un an, obtenus par une passe adjointe le long de chaque trajectoire~: la sensibilité de la moyenne à la volatilité précoce
+est la plus forte, car les mouvements précoces se répercutent sur chaque constatation ultérieure. Données~: le tutoriel.}\label{fig:dv:monte-carlo-pricers-in-practice:adjoint}
+\end{omfigure}
+
+\section{Bridges et nombres quasi-aléatoires}
+
+Les suites à discrépance faible (livre~4, chapitre~26) remplissent le cube unité plus uniformément que les nombres aléatoires, et, pour des intégrandes régulières, leur erreur décroît plus vite
+que $1/\sqrt N$. Une trajectoire de $d$ dates est toutefois un point en $d$ dimensions, et les suites à discrépance faible perdent leur avantage dans les dernières
+coordonnées. Le pont brownien réordonne la construction de sorte que les premières coordonnées portent l'essentiel de la variance de la trajectoire. La première normale fixe
+l'extrémité $W_T$, la seconde le milieu conditionnellement aux extrémités, et ainsi de suite. Les bonnes premières coordonnées de la suite déterminent alors la forme de la trajectoire.
+
+\begin{example}[Une option asiatique avec des points de Halton]\label{ex:dv:monte-carlo-pricers-in-practice:qmc}
+Un call asiatique à 16 dates (un an, strike 100, 20~\%). Avec 4\,096 trajectoires, l'erreur type Monte-Carlo vaut 0.131. Les points de Halton, décalés aléatoirement vingt fois
+pour mesurer leur erreur, donnent 0.027 avec la construction usuelle pas à pas et 0.0092 avec le pont brownien, quatorze fois plus faible que Monte-Carlo,
+soit la précision d'environ 200 fois plus de trajectoires aléatoires. Avec 256 trajectoires, les trois erreurs valent 0.53, 0.34 et 0.13
+(\cref{fig:dv:monte-carlo-pricers-in-practice:qmc}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xmode=log,ymode=log,log basis x=2,
+  xlabel={trajectoires},ylabel={erreur (écart-type)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=200,xmax=5200,ymin=0.005,ymax=0.8,grid=major,grid style={gray!25},
+  xtick={256,1024,4096},xticklabels={256,1\,024,4\,096},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.6pt] table[x=n,y=mc]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=n,y=halton]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.8pt] table[x=n,y=bridge]{figdata/derivatives/23-monte-carlo-pricers-in-practice/qmc.csv};
+\legend{Monte Carlo,Halton,Halton avec pont brownien}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Erreur d'un call asiatique à 16 dates en fonction du nombre de trajectoires~: erreur type de Monte-Carlo, et dispersion sur les décalages aléatoires des points de Halton
+selon la construction pas à pas et la construction par pont brownien. Données~: le tutoriel.}\label{fig:dv:monte-carlo-pricers-in-practice:qmc}
+\end{omfigure}
+
+\section{Concevoir un pricer Monte-Carlo}
+
+Un moteur de production sépare ce qui varie de ce qui est partagé. Les générateurs de trajectoires sont un par modèle~: lognormal, \omterm{def:dv:local-volatility:model}{volatilité locale}, Heston-QE,
+stochastic-local. Ils écrivent les trajectoires sur une grille de dates dont le produit a besoin, et ils ne connaissent jamais le paiement. Les paiements ne lisent que les trajectoires (chapitres 16 et
+18). Les estimateurs, la \omterm{def:dv:monte-carlo-pricers-in-practice:lsm}{méthode de Longstaff--Schwartz}, les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} et la \omterm{def:dv:monte-carlo-pricers-in-practice:dual}{borne supérieure duale} se placent au-dessus. Quatre règles le gardent rigoureux.
+\begin{itemize}
+\item \textbf{Les graines sont des données.} Tout prix est reproductible à partir de sa graine. Les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} par bump utilisent les mêmes tirages (nombres aléatoires communs).
+\item \textbf{Tout nombre porte son erreur.} L'erreur type pour les statistiques, un contrôle de convergence pour la discrétisation, et un écart de bornes pour
+l'exercice anticipé.
+\item \textbf{Réduire la variance d'abord.} Variables antithétiques, variables de contrôle (l'\omterm{def:dv:asians-lookbacks-cliquets-and-forward-starts:asian}{option asiatique} géométrique du chapitre~16), conditionnement par la \omterm{prop:dv:stochastic-volatility:mixing}{formule de mélange} du chapitre~10 et
+le bridge rapporte en général davantage que des trajectoires supplémentaires.
+\item \textbf{Vectoriser sur les trajectoires, boucler sur le temps.} Les générateurs de la construction sont des tableaux de trajectoires avancés date par date, la forme naturelle pour numpy, pour
+un GPU, et pour la passe adjointe qui remonte sur les mêmes dates.
+\end{itemize}
+
+\section{Tutoriel~: bornes, grecques et bridges}\label{tut:dv:monte-carlo-pricers-in-practice:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Pricer un max-call bermudéen par Longstaff--Schwartz et le borner par le haut à l'aide de la borne duale~; calculer par les \omterm{def:dv:monte-carlo-pricers-in-practice:pathwise}{grecques trajectorielles} et par rapport de vraisemblance les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} d'un call et d'un digital, ainsi que les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} par compartiment au moyen d'une passe adjointe~;
+comparer Euler et QE pour Heston~; mesurer l'effet du pont brownien sur les
+points de Halton. \textbf{État final~:} les quatre figures, le tableau et les valeurs numériques du problème du week-end.
+\begin{tutsteps}
+\item \textbf{La régression}, à rebours sur les dates d'exercice, sur les trajectoires dans la monnaie uniquement~:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{85}{103}{Régression de Longstaff--Schwartz.}\label{lst:dv:monte-carlo-pricers-in-practice:lsm}
+\item \textbf{La borne duale}~: valeurs de continuation internes, accroissements de martingale $L_j-Q_{j-1}$, le maximum~:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{126}{157}{La borne supérieure d'Andersen--Broadie.}\label{lst:dv:monte-carlo-pricers-in-practice:dual}
+\item \textbf{La passe adjointe} pour les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vegas} par compartiment~:
+\omcode{code/firm/mcpricer/firm_mcpricer.py}{184}{206}{Passes directe et rétrograde pour une option d'achat asiatique.}\label{lst:dv:monte-carlo-pricers-in-practice:adjoint}
+\item \textbf{Lancer} \texttt{dv\_mc.bounds()}, \texttt{put\_bias()}, \texttt{greek\_table()}, \texttt{adjoint()}, \texttt{heston\_bias()}, \texttt{qmc\_study()}
+et \texttt{fig\_mc.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Pricer le max-call avec une corrélation de 0.5~; ajouter l'\omterm{def:dv:asians-lookbacks-cliquets-and-forward-starts:asian}{option asiatique} géométrique comme variable de contrôle en plus des points de Halton~; remplacer le
+rapport de vraisemblance du digital par une espérance conditionnelle sur le dernier pas de temps (lissage par conditionnement).
+\end{tutorial}
+
+\section{Construction~: le moteur de Monte-Carlo}\label{bld:dv:monte-carlo-pricers-in-practice:mcpricer}
+
+\begin{build}
+\bfield{Rôle} Le moteur de simulation de la firme miniature~: générateurs de trajectoires, exercice anticipé avec bornes, \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} par trois méthodes, nombres quasi-aléatoires~;
+le moteur de Monte-Carlo du chapitre~28 l'enveloppe.
+\bfield{Interface} \texttt{gbm\_paths(s0, vols, corr, times, r, q, n, seed)}~; \texttt{heston\_terminal(\ldots, scheme)}~; \texttt{lsm\_fit(paths, ex\_idx, payoff,
+basis, k, disc)}, \texttt{lsm\_price}, \texttt{exercise\_now}, \texttt{max\_call\_basis}, \texttt{small\_basis}~; \texttt{dual\_upper(outer, \ldots, step\_sim,
+n\_inner, seed)}~; \texttt{call\_greeks(\ldots, digital, smooth)}~; \texttt{asian\_adjoint}~; \texttt{halton(n, dim, shift)}, \texttt{brownian\_bridge(z, t)},
+\texttt{norm\_inv}.
+\bfield{Règles} Régression et évaluation sur des trajectoires indépendantes~; une borne inférieure est publiée avec sa \omterm{def:dv:monte-carlo-pricers-in-practice:dual}{borne supérieure duale} pour chaque option bermudéenne~; \omterm{def:dv:monte-carlo-pricers-in-practice:pathwise}{grecques trajectorielles} là où
+le paiement est continu, par rapport de vraisemblance ou lissage là où il ne l'est pas~; graines explicites~; aucune constante mémorisée dans le calcul numérique (l'inverse de la loi normale est
+la méthode de Newton appliquée à la fonction d'erreur).
+\bfield{Tests d'acceptation} \texttt{code/firm/mcpricer/tests/}~: les bornes bermudéennes encadrent la valeur de l'arbre et la borne duale diminue avec le nombre de trajectoires internes~; \omterm{def:dv:monte-carlo-pricers-in-practice:pathwise}{grecques trajectorielles} et
+\omterm{def:dv:monte-carlo-pricers-in-practice:lr}{grecques par rapport de vraisemblance} s'accordent avec Black--Scholes et le digital trajectoriel est nul~; la passe adjointe coïncide avec le bump~; QE coïncide avec le prix de Fourier~; les premiers
+points de Halton, l'inverse de la loi normale et les covariances du pont brownien.
+\bfield{Pour aller plus loin} Points de Sobol avec des nombres de direction publiés (cités, non rappelés)~; Monte-Carlo multiniveau (livre~4)~; une passe adjointe à travers
+Longstaff--Schwartz.
+\end{build}
+
+\begin{omsources}
+\item F.~A.~Longstaff and E.~S.~Schwartz, «~Valuing American options by simulation~: a simple least-squares approach~», \emph{Review of Financial Studies}
+14(1) (2001) 113--147.
+\item L.~Andersen and M.~Broadie, «~Primal-dual simulation algorithm for pricing multidimensional American options~», \emph{Management Science} 50(9)
+(2004) 1222--1234.
+\item L.~Andersen, «~Simple and efficient simulation of the Heston stochastic volatility model~», \emph{Journal of Computational Finance} 11(3) (2008) 1--42.
+\item M.~Broadie and P.~Glasserman, «~Estimating security price derivatives using simulation~», \emph{Management Science} 42(2) (1996) 269--285.
+\item P.~Glasserman, \emph{Monte Carlo Methods in Financial Engineering} (Springer, 2003).
+\item M.~Giles and P.~Glasserman, «~Smoking adjoints~: fast Monte Carlo Greeks~», \emph{Risk} 19 (2006) 88--92~; rapport Oxford NA-05-15 (2005).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:1}
+Expliquer pourquoi un prix de Longstaff--Schwartz, calculé sur des trajectoires indépendantes de la régression, constitue une borne inférieure.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:2}
+Établir le delta trajectoriel d'un call sous Black--Scholes, $e^{-rT}\mathbf 1\{S_T>K\}S_T/S_0$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:dv:monte-carlo-pricers-in-practice:3}
+Expliquer pourquoi le delta trajectoriel d'un digital est nul, et pourquoi le delta par rapport de vraisemblance ne l'est pas.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:4}
+Établir le poids du \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{vega} par rapport de vraisemblance $(Z^2-1)/\sigma-Z\sqrt T$ pour un prix terminal lognormal.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:5}
+Expliquer pourquoi un nombre insuffisant de trajectoires internes biaise la borne duale vers le haut, jamais vers le bas.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:6}
+Expliquer pourquoi le pont brownien aide les nombres quasi-aléatoires mais non les nombres pseudo-aléatoires.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:7}
+\emph{Programmation.} Ajuster et évaluer la politique d'exercice de Longstaff--Schwartz du max-call sur les mêmes trajectoires, et comparer avec le prix sur trajectoires indépendantes. Expliquer le signe de la
+différence.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:dv:monte-carlo-pricers-in-practice:8}
+\emph{Trouver le défaut.} «~Notre Monte-Carlo évalue l'option bermudéenne à deux centimes près~: l'erreur type vaut 0.01.~»
+\end{exercise}
+
+\section{Problème~: les bornes bermudéennes}
+
+\begin{problem}[{Problème du week-end --- qualité de la politique d'exercice}]\label{pb:dv:monte-carlo-pricers-in-practice:1}
+Un desk vend un call bermudéen de trois ans sur le meilleur de trois actions (chacune à 100, strike 100, volatilité 20~\%, rendement de dividende 10~\%, taux 5~\%, neuf dates d'exercice)
+et le valorise par la \omterm{def:dv:monte-carlo-pricers-in-practice:lsm}{méthode de Longstaff--Schwartz}.
+
+\medskip\noindent\textbf{Partie I --- La borne inférieure.}
+\begin{enumerate}
+\item Donner le prix avec la base riche et son erreur type.
+\item Expliquer pourquoi l'ajustement et l'évaluation se font sur des trajectoires distinctes.
+\item Donner le prix avec la base réduite (le plus grand prix et son carré).
+\item Identifier les décisions d'exercice que la base réduite traite mal.
+\item Préciser ce que révèle le prix d'un max-call européen.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La borne supérieure.}
+\begin{enumerate}[resume]
+\item Donner la borne duale pour la base riche avec 1\,000 trajectoires externes et 1\,000 trajectoires internes, ainsi que son erreur type.
+\item Donner l'écart et l'exprimer en proportion du prix.
+\item Donner la borne et l'écart pour la base réduite.
+\item Pour le put bermudéen à un seul actif, expliquer comment la borne varie avec 100, 400 et 1\,600 trajectoires internes.
+\item Expliquer ce que coûte la borne duale par rapport à la borne inférieure, et pourquoi.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Autour du prix.}
+\begin{enumerate}[resume]
+\item Expliquer comment calculer le delta de l'option bermudéenne.
+\item Expliquer pourquoi éviter le \omterm{def:dv:greeks-and-the-hedging-pnl:bump}{bump-and-reprice} avec de nouvelles trajectoires.
+\item Préciser ce qu'apporte la méthode adjointe à un portefeuille de telles transactions.
+\item Expliquer en quoi les nombres quasi-aléatoires aideraient, et ce qui les limite ici.
+\item Identifier l'erreur de discrétisation que ce produit n'a pas, et le modèle qui en introduirait une.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Déterminer quel prix coter et lequel passer en compte~?
+\item Préciser la réserve à constituer pour la politique d'exercice~?
+\item Préciser à partir de quel moment arrêter d'améliorer la base~?
+\item Énoncer le \emph{résultat nommé}~: l'écart entre la borne inférieure de Longstaff--Schwartz et la \omterm{def:dv:monte-carlo-pricers-in-practice:dual}{borne supérieure duale} pour le max-call bermudéen à trois actifs, et
+sa sensibilité à la base de régression.
+\item En une phrase~: que mesure l'écart entre les bornes~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:dv:monte-carlo-pricers-in-practice:1}
+Expliquez l'algorithme de Longstaff--Schwartz.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:dv:monte-carlo-pricers-in-practice:2}
+Comment obtenez-vous une borne supérieure pour un prix bermudéen par simulation~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:dv:monte-carlo-pricers-in-practice:3}
+Comparez les \omterm{def:dv:monte-carlo-pricers-in-practice:pathwise}{grecques trajectorielles} et les \omterm{def:dv:monte-carlo-pricers-in-practice:lr}{grecques par rapport de vraisemblance}. Quand chacune échoue-t-elle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:dv:monte-carlo-pricers-in-practice:4}
+Comment simuleriez-vous efficacement le \omterm{def:dv:stochastic-volatility:heston}{modèle de Heston}, et pourquoi pas Euler~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:dv:monte-carlo-pricers-in-practice:5}
+Votre risque Monte-Carlo est bruité d'un jour à l'autre. Que changez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:dv:monte-carlo-pricers-in-practice:6}
+Expliquez la différentiation algorithmique adjointe pour les \omterm{def:dv:greeks-and-the-hedging-pnl:greeks}{grecques} Monte-Carlo. Quel en est le coût en mémoire et en temps~?
+\end{interviewq}

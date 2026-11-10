@@ -1,0 +1,457 @@
+\chapter{Lecture des données de marché}\label{ch:m1:reading-market-data}
+
+Avant midi, une bourse a envoyé à une même firme des dizaines de millions de messages portant sur
+des milliers d'instruments. Chacun annonce qu'un ordre a été ajouté, réduit,
+exécuté ou retiré, en quelques dizaines d'octets. Aucun ne dit quel est le meilleur cours acheteur~:
+c'est au destinataire de le déduire, en appliquant chaque message, dans l'ordre, à
+un carnet d'ordres qu'il maintient lui-même. Si un message se perd, le carnet est faux
+jusqu'à la fin de la journée, en silence. Si un compte rendu de transaction comporte une faute de frappe, un cours
+de 10.01 pour une action valant 100, le plus bas de la journée, sa volatilité, son
+prix moyen pondéré par les volumes et tout signal calculé à partir de ces données sont faux,
+tout aussi en silence. Chaque résultat de la suite de cette série repose sur un tableau de
+cours~; ce chapitre porte sur la façon dont ce tableau est construit et sur les défauts
+dont il hérite.
+
+\section{Trois niveaux de données}
+
+\begin{definition}[Niveau 1, niveau 2, niveau 3]\label{def:m1:reading-market-data:levels}
+Les données de \emph{niveau 1}\index{niveau 1} sont le meilleur cours acheteur et le meilleur cours vendeur, avec leurs
+quantités, et la dernière transaction. Les données de \emph{niveau 2}\index{niveau 2} sont le carnet
+d'ordres agrégé par prix~: pour chaque palier de prix, la quantité totale (et parfois
+le nombre d'ordres), sur une certaine profondeur ou en totalité~: le flux \omterm{def:m1:matching-algorithms-and-implied-spreads:mbo}{market-by-price} de
+la \cref{def:m1:matching-algorithms-and-implied-spreads:mbo}. Les données de \emph{niveau
+3}\index{niveau 3} sont la totalité des ordres, pris individuellement, avec leur identifiant et
+chacun de leurs événements au cours de leur vie~: le flux \omterm{def:m1:matching-algorithms-and-implied-spreads:mbo}{market-by-order}, à partir duquel les deux autres
+peuvent être calculés, et seul lui donne les rangs dans la file d'attente.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  col/.style={draw=omDef,rounded corners=2pt,minimum width=3.9cm,minimum height=3.3cm,align=left,fill=omDef!4,font=\footnotesize\ttfamily,inner sep=5pt}]
+\node[col] (l3) at (0,0) {réf. côté  quantité  prix\\1001 A \ \ \ 300 \ 99.99\\1002 A \ \ \ 200 \ 99.99\\1004 A \ \ \ 100 \ 99.98\\1003 V \ \ \ 500 100.01\\1005 V \ \ \ 100 100.02};
+\node[col] (l2) at (4.6,0) {côté  quantité  prix  nb\\A \ \ \ \ 500 \ 99.99 \ 2\\A \ \ \ \ 100 \ 99.98 \ 1\\V \ \ \ \ 500 100.01 \ 1\\V \ \ \ \ 100 100.02 \ 1};
+\node[col] (l1) at (9.2,0) {bid \ 99.99 x 500\\ask 100.01 x 500\\dernier 100.01 x 100};
+\node[font=\small\bfseries,above=2pt of l3] {Niveau~3~: ordres};
+\node[font=\small\bfseries,above=2pt of l2] {Niveau~2~: prix};
+\node[font=\small\bfseries,above=2pt of l1] {Niveau~1~: meilleurs cours};
+\draw[-{Stealth[length=2mm]},thick] (l3.east) -- (l2.west);
+\draw[-{Stealth[length=2mm]},thick] (l2.east) -- (l1.west);
+\end{tikzpicture}
+
+\omcaption{Un même carnet à trois niveaux de détail. Chaque niveau peut être calculé
+à partir de celui situé à sa gauche, et jamais l'inverse~: les barres d'une seconde d'un fournisseur
+sont des données de \omterm{def:m1:reading-market-data:levels}{niveau 1} échantillonnées~; elles ne peuvent pas être reconstituées en un
+carnet d'ordres.}\label{fig:m1:reading-market-data:levels}
+\end{omfigure}
+
+\begin{definition}[Numéro de séquence]\label{def:m1:reading-market-data:seq}
+Un \emph{numéro de séquence}\index{numéro de séquence} est un compteur que le
+diffuseur incrémente à chaque message sur un canal. Un récepteur qui constate un
+saut dans la numérotation a perdu des messages et doit les récupérer, auprès d'un service
+de retransmission ou d'un instantané, avant que son carnet puisse de nouveau être jugé fiable.
+\end{definition}
+
+Un flux de \omterm{def:m1:reading-market-data:levels}{niveau 3} est un flux de \emph{différences}. L'état se trouve du
+côté du récepteur, ce qui rend le protocole compact et fait de chaque récepteur
+responsable de l'exactitude des données. Les \omterm{def:m1:us-equity-market-structure:sip}{flux directs} sont publiés sur deux
+chemins réseau redondants~; le récepteur retient, pour chaque \omterm{def:m1:reading-market-data:seq}{numéro de séquence}, la copie
+qui arrive en premier~; il signale le cas où aucune des deux n'arrive.
+
+\begin{dated}{2026-09}{Un format de transmission}\label{dat:m1:reading-market-data:itch}
+Le flux actions ordre par ordre dont la spécification version 5.0 sert de
+modèle à ce chapitre encode tous les entiers en big-endian~; les prix sont des entiers
+avec quatre décimales implicites~; les horodatages en nanosecondes depuis minuit
+sur six octets~; et les instruments par un code \emph{locate} de deux octets attribué pour
+la journée, à la même position dans chaque message. Un message d'ajout d'ordre compte 36
+octets~: type, locate, numéro de suivi, horodatage, référence de l'ordre sur huit
+octets, côté, nombre d'actions, un symbole de huit caractères et le prix.
+Une exécution compte 31 octets et ne renvoie à l'ordre que par sa référence, comme le font
+l'annulation (23 octets) et la suppression (19 octets)~: le prix d'une transaction ne figure pas
+dans le message d'exécution~: il se trouve là où le récepteur a stocké l'ordre.
+\end{dated}
+
+\section{Transactions, cotations et codes de condition}
+
+\begin{definition}[Condition de transaction]\label{def:m1:reading-market-data:condition}
+Une \emph{condition de transaction}\index{condition de transaction} (ou condition de vente) est un code
+rattaché à un compte rendu de transaction qui indique la nature de celle-ci et la manière dont elle
+peut être utilisée~: une transaction ordinaire~; une transaction d'ouverture ou de clôture en enchère~; un \omterm{def:m1:us-equity-market-structure:lots}{lot
+irrégulier}~; une transaction déclarée en retard ou hors séquence~; une transaction à un prix
+moyen ou dérivé~; une correction ou une annulation d'un compte rendu antérieur. Les
+consolidated tapes et chaque bourse définissent les conditions qui mettent à jour le dernier
+cours, le plus haut et le plus bas, et le volume.
+\end{definition}
+
+Un tape n'est pas une liste de cours auxquels on aurait pu négocier. Un
+compte rendu hors séquence porte un cours datant de quelques minutes. Une
+transaction à prix moyen ne correspond à aucune cotation qui ait jamais existé. Une transaction annulée n'a pas eu lieu~;
+son annulation arrive sous forme d'un message ultérieur qu'un chargeur négligent ignore.
+Une transaction d'enchère est un seul cours pour une large part du volume de la journée. Les transactions hors bourse
+(décrites au \cref{ch:m1:retail-flow-and-wholesaling}) sont déclarées après
+coup, avec quelques secondes de retard, et un horodatage pouvant être celui du déclarant.
+Avant de calculer la moindre statistique à partir des transactions, une règle doit préciser quelles
+conditions sont retenues.
+
+\begin{method}[Nettoyage d'un tape]\label{met:m1:reading-market-data:clean}
+\begin{enumerate}
+\item Appliquer les corrections et les annulations en les rapprochant des
+comptes rendus d'origine.
+\item Conserver ou écarter explicitement chaque condition, selon l'usage~: tout le volume exécuté
+pour le volume total~; seulement les transactions régulières et en séquence pour le
+dernier cours, un plus haut ou un plus bas~; les enchères à part.
+\item Signaler les transactions très éloignées de la cotation en vigueur ou d'une médiane glissante~;
+les examiner avant de les supprimer~: un flash crash est une donnée, une erreur de décimale n'en est pas une.
+\item Consigner ce qui a été supprimé et pourquoi. La règle fait partie du résultat.
+\end{enumerate}
+\end{method}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=4.8cm,
+  xlabel={numéro de transaction},ylabel={prix},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=16,ymin=0,ymax=115,grid=major,grid style={gray!25},
+  scatter/classes={1={mark=*,omDef,mark size=1.8pt},0={mark=x,omThm,mark size=3.5pt,very thick}},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[scatter,only marks,scatter src=explicit symbolic] table[x=seq,y=price,meta=kept]{figdata/markets-1/28-reading-market-data/badtick.csv};
+\legend{conservées,écartées par le filtre}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Quinze transactions déclarées sur un même titre. Le filtre automatique en écarte
+deux, l'impression à 10.01 et une transaction annulée d'apparence tout à fait normale~;
+la déclaration tardive à 99.80 passe à travers. Avec les quinze, le prix moyen pondéré
+par les volumes vaut 98.40~; la valeur réelle est proche de 100. Données~: le
+problème du week-end.}\label{fig:m1:reading-market-data:badtick}
+\end{omfigure}
+
+\section{Horodatages}
+
+\begin{definition}[Horodatages de la bourse et de réception]\label{def:m1:reading-market-data:ts}
+L'\emph{horodatage de la bourse}\index{horodatage de la bourse} est écrit par le
+moteur d'appariement ou la passerelle de l'éditeur lorsque l'événement se produit. Le
+\emph{horodatage de réception}\index{horodatage de réception} est écrit par le
+système de capture du destinataire lorsque le message arrive. Le premier ordonne les événements
+au sein d'une même plateforme~; seul le second indique ce que le destinataire pouvait savoir,
+et à quel moment.
+\end{definition}
+
+Un backtest qui utilise les \omterm{def:m1:reading-market-data:ts}{horodatages de la bourse} suppose que la firme a pris connaissance de chaque
+événement à l'instant où il s'est produit. L'écart, de quelques dizaines de microsecondes dans
+un même bâtiment et de quelques millisecondes entre villes, constitue à lui seul
+l'avantage de certaines stratégies (livre~10). Les horloges de deux plateformes ne sont pas
+la même horloge~: comparer leurs horodatages pour décider quelle cotation a bougé en premier
+n'est valable qu'à la précision de leur synchronisation.
+
+\begin{dated}{2026-09}{Précision requise des horloges}\label{dat:m1:reading-market-data:clocks}
+\emph{Union européenne.} La norme technique de réglementation sur la synchronisation des horloges
+impose aux membres d'une plateforme de négociation qui recourent à des techniques
+algorithmiques à haute fréquence de maintenir leurs horloges de gestion à moins de 100
+microsecondes de l'UTC et d'horodater avec une granularité d'une microseconde ou
+mieux. \emph{États-Unis.} Le plan du consolidated audit trail exige que les bourses
+maintiennent leurs horloges à moins de 100 microsecondes de l'heure de l'institut national
+de \omterm{def:m1:reading-market-data:norm}{normalisation}, et que les \omterm{def:m1:the-sell-side:sell-side}{broker-dealers} le fassent à moins de 50 millisecondes (une
+seconde pour les horloges qui ne servent qu'aux événements manuels).
+\end{dated}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=4.6cm,
+  xlabel={gigue moyenne de latence (microsecondes)},ylabel={hors d'ordre (\%)},
+  tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=5200,ymin=0,ymax=36,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=jitter_us,y=inversions_pct]{figdata/markets-1/28-reading-market-data/reorder.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'échantillon de flux du chapitre, rejoué avec un \omterm{def:m1:reading-market-data:ts}{horodatage de réception} égal
+à l'\omterm{def:m1:reading-market-data:ts}{horodatage de la bourse}, plus 200 microsecondes, plus une gigue exponentielle. Trier
+par \omterm{def:m1:reading-market-data:ts}{horodatage de réception} désordonne 1~\% des messages pour une gigue de 100 microsecondes et
+un tiers pour 5 millisecondes. Au sein d'un même flux, ordonner par \omterm{def:m1:reading-market-data:seq}{numéro de séquence}, jamais
+par l'une ou l'autre horloge. Données~: le tutoriel.}\label{fig:m1:reading-market-data:reorder}
+\end{omfigure}
+
+\section{Symbologie et données de référence}
+
+\begin{definition}[Symbologie et données de référence]\label{def:m1:reading-market-data:refdata}
+La \emph{symbologie}\index{symbologie} est l'ensemble des identifiants sous lesquels un
+même instrument est connu~: symbole boursier de cotation, codes des fournisseurs, numéros nationaux et
+internationaux de valeurs, code numérique du flux pour la journée.
+Les \emph{données de référence}\index{données de référence} regroupent tout ce qui concerne
+l'instrument et qui n'est pas un prix~: identifiants et leur historique, plateforme de cotation,
+devise, pas de cotation, taille de lot, multiplicateur, échéance, opérations sur titres,
+calendrier de négociation.
+\end{definition}
+
+Un symbole boursier n'est pas un identifiant. Les symboles sont réutilisés après des radiations, modifiés
+lors de fusions, et diffèrent selon la plateforme et le fournisseur~; le code locate d'un flux n'est valable
+pour une journée. Les tables de recherche doivent être indexées par un identifiant interne
+permanent, chaque symbole externe étant rattaché à celui-ci par plage de dates. L'erreur
+silencieuse la plus fréquente en recherche sur actions, après le look-ahead, est une
+série temporelle qui assemble deux entreprises différentes à la date où l'une a repris le
+symbole de l'autre. Les constructions des chapitres~\ref{ch:m1:shares-corporate-actions-indices},
+\ref{ch:m1:futures-contracts-and-exchanges} et
+\ref{ch:m1:option-contracts-and-exchanges} constituent les \omterm{def:m1:reading-market-data:refdata}{données de référence} de ce chapitre.
+
+\section{Du flux brut à la table de recherche}
+
+\begin{definition}[Normalisation]\label{def:m1:reading-market-data:norm}
+La \emph{normalisation}\index{normalisation} est la conversion de chaque plateforme
+de ses messages natifs en une représentation interne unique~: types de messages communs,
+prix entiers dans une unité commune, champ d'horloge commun, identifiants permanents
+des instruments, indicateurs explicites des conditions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,
+  xlabel={secondes depuis le premier message},ylabel={prix},
+  tick label style={font=\small},label style={font=\small},
+  ymin=99.945,ymax=100.065,grid=major,grid style={gray!25},
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/fixed zerofill,/pgf/number format/precision=2},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[omDef,thick,const plot] table[x=seconds,y=bid]{figdata/markets-1/28-reading-market-data/l1.csv};
+\addplot[omThm,thick,const plot] table[x=seconds,y=ask]{figdata/markets-1/28-reading-market-data/l1.csv};
+\addplot[only marks,mark=*,mark size=1.2pt,black] table[x=seconds,y=price]{figdata/markets-1/28-reading-market-data/tape.csv};
+\legend{meilleur bid,meilleur ask,transactions}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:m1:reading-market-data:levels}{Niveau 1} et le tape, reconstruits à partir de 640 messages de l'échantillon
+binaire du chapitre, par le décodeur et le carnet de la construction. Chaque exécution d'un ordre affiché
+s'imprime au bid ou à l'ask, ce qui permet de connaître son agresseur~;
+les impressions intermédiaires sont des transactions contre des ordres cachés. Données~: la
+construction du chapitre.}\label{fig:m1:reading-market-data:l1}
+\end{omfigure}
+
+Le pipeline comporte quatre étapes, et la recherche doit savoir de laquelle
+provient sa table. \emph{Capture}~: chaque paquet, avec un \omterm{def:m1:reading-market-data:ts}{horodatage de réception} matériel,
+écrit sans modification. \emph{Décodage et \omterm{def:m1:reading-market-data:norm}{normalisation}}~: la construction ci-dessous.
+\emph{Construction du carnet}~: appliquer les messages dans l'ordre de séquence, détecter les trous, émettre le \omterm{def:m1:reading-market-data:levels}{niveau 2}
+et le \omterm{def:m1:reading-market-data:levels}{niveau 1} comme flux dérivés. \emph{Tables}~: transactions avec conditions et
+côté agresseur~; cotations~; barres, qui constituent un résumé avec perte choisi dans un
+but précis. Chaque étape doit pouvoir être rejouée à partir de la précédente, bit pour bit~:
+lorsqu'un résultat paraît faux, la question «~est-ce la donnée~?~» doit avoir une
+réponse.
+
+\section{Tutoriel~: un flux binaire alimentant un carnet et un tape}\label{tut:m1:reading-market-data:decode}
+
+\begin{tutorial}
+\textbf{Objectif.} Décoder un flux binaire ordre par ordre encadré, tenir à jour le carnet,
+produire le \omterm{def:m1:reading-market-data:levels}{niveau 1} et un tape avec le côté agresseur, et mesurer l'effet de la gigue de
+l'\omterm{def:m1:reading-market-data:ts}{horodatage de réception} sur l'ordre des messages. \textbf{État final~:} les trois figures de
+données de ce chapitre, à partir de \texttt{code/firm/feed/data/sample.itch} (2\,020 messages,
+65\,842 octets).
+\begin{tutsteps}
+\item \textbf{Encadrement et en-tête.} Préfixe de longueur, type, puis les champs que
+tous les messages partagent. Une longueur incompatible avec le type est une erreur, non
+une indication.
+\omcode{code/firm/feed/firm_feed.py}{58}{74}{Python~: encadrer, contrôler, lire l'en-tête commun.}\label{lst:m1:reading-market-data:py}
+\item \textbf{Le même code en C++}, sur un span d'octets, sans copies.
+\omcode{code/firm/feed/cpp/firm_feed.hpp}{47}{59}{C++~: l'encadrement et l'en-tête de la boucle de décodage.}\label{lst:m1:reading-market-data:cpp}
+\item \textbf{Et en Rust}, sous la forme d'un itérateur qui produit un résultat par message
+et s'arrête après la première erreur.
+\omcode{code/firm/feed/rust/src/lib.rs}{53}{79}{Rust~: une étape du décodeur.}\label{lst:m1:reading-market-data:rs}
+\item \textbf{Le carnet.} Une exécution ne porte aucun prix~: il faut le retrouver.
+\omcode{code/firm/feed/firm_feed.py}{146}{168}{Application d'un message au carnet et au tape.}\label{lst:m1:reading-market-data:apply}
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Retirer un message d'ajout d'ordre de l'échantillon et
+observer les erreurs que le carnet enregistre, ainsi que le délai avant qu'une exécution
+ne fasse référence à l'ordre manquant. Ajouter ensuite un message de remplacement (annulation
+et ajout avec une nouvelle référence, avec perte de priorité) dans les trois décodeurs.
+\end{tutorial}
+
+\section{Construction~: le normaliseur de flux}\label{bld:m1:reading-market-data:feed}
+
+\begin{build}
+\bfield{Rôle} Le point d'entrée de toutes les données de marché dans la
+mini-firme~: la bourse simulée du livre~10 publie ce format, les
+stratégies du livre~11 consomment le carnet, et les tables de recherche du livre~7 sont
+écrites à partir du tape.
+\bfield{Interface} Python: \texttt{encode(msg)}, \texttt{decode(buffer)},
+\texttt{Book.apply(msg)}, \texttt{Book.best(locate)}, \texttt{Book.depth(locate,
+side, n)}, \texttt{Book.trades}, \texttt{Book.errors}, \texttt{summary(book,
+locate)}.
+C++20 (en-tête seul)~: \texttt{firm::feed::decode(span, callback)},
+\texttt{Book}, \texttt{Summary}. Rust~: \texttt{decode(\&[u8])} renvoyant un
+itérateur de résultats, \texttt{Book}, \texttt{Summary}.
+\bfield{Règles} Entiers en gros-boutiste, prix en dix-millièmes, horodatages de
+48~bits en nanosecondes, encadrement par préfixe de longueur sur deux octets. Une trame
+tronquée ou une longueur incompatible avec le type arrête le décodage par une erreur. Le
+carnet ne devine jamais~: une référence d'ordre inconnue, une sur-exécution, un ajout en double
+ou un horodatage qui recule est enregistré et compté. Les trois implémentations doivent
+produire le même résumé sur l'échantillon commun.
+\bfield{Tests d'acceptation} \texttt{code/firm/feed/tests/} (aller-retour, données
+aléatoires, un carnet construit à la main, erreurs enregistrées, reproductibilité de
+l'échantillon)~; \texttt{cpp/firm\_feed\_test.cpp} et les tests de la crate Rust (le
+résumé de l'échantillon commun, la troncature, une mauvaise longueur, un ordre inconnu).
+\bfield{Pour aller plus loin} \omterm{def:m1:reading-market-data:seq}{Numéros de séquence} avec détection des trous et arbitrage
+des lignes A/B~; un message d'instantané pour la reprise~; un benchmark du nombre de messages
+par seconde dans chaque langage (le livre~13 part de là).
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{Nasdaq TotalView-ITCH 5.0} spécification (révision du 28
+avril 2023).
+\item Commission Delegated Regulation (EU) 2017/574 (synchronisation des horloges,
+«~RTS 25~»).
+\item CAT NMS Plan, questions fréquemment posées sur la synchronisation des horloges
+(R1)~; FINRA Rule 6820.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:1}
+À partir de la vue de \omterm{def:m1:reading-market-data:levels}{niveau 3} de la \cref{fig:m1:reading-market-data:levels}, une exécution
+de 300 actions arrive pour l'ordre 1001, puis une annulation de 100 actions pour l'ordre
+1002. Donner les niveaux 2 et 1 après ces événements. À quel prix la transaction a-t-elle
+été publiée, et qui était l'agresseur~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:2}
+Un champ de prix contient les quatre octets \texttt{00 0F 41 DC} (hexadécimal),
+en gros-boutiste, avec quatre décimales implicites. Donner le prix. Que lirait un
+lecteur en petit-boutiste~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:m1:reading-market-data:3}
+L'échantillon du chapitre comporte 1\,102 ajouts, 311 exécutions, 114 annulations, 473 suppressions
+et 20 transactions cachées. Vérifier la taille du fichier à partir des longueurs des messages
+et de l'encadrement.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:4}
+Un horodatage de six octets compte les nanosecondes depuis minuit. Quelle est la plus grande
+heure de la journée qu'il peut contenir~? Pourquoi quatre octets ne suffisent-ils pas, et que
+gagne-t-on par rapport à huit~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:5}
+La plateforme A horodate une modification de cotation à 10:00:00.000\,150 et la plateforme B
+à 10:00:00.000\,190. Les horloges des deux plateformes sont à moins de 100 microsecondes de
+l'UTC. Peut-on dire laquelle a bougé la première~? De quoi aurait-on besoin~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:m1:reading-market-data:6}
+Un récepteur voit les \omterm{def:m1:reading-market-data:seq}{numéros de séquence} 5\,001, 5\,002, 5\,004 sur la ligne A et 5\,001,
+5\,003, 5\,004 sur la ligne B. Que fait-il~? Maintenant, les deux lignes sautent 5\,003~:
+que faut-il faire avant de réutiliser le carnet, et que peut faire la stratégie
+entre-temps~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m1:reading-market-data:7}
+\emph{Programmation.} Avec \texttt{receive\_times} et \texttt{inversions} sur l'échantillon,
+reproduire les pourcentages de messages hors ordre pour des gigues de 100 et 1\,000
+microsecondes. Diviser ensuite le débit de messages par deux (garder un message sur deux) et
+expliquer la variation.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:m1:reading-market-data:8}
+\emph{Chasse à l'erreur.} Un chercheur télécharge des barres d'une minute pour 3\,000
+tickers sur quinze ans, les indexe par ticker, calcule le plus bas quotidien de chaque action
+comme le minimum des plus bas des barres, et constate qu'acheter les actions qui ont chuté de
+plus de 50~\% en cours de séance et remonté à la clôture est extrêmement rentable. Nommer
+trois défauts de données, vus dans ce chapitre, qui pourraient produire ce résultat.
+\end{exercise}
+
+\section{Problème~: le mauvais tick}
+
+\begin{problem}[{Problème du week-end --- quinze impressions et un indice de référence}]\label{pb:m1:reading-market-data:1}
+Un desk doit déclarer le prix moyen pondéré par les volumes d'une action entre 09:30:00
+et 09:32:00, en tant qu'indice de référence d'un ordre client. Le ruban (séquence, heure,
+prix, actions, condition~; les conditions sont les étiquettes de ce livre)~:
+
+\begin{center}\footnotesize
+\begin{tabular}{rlrrl@{\qquad}rlrrl}
+\toprule
+1 & 09:30:00 & 100.02 & 12\,000 & ouverture & 9 & 09:30:52 & 100.09 & 300 & annulée \\
+2 & 09:30:04 & 100.05 & 300 & & 10 & 09:31:03 & 100.11 & 600 & \\
+3 & 09:30:09 & 100.04 & 50 & \omterm{def:m1:us-equity-market-structure:lots}{lot irrégulier} & 11 & 09:31:10 & 99.80 & 5\,000 & tardive \\
+4 & 09:30:15 & 100.07 & 500 & & 12 & 09:31:18 & 100.12 & 200 & \\
+5 & 09:30:21 & 100.06 & 200 & & 13 & 09:31:25 & 100.13 & 700 & \\
+6 & 09:30:30 & 10.01 & 400 & & 14 & 09:31:40 & 100.12 & 100 & \\
+7 & 09:30:31 & 100.08 & 400 & & 15 & 09:31:55 & 100.15 & 900 & \\
+8 & 09:30:40 & 100.10 & 1\,000 & & & & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip\noindent\textbf{Partie I --- Le chiffre naïf.}
+\begin{enumerate}
+\item Donner le total des actions et le prix moyen pondéré par les volumes de l'ensemble des
+quinze impressions.
+\item Donner le plus bas de la période à partir de toutes les impressions.
+\item De combien de points de base la moyenne naïve diffère-t-elle de 100.05~?
+\item Que produirait une estimation de la volatilité à partir de ces impressions~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Impression par impression.}
+\begin{enumerate}[resume]
+\item Impression 6~: de quoi s'agit-il, comment un filtre la détecterait-il, et comment
+le confirmer~?
+\item Impression 9~: pourquoi un filtre sur les valeurs aberrantes ne la détecte-t-il pas, et qu'est-ce qui le fait~?
+\item L'impression 11 a été exécutée à 09:24 et déclarée à 09:31. Doit-elle figurer dans
+l'indice de référence d'un ordre commencé à 09:30~?
+\item L'impression 3 est un \omterm{def:m1:us-equity-market-structure:lots}{lot irrégulier}. Dedans ou dehors~?
+\item L'impression 1 est l'enchère d'ouverture. L'ordre du client a été saisi à
+09:30:02. Dedans ou dehors~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les chiffres corrigés.}
+\begin{enumerate}[resume]
+\item En excluant les impressions erronées, annulées et tardives, donner le nombre
+d'impressions exclues, les actions et le prix moyen.
+\item En excluant également l'enchère, donner le prix moyen de la
+négociation en continu.
+\item Donner le plus bas et le plus haut corrigés.
+\item L'ordre du client a acheté 2\,000 actions à un prix moyen de 100.09. Donner son
+glissement en points de base par rapport à chacun des deux indices corrigés.
+\item Lequel des deux indices est le bon~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item La bourse annule plus tard la transaction~6. Comment cela parvient-il à votre base de
+données, et que doit faire votre chargeur~?
+\item Pourquoi faut-il fixer la règle de nettoyage avant d'examiner
+le résultat de l'ordre~?
+\item Les barres «~nettoyées~» d'un fournisseur excluent déjà certaines conditions. Que
+devez-vous obtenir du fournisseur~?
+\item À quelle étape du pipeline en quatre étapes chacun des défauts de la partie II est-il
+traité~?
+\item Énoncer le \emph{résultat nommé}~: le nombre d'impressions à exclure et le prix moyen
+pondéré par les volumes corrigé.
+\item En une phrase~: qu'est-ce qu'un compte rendu de transaction~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur, trader}]\label{iq:m1:reading-market-data:1}
+Quelle est la différence entre les données de marché de \omterm{def:m1:reading-market-data:levels}{niveau 1}, de \omterm{def:m1:reading-market-data:levels}{niveau 2} et de \omterm{def:m1:reading-market-data:levels}{niveau 3}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:m1:reading-market-data:2}
+Comment construisez-vous un carnet d'ordres à partir d'un flux ordre par ordre~?
+Quelles structures de données utilisez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:m1:reading-market-data:3}
+Votre gestionnaire de flux détecte un trou dans les \omterm{def:m1:reading-market-data:seq}{numéros de séquence}. Que se passe-t-il ensuite~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:m1:reading-market-data:4}
+Quel horodatage utilisez-vous dans un backtest, et que se passe-t-il si vous choisissez
+l'autre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:m1:reading-market-data:5}
+On vous remet un fichier de transactions. Que vérifiez-vous avant de calculer quoi que ce soit~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:m1:reading-market-data:6}
+Concevoir le stockage des données de marché captées par une société de sorte que tout résultat de recherche
+puisse être reproduit cinq ans plus tard.
+\end{interviewq}

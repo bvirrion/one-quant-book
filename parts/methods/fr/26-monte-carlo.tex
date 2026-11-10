@@ -1,0 +1,385 @@
+\chapter{Monte-Carlo}\label{ch:qm:monte-carlo}
+
+La saisie de nuit valorise 40\,000 transactions à trajectoires dépendantes avec 100\,000 trajectoires chacune. L'\omterm{def:qm:estimation:estimator}{erreur type} sur le livre est de 80\,000 dollars, et le responsable des risques veut la voir descendre sous 20\,000 d'ici demain.
+L'erreur de Monte-Carlo décroît comme l'inverse de la racine carrée du nombre de trajectoires~; diviser l'erreur par quatre exige donc de multiplier le nombre de trajectoires par seize, et seize fois plus de machines ne sont pas disponibles. La
+solution consiste à rendre chaque trajectoire plus utile. Ce chapitre construit l'\omterm{def:qm:estimation:estimator}{estimateur} et ses générateurs, puis les techniques de \omterm{def:qm:monte-carlo:mc}{réduction de variance} qui modifient la constante (\omterm{def:qm:monte-carlo:vr}{variables antithétiques},
+\omterm{def:qm:monte-carlo:vr}{variables de contrôle}, stratification, \omterm{def:qm:monte-carlo:is}{échantillonnage préférentiel}), les points à discrépance faible qui modifient le taux, et les méthodes de discrétisation et multiniveau qui déterminent le coût d'une trajectoire.
+
+\section{Estimateurs et générateurs}
+
+\begin{definition}[Méthode de Monte-Carlo, réduction de variance]\label{def:qm:monte-carlo:mc}
+La \emph{méthode de Monte-Carlo}\index{méthode de Monte-Carlo} estime $\mu = \E[f(X)]$ par la moyenne $\hat\mu_n = \frac1n\sum_{i=1}^nf(X_i)$ de tirages indépendants. La \emph{réduction de
+variance}\index{réduction de variance} désigne tout changement d'\omterm{def:qm:estimation:estimator}{estimateur} qui conserve $\E[\hat\mu_n] = \mu$ (ou rend le biais négligeable) et abaisse sa variance à coût égal.
+\end{definition}
+
+\begin{proposition}[Erreur et coût de l'estimateur de Monte-Carlo]\label{prop:qm:monte-carlo:clt}
+Si $\sigma^2 = \Var(f(X)) < \infty$, alors $\sqrt n(\hat\mu_n - \mu) \Rightarrow \mathcal N(0, \sigma^2)$, de sorte que $\hat\mu_n \pm 1.96\,s_n/\sqrt n$ est un intervalle asymptotique à 95~\%. Si un tirage coûte $c$, le
+coût pour atteindre une \omterm{def:qm:estimation:estimator}{erreur type} $\epsilon$ est $c\sigma^2/\epsilon^2$~: parmi deux \omterm{def:qm:estimation:estimator}{estimateurs sans biais}, le meilleur est celui dont le produit de la variance par le coût par tirage est le plus petit.
+\end{proposition}
+
+\begin{proof}
+La première affirmation est le théorème central limite pour des tirages indépendants et identiquement distribués, combiné au lemme de Slutsky pour l'\omterm{def:qm:estimation:estimator}{estimateur} $s_n$. La seconde~: $\sigma/\sqrt n = \epsilon$ exige $n =
+\sigma^2/\epsilon^2$ tirages.
+\end{proof}
+
+Le taux $n^{-1/2}$ ne dépend pas de la dimension, ce qui permet à la \omterm{def:qm:monte-carlo:mc}{méthode de Monte-Carlo} de valoriser des moyennes sur 64 dates et des paniers de 30 actifs qu'aucune grille ne peut atteindre~; la constante $\sigma^2c$ est l'endroit où se
+concentre le travail. Sur la transaction représentative de la saisie, un call sur moyenne arithmétique portant sur 64 fixings d'un \omterm{def:qm:stochastic-differential-equations:gbm}{mouvement brownien géométrique} ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, un an), $2^{14}$ trajectoires donnent
+6.495 avec une \omterm{def:qm:estimation:estimator}{erreur type} de 0.077~; le prix vaut 6.4788.
+
+\begin{definition}[Générateurs pseudo-aléatoires et à compteur, méthode d'inversion]\label{def:qm:monte-carlo:prng}
+Un \emph{générateur de nombres pseudo-aléatoires}\index{générateur de nombres pseudo-aléatoires} est une récurrence déterministe $s_{k+1} = F(s_k)$, $u_k = G(s_k)$ dont les sorties passent les tests statistiques
+d'uniformité indépendante~; le Mersenne Twister (Matsumoto et Nishimura, 1998) et PCG (O'Neill, 2014~; générateur par défaut de NumPy) en sont des exemples. Un \emph{générateur à compteur}\index{générateur à compteur}
+calcule $u = G_k(c)$ directement à partir d'un compteur $c$ et d'une clé $k$ grâce à une bijection $G_k$, de sorte que tout tirage peut être produit sans ses prédécesseurs~; Philox (Salmon, Moraes, Dror
+et Shaw, 2011) en est un. La \emph{méthode d'inversion}\index{méthode d'inversion} transforme une variable uniforme $U$ en un tirage $F^{-1}(U)$ de la fonction de répartition $F$.
+\end{definition}
+
+Un \omterm{def:qm:monte-carlo:prng}{générateur à compteur} rend un lot distribué reproductible. Le moteur attribue à la trajectoire $j$ de la transaction $i$ le compteur $(b, j, i, 0)$ pour son $b$-ième bloc de quatre nombres, de sorte que
+les nombres de la trajectoire ne dépendent ni de la répartition des trajectoires entre les machines, ni de l'ordre dans lequel elles s'exécutent, ni de leur nombre~: relancer une seule trajectoire pour déboguer une transaction la reproduit à l'identique, bit pour
+bit. Le Philox4x64-10 du kit reproduit l'implémentation de NumPy bloc par bloc, en Python, en C++20 et en Rust (la version C++ figure dans la \cref{tut:qm:monte-carlo:asian}). Les normales proviennent de la \omterm{def:qm:monte-carlo:prng}{méthode d'inversion} avec
+l'approximation rationnelle d'Acklam de $\Phi^{-1}$ (erreur relative inférieure à $1.15 \times 10^{-9}$), qui, contrairement à Box--Muller, associe une uniforme à une normale~: la propriété dont ont besoin les points à discrépance faible.
+
+\section{Réduction de variance et échantillonnage préférentiel}
+
+\begin{definition}[Variables antithétiques, variable de contrôle, échantillonnage stratifié]\label{def:qm:monte-carlo:vr}
+Les \emph{variables antithétiques}\index{variables antithétiques} associent chaque tirage $Z$ à $-Z$ (chaque uniforme $U$ à $1 - U$) et moyennent $\frac12(f(Z) + f(-Z))$. Une \emph{variable de contrôle}\index{variable de contrôle}
+est une variable $C$ dont l'espérance est connue, utilisée dans $\hat\mu_\beta = \frac1n\sum_i(Y_i - \beta(C_i - \E C))$. L'\emph{échantillonnage stratifié}\index{echantillonnage@échantillonnage stratifié} partitionne l'espace d'une entrée en
+strates de probabilité connue $p_s$ et tire un nombre fixe $n_s = np_s$ dans chacune.
+\end{definition}
+
+\begin{proposition}[Coefficient optimal de la variable de contrôle]\label{prop:qm:monte-carlo:cv}
+$\Var(Y - \beta(C - \E C))$ est minimale en $\beta^* = \Cov(Y, C)/\Var(C)$, où elle vaut $(1 - \rho^2)\Var(Y)$ avec $\rho = \mathrm{Corr}(Y, C)$.
+\end{proposition}
+
+\begin{proof}
+$\Var(Y - \beta C) = \Var Y - 2\beta\Cov(Y, C) + \beta^2\Var C$ est un trinôme en $\beta$ minimal en $\beta^*$~; en substituant, on obtient $\Var Y - \Cov(Y, C)^2/\Var C = (1 - \rho^2)\Var Y$.
+\end{proof}
+
+Pour le call sur moyenne, la moyenne géométrique $G = (\prod_kS_{t_k})^{1/64}$ suit une loi lognormale et son call admet une formule fermée (Kemna et Vorst, 1990)~: 6.1793. Son gain a une corrélation de 0.99941 avec
+celui de la moyenne arithmétique, donc $1 - \rho^2 = 0.0012$ et, avec $\beta = 1.04$ estimé sur les mêmes trajectoires, la variance est divisée par 853 à nombre de trajectoires égal. Les paires antithétiques font beaucoup moins bien~:
+les deux gains d'une paire ont une corrélation de $-0.43$, soit un facteur de 1.8 à nombre d'évaluations de gain égal. La stratification est l'idée de la section suivante~: elle élimine la variance entre strates, et un
+ensemble de points à discrépance faible stratifie chaque coordonnée, ainsi que beaucoup de leurs produits, d'un seul coup.
+
+\begin{definition}[Échantillonnage préférentiel]\label{def:qm:monte-carlo:is}
+L'\emph{échantillonnage préférentiel}\index{echantillonnage@échantillonnage préférentiel} tire $X$ selon une densité $g$ au lieu de $f$ et moyenne $h(X)f(X)/g(X)$, c'est-à-dire le gain multiplié par le rapport de vraisemblance (une \omterm{def:qm:probability-at-speed:change}{dérivée de Radon--Nikodym})~;
+il est sans biais dès que $g > 0$ là où $hf \ne 0$.
+\end{definition}
+
+\begin{proposition}[Densité d'importance à variance nulle]\label{prop:qm:monte-carlo:zero}
+Pour $h \ge 0$ avec $\mu = \E_f[h(X)] > 0$, la densité $g^* = hf/\mu$ vérifie $h(X)f(X)/g^*(X) = \mu$ pour chaque tirage~: l'\omterm{def:qm:estimation:estimator}{estimateur} est de variance nulle.
+\end{proposition}
+
+\begin{proof}
+Il suffit de substituer~: $hf/g^* = hf\mu/(hf) = \mu$ partout où $h > 0$, et $g^*$ ne porte aucune masse là où $h = 0$.
+\end{proof}
+
+La densité optimale exige la réponse, mais elle indique où chercher~: il faut échantillonner proportionnellement à l'endroit où vit le gain. Pour un digital qui paie si $S_T > 250$ (probabilité $1.21 \times 10^{-4}$, le
+driver normal au-delà de $z^* = 3.67$), 100\,000 tirages ordinaires produisent six succès et une \omterm{def:qm:estimation:estimator}{erreur type} relative de 20~\%. En décalant la moyenne du driver de $\theta$ et en pondérant chaque tirage par $e^{-\theta Z +
+\theta^2/2}$, on ramène cette erreur à 0.64~\% pour $\theta = 3.8$, soit un facteur de variance d'environ 1\,000 (\cref{fig:qm:monte-carlo:is})~; un décalage excessif la dégrade de nouveau, car les poids des rares tirages qui
+comptent explosent.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=10cm,height=4.8cm,xlabel={décalage de moyenne $\theta$ du driver normal},ylabel={erreur type relative},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=5,ymin=3e-3,ymax=0.5,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=theta,y=relse]{figdata/methods/26-monte-carlo/is.csv};
+\draw[omThm,dashed,thick] (axis cs:3.67,3e-3) -- (axis cs:3.67,0.5) node[pos=0.85,right,font=\footnotesize]{$z^* = 3.67$};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:qm:monte-carlo:is}{Échantillonnage préférentiel} pour un digital qui paie si $S_T > 250$ ($S_0 = 100$, $\sigma = 25\%$, un an~; probabilité $1.21 \times 10^{-4}$)~: \omterm{def:qm:estimation:estimator}{erreur type} relative de 100\,000 tirages en fonction du
+décalage de moyenne du driver normal. Données~: le tutoriel du chapitre, avec graine fixée.}\label{fig:qm:monte-carlo:is}
+\end{omfigure}
+
+\section{Suites à discrépance faible}
+
+\begin{definition}[Suite à discrépance faible, suite de Sobol, quasi-Monte-Carlo]\label{def:qm:monte-carlo:qmc}
+La discrépance étoilée $D_n^*$ de points $x_1, \dots, x_n$ de $[0, 1)^d$ est la plus grande différence, sur les pavés $[0, a)$, entre la fraction des points situés dans le pavé et son volume. Une \emph{suite à
+discrépance faible}\index{suite à discrépance faible} vérifie $D_n^* = O((\log n)^d/n)$. La \emph{suite de Sobol}\index{suite de Sobol} (Sobol, 1967) est une suite à discrépance faible en base 2, construite coordonnée par
+coordonnée à partir de polynômes primitifs et de nombres de direction, par ou exclusif sur les chiffres binaires. Le \emph{quasi-Monte-Carlo}\index{quasi-Monte-Carlo} remplace les tirages aléatoires de Monte-Carlo par de tels
+points.
+\end{definition}
+
+\begin{proposition}[Inégalité de Koksma--Hlawka]\label{prop:qm:monte-carlo:kh}
+Pour $f$ à variation bornée $V(f)$ au sens de Hardy et Krause, $\bigl|\frac1n\sum_if(x_i) - \int_{[0,1)^d}f\bigr| \le V(f)\,D_n^*$.
+\end{proposition}
+
+La borne donne au \omterm{def:qm:monte-carlo:qmc}{quasi-Monte-Carlo} un taux voisin de $1/n$ pour des intégrandes régulières de dimension effective modérée, mais c'est une borne dans le pire des cas, qui ne peut pas être estimée à partir des points. La randomisation
+restaure une estimation de l'erreur.
+
+\begin{definition}[Quasi-Monte-Carlo randomisé, construction par pont brownien]\label{def:qm:monte-carlo:rqmc}
+Le \emph{quasi-Monte-Carlo randomisé}\index{quasi-Monte-Carlo randomisé} randomise un ensemble à discrépance faible de sorte que chaque point soit uniforme tandis que l'ensemble conserve sa structure, et estime l'erreur
+à partir de réplications indépendantes. Le kit utilise le brouillage uniforme emboîté d'Owen (1995)~: chaque chiffre binaire de chaque coordonnée est retourné par un bit aléatoire attaché au nœud de l'arbre binaire que définissent ses
+chiffres de tête. La \emph{construction par pont brownien}\index{construction par pont brownien} affecte la première coordonnée à $W_T$, la suivante à $W_{T/2}$ conditionnellement à ses extrémités, et ainsi de suite
+aux niveaux inférieurs, de sorte que les premières coordonnées, là où les points à discrépance faible sont les meilleurs, portent l'essentiel de la variance de la trajectoire.
+\end{definition}
+
+La \Cref{fig:qm:monte-carlo:points} montre pourquoi~: 256 points de Sobol brouillés en deux dimensions placent exactement un point dans chacune des 256 boîtes dyadiques de toute forme, alors que des tirages indépendants laissent des trous
+et des amas. Sur le call à prix moyen avec $2^{14}$ trajectoires et 32 brouillages indépendants, les points de Sobol brouillés, avec les accroissements dans l'ordre temporel, réduisent la variance d'un facteur d'environ 34~; avec
+la \omterm{def:qm:monte-carlo:rqmc}{construction par pont brownien}, d'environ 2\,500~; avec le pont et la \omterm{def:qm:monte-carlo:vr}{variable de contrôle} ensemble, d'environ 37\,000, soit une \omterm{def:qm:estimation:estimator}{erreur type} 190 fois plus petite pour le même nombre de trajectoires. L'erreur
+décroît aussi plus vite que $n^{-1/2}$~: les pentes ajustées sont comprises entre $-0.7$ et $-0.8$ de $2^6$ à $2^{15}$ trajectoires (\cref{fig:qm:monte-carlo:cost}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=l,width=5.6cm,height=5.6cm,title={Philox},title style={font=\small},xmin=0,xmax=1,ymin=0,ymax=1,
+  tick label style={font=\scriptsize},xtick={0,0.5,1},ytick={0,0.5,1},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.9pt,omThm] table[x=px,y=py]{figdata/methods/26-monte-carlo/points.csv};
+\end{axis}
+\begin{axis}[at={(l.east)},anchor=west,xshift=1cm,width=5.6cm,height=5.6cm,title={Sobol brouillé},title style={font=\small},xmin=0,xmax=1,ymin=0,ymax=1,
+  tick label style={font=\scriptsize},xtick={0,0.5,1},ytick={0,0.5,1},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.9pt,omDef] table[x=sx,y=sy]{figdata/methods/26-monte-carlo/points.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{256 points dans le carré unité~: uniformes Philox indépendantes et deux premières coordonnées de points de Sobol brouillés par Owen. Données~: le tutoriel du chapitre,
+avec graine fixée.}\label{fig:qm:monte-carlo:points}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=11cm,height=6cm,xlabel={nombre de trajectoires},ylabel={erreur type du prix},
+  tick label style={font=\small},label style={font=\small},xmin=50,xmax=45000,ymin=1e-4,ymax=3,grid=major,grid style={gray!25},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=n,y=plain]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omThm!50,very thick,mark=o,mark size=1.6pt] table[x=n,y=rqmcinc]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[black,very thick,mark=square*,mark size=1.4pt] table[x=n,y=cv]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omDef!60,very thick,mark=triangle*,mark size=1.8pt] table[x=n,y=rqmcbridge]{figdata/methods/26-monte-carlo/cost.csv};
+\addplot[omDef,very thick,mark=diamond*,mark size=1.8pt] table[x=n,y=rqmccv]{figdata/methods/26-monte-carlo/cost.csv};
+\legend{Monte Carlo classique,{RQMC, ordre temporel},variable de contrôle,{RQMC, pont},{RQMC, pont + contrôle}}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:qm:estimation:estimator}{Erreur type} du call à prix moyen (64 constatations) en fonction du nombre de trajectoires~: Monte Carlo classique et \omterm{def:qm:monte-carlo:vr}{variable de contrôle} (pente $-\frac12$), et points de Sobol brouillés (16
+brouillages indépendants) avec les accroissements dans l'ordre temporel, avec la \omterm{def:qm:monte-carlo:rqmc}{construction par pont brownien}, et avec le pont et la \omterm{def:qm:monte-carlo:vr}{variable de contrôle}. Données~: le tutoriel du chapitre,
+avec graine fixée.}\label{fig:qm:monte-carlo:cost}
+\end{omfigure}
+
+\section{Discrétisation et méthodes multiniveaux}
+
+\begin{definition}[Ordres de convergence forts et faibles, schéma de Milstein]\label{def:qm:monte-carlo:order}
+Un schéma de pas $h$ possède un \emph{ordre de convergence fort}\index{ordre de convergence fort} $\gamma$ si $\E|X_T^h - X_T| \le Ch^\gamma$, et un \emph{ordre de convergence faible}\index{ordre de convergence faible} $\beta$ si
+$|\E g(X_T^h) - \E g(X_T)| \le Ch^\beta$ pour $g$ régulière. Le \emph{schéma de Milstein}\index{schéma de Milstein} pour $dX = a(X)\,dt + b(X)\,dW$ ajoute au pas d'Euler--Maruyama le
+terme $\frac12b(X)b'(X)((\Delta W)^2 - h)$.
+\end{definition}
+
+\begin{proposition}[Ordres d'Euler et de Milstein]\label{prop:qm:monte-carlo:orders}
+Sous des conditions de Lipschitz et de croissance (et la régularité de $a$, $b$ pour Milstein), le \omterm{def:qm:stochastic-differential-equations:euler}{schéma d'Euler--Maruyama} est d'ordre fort $\frac12$ et d'ordre faible 1, et le \omterm{def:qm:monte-carlo:order}{schéma de Milstein} d'ordre fort 1
+(Kloeden et Platen, 1992).
+\end{proposition}
+
+\begin{proof}[Idée]
+Le pas d'Euler néglige l'intégrale stochastique double $\int\!\!\int dW\,dW = \frac12((\Delta W)^2 - h)$, de taille $h$ et d'espérance nulle, multipliée par $bb'$~; ces erreurs s'additionnent comme une marche aléatoire sur $1/h$
+pas, soit $h\sqrt{1/h} = h^{1/2}$ trajectoire par trajectoire, tandis que leurs espérances se compensent, laissant un biais en loi d'ordre $O(h)$. Milstein conserve ce terme, et les termes manquants suivants sont d'ordre $h^{3/2}$ par pas.
+\end{proof}
+
+Un prix exige l'ordre faible~; une couverture simulée le long de la trajectoire, ou un \omterm{def:qm:estimation:estimator}{estimateur} multiniveau, exige l'ordre fort. Sur un \omterm{def:qm:stochastic-differential-equations:gbm}{mouvement brownien géométrique} avec $\sigma = 50\%$, piloté par les mêmes accroissements que
+la solution exacte, les pentes fortes ajustées valent 0.49 pour Euler et 0.89 pour Milstein, et l'erreur faible de la moyenne vaut exactement $X_0|(1 + \mu h)^n - e^{\mu T}|$, pente 1.00
+(\cref{fig:qm:monte-carlo:orders}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={pas de temps $h$ (années)},ylabel={erreur},x dir=reverse,
+  tick label style={font=\small},label style={font=\small},xmin=0.003,xmax=0.6,ymin=3e-4,ymax=20,grid=major,grid style={gray!25},
+  legend columns=3,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.4pt] table[x=h,y=euler]{figdata/methods/26-monte-carlo/orders.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.4pt] table[x=h,y=milstein]{figdata/methods/26-monte-carlo/orders.csv};
+\addplot[black,very thick,mark=triangle*,mark size=1.8pt] table[x=h,y=weak]{figdata/methods/26-monte-carlo/orders.csv};
+\legend{erreur forte (Euler),erreur forte (Milstein),erreur faible de la moyenne}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Erreur forte $\E|X_T^h - X_T|$ des schémas d'Euler et de Milstein (20\,000 trajectoires d'un \omterm{def:qm:stochastic-differential-equations:gbm}{mouvement brownien géométrique}, $\mu = 5\%$, $\sigma = 50\%$, $X_0 = 100$, un an) et erreur faible exacte de
+la moyenne, en fonction du pas de temps. Données~: le tutoriel du chapitre, avec graine fixée.}\label{fig:qm:monte-carlo:orders}
+\end{omfigure}
+
+\begin{definition}[Monte-Carlo multiniveau]\label{def:qm:monte-carlo:mlmc}
+Le \emph{Monte-Carlo multiniveau}\index{Monte-Carlo multiniveau} (Giles, 2008) écrit l'espérance au niveau le plus fin comme une somme télescopique $\E P_L = \E P_0 + \sum_{l=1}^L\E[P_l - P_{l-1}]$, où $P_l$ est le
+gain calculé avec le pas $h_l = 2^{-l}T$, et estime chaque terme indépendamment, $P_l$ et $P_{l-1}$ dans chaque correction étant calculés à partir de la même trajectoire brownienne.
+\end{definition}
+
+\begin{proposition}[Complexité du Monte-Carlo multiniveau]\label{prop:qm:monte-carlo:giles}
+Si le biais de $P_l$ est $O(2^{-\alpha l})$, la variance de la correction $V_l = O(2^{-\beta l})$ et son coût $C_l = O(2^{\gamma l})$, avec $\alpha \ge \frac12\min(\beta, \gamma)$, alors une erreur quadratique moyenne
+$\epsilon^2$ coûte $O(\epsilon^{-2})$ si $\beta > \gamma$, $O(\epsilon^{-2}(\log\epsilon)^2)$ si $\beta = \gamma$ et $O(\epsilon^{-2 - (\gamma - \beta)/\alpha})$ si $\beta < \gamma$~; le Monte-Carlo standard coûte
+$O(\epsilon^{-2 - \gamma/\alpha})$.
+\end{proposition}
+
+\begin{proof}[Idée]
+Minimiser le coût $\sum_lN_lC_l$ sous la contrainte de variance $\sum_lV_l/N_l = \epsilon^2/2$ donne $N_l \propto\sqrt{V_l/C_l}$ et un coût total
+\[2\epsilon^{-2}\Bigl(\sum_l\sqrt{V_lC_l}\Bigr)^2;\]
+la somme est dominée par les niveaux les plus grossiers
+si $\beta > \gamma$, par les plus fins si $\beta < \gamma$, et croît comme $L \sim \log\epsilon^{-1}$ si elles sont égales. Le niveau le plus fin $L$ est fixé par le biais, $2^{-\alpha L} \sim \epsilon$.
+\end{proof}
+
+L'ordre fort fixe $\beta$~: Milstein sur un gain lipschitzien donne $\beta = 2 > \gamma = 1$, et les variances des corrections dans le tutoriel diminuent d'un facteur d'environ quatre par niveau
+(0.23, 0.060, 0.016, 0.0045, 0.0012, 0.00030, 0.000079). Pour un call européen ($\alpha = 1$), le pilote listé à la \cref{tut:qm:monte-carlo:asian} atteint une erreur quadratique moyenne de 0.005 avec 7 niveaux
+pour un coût de $3.2 \times 10^7$ pas de temps, là où le Monte-Carlo standard au même pas le plus fin en exigerait $3.0 \times 10^9$~: un facteur de 94, qui croît à mesure que $\epsilon$ diminue (8, 20, 45, 94 pour
+$\epsilon$ de 0.04 à 0.005~; \cref{fig:qm:monte-carlo:mlmc}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=10cm,height=5cm,xlabel={erreur quadratique moyenne cible $\epsilon$},ylabel={coût (pas de temps)},x dir=reverse,
+  tick label style={font=\small},label style={font=\small},xmin=0.004,xmax=0.05,ymin=1e5,ymax=1e10,grid=major,grid style={gray!25},
+  xtick={0.005,0.01,0.02,0.04},xticklabels={0.005,0.01,0.02,0.04},
+  legend columns=2,legend cell align=left,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=eps,y=standard]{figdata/methods/26-monte-carlo/mlmc.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=eps,y=mlmc]{figdata/methods/26-monte-carlo/mlmc.csv};
+\legend{Monte Carlo standard (Milstein),Monte-Carlo multiniveau}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Coût de la valorisation d'un call européen ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, un an) pour une erreur quadratique moyenne cible~: \omterm{def:qm:monte-carlo:mlmc}{Monte-Carlo multiniveau} avec corrections de Milstein, contre
+Monte Carlo standard au même pas le plus fin. Données~: le tutoriel du chapitre, avec graine fixée.}\label{fig:qm:monte-carlo:mlmc}
+\end{omfigure}
+
+\section{Tutoriel~: seize fois moins de machines}\label{tut:qm:monte-carlo:asian}
+
+\begin{tutorial}
+\textbf{Objectif.} Valoriser la transaction représentative du lot de cinq façons et mesurer la variance de chaque \omterm{def:qm:estimation:estimator}{estimateur} à nombre de trajectoires égal. \textbf{État final~:} les facteurs 1.8, 853, 34, 2\,500 et 37\,000 et
+la \cref{fig:qm:monte-carlo:cost}.
+\begin{tutsteps}
+\item \textbf{Variables uniformes à compteur.} Philox4x64-10 en C++20, reproduisant le bloc de \texttt{Philox} de NumPy bloc par bloc.
+\omcode{code/firm/mcengine/cpp/firm_mcengine.hpp}{113}{124}{Philox4x64-10~: dix tours de deux multiplications larges (C++20).}\label{lst:qm:monte-carlo:philox}
+\item \textbf{Points de Sobol brouillés.} Points de Sobol en code de Gray à partir des nombres de direction de Joe et Kuo, et brouillage d'Owen par nœuds d'arbre hachés.
+\omcode{code/firm/mcengine/firm_mcengine.py}{268}{297}{Points de Sobol et brouillage uniforme imbriqué (Python).}\label{lst:qm:monte-carlo:sobol}
+\item \textbf{\omterm{def:qm:estimation:estimator}{Estimateurs}.} Exécuter \texttt{table()} dans \texttt{qm\_mc.py}~: \omterm{def:qm:estimation:estimator}{estimateur} standard, \omterm{def:qm:monte-carlo:vr}{variables antithétiques}, \omterm{def:qm:monte-carlo:vr}{variable de contrôle}, et points de Sobol brouillés avec et sans le pont (32 brouillages de $2^{14}$ points)~; puis
+\texttt{error\_vs\_cost()}.
+\item \textbf{Multiniveau.} Exécuter \texttt{mlmc\_study()}~; le pilote figure ci-dessous.
+\omcode{code/firm/mcengine/firm_mcengine.py}{384}{412}{Pilote de Monte-Carlo multiniveau de Giles (Python).}\label{lst:qm:monte-carlo:mlmc}
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Fixer le strike à 130 et observer la baisse du facteur de la \omterm{def:qm:monte-carlo:vr}{variable de contrôle} avec la corrélation~; remplacer le pont par une construction en composantes principales~; valoriser une option à barrière avec
+la probabilité de franchissement du pont du chapitre~2 à l'intérieur du pilote multiniveau.
+\end{tutorial}
+
+\section{Construction~: le moteur de Monte-Carlo, étape trois}\label{bld:qm:monte-carlo:mcengine}
+
+\begin{build}
+\bfield{Rôle} Rendre chaque trajectoire plus utile et chaque trajectoire reproductible~: les générateurs, ensembles de points et \omterm{def:qm:estimation:estimator}{estimateurs} qu'appellent les lots de valorisation et de risque de la firme.
+\bfield{Interface} \texttt{philox4x64}, \texttt{philox\_uniforms(n, dim, seed, stream, first\_path)}~; \texttt{sobol\_points}, \texttt{owen\_scramble}~; \texttt{norm\_ppf}~;
+\texttt{bridge\_from\_normals}~; \texttt{asian\_payoffs}, \texttt{geometric\_asian\_price}, \texttt{control\_variate}~; \texttt{mlmc(sampler, eps)}. Jumeaux C++20 et Rust de \texttt{philox4x64},
+\texttt{sobol\_point} (huit dimensions) et \texttt{owen\_scramble}.
+\bfield{Règles} Les compteurs, et non un état séquentiel, identifient les trajectoires~; chaque estimation est accompagnée de son \omterm{def:qm:estimation:estimator}{erreur type} (calculée à partir de réplications pour le \omterm{def:qm:monte-carlo:rqmc}{quasi-Monte-Carlo randomisé}, jamais à l'intérieur d'un seul ensemble de points)~;
+les points de Sobol non brouillés ne servent jamais aux barres d'erreur~; les nombres de direction portent leur licence.
+\bfield{Tests d'acceptation} \texttt{code/firm/mcengine/\{tests,cpp,rust\}}~: Philox face à celui de NumPy~; la découpe des trajectoires les reproduit~; les premiers points publiés de Joe et Kuo~; des entiers brouillés identiques dans
+les trois langages~; la propriété de réseau après brouillage~; $\Phi^{-1}$ face à la bibliothèque standard à $10^{-8}$ près~; la covariance du pont~; la forme fermée géométrique face à la simulation et face à
+Black--Scholes pour une seule date de fixing~; le pilote multiniveau sur un échantillonneur à réponse connue.
+\bfield{Pour aller plus loin} Les 21\,201 dimensions complètes de Joe et Kuo~; une construction de trajectoires en composantes principales~; le Monte Carlo conditionnel pour les barrières~; les grecques adjointes le long des trajectoires (chapitre~28).
+\end{build}
+
+\begin{omsources}
+\item N.~Metropolis et S.~Ulam, « The Monte Carlo method », \emph{Journal of the American Statistical Association} 44, 1949~; P.~P.~Boyle, « Options: a Monte Carlo approach », \emph{Journal of
+Financial Economics} 4, 1977.
+\item P.~Glasserman, \emph{Monte Carlo Methods in Financial Engineering}, Springer, 2003.
+\item J.~K.~Salmon, M.~A.~Moraes, R.~O.~Dror et D.~E.~Shaw, « Parallel random numbers: as easy as 1, 2, 3 », SC11, 2011~; M.~Matsumoto et T.~Nishimura, \emph{ACM TOMACS} 8, 1998~; M.~E.~O'Neill,
+PCG, Harvey Mudd College report HMC-CS-2014-0905, 2014.
+\item I.~M.~Sobol', \emph{USSR Computational Mathematics and Mathematical Physics} 7, 1967~; S.~Joe et F.~Y.~Kuo, \emph{SIAM Journal on Scientific Computing} 30, 2008 (nombres de direction
+\texttt{new-joe-kuo-6.21201})~; A.~B.~Owen, « Randomly permuted $(t, m, s)$-nets and $(t, s)$-sequences », 1995~; B.~Moskowitz et R.~E.~Caflisch, \emph{Mathematical and Computer Modelling} 23, 1996.
+\item A.~G.~Z.~Kemna et A.~C.~F.~Vorst, \emph{Journal of Banking and Finance} 14, 1990.
+\item M.~B.~Giles, « Multilevel Monte Carlo path simulation », \emph{Operations Research} 56, 2008~; P.~E.~Kloeden et E.~Platen, \emph{Numerical Solution of Stochastic Differential Equations},
+Springer, 1992~; G.~N.~Milstein, \emph{Theory of Probability and its Applications} 19, 1975.
+\item P.~J.~Acklam, « An algorithm for computing the inverse normal cumulative distribution function » (note en ligne, 2004).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:1}
+Un lot a une \omterm{def:qm:estimation:estimator}{erreur type} de 80\,000 dollars avec 100\,000 trajectoires. Combien de trajectoires permettent d'atteindre 20\,000, et quel facteur de \omterm{def:qm:monte-carlo:mc}{réduction de variance} le même lot à 100\,000 trajectoires donne-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:2}
+Une \omterm{def:qm:monte-carlo:vr}{variable de contrôle} a une corrélation de 0.9 avec le payoff. Quel est le facteur de variance~? Et avec 0.99~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:qm:monte-carlo:3}
+Pourquoi les \omterm{def:qm:monte-carlo:vr}{variables antithétiques} aident-elles un payoff monotone et non une fonction paire de $Z$, comme $Z^2$~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:4}
+Montrer que la stratification proportionnelle n'augmente jamais la variance~: avec des strates $s$ de probabilité $p_s$ et des variances conditionnelles $\sigma_s^2$, la variance stratifiée vaut $\frac1n\sum_sp_s\sigma_s^2 \le
+\sigma^2/n$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:5}
+Pour $P(Z > z^*)$ avec $Z$ normale centrée réduite, calculer le second moment de l'\omterm{def:qm:estimation:estimator}{estimateur} par \omterm{def:qm:monte-carlo:is}{échantillonnage préférentiel} avec le décalage $\theta$, et montrer qu'il est minimisé près de $\theta = z^*$ pour de grands $z^*$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:qm:monte-carlo:6}
+Dériver le pas de Milstein pour le \omterm{def:qm:stochastic-differential-equations:gbm}{mouvement brownien géométrique} et montrer que c'est le développement au second ordre du pas exact $X e^{(\mu - \sigma^2/2)h + \sigma\Delta W}$ en $\Delta W$.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:monte-carlo:7}
+\emph{Codage.} Calculer le facteur de variance de la \omterm{def:qm:monte-carlo:vr}{variable de contrôle} pour les strikes 80, 100 et 130, et expliquer la tendance.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:qm:monte-carlo:8}
+\emph{Repérer l'erreur.} « Nous avons basculé le lot vers des points de Sobol, 100\,000 par transaction, et nous rapportons l'\omterm{def:qm:estimation:estimator}{erreur type} $s/\sqrt n$ calculée à partir des points comme auparavant~; elle a été divisée par dix. »
+\end{exercise}
+
+\section{Problème~: seize fois moins de machines}
+
+\begin{problem}[{Problème du week-end --- un facteur quatre sur l'erreur, sans seize fois plus de trajectoires}]\label{pb:qm:monte-carlo:1}
+La transaction représentative est un call sur moyenne arithmétique sur 64 fixings ($S_0 = K = 100$, $r = 3\%$, $\sigma = 25\%$, un an), valorisé avec $2^{14}$ trajectoires~; le lot a besoin d'un facteur quatre sur l'\omterm{def:qm:estimation:estimator}{erreur type}.
+
+\medskip\noindent\textbf{Partie I --- L'\omterm{def:qm:estimation:estimator}{estimateur} standard.}
+\begin{enumerate}
+\item Quels sont l'estimation standard, son \omterm{def:qm:estimation:estimator}{erreur type} et le prix de référence~?
+\item Quel facteur de variance la cible exige-t-elle~?
+\item Que dit le produit coût-variance pour comparer des \omterm{def:qm:estimation:estimator}{estimateurs}~?
+\item Pourquoi le \omterm{def:qm:monte-carlo:prng}{générateur à compteur} rend-il le lot reproductible d'une machine à l'autre~?
+\item Pourquoi utiliser l'inversion plutôt que Box--Muller pour alimenter les points à discrépance faible~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- \omterm{def:qm:monte-carlo:mc}{Réduction de variance}.}
+\begin{enumerate}[resume]
+\item Quel facteur donnent les paires antithétiques, et pourquoi si peu~?
+\item Qu'est-ce que la \omterm{def:qm:monte-carlo:vr}{variable de contrôle}, quelle est sa valeur fermée, sa corrélation et son facteur~?
+\item Quel est le coefficient optimal, et que cela a-t-il estimé~?
+\item Où l'\omterm{def:qm:monte-carlo:is}{échantillonnage préférentiel} aide-t-il, et de combien sur le digital profondément hors de la monnaie~?
+\item Pourquoi un décalage trop grand l'empire-t-il~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Points et trajectoires.}
+\begin{enumerate}[resume]
+\item Quel facteur donnent les points de Sobol mélangés avec les accroissements dans l'ordre temporel, et avec le pont~?
+\item Pourquoi le pont compte-t-il autant~?
+\item Que donnent les deux ensemble, et quelle est la pente de l'erreur en fonction du nombre de trajectoires~?
+\item Comment estime-t-on l'erreur du \omterm{def:qm:monte-carlo:rqmc}{quasi-Monte-Carlo randomisé}~?
+\item Que mesurent les ordres forts et faibles, et quelles sont leurs valeurs ajustées ici~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Que économise le \omterm{def:qm:monte-carlo:mlmc}{Monte-Carlo multiniveau} sur le call européen à $\epsilon = 0.005$, et pourquoi~?
+\item Le facteur de 37\,000 se maintiendrait-il sur l'ensemble du lot~?
+\item Que doit consigner le lot pour que les trajectoires d'une transaction puissent être régénérées~?
+\item Énoncer le \emph{résultat nommé}~: le facteur de \omterm{def:qm:monte-carlo:mc}{réduction de variance} de la \omterm{def:qm:monte-carlo:vr}{variable de contrôle} combinée au \omterm{def:qm:monte-carlo:rqmc}{quasi-Monte-Carlo randomisé} sur la transaction représentative, face aux 16 requis.
+\item En une phrase~: où va le travail d'un moteur de Monte-Carlo~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, développeur}]\label{iq:qm:monte-carlo:1}
+Comment l'erreur de Monte-Carlo évolue-t-elle avec le nombre de trajectoires et avec la dimension~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:qm:monte-carlo:2}
+Citez trois techniques de \omterm{def:qm:monte-carlo:mc}{réduction de variance} et dites quand chacune fonctionne.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:qm:monte-carlo:3}
+Comment rendez-vous un lot de Monte-Carlo distribué reproductible quel que soit le nombre de machines~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:qm:monte-carlo:4}
+Pourquoi le \omterm{def:qm:monte-carlo:qmc}{quasi-Monte-Carlo} peut-il mal se comporter sur une trajectoire à 250 pas, et qu'est-ce qui y remédie~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, risque}]\label{iq:qm:monte-carlo:5}
+Comment estimeriez-vous, par simulation, la probabilité d'une perte au-delà d'un seuil très élevé~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:qm:monte-carlo:6}
+Expliquez le \omterm{def:qm:monte-carlo:mlmc}{Monte-Carlo multiniveau} et pourquoi l'ordre fort du schéma compte pour celui-ci.
+\end{interviewq}

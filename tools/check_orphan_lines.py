@@ -86,6 +86,9 @@ def prose_words(line: str):
     s = re.sub(r"\\(?:includegraphics|input|includepdf)\s*(\[[^\]]*\])?\s*"
                r"\{[^{}]*\}", " ", s)
     s = re.sub(r"\[[^\]]*=[^\]]*\]", " ", s)          # option groups (width=..)
+    # One Quant Book (2026-11-09): code identifiers and listing include arguments
+    s = re.sub(r"\\texttt\s*\{(?:[^{}]|\{[^{}]*\})*\}", " ", s)
+    s = re.sub(r"\\omcode\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{[^{}]*\}", " ", s)
     # a label argument is not prose
     s = re.sub(r"\\(?:label|ref|cref|Cref|autoref|eqref|omterm)\s*\{[^{}]*\}",
                " ", s)
@@ -111,6 +114,7 @@ def scan_file(tpath: pathlib.Path, epath: pathlib.Path):
 
     hits = []
     depth = 0
+    in_sources = False
     for i, raw in enumerate(tlines, 1):
         t = raw.strip()
         # track drawing / math environments: their content is copied on
@@ -122,7 +126,14 @@ def scan_file(tpath: pathlib.Path, epath: pathlib.Path):
         if m and m.group(1).rstrip("*") in DRAW_ENVS + MATH_ENVS:
             depth = max(0, depth - 1)
             continue
-        if depth or not interesting(raw):
+        # omsources lists keep their document titles in English on purpose
+        # (quant Book 2 fr, 2026-11-10)
+        if re.match(r"^\\begin\{omsources\}", t):
+            in_sources = True
+        if re.match(r"^\\end\{omsources\}", t):
+            in_sources = False
+            continue
+        if in_sources or depth or not interesting(raw):
             continue
         if t not in eset:
             continue

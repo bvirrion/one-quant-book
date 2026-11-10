@@ -5,10 +5,11 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 `one-quant-book/` — the **One Quant Book** series of the One Course project:
-twenty English-only LaTeX books covering quantitative finance end to end
+twenty LaTeX books, written in English, covering quantitative finance end to end
 (markets, methods, derivatives, risk, research, strategies, microstructure,
 HFT, machine learning, low-latency software, networks, platforms, the firm,
-the industry, interviews).
+the industry, interviews). **Books 1–5 also ship in French** (pilot tier, below); the
+other fifteen are English-only.
 
 **Status (2026-11-03): all twenty books are written.** Books 18, 19 and 20 are the interview books, written 2026-11-02/03
 in one parallel batch of three (one Opus 5.5 agent per book), which replaced the old 220-page Book 18: 1,789 new questions, long
@@ -90,6 +91,18 @@ installs g++-11; Java, .NET, Rust nightly and the local EVM (`build/iv38/node`) 
 Fresh expert readers have read every answer in the three books, in two rounds on 2026-11-03: 252 defects in 1,789 answers (Book 18 69, Book 19 66, Book 20 117), logged as
 fixed. A reader's finding is rechecked by script before it is applied, as some proposed replacement text was itself wrong. `tools/check_omcode.py` does not notice a range that stops inside a block.
 Working notes: `sources/<slug>/PROGRESS.md` per book.
+
+**French pilot editions of Books 1–5 (2026-11-09/10).** Made by the pilot method (`../pilot_translation_instruction.md`):
+one tool-less Haiku 5.5 call per section (effort medium), one Opus 5.5 coordinator per book, three at once, rolling.
+Self-scored from a 20-passage sample, not read in full: Book 1 88 (403 pp), Book 2 88 (393), Book 3 87 (354), Book 4
+88 (372), Book 5 88 (366); all 0/0/0 under TeX Live 2026 and `tools/check_translation.sh <slug> fr` green. Run file
+`sources/TRANSLATION_BOOKS_1-5_FR.md` (with the wave findings), one per book `sources/TRANSLATION_BOOK_N_FR.md`, scores
+`translation_scores/book_N/fr/`, glossaries `sources/GLOSSARY_BOOK_N_FR.md`, term configs `tools/term_config/bookN_fr.py`.
+Entries `one_quant_book_0N_*_fr.tex` (babel French on pdfTeX, `shorthands=off`); `\ominput` reads `parts/<slug>/fr/`
+when it exists; UI strings in `styles/lang/fr.tex`. Gate 12 (`tools/check_quant_twin.py`) compares each translated
+file's `\omcode` triples, dated-box dates, `\texttt` identifiers and math spans with its English twin, on disk.
+Terminology follows French desk usage (`../pilot_translation/langs/series/one-quant-book.fr.md`). English canon: no
+fresh-reader pass, solutions not recomputed. Not done: the HTML reader for the French books.
 
 ## Commands
 
