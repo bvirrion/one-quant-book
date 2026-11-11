@@ -1,0 +1,324 @@
+\chapter{Backtests vectorisés}\label{ch:rs:vectorised-backtests}
+
+Un \omterm{def:rs:vectorised-backtests:backtest}{backtest} en une seule ligne de l'inversion à un jour sur le marché synthétique (acheter les perdants de la veille, vendre ses gagnants, chaque jour) affiche un ratio de Sharpe
+de 7.2 sur dix ans. Écrite autrement, en multipliant le portefeuille construit à partir du cours de clôture du jour par le rendement du jour, elle affiche
+$-65$. Aucun des deux n'est un résultat. La première opère à la clôture qui a servi à calculer le signal, ignore les coûts de transaction sur un portefeuille qui
+se renouvelle des trois quarts de lui-même chaque jour, et perdrait de l'argent de l'une quelconque des façons que ce chapitre énumère~; la seconde est un \omterm{def:rs:point-in-time-data-and-the-biases:lookahead}{biais d'anticipation} si
+grossier qu'il inverse le signal. Le \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé}, quelques opérations sur des tableaux portant sur un panel de poids et de rendements, est l'outil de recherche le plus rapide de la
+société, et la plupart du temps le bon~; ce chapitre le construit (\texttt{firm.vecbt}), indique quand il est juste, et
+démonte ses mensonges un par un.
+
+\section{Le backtest vectorisé}
+
+\begin{definition}[Backtest, backtest vectorisé]\label{def:rs:vectorised-backtests:backtest}
+Un \emph{backtest}\index{backtest} est la simulation d'une règle de trading sur des données historiques, produisant les positions, les transactions, les coûts et
+les rendements que la règle aurait eus. Un \emph{backtest vectorisé}\index{backtest vectorisé} les calcule sous forme d'opérations sur des tableaux entiers, sur des panels
+(périodes par titres)~: poids cibles, rendements, et coûts en fonction du poids échangé, sans simuler les ordres.
+\end{definition}
+
+\begin{definition}[Instant de décision, délai d'exécution, fréquence de rebalancement]\label{def:rs:vectorised-backtests:timing}
+L'\emph{instant de décision}\index{instant de décision} d'un portefeuille est le moment où l'information utilisée pour le construire était complète. Le
+\emph{délai d'exécution}\index{délai d'exécution} est le nombre de périodes séparant l'instant de décision du premier rendement que le portefeuille rapporte. La
+\emph{fréquence de rebalancement}\index{fréquence de rebalancement} est la périodicité à laquelle le portefeuille cible est recalculé et échangé.
+\end{definition}
+
+Dans \texttt{firm.vecbt}, un portefeuille décidé à la clôture du jour $t$ avec un délai $L$ est détenu le jour $t + L$~: le délai 0 le multiplie par le rendement qui
+l'a produit, le délai 1 suppose qu'il a été échangé à la clôture même d'où il a été calculé, le délai 2 l'échange à la clôture suivante. Le portefeuille dérive avec
+les rendements entre deux rebalancements, si bien que le poids échangé lors d'un rebalancement est la cible moins le portefeuille dérivé, et non la cible moins la cible précédente~;
+les titres situés hors de l'\omterm{def:rs:universe-symbology-and-corporate-actions:universe}{univers investissable} à l'\omterm{def:rs:vectorised-backtests:timing}{instant de décision} ne sont pas détenus~; un titre qui cesse d'être coté perçoit son \omterm{def:rs:universe-symbology-and-corporate-actions:delisting}{rendement de radiation} et rien
+après. Le résultat est un \texttt{BacktestResult} (poids, transactions, rendements bruts, coûts par type, rendements nets, capital), le type que renvoient tous les
+backtesteurs de la société et que lit le module de performance du chapitre~22.
+
+\begin{definition}[Rotation du portefeuille, modèle de coûts linéaire]\label{def:rs:vectorised-backtests:turnover}
+La \emph{rotation du portefeuille}\index{rotation du portefeuille} (portfolio turnover) d'une période est la moitié de la somme des poids absolus échangés, la fraction du portefeuille
+remplacée. Un \emph{modèle de coûts linéaire}\index{modèle de coûts linéaire} (linear cost model) facture à chaque transaction un coût fixe par unité de poids échangé (une demi-fourchette plus
+les commissions), indépendant de sa taille.
+\end{definition}
+
+\section{Quatre niveaux de fidélité}
+
+\begin{definition}[Niveau de fidélité]\label{def:rs:vectorised-backtests:fidelity}
+Le \emph{niveau de fidélité}\index{niveau de fidélité} d'un \omterm{def:rs:vectorised-backtests:backtest}{backtest} est la part du processus de trading qu'il simule. Ce livre en utilise quatre~: le niveau~1,
+le \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé} sur les rendements de barres, avec des coûts fonctions de la rotation~; le niveau~2, le \omterm{def:rs:vectorised-backtests:backtest}{backtest} événementiel sur barres, avec ordres, exécutions et
+une horloge simulée (chapitre~17)~; le niveau~3, le rejeu des messages du carnet d'ordres avec positions dans la file et latence (chapitre~18)~; le niveau~4, le trading en direct
+à petite taille ou trading simulé (paper trading) sur données en temps réel (chapitres 19 et 21).
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=3mm,
+  lvl/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=left,text width=3.2cm,inner sep=4pt,minimum height=3.3cm,anchor=north}]
+\node[lvl] (a) at (0,0) {\textbf{Niveau 1}\\ vectorisé\\[2pt] poids $\times$ rendements~;\\ coûts à partir de la rotation~;\\ secondes par passage};
+\node[lvl] (b) at (3.7,0) {\textbf{Niveau 2}\\ événementiel, barres\\[2pt] ordres, modèles d'exécution,\\ horloge, calendriers~;\\ minutes par passage};
+\node[lvl] (c) at (7.4,0) {\textbf{Niveau 3}\\ rejeu du carnet d'ordres\\[2pt] files, latence,\\ impact propre~;\\ heures par passage};
+\node[lvl] (d) at (11.1,0) {\textbf{Niveau 4}\\ en direct ou trading simulé\\[2pt] exécutions réelles,\\ latence réelle~;\\ semaines par réponse};
+\draw[-Stealth,thick,omThm] (-1.5,-3.65) -- node[below,font=\footnotesize]{la fidélité et le coût de chaque passage augmentent~; le nombre d'idées testables diminue} (12.6,-3.65);
+\end{tikzpicture}
+
+\omcaption{Les quatre niveaux de fidélité des \omterm{def:rs:vectorised-backtests:backtest}{backtests} de la société. Une idée de recherche ne progresse vers la droite que si elle survit à gauche.}\label{fig:rs:vectorised-backtests:levels}
+\end{omfigure}
+
+Les niveaux ne sont pas rivaux~: mille idées sont criblées au niveau~1 dans le temps qu'il faut pour en exécuter une au niveau~3, et un résultat de niveau~1 négatif
+après coûts n'a pas besoin du niveau~3 pour être rejeté. La question, pour chaque stratégie, est le niveau le plus bas
+dont la réponse ne serait pas modifiée par les niveaux supérieurs.
+
+\section{Où le backtest vectorisé est juste}
+
+Il est juste lorsque le trading ne modifie pas la réponse~: signaux lents (périodes de détention de quelques jours à quelques mois), titres liquides, portefeuilles petits par rapport
+au volume des titres, et des coûts bien approchés par une fourchette et une commission par unité échangée. Le momentum 12-1 mensuel sur les 500 titres les plus liquides
+synthétiques échange 1.9~\% de son portefeuille par jour~; son ratio de Sharpe passe de 0.32 avant coûts à 0.21 après 10 points de base par unité échangée,
+0.19 après l'emprunt, et 0.17 lorsqu'il est échangé à la clôture suivante (\cref{fig:rs:vectorised-backtests:waterfall}). Aucune de ces étapes ne dépend de la manière dont les
+transactions sont exécutées, et un \omterm{def:rs:vectorised-backtests:backtest}{backtest} de niveau~2 ou~3 n'ajouterait que peu de chose. Il est faux, au sens où il manque la réponse, lorsque les exécutions dépendent du
+carnet d'ordres (ordres passifs, chapitre~17), lorsque les transactions propres à la stratégie déplacent les prix (chapitre~27), lorsque le moment de la journée compte, et lorsque
+des événements tels que les suspensions de cotation, les enchères ou les opérations sur titres interviennent entre la décision et la transaction.
+
+\section{Les mensonges qu'il raconte}
+
+\begin{proposition}[Coûts face à la rotation]\label{prop:rs:vectorised-backtests:breakeven}
+Un portefeuille de rendement brut moyen $g$ par période et de rotation $\tau$ par période (moitié du poids échangé) atteint le point mort à un coût linéaire de
+$g/(2\tau)$ par unité de poids échangé.
+\end{proposition}
+
+\begin{proof}
+Le poids échangé par période vaut $2\tau$, et à un coût $c$ par unité, le coût par période vaut $2\tau c$~; on l'égalise à $g$.
+\end{proof}
+
+L'inversion à un jour sur le marché synthétique, reconstruite chaque jour comme un portefeuille neutre en dollars d'exposition brute~1, corrigée un mensonge à la fois
+(\texttt{rs\_vecbt.waterfall}~; chaque étape conserve les corrections qui la précèdent)~:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{5.4cm}ccc@{}}
+\toprule
+étape & ratio de Sharpe & rendement moyen annuel & rotation quotidienne\\
+\midrule
+naïve (survivants, exécution à la clôture du signal) & 7.17 & 27.0~\% & 74~\%\\
+titres cotés à chaque décision & 7.22 & 27.4~\% & 74~\%\\
+les 500 titres les plus liquides & 6.95 & 27.4~\% & 75~\%\\
+10 pb par unité échangée & $-2.58$ & $-10.2~\%$ & 75~\%\\
+emprunt à 50 pb par an & $-2.64$ & $-10.4~\%$ & 75~\%\\
+exécution à la clôture suivante & $-9.45$ & $-37.7~\%$ & 75~\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{L'univers.} L'univers naïf est la liste des titres encore cotés à la fin de l'échantillon, celle que le chercheur télécharge aujourd'hui. Pour
+l'inversion, il change peu (7.17 contre 7.22 sur la liste à date), pour le momentum beaucoup, et dans le sens qu'un manuel
+ne prévoit pas~: 0.21 contre 0.44 (\cref{fig:rs:vectorised-backtests:waterfall}). Les titres radiés par la suite étaient les perdants du momentum, et la
+vente à découvert profitait de leurs dernières baisses~; le \omterm{def:rs:point-in-time-data-and-the-biases:survivorship}{biais de survie} supprime ce profit. Son signe dépend de la stratégie~; sa taille ne peut qu'être mesurée.
+
+\textbf{Coûts.} Le rendement brut de l'inversion est élevé et sa rotation plus élevée encore~: 74~\% du portefeuille par jour. À 10 points de base par unité de poids échangé
+le coût vaut $2 \times 0.75 \times 0.001 \times 252 = 38~\%$ par an pour un brut de 27~\%, et le ratio de Sharpe passe de 6.95 à $-2.58$. Par
+la \cref{prop:rs:vectorised-backtests:breakeven}, le portefeuille atteint le point mort à 7.3 points de base. Novy-Marx et Velikov (2016) ont constaté la même chose sur de vraies
+anomalies~: la plupart des stratégies dont la rotation mensuelle est inférieure à 50~\% dégageaient encore des écarts significatifs après coûts lorsqu'elles étaient conçues pour les limiter, et peu
+de celles à rotation plus élevée le faisaient.
+
+\textbf{Emprunt.} Les positions courtes versent des frais au prêteur du titre (livre~1, chapitre~6), 50 points de base par an sur le collatéral général et bien davantage
+sur les titres difficiles à emprunter~; ici, il coûte 0.25~\% par an et ne pèse guère sur le ratio de Sharpe. Ce point compte davantage pour les stratégies dont les positions courtes se concentrent sur de petits
+titres encombrés, ce qui n'est pas le cas de celles de l'inversion.
+
+\textbf{Calendrier.} Un portefeuille calculé à partir d'un cours de clôture ne peut pas être exécuté à ce cours~: les ordres de l'enchère de clôture sont transmis avant que la clôture ne soit connue
+(livre~1, chapitre~13). Si elle est exécutée à la clôture suivante, l'inversion ne conserve plus aucun alpha (son information dure un jour, chapitre~13) et garde ses
+coûts~: $-9.45$. La réponse honnête au niveau~1 utiliserait un signal calculé à partir des cours connus avant la clôture, et un modèle de coûts de l'enchère de clôture~;
+le \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé} peut retenir cette hypothèse, à condition que quelqu'un la consigne par écrit.
+
+\textbf{Capitalisation.} Sommer les rendements quotidiens au lieu de les composer est sans conséquence pour de petits rendements, mais non pour les grands. Le capital
+de l'inversion avec coûts, composé, tombe à 0.35 de sa valeur initiale au bout de dix ans~; sommé, il atteint $-0.04$, un capital qu'aucun portefeuille ne peut avoir.
+
+\textbf{Anticipation.} Multiplier le portefeuille du jour par le rendement du jour fait perdre à l'inversion 694~\% par an ($-65$ de ratio de Sharpe)~: son signal est l'opposé de ce
+rendement. L'anticipation ne flatte pas toujours~; elle fausse toujours.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=rev,width=6.8cm,height=5.6cm,ybar,bar width=10pt,title={\small inversion à un jour},ylabel={ratio de Sharpe},tick label style={font=\footnotesize},
+  label style={font=\small},xtick={0,1,2,3,4,5},xticklabels={naïf,PIT,liquide,coûts,emprunt,suivant},x tick label style={rotate=45,anchor=east},
+  ymin=-10.5,ymax=8.5,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=reversal]{figdata/research/16-vectorised-backtests/waterfall.csv};
+\end{axis}
+\begin{axis}[at={(rev.east)},anchor=west,xshift=1.6cm,width=6.8cm,height=5.6cm,ybar,bar width=10pt,title={\small momentum 12-1, mensuel},
+  tick label style={font=\footnotesize},label style={font=\small},xtick={0,1,2,3,4,5},xticklabels={naïf,PIT,liquide,coûts,emprunt,suivant},
+  x tick label style={rotate=45,anchor=east},ymin=0,ymax=0.5,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=momentum]{figdata/research/16-vectorised-backtests/waterfall.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Ratio de Sharpe de deux stratégies sur \texttt{firm.synthmkt} à mesure que les erreurs du \omterm{def:rs:vectorised-backtests:backtest}{backtest} sont corrigées une à une~: univers des survivants (naïf),
+univers en temps réel (PIT), 500 titres les plus liquides, 10 pb par unité échangée, emprunt à 50 pb par an, exécution à la clôture suivante. Les deux
+échelles diffèrent.}\label{fig:rs:vectorised-backtests:waterfall}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={années},ylabel={capital ($\log_{10}$)},tick label style={font=\small},label style={font=\small},
+  xmin=0,xmax=10,ymin=-2,ymax=1.5,grid=major,grid style={gray!25},legend columns=2,
+  legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!50,thick,dashed] table[x=year,y=gross]{figdata/research/16-vectorised-backtests/capital.csv};
+\addplot[omThm,thick] table[x=year,y=costed]{figdata/research/16-vectorised-backtests/capital.csv};
+\addplot[omThm,thick,dotted] table[x=year,y=next]{figdata/research/16-vectorised-backtests/capital.csv};
+\addplot[omDef,very thick] table[x=year,y=momentum]{figdata/research/16-vectorised-backtests/capital.csv};
+\legend{inversion avant coûts,inversion après coûts et emprunt,inversion exécutée à la clôture suivante,momentum après toutes les corrections}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Capital composé de l'inversion sur les 500 titres synthétiques les plus liquides avant coûts, après coûts et emprunt, et exécuté à la clôture suivante,
+avec le momentum mensuel après toutes les corrections. Données~: \texttt{rs\_vecbt} sur \texttt{firm.synthmkt}.}\label{fig:rs:vectorised-backtests:capital}
+\end{omfigure}
+
+\section{Une liste de contrôle}
+
+Tout \omterm{def:rs:vectorised-backtests:backtest}{backtest} de niveau~1 que la société mène énonce, et \texttt{firm.vecbt} l'impose lorsque c'est possible~:
+\begin{enumerate}
+\item l'\omterm{def:rs:vectorised-backtests:timing}{instant de décision} de chaque donnée d'entrée, et le \omterm{def:rs:vectorised-backtests:timing}{délai d'exécution} entre celui-ci et la transaction (jamais 0~; 1 seulement avec une raison énoncée)~;
+\item l'\omterm{def:rs:universe-symbology-and-corporate-actions:universe}{univers investissable} à chaque décision, en temps réel, avec les \omterm{def:rs:universe-symbology-and-corporate-actions:delisting}{rendements de radiation}~;
+\item le coût par unité échangée, par titre si la liquidité diffère, et le coût de point mort (\cref{prop:rs:vectorised-backtests:breakeven})~;
+\item les frais d'emprunt et la disponibilité des titres pour les positions courtes, ainsi que le financement de tout effet de levier et les intérêts sur la trésorerie~;
+\item la \omterm{def:rs:vectorised-backtests:timing}{fréquence de rebalancement} et la dérive du portefeuille entre deux rebalancements~;
+\item la capitalisation, et un capital qui ne peut pas descendre sous zéro~;
+\item l'exposition brute, et les plafonds de position face à la liquidité~;
+\item le nombre de variantes essayées avant celle-ci (chapitre~20), et le niveau auquel le résultat doit être confirmé.
+\end{enumerate}
+Arnott, Harvey et Markowitz (2019) ont exposé un tel protocole pour la recherche en apprentissage automatique, en soulignant que ses méthodes exigent bien plus de données
+que n'en possède la finance.
+
+\section{Tutoriel~: Sharpe 7.2 le lundi}\label{tut:rs:vectorised-backtests:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Backtester l'inversion à un jour et le momentum mensuel sur \texttt{firm.synthmkt} en un seul passage vectorisé chacun, corriger les erreurs une à une
+et calculer le coût de point mort de l'inversion. \textbf{État final~:}
+les \cref{fig:rs:vectorised-backtests:waterfall,fig:rs:vectorised-backtests:capital}~; le tableau.
+\begin{tutsteps}
+\item \textbf{La boucle principale}~: le portefeuille décalé, la transaction issue du portefeuille dérivé, les coûts, l'emprunt, le financement.
+\omcode{code/firm/vecbt/firm_vecbt.py}{90}{101}{La boucle de période du backtest de niveau~1.}\label{lst:rs:vectorised-backtests:loop}
+\item \textbf{L'\omterm{def:rs:universe-symbology-and-corporate-actions:universe}{univers investissable}}~: les titres les plus liquides selon le volume en dollars glissant, tel qu'il est connu à chaque clôture.
+\omcode{code/research/16-vectorised-backtests/python/rs_vecbt.py}{37}{43}{Un univers liquide en temps réel.}\label{lst:rs:vectorised-backtests:liquid}
+\item \textbf{Exécuter} \texttt{waterfall()} pour les deux signaux, \texttt{lookahead()}, \texttt{breakeven\_cost()}, \texttt{compounding()} et
+\texttt{fig\_vecbt.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Lisser le signal d'inversion sur trois jours et observer la rotation et le coût de point mort~; facturer les coûts par titre, proportionnellement
+à la volatilité de chaque titre.
+\end{tutorial}
+
+\section{Construction~: le backtester de niveau~1}\label{bld:rs:vectorised-backtests:vecbt}
+
+\begin{build}
+\bfield{Rôle} Le backtester de criblage de la société~: quelques secondes par exécution, honnête par construction pour le calendrier, l'univers, les coûts et le financement, et source
+du type \texttt{BacktestResult} que tous les \omterm{def:rs:vectorised-backtests:backtest}{backtests} ultérieurs renvoient.
+\bfield{Interface} \texttt{BacktestResult(dates, names, weights, trades, gross, costs, net, capital, meta)} avec \texttt{turnover},
+\texttt{gross\_exposure}, \texttt{net\_exposure}~; \texttt{signal\_to\_weights(signal, universe, gross, neutral)}~; \texttt{backtest(weights, returns, lag,
+universe, cost, borrow, cash\_rate, borrow\_spread, cap, compound, periods)}.
+\bfield{Règles} Le décalage est un argument, non une hypothèse~; l'univers s'applique à l'\omterm{def:rs:vectorised-backtests:timing}{instant de décision}~; les transactions se mesurent à partir du portefeuille dérivé~; les coûts
+sont imputés à chaque transaction~; le capital se compose par défaut.
+\bfield{Tests d'acceptation} \texttt{code/firm/vecbt/tests/}~: décalages 0, 1 et 2 sur une série manuelle~; capitalisation comparée à la sommation~; la transaction issue d'un portefeuille dérivé~;
+coûts et rotation d'un portefeuille alternant~; emprunt, intérêts sur la trésorerie et financement par levier~; masques d'univers et plafonds~; poids neutres en dollars d'une exposition brute donnée.
+\bfield{Pour aller plus loin} Coûts issus d'un modèle d'impact en racine carrée (chapitre~27)~; disponibilité des titres à emprunter par titre~; trésorerie multidevise.
+\end{build}
+
+\begin{omsources}
+\item R.~Novy-Marx et M.~Velikov, ``A taxonomy of anomalies and their trading costs'', \emph{Review of Financial Studies} 29(1), 2016.
+\item R.~Arnott, C.~R.~Harvey et H.~Markowitz, ``A backtesting protocol in the era of machine learning'', \emph{Journal of Financial Data Science} 1(1), 2019.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:rs:vectorised-backtests:1}
+Un portefeuille rapporte 12~\% brut par an et tourne de 20~\% de lui-même chaque jour (252 jours). À quel coût par unité échangée atteint-il le point mort~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:vectorised-backtests:2}
+Un portefeuille détient 60~\% en A et 40~\% en B. A rapporte 10~\% et B 0~\% sur la période. Quels sont les poids dérivés, et que faut-il échanger pour revenir à
+60/40~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:vectorised-backtests:3}
+Les rendements quotidiens de $+50~\%$ et $-40~\%$ alternent pendant dix jours. Quel est le capital après dix jours en composant les rendements, et que suggère la somme des rendements~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:vectorised-backtests:4}
+Pourquoi le \omterm{def:rs:vectorised-backtests:backtest}{backtest} avec anticipation (look-ahead) du retournement perd-il de l'argent, alors que celui d'un signal de momentum incluant le rendement du jour en gagnerait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:vectorised-backtests:5}
+Pourquoi le \omterm{def:rs:point-in-time-data-and-the-biases:survivorship}{biais de survie} peut-il gonfler le \omterm{def:rs:vectorised-backtests:backtest}{backtest} d'une stratégie et réduire celui d'une autre~? Donner le mécanisme pour le momentum sur le marché synthétique.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:vectorised-backtests:6}
+Un portefeuille neutre en dollars, d'exposition brute 2, dépose son capital en collatéral rémunéré à 3~\% par an et verse 50 points de base par an pour emprunter ses positions courtes. Quel
+est l'effet du financement, gain ou coût, par an et par unité de capital~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:vectorised-backtests:7}
+\emph{Programmation.} Reconstruire le retournement à partir de la moyenne des rendements des trois derniers jours au lieu du seul dernier. Comment la \omterm{def:rs:vectorised-backtests:turnover}{rotation du portefeuille} (turnover), le ratio de Sharpe brut et
+le coût de point mort évoluent-ils~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:vectorised-backtests:8}
+\emph{Trouver la faille.} «~Notre stratégie s'exécute à la clôture au cours de clôture, ce qui est correct parce que nous utilisons des ordres au marché à la clôture.~»
+\end{exercise}
+
+\section{Problème~: Sharpe 7.2 le lundi, $-2.6$ le vendredi}
+
+\begin{problem}[{Problème du week-end --- un backtest, mensonge par mensonge}]\label{pb:rs:vectorised-backtests:1}
+Le retournement à un jour et le momentum mensuel 12-1 sur \texttt{firm.synthmkt}, neutre en dollars, d'exposition brute 1.
+
+\medskip\noindent\textbf{Partie I --- Le \omterm{def:rs:vectorised-backtests:backtest}{backtest} naïf.}
+\begin{enumerate}
+\item Quel ratio de Sharpe et quel rendement moyen le \omterm{def:rs:vectorised-backtests:backtest}{backtest} naïf du retournement affiche-t-il, et que suppose-t-il~?
+\item Que montre la version à retard nul, et pourquoi son signe est-il négatif~?
+\item Quelle \omterm{def:rs:vectorised-backtests:turnover}{rotation du portefeuille} (turnover) présente le retournement~?
+\item Quelles entrées du \omterm{def:rs:vectorised-backtests:backtest}{backtest} naïf un chercheur aurait-il pu connaître à l'\omterm{def:rs:vectorised-backtests:timing}{instant de décision}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- L'univers.}
+\begin{enumerate}[resume]
+\item Que font les univers point-in-time et liquide à chacune des stratégies~?
+\item Pourquoi le \omterm{def:rs:point-in-time-data-and-the-biases:survivorship}{biais de survie} abaisse-t-il le momentum ici~?
+\item Que ferait-il à une stratégie qui achète des actions bon marché et en difficulté~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Coûts et délais.}
+\begin{enumerate}[resume]
+\item Que font 10 points de base par unité échangée au retournement et au momentum~?
+\item Quel est le coût de point mort du retournement~?
+\item Combien coûte l'emprunt~?
+\item Que se passe-t-il lorsque le retournement est exécuté à la clôture suivante, et pourquoi~?
+\item Qu'est-ce que la composition des rendements change pour le retournement après coûts~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la cascade du ratio de Sharpe, du \omterm{def:rs:vectorised-backtests:backtest}{backtest} naïf au \omterm{def:rs:vectorised-backtests:backtest}{backtest} honnête de niveau 1, mensonge par mensonge, pour les deux stratégies.
+\item Laquelle des deux stratégies relève d'un résultat de niveau 1, et laquelle exige un \omterm{def:rs:vectorised-backtests:fidelity}{niveau de fidélité} supérieur avant que quiconque y croie~?
+\item Que changeraient un modèle de coût de l'enchère de clôture et un signal fondé sur les cours de 15:50~?
+\item Comment réduire la \omterm{def:rs:vectorised-backtests:turnover}{rotation du portefeuille} (turnover) du retournement sans perdre son alpha~?
+\item Quelle ligne de la liste de contrôle le \omterm{def:rs:vectorised-backtests:backtest}{backtest} naïf a-t-il violée en premier~?
+\item Que faut-il attendre, d'après les résultats de Novy-Marx et Velikov, d'un véritable retournement quotidien~?
+\item Que doit consigner le \omterm{def:rs:the-research-process:log}{journal de recherche} sur ce \omterm{def:rs:vectorised-backtests:backtest}{backtest}~?
+\item En une phrase~: à quoi sert un \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur}]\label{iq:rs:vectorised-backtests:1}
+Citer cinq façons dont un \omterm{def:rs:vectorised-backtests:backtest}{backtest} peut surestimer la performance.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, développeur}]\label{iq:rs:vectorised-backtests:2}
+Décrire, en mots, les étapes d'un \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé} d'une stratégie long-short quotidienne, et l'endroit où chaque biais intervient.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:rs:vectorised-backtests:3}
+Le ratio de Sharpe brut d'une stratégie vaut 7. Pourquoi pourrait-on encore ne pas la mettre en production~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:rs:vectorised-backtests:4}
+Quand un \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé} est-il suffisant, et quand faut-il un \omterm{def:rs:vectorised-backtests:backtest}{backtest} événementiel~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, risque}]\label{iq:rs:vectorised-backtests:5}
+Comment tenez-vous compte de l'emprunt et du financement dans un \omterm{def:rs:vectorised-backtests:backtest}{backtest} long-short~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:rs:vectorised-backtests:6}
+Dériver le coût de point mort d'une stratégie à partir de son rendement brut et de son turnover, et l'utiliser pour comparer un retournement quotidien avec un momentum mensuel.
+\end{interviewq}

@@ -8,8 +8,8 @@ Guidance for Claude Code when working in this repository.
 twenty LaTeX books, written in English, covering quantitative finance end to end
 (markets, methods, derivatives, risk, research, strategies, microstructure,
 HFT, machine learning, low-latency software, networks, platforms, the firm,
-the industry, interviews). **Books 1–5 also ship in French** (pilot tier, below); the
-other fifteen are English-only.
+the industry, interviews). **Books 1–10 also ship in French** (pilot tier, below); the
+other ten are English-only.
 
 **Status (2026-11-03): all twenty books are written.** Books 18, 19 and 20 are the interview books, written 2026-11-02/03
 in one parallel batch of three (one Opus 5.5 agent per book), which replaced the old 220-page Book 18: 1,789 new questions, long
@@ -93,7 +93,8 @@ fixed. A reader's finding is rechecked by script before it is applied, as some p
 Working notes: `sources/<slug>/PROGRESS.md` per book.
 
 **French pilot editions of Books 1–5 (2026-11-09/10).** Made by the pilot method (`../pilot_translation_instruction.md`):
-one tool-less Haiku 5.5 call per section (effort medium), one Opus 5.5 coordinator per book, three at once, rolling.
+one tool-less Haiku 5.5 call per section (effort medium), but run with five Opus 5.5 coordinator subagents, one per
+book, against the pilot method's one-coordinator rule; they made most of the run's ~13 % of a weekly plan.
 Self-scored from a 20-passage sample, not read in full: Book 1 88 (403 pp), Book 2 88 (393), Book 3 87 (354), Book 4
 88 (372), Book 5 88 (366); all 0/0/0 under TeX Live 2026 and `tools/check_translation.sh <slug> fr` green. Run file
 `sources/TRANSLATION_BOOKS_1-5_FR.md` (with the wave findings), one per book `sources/TRANSLATION_BOOK_N_FR.md`, scores
@@ -102,7 +103,18 @@ Entries `one_quant_book_0N_*_fr.tex` (babel French on pdfTeX, `shorthands=off`);
 when it exists; UI strings in `styles/lang/fr.tex`. Gate 12 (`tools/check_quant_twin.py`) compares each translated
 file's `\omcode` triples, dated-box dates, `\texttt` identifiers and math spans with its English twin, on disk.
 Terminology follows French desk usage (`../pilot_translation/langs/series/one-quant-book.fr.md`). English canon: no
-fresh-reader pass, solutions not recomputed. Not done: the HTML reader for the French books.
+fresh-reader pass, solutions not recomputed.
+
+**French pilot editions of Books 6–10 (2026-11-11).** Made by the same method, this time as written: **one coordinator,
+the main session, for all five books, and no subagents of any kind**. That makes it the first whole-book run of that
+shape. The Haiku 5.5 section calls ran at most three books at once: 1,497 calls, $10.9 at list price. The weekly plan went from
+74 % to 78 % by the last book's close, against about 13 % for Books 1–5. Self-scored 88 each from a 20-passage sample:
+Book 6 343 pp, Book 7 370, Book 8 356, Book 9 356, Book 10 327; all 0/0/0 under TeX Live 2026 and
+`check_translation.sh` green. Run file `sources/TRANSLATION_BOOKS_6-10_FR.md`, one per book
+`sources/TRANSLATION_BOOK_N_FR.md`. The shared sweeps are in `draft/pilot-quant-fr/` and take a slug (`fix_common.py`,
+`typo_apply.py`, `iqroles_fr.py`, `wkend_labels.py`, `quotes_fr.py`, `numfile.py`, `index_join.py`, …). Books 1–5 still
+carry two defect classes this run found and fixed only in Books 6–10: weekend-problem part labels in six forms, and the
+mid price as *point médian* / *cours médian*. Not done: the HTML reader for the French books.
 
 ## Commands
 

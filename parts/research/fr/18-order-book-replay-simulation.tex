@@ -1,0 +1,304 @@
+=\chapter{Simulation de rejeu du carnet d'ordres}\label{ch:rs:order-book-replay-simulation}
+
+Une stratégie qui maintient un lot sur le meilleur cours acheteur et un lot sur le meilleur cours vendeur gagne 1\,106~\$ par heure dans un \omterm{def:rs:order-book-replay-simulation:replay}{rejeu du carnet d'ordres} simulé, en exécutant
+61~\% de tout le volume qui se traite. La même stratégie, sur les mêmes messages, placée là où un ordre réel se trouverait, derrière les ordres déjà
+en attente à son prix, n'exécute que 10~\% du volume et perd 76~\$ par heure. Le premier rejeu supposait que les cotations de la stratégie se trouvaient en tête de chaque
+file dans laquelle elles entraient. Le niveau~3 des \omterm{def:rs:vectorised-backtests:backtest}{backtests} de la maison rejoue les messages du marché un à un, place les ordres propres de la stratégie dans la file, et
+rend explicites, par des modèles, leur position dans celle-ci ainsi que le temps qu'il leur faut pour y parvenir. Ce chapitre construit ce dispositif (\texttt{firm.lobreplay}, avec un cœur en C++20
+et un jumeau en Rust qui reproduisent ses exécutions), mesure la part du résultat d'une stratégie passive qui tient à la \omterm{def:rs:order-book-replay-simulation:queue}{position dans la file} et à la latence, et borne ce qu'un
+rejeu ne peut pas voir~: l'impact propre de la stratégie.
+
+\section{Rejouer un flux market-by-order}
+
+\begin{definition}[Rejeu du carnet d'ordres]\label{def:rs:order-book-replay-simulation:replay}
+Un \emph{rejeu du carnet d'ordres}\index{rejeu du carnet d'ordres} reconstruit le carnet à partir d'un flux de messages enregistré et fait tourner une stratégie contre lui, en insérant les
+ordres propres de la stratégie comme ordres fantômes~: ils peuvent être exécutés par les transactions enregistrées sans modifier les messages qui suivent.
+\end{definition}
+
+Un flux market-by-order (livre~1, chapitre~19) transmet l'arrivée, l'annulation et l'exécution de chaque ordre avec son identifiant, de sorte que le rejeu connaît la
+file à chaque prix, selon la priorité temporelle. \texttt{firm.lobreplay} rejoue les messages de \texttt{firm.tape}~: une heure simulée en contient 129\,303.
+Son carnet est la file des couples (ordre, taille) à chaque prix~; son horloge est l'horodatage des messages, fusionné avec les événements propres de la stratégie (les arrivées et annulations de ses ordres
+à la bourse, sa vision du marché) dans une file de priorité unique, comme au chapitre~17.
+
+\section{Où suis-je dans la file~?}
+
+\begin{definition}[Position dans la file, modèle de position dans la file]\label{def:rs:order-book-replay-simulation:queue}
+La \emph{position dans la file}\index{position dans la file} d'un ordre en attente est la quantité qui le précède à son prix, et qui doit être exécutée ou annulée avant
+qu'il puisse être exécuté. Un \emph{modèle de position dans la file}\index{modèle de position dans la file} indique comment la position d'un ordre fantôme est fixée à son arrivée et comment elle évolue
+à mesure que le carnet change.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,x=1cm,y=1cm]
+\foreach \x/\w/\l in {0/1.6/300,1.7/1.1/200,2.9/1.3/250} {\draw[fill=omDef!15,draw=omDef] (\x,0) rectangle ++(\w,0.7); \node at (\x+\w/2,0.35) {\l};}
+\draw[fill=omThm!30,draw=omThm,thick] (4.3,0) rectangle ++(0.9,0.7); \node at (4.75,0.35) {nôtre};
+\foreach \x/\w/\l in {5.3/1.4/400,6.8/0.9/100} {\draw[fill=gray!10,draw=gray] (\x,0) rectangle ++(\w,0.7); \node at (\x+\w/2,0.35) {\l};}
+\draw[-Stealth,thick] (-0.8,0.35) -- (-0.05,0.35) node[pos=0,left,align=right,font=\footnotesize]{transactions\\ depuis la tête};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (0,-0.1) -- (4.2,-0.1) node[midway,below=6pt,font=\footnotesize]{devant~: 750 actions};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (5.3,-0.1) -- (7.7,-0.1) node[midway,below=6pt,font=\footnotesize]{derrière~: arrivés plus tard};
+\draw[-Stealth,thick,omThm] (2.3,1.4) -- (2.3,0.8) node[pos=0,above,font=\footnotesize,align=center]{une annulation devant\\ nous fait avancer};
+\node[font=\footnotesize,anchor=west,align=left] at (8.0,0.35) {meilleur cours acheteur,\\ priorité temporelle};
+\end{tikzpicture}
+
+\omcaption{Un ordre fantôme dans la file à son prix. Les transactions consomment la file par la tête~; les annulations devant l'ordre le font remonter,
+les annulations derrière lui n'ont pas cet effet~; il est exécuté lorsqu'une transaction l'atteint.}\label{fig:rs:order-book-replay-simulation:queue}
+\end{omfigure}
+
+\texttt{firm.lobreplay} implémente trois modèles~:
+\begin{itemize}
+\item \emph{tête}~: l'ordre est en tête à son prix dès son arrivée, et chaque transaction à ce prix l'exécute (\omterm{def:rs:event-driven-backtests:fill}{exécution au contact} (touch fill) du chapitre~17)~;
+\item \emph{fifo}~: l'ordre se place derrière les ordres en attente à son prix au moment de son arrivée, connus par leur identifiant grâce au flux market-by-order~; il
+remonte à mesure que ces ordres sont exécutés ou annulés, et il est exécuté lorsqu'une transaction atteint un ordre arrivé après lui~;
+\item \emph{prob}~: seule la taille totale du niveau est connue (flux market-by-price)~; les transactions consomment d'abord la quantité qui précède, et une annulation
+retire de la taille devant l'ordre au prorata de la part du niveau qui se trouve devant lui.
+\end{itemize}
+L'outil de \omterm{def:rs:vectorised-backtests:backtest}{backtest} open source hftbacktest, qui rejoue des données market-by-price, propose les mêmes deux familles~: un modèle averse au risque dans lequel les annulations
+n'interviennent qu'en queue de file, de sorte que l'ordre n'avance qu'avec les transactions, et des modèles probabilistes dans lesquels les réductions interviennent à la fois avant et après
+la position de l'ordre, avec une probabilité donnée par une fonction de sa place dans la file.
+
+\section{Latence}
+
+\begin{definition}[Modèle de latence, latence de saisie des ordres, latence des données de marché]\label{def:rs:order-book-replay-simulation:latency}
+Un \emph{modèle de latence}\index{modèle de latence} fixe les délais entre le marché et la stratégie~: la \emph{latence des données de marché}%
+\index{latence des données de marché}, depuis un événement à la bourse jusqu'à ce que la stratégie le voie, et la \emph{latence de saisie des ordres}\index{latence de saisie des ordres}, depuis
+l'envoi par la stratégie d'un ordre ou d'une annulation jusqu'à ce que la bourse le traite.
+\end{definition}
+
+Le cotateur au contact (touch quoter) du chapitre garde un lot sur le meilleur cours acheteur et un lot sur le meilleur cours vendeur, en déplaçant un ordre lorsque son prix n'est plus le meilleur, dans la limite de cinq lots
+d'inventaire. Rejoué sur deux heures simulées avec chaque modèle, avec des \omterm{def:rs:order-book-replay-simulation:latency}{latences de saisie des ordres} allant de zéro à cinq secondes et une \omterm{def:rs:order-book-replay-simulation:latency}{latence des données de marché} égale à la
+moitié de celle-ci (la \cref{fig:rs:order-book-replay-simulation:latency})~:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\omterm{def:rs:order-book-replay-simulation:latency}{latence de saisie des ordres} & 0 & 50 ms & 200 ms & 1 s & 5 s\\
+\midrule
+tête~: P\&L par heure (\$) & 1\,106 & 778 & 672 & 498 & 192\\
+tête~: part du volume échangé & 61~\% & 48~\% & 43~\% & 28~\% & 11~\%\\
+fifo~: P\&L par heure (\$) & $-76$ & $-94$ & $-89$ & $-146$ & $-8$\\
+fifo~: lots exécutés par heure & 522 & 505 & 470 & 350 & 182\\
+fifo~: mark-out après 10 s (ticks) & $+0.008$ & $-0.001$ & $-0.025$ & $-0.100$ & $-0.115$\\
+prob~: P\&L par heure (\$) & $-49$ & $-42$ & $-41$ & $-26$ & $+33$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Les profits du modèle tête sont un artefact~: une cotation qui est en tête de chaque file capte les transactions bénignes qu'un ordre réel placé derrière la file
+ne voit jamais, et son mark-out reste proche de $+0.4$ ticks à toute latence. Avec des \omterm{def:rs:order-book-replay-simulation:queue}{positions dans la file}, le cotateur n'a pas d'edge~: son P\&L se confond avec son bruit autour de zéro,
+et son mark-out à 10 secondes, un centième de tick sans latence, devient négatif dès 50 millisecondes et atteint $-0.1$ ticks à une seconde~: les ordres
+qui sont encore exécutés quand le cotateur est lent sont ceux que les traders rapides laissent passer. Lehalle et Mounjid (2017) ont trouvé la même érosion dans un modèle d'ordres
+à cours limité~: la valeur de la connaissance du déséquilibre de liquidité est érodée par la latence lorsqu'il n'y a pas assez de temps pour annuler et réinsérer. Le modèle probabiliste,
+qui ne connaît que la taille du niveau, se situe près du modèle exact (499 lots contre 522 sans latence).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=pnl,width=7cm,height=5.4cm,title={\small P\&L par heure (\$)},tick label style={font=\footnotesize},xtick={0,1,2,3,4},
+  xticklabels={0,50 ms,200 ms,1 s,5 s},xlabel={\small latence de saisie des ordres},ymin=-250,ymax=1200,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(1.1,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!55,thick,dashed,mark=o] table[x=k,y=front_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omDef,very thick,mark=*] table[x=k,y=fifo_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omThm,thick,mark=square*] table[x=k,y=prob_pnl]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\legend{tête de file,fifo (market-by-order),prob (market-by-price)}
+\end{axis}
+\begin{axis}[at={(pnl.east)},anchor=west,xshift=1.4cm,width=7cm,height=5.4cm,title={\small mark-out après 10 s (ticks)},tick label style={font=\footnotesize},
+  xtick={0,1,2,3,4},xticklabels={0,50 ms,200 ms,1 s,5 s},xlabel={\small latence de saisie des ordres},ymin=-0.2,ymax=0.45,grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[black!55,thick,dashed,mark=o] table[x=k,y=front_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omDef,very thick,mark=*] table[x=k,y=fifo_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\addplot[omThm,thick,mark=square*] table[x=k,y=prob_markout]{figdata/research/18-order-book-replay-simulation/latency.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le quoteur de tête rejoué sur deux heures simulées de \texttt{firm.tape} sous trois \omterm{def:rs:order-book-replay-simulation:queue}{modèles de position dans la file}, en fonction de la \omterm{def:rs:order-book-replay-simulation:latency}{latence de saisie des ordres} (la
+\omterm{def:rs:order-book-replay-simulation:latency}{latence des données de marché} en est la moitié). Seul le modèle de tête de file, qu'aucun ordre réel ne connaît, rapporte de l'argent. Données~: \texttt{rs\_lobreplay.touch\_grid}.}\label{fig:rs:order-book-replay-simulation:latency}
+\end{omfigure}
+
+\section{Logique d'exécution}
+
+\begin{definition}[Probabilité d'exécution passive]\label{def:rs:order-book-replay-simulation:passive}
+La \emph{probabilité d'exécution passive}\index{probabilité d'exécution passive} d'un ordre au repos sur un horizon est la probabilité que les exécutions à son prix
+consomment la file qui le précède et l'atteignent dans l'horizon.
+\end{definition}
+
+Sous le modèle fifo, une exécution suit une seule règle~: une exécution contre un ordre arrivé après le fantôme signifie, par priorité temporelle, que l'agresseur a
+atteint le fantôme en premier~; le fantôme s'exécute pour le plus petit de sa taille restante et de celle de l'exécution. Tout autre message à son prix ne fait que
+le faire avancer (une exécution ou une annulation d'un ordre qui le précède) ou ne fait rien (un ordre qui rejoint derrière, une annulation derrière). La règle est
+assez simple pour être écrite trois fois~: en Python pour la recherche, en C++20 pour les moteurs de la société (livre~13) et en Rust, et les trois doivent concorder. Le jeu
+de test commun est constitué de cinq minutes simulées (8\,513 messages) et des 75 ordres fantômes qu'un quoteur de tête a envoyés avec une latence de 50 millisecondes~; le moteur Python,
+la référence Python \texttt{track\_fifo}, le cœur C++20 et le jumeau Rust produisent tous les mêmes 29 exécutions, jusqu'au dernier bit des horodatages.
+
+Le même moteur donne au chapitre~17 sa réponse. Le quoteur à barres de ce chapitre, rejoué sur ses quatre jours sous le modèle fifo, exécute 344 lots par jour (47~\%
+de ses ordres) et perd 239~\$ par jour, avec un mark-out à cinq minutes de $-0.77$ tick~: entre les 523 lots et $+\$17$ de l'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact}, et les
+290 lots et $-\$584$ de l'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration}, et plus près de l'extrémité pessimiste. L'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration} était la meilleure estimation de niveau~2~; aucune des deux n'était la réponse.
+
+\section{L'impact de marché manquant et comment le borner}
+
+\begin{definition}[Impact de marché, impact contrefactuel]\label{def:rs:order-book-replay-simulation:impact}
+L'\emph{impact de marché}\index{impact de marché} d'une stratégie est la modification que ses propres ordres et transactions provoquent dans les prix auxquels elle échange ensuite. Dans un rejeu,
+il s'agit d'un \emph{impact contrefactuel}\index{impact contrefactuel}~: le marché enregistré ne contenait pas les ordres de la stratégie, si bien que ce qu'il aurait fait
+de ces ordres ne peut être que modélisé.
+\end{definition}
+
+Un rejeu laisse inchangés les messages enregistrés~: lorsque le fantôme s'exécute, l'ordre réel qui se trouve derrière lui s'exécute toujours dans les données, et l'agresseur qui en
+réalité aurait pris le lot du fantôme puis se serait arrêté (ou aurait fait monter davantage le prix) est rejoué comme si le fantôme n'était pas là. La documentation de hftbacktest
+énonce l'hypothèse sans détour~: l'ordre rejoué ne peut pas modifier le marché simulé, et doit être assez petit pour ne produire aucun impact.
+L'hypothèse peut être bornée. Le \omterm{def:rs:trade-flow-features:lambda}{lambda de Kyle} sur ce tape simulé vaut 0.10 tick pour 100 actions (chapitre~9)~; si chaque lot que le quoteur échange faisait reculer le
+prix contre lui de la moitié de cette valeur en moyenne, l'heure du quoteur fifo coûterait environ 26~\$ de plus sans latence et 9~\$ de plus à cinq secondes, peu de chose face à son bruit ici,
+mais décisif pour une stratégie dont l'edge ne vaut que quelques dizaines de dollars. Lorsque la borne compte, la réponse n'est pas un meilleur rejeu mais un
+simulateur réactif, dans lequel les autres traders répondent aux ordres de la stratégie (livre~10), ou un trading réel à petite taille (chapitre~21).
+
+\section{Le quatrième niveau}
+
+Les quatre niveaux du chapitre~16 disposent désormais de leur outillage~: \texttt{firm.vecbt} pour les poids et les coûts, \texttt{firm.evbt} pour les ordres sur barres,
+\texttt{firm.lobreplay} pour les ordres dans la file avec latence. Chaque niveau a répondu à une question que le précédent ne pouvait pas traiter~: le niveau~2 a montré que le résultat du quoteur passif tenait au
+\omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}~; le niveau~3 a montré lequel, et que son edge était un artefact de la \omterm{def:rs:order-book-replay-simulation:queue}{position dans la file}. Ce qu'aucun rejeu ne peut fournir, c'est
+la réaction du marché à la stratégie ainsi que la latence et les exécutions réelles de celle-ci~: c'est le niveau~4, le trading réel à petite taille ou sur papier, face aux
+données en direct, et les chapitres 19 et 21 mesurent à quelle distance les trois simulations en sont.
+
+\section{Tutoriel~: où est passée la file~?}\label{tut:rs:order-book-replay-simulation:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Rejouer un quoteur de tête sous trois \omterm{def:rs:order-book-replay-simulation:queue}{modèles de position dans la file} et cinq latences, rejouer le quoteur à barres du chapitre~17 au niveau~3, et vérifier les cœurs C++20 et Rust par rapport aux
+exécutions Python. \textbf{État final~:} \cref{fig:rs:order-book-replay-simulation:latency}~; le tableau~; trois implémentations concordantes.
+\begin{tutsteps}
+\item \textbf{Les modèles de file}~: ce que chaque message au prix du fantôme lui fait.
+\omcode{code/firm/lobreplay/firm_lobreplay.py}{106}{143}{Positions dans la file selon trois modèles.}\label{lst:rs:order-book-replay-simulation:models}
+\item \textbf{Le cœur C++20} du modèle fifo, qui reproduit les exécutions Python.
+\omcode{code/firm/lobreplay/cpp/firm_lobreplay.hpp}{88}{106}{L'étape par message du modèle fifo en C++20.}\label{lst:rs:order-book-replay-simulation:cpp}
+\item \textbf{Exécuter} \texttt{touch\_grid()}, \texttt{bar\_quoter\_level3()}, \texttt{impact\_bound()}, \texttt{fig\_lobreplay.py} et \texttt{make\_lobreplay\_fixture.py}~; compiler
+le test C++ et lancer \texttt{cargo test} sur la caisse Rust.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ne coter que lorsque la file au meilleur prix est courte (un filtre de \omterm{def:rs:order-book-features:imbalance}{déséquilibre des files}, chapitre~8) et voir si un edge apparaît~; remplacer
+la règle d'annulation proportionnelle du modèle prob par une règle d'aversion au risque et comparer ses exécutions à celles du modèle exact.
+\end{tutorial}
+
+\section{Construction~: le moteur de rejeu de niveau~3}\label{bld:rs:order-book-replay-simulation:lobreplay}
+
+\begin{build}
+\bfield{Rôle} Le moteur de \omterm{def:rs:vectorised-backtests:backtest}{backtest} de la société pour les stratégies dont les exécutions dépendent de la file et de la latence~: tenue de marché, exécution passive, signaux de \omterm{def:rs:order-book-features:imbalance}{déséquilibre des files}~;
+la référence à laquelle la logique d'exécution des moteurs de production est comparée.
+\bfield{Interface} \texttt{Book}, \texttt{Shadow}, \texttt{QueueTracker(model)}, \texttt{Replay(msgs, strategy, model, entry\_latency, data\_latency).run()}
+renvoyant les fantômes, les exécutions, la position, la trésorerie et le trajet du milieu~; \texttt{Strategy.on\_market(ctx, t, snapshot)}, \texttt{on\_fill}~; \texttt{track\_fifo(msgs,
+orders)}~; C++20 \texttt{firm::track\_fifo} dans \texttt{cpp/firm\_lobreplay.hpp}~; Rust \texttt{firm\_lobreplay::track\_fifo}.
+\bfield{Règles} Les ordres fantômes ne modifient jamais les messages rejoués~; nos événements à l'instant d'un message agissent avant lui~; toute hypothèse sur la file réside dans le modèle~;
+les trois implémentations concordent sur le jeu de test.
+\bfield{Tests d'acceptation} \texttt{code/firm/lobreplay/tests/}~: le carnet à la main~; la file fifo qui avance sur les exécutions et annulations qui la précèdent et s'exécute sur
+une exécution qui la suit, avec et sans annulation~; les trois modèles et les deux latences sur un flux écrit à la main~; les 29 exécutions du jeu de test d'après la référence~;
+les tests C++20 et Rust sur le même jeu de test.
+\bfield{Pour aller plus loin} Appariement au prorata~; ordres icebergs~; un carnet réactif dans lequel d'autres traders répondent (livre~10).
+\end{build}
+
+\begin{omsources}
+\item C.-A.~Lehalle et O.~Mounjid, ``Limit order strategic placement with adverse selection risk and the role of latency'', \emph{Market Microstructure and
+Liquidity} 3(1), 2017.
+\item R.~Cont et A.~de Larrard, ``Price dynamics in a Markovian limit order market'', \emph{SIAM Journal on Financial Mathematics} 4(1), 2013.
+\item hftbacktest (moteur de backtest open source), documentation, ``Order fill''~: modèles de bourse et modèles de file.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:1}
+Un fantôme d'achat rejoint une file d'achat de 300, 200 et 250 actions. Puis 300 s'exécutent, 100 des 200 actions de l'ordre suivant s'annulent, un ordre de 400 rejoint la file, et 450 s'exécutent. Quelle
+part des 100 actions du fantôme s'exécute sous le modèle fifo~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:2}
+Sous le modèle prob, un fantôme a 600 devant lui et 200 derrière lorsque 400 actions s'annulent à son prix. Quelle est sa nouvelle position~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:order-book-replay-simulation:3}
+La stratégie voit un événement 3 millisecondes après qu'il se produit, et ses ordres atteignent la bourse 5 millisecondes après qu'elle les envoie. Quel est l'âge du carnet que rencontre son
+ordre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:4}
+Pourquoi le mark-out du modèle de tête de file reste-t-il positif à toutes les latences alors que celui du modèle fifo devient négatif~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:5}
+Le quoteur fifo échange 522 lots par heure. Avec un \omterm{def:rs:trade-flow-features:lambda}{lambda de Kyle} de 0.10 tick pour 100 actions, quelle borne d'impact la règle du chapitre donne-t-elle, en dollars par heure~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:order-book-replay-simulation:6}
+Pourquoi un ordre fictif placé à un prix sans ordre au repos (à l'intérieur de la fourchette) ne s'exécute-t-il jamais dans un rejeu, et qu'est-ce que cela dit du rejeu des stratégies
+qui améliorent le prix~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-replay-simulation:7}
+\emph{Programmation.} Lancer le quoteur de tête sous le modèle fifo, avec la \omterm{def:rs:order-book-replay-simulation:latency}{latence des données de marché} fixée à zéro et seule la \omterm{def:rs:order-book-replay-simulation:latency}{latence de saisie des ordres} variant. L'avantage
+dépend-il davantage du fait de voir tard ou du fait d'agir tard~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:order-book-replay-simulation:8}
+\emph{Trouver la faille.} «~Notre rejeu de tenue de marché exécute nos cotations chaque fois qu'une transaction s'imprime à notre prix, et il affiche un ratio de Sharpe de 9.~»
+\end{exercise}
+
+\section{Problème~: où est passée la file~?}
+
+\begin{problem}[{Problème du week-end --- une stratégie passive, niveau 3}]\label{pb:rs:order-book-replay-simulation:1}
+Le quoteur de tête du chapitre sur deux heures simulées, et le quoteur par barres du chapitre~17 sur quatre jours simulés, rejoués au moyen de \texttt{firm.lobreplay}.
+
+\medskip\noindent\textbf{Partie I --- Le rejeu.}
+\begin{enumerate}
+\item Combien de messages une heure simulée contient-elle, et que donne un flux market-by-order aux modèles de file que ne donne pas un flux market-by-price~?
+\item Que change un ordre fictif dans le rejeu, et que ne change-t-il pas~?
+\item Dans quel ordre les événements de la stratégie et un message de marché survenant au même instant agissent-ils~?
+\item Comment les trois implémentations du modèle fifo ont-elles été vérifiées~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- \omterm{def:rs:order-book-replay-simulation:queue}{Position dans la file}.}
+\begin{enumerate}[resume]
+\item Que donnent les modèles de tête et fifo au quoteur de tête sans latence~: P\&L, part du volume échangé, lots~?
+\item Que donne le modèle prob, et pourquoi est-il proche de fifo~?
+\item Pourquoi le profit du modèle de tête est-il un artefact~?
+\item Quels sont les mark-outs des modèles de tête et fifo~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Latence.}
+\begin{enumerate}[resume]
+\item Comment les lots et le mark-out du modèle fifo évoluent-ils de zéro à cinq secondes~?
+\item À quelle latence l'avantage du quoteur disparaît-il~?
+\item Qu'ont trouvé Lehalle et Mounjid au sujet de la latence~?
+\item Que fait le modèle de tête lorsque la latence augmente, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le P\&L de la stratégie passive selon chaque modèle de file et chaque latence, et la latence à laquelle son avantage disparaît.
+\item Quelle est la réponse de niveau 3 pour le quoteur par barres du chapitre~17, et quel \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution} de niveau 2 s'en est le plus approché~?
+\item Qu'apporte la borne d'impact, et quand permettrait-elle de trancher~?
+\item Que manque fondamentalement un rejeu, et où l'entreprise va-t-elle le chercher~?
+\item Que faudrait-il changer dans la stratégie avant de la rejouer de nouveau~?
+\item Que faudrait-il journaliser en production pour calibrer le modèle de file~?
+\item Pourquoi écrire la règle d'exécution dans trois langages~?
+\item En une phrase~: que suppose un \omterm{def:rs:order-book-replay-simulation:queue}{modèle de position dans la file}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, trader}]\label{iq:rs:order-book-replay-simulation:1}
+Pourquoi les \omterm{def:rs:vectorised-backtests:backtest}{backtests} de tenue de marché surestiment-ils en général les profits~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:rs:order-book-replay-simulation:2}
+Comment estimeriez-vous la position de votre ordre dans la file à partir d'un flux market-by-price~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:rs:order-book-replay-simulation:3}
+Concevez un moteur de rejeu de carnet d'ordres qui prend en charge la latence et les ordres fictifs. Quels sont ses invariants~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:rs:order-book-replay-simulation:4}
+Comment la latence affecte-t-elle les exécutions d'une stratégie passive et leur qualité~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:rs:order-book-replay-simulation:5}
+Que manque-t-il à un \omterm{def:rs:vectorised-backtests:backtest}{backtest} par rejeu concernant l'\omterm{def:rs:order-book-replay-simulation:impact}{impact de marché}, et comment en borneriez-vous l'effet~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:rs:order-book-replay-simulation:6}
+Comment vous assureriez-vous qu'un rejeu de recherche en Python et un moteur de production en C++ exécutent les ordres de manière identique~?
+\end{interviewq}

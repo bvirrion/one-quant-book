@@ -1,0 +1,289 @@
+\chapter{Coupe-circuits et suspensions de cotation}\label{ch:mx:circuit-breakers-and-halts}
+
+Le 9 mars 2020, le S\&P 500 a perdu sept pour cent quelques minutes après l'ouverture, et toute la négociation des actions américaines s'est arrêtée pendant quinze minutes~; la scène s'est répétée trois
+fois ce mois-là. Savoir si arrêter un marché en chute le calme ou le fait chuter plus vite vers le seuil d'arrêt est un vieux débat, qui dispose désormais de données nouvelles. Ce chapitre
+présente les dispositifs, les construit comme des politiques côté plateforme pour le simulateur de bourse (\texttt{firm.halts}), et fait traverser une chute à chacun d'eux, en mesurant
+en particulier si les vendeurs se précipitent vers un seuil avant qu'il ne les arrête~: c'est l'effet d'aimant.
+
+\section{Dispositifs~: seuils, pauses, suspensions, limites}
+
+\begin{definition}[Seuils de réservation statiques et dynamiques]\label{def:mx:circuit-breakers-and-halts:bands}
+Un \emph{seuil de réservation statique}\index{seuil de réservation statique} (static price band) limite la négociation à une fourchette autour d'une référence fixe (la clôture de la veille, le cours d'ouverture) pour
+toute la séance. Un \emph{seuil de réservation dynamique}\index{seuil de réservation dynamique} (dynamic price band) le limite à une fourchette autour d'une référence qui suit les transactions récentes, par exemple
+leur moyenne sur les dernières minutes.
+\end{definition}
+
+\begin{definition}[Pause de négociation, enchère de réouverture]\label{def:mx:circuit-breakers-and-halts:pause}
+Une \emph{pause de négociation}\index{pause de négociation} (trading pause) suspend la négociation continue d'un instrument pendant une durée courte et fixée, tandis que les ordres peuvent encore être saisis,
+modifiés et annulés~; elle se termine par une \emph{enchère de réouverture}\index{enchère de réouverture} (reopening auction), une enchère (livre~1, chapitre~13) qui fixe le cours
+auquel la négociation reprend.
+\end{definition}
+
+Un seuil de réservation empêche les transactions de se former en dehors d'une fourchette~; une pause les arrête toutes pendant un certain temps~; une suspension (livre~8, chapitre~17) les arrête jusqu'à ce que la
+plateforme ou le régulateur en décide~; une limite de variation de cours (livre~1, chapitre~12) est un seuil qui tient toute la journée. Ces mécanismes ne protègent pas contre les mêmes risques~: le
+seuil contre un ordre erroné ou emballé, la pause contre un cours qui bouge plus vite que la liquidité ne peut revenir, la suspension contre une nouvelle que le marché n'a pas
+encore digérée.
+
+\texttt{firm.halts} les implémente comme des politiques que \texttt{firm.exchsim} charge (le champ \texttt{halts} de la configuration de la plateforme)~: la politique
+surveille le moteur de la plateforme
+toutes les demi-secondes, au moyen d'un appel planifié, et envoie les commandes propres au moteur, R pour fixer un seuil (les ordres dont le prix se situe hors de celui-ci sont rejetés) et l'appariement
+s'arrête à ce seuil) et P pour changer de phase (suspendu, \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture}, négociation). La sortie de l'enchère la décroise au moyen de l'enchère du chapitre~10.
+
+\omcode{code/firm/halts/firm_halts.py}{110}{138}{Contrôle de la politique de style Limit Up--Limit Down (LULD)~: mise à jour des transactions derrière le cours de référence, réinitialisation du seuil, détection d'un état de limite à partir des meilleurs cours, et suspension de l'action par une enchère de réouverture si l'état persiste.}\label{lst:mx:circuit-breakers-and-halts:luld}
+
+\section{Mécanismes sur un titre et mécanismes de marché}
+
+Aux États-Unis, les actions se négocient à l'intérieur de seuils Limit Up--Limit Down (LULD) (livre~1, chapitre~31), et l'ensemble du marché actions s'arrête lorsque le
+S\&P~500 s'éloigne suffisamment de la clôture de la veille.
+
+\begin{dated}{2026-09}{Coupe-circuits de marché en mars 2020}\label{dat:mx:circuit-breakers-and-halts:mwcb}
+Le coupe-circuit de marché suspend pendant 15 minutes toute la négociation des actions et des options sur actions américaines lorsque le S\&P~500 chute de 7~\% (niveau~1) ou de 13~\%
+(niveau~2) par rapport à la clôture de la veille avant 15 h 25, chacun au plus une fois par jour, et de 20~\% (niveau~3) pour le reste de la journée. Des suspensions de niveau~1 ont eu lieu
+les 9, 12, 16 et 18 mars 2020~; le 9 mars, l'indice a franchi le seuil à 9 h 34 min 13 s et les \omterm{def:mx:circuit-breakers-and-halts:pause}{enchères de réouverture} ont commencé à 9 h 49 min 13 s~; le 18 mars, il
+a franchi le seuil à 12 h 56 min 17 s et a rouvert à 13 h 11 min 17 s (rapport du groupe de travail de l'industrie remis à la SEC en mars 2021).
+\end{dated}
+
+La simulation réduit les mécanismes à ses séances de cinq minutes~: une action à 100.00~\$ avec un tick d'un cent, une chute au cours de laquelle un vendeur envoie
+40\,000 actions sous forme de soixante \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} sur une minute, et quatre régimes~: aucun mécanisme~; un seuil dynamique de 0.15~\% autour du prix moyen des
+transactions de la dernière minute, avec un état de limite (le meilleur cours vendeur au niveau ou en dessous du seuil inférieur, ou le meilleur cours acheteur au niveau ou au-dessus du seuil supérieur) qui suspend l'action pendant 20 secondes s'il
+dure 3~; la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} (ci-dessous)~; et une suspension de marché de 30 secondes en cas de baisses de 0.1~\%, 0.2~\% et 0.3~\%.
+
+\section{Contrats à terme~: logique de vélocité et logique stop}
+
+\begin{definition}[Logique de vélocité]\label{def:mx:circuit-breakers-and-halts:velocity}
+La \emph{logique de vélocité}\index{logique de vélocité} (velocity logic) suspend l'appariement d'un contrat à terme pendant quelques secondes lorsque son cours se déplace de plus d'un nombre fixé de
+ticks dans un délai court et fixé~; pendant la pause, les ordres peuvent être saisis, modifiés et annulés, et l'appariement reprend par une enchère.
+\end{definition}
+
+Le Globex de CME décrit la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} comme la détection d'un mouvement du marché d'un nombre prédéfini de ticks à la hausse ou à la baisse dans un délai prédéfini, et le
+passage de l'instrument dans un état réservé où les clients peuvent soumettre, modifier et annuler des ordres. La logique stop fait de même lorsque le déclenchement des \omterm{def:mx:order-types-and-their-uses:stop}{ordres stop} (chapitre~2)
+ferait bouger le cours de plus d'un montant fixé. La politique de vélocité de la simulation suspend pendant 10 secondes après un mouvement de 8 ticks en 2
+secondes (\texttt{firm\_halts.Velocity}).
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+mécanisme & baisse (ticks) & durée de suspension (s) & exécutions du vendeur & coût du vendeur (ticks) \\
+\midrule
+aucun & 27.4 & 0 & 17\,580 & 12.2 \\
+bande dynamique et pause & 20.0 & 0 & 16\,440 & 9.6 \\
+\omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} & 24.9 & 79 & 11\,752 & 13.2 \\
+suspension de marché & 18.9 & 48 & 9\,279 & 6.6 \\
+\bottomrule
+\end{tabular}
+\caption{La même chute selon quatre mécanismes, 20 séances chacun~: la plus forte baisse du prix milieu depuis son début, la durée pendant laquelle la négociation a été suspendue ou mise en pause,
+les exécutions du vendeur de la chute (sur 40\,000 envoyées sous forme d'\omterm{def:mx:the-limit-order-book:orders}{ordres au marché}) et son prix moyen de vente sous le prix milieu initial. Données~:
+\texttt{mx\_halts.mechanisms\_study}.}\label{tab:mx:circuit-breakers-and-halts:mechs}
+\end{table}
+
+Chaque mécanisme réduit la baisse en retirant des ordres du marché (le \cref{tab:mx:circuit-breakers-and-halts:mechs}). Le seuil y parvient sans
+aucune pause~: les \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} s'arrêtent à son bord inférieur et le reste de chaque ordre est annulé, de sorte que le vendeur vend moins d'actions à de meilleurs prix. La \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité}
+suspend souvent (79 secondes sur cinq minutes) et aide le moins~: chaque \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture} rencontre les mêmes ventes. La suspension de marché réduit le plus la baisse et le
+volume du vendeur, ce qui résume la question politique en une phrase~: un mécanisme qui protège les cours le fait en refusant des transactions.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.6cm,xlabel={\small secondes},ylabel={\small prix (USD)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=300,
+  yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=2},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,thick] table[x=t,y=mid]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\addplot[omProp,thick,dashed] table[x=t,y=lo]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\addplot[omThm,thick,dashed] table[x=t,y=hi]{figdata/microstructure/25-circuit-breakers-and-halts/example.csv};
+\legend{prix milieu,seuil inférieur,seuil supérieur}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Une séance de chute sous le seuil dynamique, avec des vendeurs anticipateurs~: le prix milieu descend à quelques ticks du seuil inférieur et rebondit
+sans pause, tandis que le seuil, qui suit le prix moyen des transactions de la minute, descend derrière lui puis remonte. Données~:
+\texttt{mx\_halts.example}.}\label{fig:mx:circuit-breakers-and-halts:example}
+\end{omfigure}
+
+\section{Effets d'aimant dans les faits}
+
+Subrahmanyam (1994) a montré dans un modèle que les coupe-circuits peuvent amener les agents à avancer leurs transactions dans le temps, et donc à accroître la variabilité des cours et
+aggraver les mouvements qu'ils sont censés arrêter~; Cho, Russell, Tiao et Tsay (2003) ont cherché cet effet d'aimant des limites de variation de cours dans les données haute fréquence
+de la Bourse de Taïwan. La simulation ajoute le mécanisme qui sous-tend cet argument~: des vendeurs qui, lorsqu'un seuil est publié et appliqué, vendent
+d'autant plus vite que le meilleur cours acheteur se rapproche de son bord inférieur (jusqu'à deux fois leur rythme de base à moins d'un tick de celui-ci), de peur de ne plus pouvoir vendre une fois le seuil atteint.
+
+La mesure est un premier passage~: pour chaque séance et chaque distance $x$ au seuil inférieur, le premier instant où le meilleur cours acheteur entre à moins de $x$ ticks~; a-t-il
+se rapproche à moins d'un tick du seuil dans les 30 secondes suivantes~? Trois conditions, 80 séances chacune~: le seuil appliqué avec les vendeurs anticipateurs, le seuil
+appliqué sans eux, et aucun seuil (le même seuil calculé mais non appliqué, et aucune anticipation).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.6cm,xlabel={\small distance au seuil inférieur (ticks)},ylabel={\small probabilité de l'atteindre en 30~s},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=1.5,xmax=12.5,ymin=0,ymax=1,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.4pt] table[x=x,y=both]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=x,y=band]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=1.6pt] table[x=x,y=none]{figdata/microstructure/25-circuit-breakers-and-halts/passage.csv};
+\legend{seuil et anticipateurs,seuil seul,aucun seuil}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La probabilité que le meilleur cours acheteur atteigne à moins d'un tick le seuil inférieur dans les 30 secondes suivant le moment où il entre pour la première fois à $x$ ticks de celui-ci, dans trois
+conditions, 80 séances de chute chacune. Données~: \texttt{mx\_halts.magnet\_study}.}\label{fig:mx:circuit-breakers-and-halts:passage}
+\end{omfigure}
+
+La \Cref{fig:mx:circuit-breakers-and-halts:passage} sépare deux effets. L'effet d'aimant, la contribution des anticipateurs (seuil et anticipateurs moins seuil
+seul), vaut en moyenne $+0.03$ pour des distances de 3 à 7 ticks~: à 5 ticks, 0.66 contre 0.63, avec des erreurs types de 0.05 et 0.06. Il a le signe prédit par la théorie
+pour neuf des onze distances, et il est trop faible pour se distinguer de zéro sur 80 séances. L'effet propre du seuil (seuil seul moins aucun seuil)
+vaut en moyenne $-0.12$ et est négatif pour dix des onze distances~: à 5 ticks, 0.63 contre 0.75. Sur ce marché, le seuil repousse davantage qu'il n'attire, car il retire des carnets, à son bord, les \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} des vendeurs, ce qui
+pèse plus que la vente supplémentaire qu'il suscite. Un véritable aimant exige davantage de négociateurs qui anticipent, ou un seuil qui ne soit pas aussi une barrière~; la simulation indique
+comment en chercher un~: conditionner sur la distance, comparer avec un marché sans le mécanisme, et séparer le comportement de la mécanique.
+
+\section{Réouverture}
+
+Une pause ou une suspension se termine par une \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture}, et c'est sa conception qui décide si la pause a été utile. Les enchères du chapitre~10 s'appliquent~: un cours indicatif
+publié pendant la phase d'enchère, des collars qui empêchent le cours de réouverture de sauter trop loin, et des prolongations lorsque le déséquilibre est trop important. Brugler, Linton, Noss
+et Pedace (2018), à partir des données de la London Stock Exchange, ont constaté que les coupe-circuits sur une seule action amélioraient la liquidité et réduisaient la volatilité des
+autres actions qui continuaient à être négociées~: le bénéfice de la pause peut se faire sentir en dehors de l'action suspendue. Dans la simulation, les réouvertures des pauses de vélocité ont rencontré la même
+vente, et la chute a repris~: une pause qui prend fin avant que l'autre côté du marché ne soit arrivé ne fait que retarder l'échéance.
+
+\section{Tutoriel~: arrêter une chute}\label{tut:mx:circuit-breakers-and-halts:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Faire passer une chute par des seuils, des pauses, la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} et une suspension de marché dans \texttt{firm.exchsim}, et mesurer l'effet d'aimant.
+\textbf{État final~:} le \cref{tab:mx:circuit-breakers-and-halts:mechs}, les \cref{fig:mx:circuit-breakers-and-halts:example,fig:mx:circuit-breakers-and-halts:passage}.
+\begin{tutsteps}
+\item \textbf{Politiques.} \texttt{firm\_halts.LULD(pct, window\_s, limit\_state\_s, pause\_s)}, \texttt{Velocity}, \texttt{MarketWide},
+\texttt{Combined}~; \texttt{ExchangeConfig(halts=policy)}~; le \texttt{schedule\_call} du simulateur.
+\item \textbf{Chute.} \texttt{mx\_halts.crash(policy, seed, anticipate)}, \texttt{Anticipator}.
+\item \textbf{Mesure.} \texttt{first\_passage(policy.dist)}~; \texttt{magnet\_study()}, \texttt{mechanisms\_study()}, \texttt{example()}~; tracer avec
+\texttt{fig\_halts.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Laisser davantage d'agents anticiper le seuil~; faire du seuil un simple déclencheur de pause (sans rejets) pour supprimer sa barrière~; rejouer la
+pause d'une séance avec les moniteurs de flux du livre~1.
+\end{tutorial}
+
+\section{Construction~: suspensions}\label{bld:mx:circuit-breakers-and-halts:halts}
+
+\begin{build}
+\bfield{Rôle} Les mécanismes de stabilité côté plateforme de \texttt{firm.exchsim}, pour ce chapitre et pour les scénarios de stress des livres~11 à 13.
+\bfield{Interface} \texttt{LULD(pct, window\_s, limit\_state\_s, pause\_s, check\_s, locate, shadow)},
+\texttt{MarketWide(levels, halt\_s, check\_s, reference)}, \texttt{Velocity(ticks, window\_s, pause\_s, check\_s)}, \texttt{Combined(*policies)}~; \texttt{policy.log}, \texttt{.bands},
+\texttt{.dist}~; \texttt{Simulator.schedule\_call(t\_ns, fn, *args)}.
+\bfield{Règles} Les politiques n'agissent qu'à travers les contrôles R et P du moteur~; seuils sur la grille des ticks~; une pause est une \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture} terminée par un croisement~; une
+politique fantôme calcule sans agir.
+\bfield{Tests d'acceptation} \texttt{code/firm/halts/tests/}~: un seuil rejette les ordres situés en dehors de lui~; un état limite persistant suspend puis reprend le titre~; la
+politique de marché global suspend et reprend chaque instrument une fois par niveau~; la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} suspend après un mouvement rapide.
+\bfield{Pour aller plus loin} Logique d'arrêt~; collars sur l'\omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture}~; les règles propres au prix de référence de LULD.
+\end{build}
+
+\begin{omsources}
+\item A.~Subrahmanyam, ``Circuit breakers and market volatility: a theoretical perspective'', \emph{Journal of Finance} 49(1), 1994.
+\item K.~Cho, J.~R.~Russell, G.~C.~Tiao and R.~Tsay, ``The magnet effect of price limits: evidence from high-frequency data on Taiwan Stock
+Exchange'', \emph{Journal of Empirical Finance} 10(1--2), 2003.
+\item A.~Brugler, O.~Linton, J.~Noss and L.~Pedace, ``The cross-sectional spillovers of single stock circuit breakers'', \emph{Market Microstructure and
+Liquidity} 4(3--4), 2018.
+\item Report of the Market-Wide Circuit Breaker Working Group regarding the March 2020 MWCB events, soumis le 31 mars 2021 (dossier SEC, Release 34-92428).
+\item CME Group, Velocity Logic (wiki des systèmes clients).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:1}
+Calculer où se trouvent les seuils de 0.15~\% du chapitre, sur une grille au centime, sachant que le cours moyen des transactions de la minute est de USD~99.93.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:2}
+À partir de l'encadré daté, déterminer combien de temps a duré la suspension du 9 mars 2020, et à quel moment une baisse de niveau~2 survenant après 15\,h\,25 aurait suspendu le marché.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:circuit-breakers-and-halts:3}
+À partir du tableau, déterminer la part de ses 40\,000 actions que le vendeur de la chute a vendue dans chaque mécanisme.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:4}
+Expliquer pourquoi le seuil dynamique raccourcit la chute sans jamais suspendre le titre.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:5}
+Expliquer pourquoi la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} est la moins utile dans cette chute.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:circuit-breakers-and-halts:6}
+Concevoir une étude de l'effet d'aimant sur des données réelles, à partir de ce que sépare la simulation.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:circuit-breakers-and-halts:7}
+\emph{Programmation.} Mesurer les effets d'aimant et de barrière à une distance de 3 ticks avec les 80 séances du chapitre, puis déterminer s'ils se distinguent de zéro.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:circuit-breakers-and-halts:8}
+\emph{Trouver la faille.} «~Après l'introduction du seuil, les actions ont atteint leurs limites moins souvent, donc le seuil a calmé le marché.~»
+\end{exercise}
+
+\section{Problème~: Quinze minutes de silence}
+
+\begin{problem}[{Problème du week-end --- quinze minutes de silence}]\label{pb:mx:circuit-breakers-and-halts:1}
+Un régulateur se demande si ses seuils de réservation et ses suspensions de négociation calment les marchés ou attirent les cours vers eux.
+
+\medskip\noindent\textbf{Partie I --- Conceptions.}
+\begin{enumerate}
+\item Définir les \omterm{def:mx:circuit-breakers-and-halts:bands}{seuils de réservation statiques} et dynamiques, une \omterm{def:mx:circuit-breakers-and-halts:pause}{pause de négociation} et une \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture}.
+\item En quoi les seuils de réservation, les \omterm{def:mx:circuit-breakers-and-halts:pause}{pauses de négociation}, les suspensions et les limites diffèrent-ils dans ce qu'ils protègent~?
+\item Comment \texttt{firm.halts} agit-il sur la plateforme simulée~?
+\item Énoncer les niveaux et les durées de suspension du coupe-circuit de marché, ainsi que les événements de mars 2020.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le krach.}
+\begin{enumerate}[resume]
+\item Décrire le krach et les quatre régimes.
+\item Donner, pour chaque régime, la baisse, la durée de suspension, les exécutions du vendeur et leur coût.
+\item Pourquoi la suspension généralisée du marché réduit-elle le plus la baisse~?
+\item Définir la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} et l'état réservé du CME.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'effet d'aimant.}
+\begin{enumerate}[resume]
+\item Qu'a soutenu Subrahmanyam~?
+\item Décrire les vendeurs qui anticipent.
+\item Définir la mesure de premier passage et les trois conditions.
+\item \emph{Énoncer le résultat nommé}~: la probabilité d'atteindre le seuil conditionnellement à la distance qui l'en sépare, avec et sans seuil, et la taille de
+l'effet d'aimant simulé.
+\item Pourquoi le seuil repousse-t-il davantage qu'il n'attire ici~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Réouverture et jugement.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qui fait fonctionner une \omterm{def:mx:circuit-breakers-and-halts:pause}{enchère de réouverture}~?
+\item Qu'ont trouvé Brugler, Linton, Noss et Pedace~?
+\item Pourquoi les pauses de vélocité n'ont-elles pas réussi à enrayer la baisse~?
+\item Qu'est-ce qui rendrait visible un effet d'aimant dans la simulation~?
+\item Quel arbitrage montre le tableau~?
+\item Que dire au régulateur~?
+\item En une phrase~: que procure un coupe-circuit, et à quel prix~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:circuit-breakers-and-halts:1}
+Votre action entre dans un état de limite de variation de cours, puis une \omterm{def:mx:circuit-breakers-and-halts:pause}{pause de négociation} intervient alors que votre ordre de vente n'est exécuté qu'à moitié. Que faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:circuit-breakers-and-halts:2}
+Qu'est-ce que l'effet d'aimant, et comment le testeriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risque}]\label{iq:mx:circuit-breakers-and-halts:3}
+Le coupe-circuit de marché se déclenche. Que deviennent les couvertures et les limites de risque de votre maison pendant les quinze minutes~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:circuit-breakers-and-halts:4}
+Comment un \omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} doit-il gérer une suspension, une \omterm{def:mx:circuit-breakers-and-halts:pause}{pause de négociation} et un rejet par le seuil de réservation~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:circuit-breakers-and-halts:5}
+Comparez la \omterm{def:mx:circuit-breakers-and-halts:velocity}{logique de vélocité} des contrats à terme à celle de Limit Up--Limit Down pour les actions.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{banque}]\label{iq:mx:circuit-breakers-and-halts:6}
+Un régulateur propose des seuils de réservation plus larges et des \omterm{def:mx:circuit-breakers-and-halts:pause}{pauses de négociation} plus courtes. Quels éléments apporteriez-vous, et quels résultats attendriez-vous~?
+\end{interviewq}

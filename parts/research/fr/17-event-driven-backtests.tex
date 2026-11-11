@@ -1,0 +1,288 @@
+\chapter{Backtests événementiels}\label{ch:rs:event-driven-backtests}
+
+Une stratégie qui laisse reposer des ordres à cours limité à un tick de part et d'autre du dernier cours voit ses ordres exécutés, dans un \omterm{def:rs:vectorised-backtests:backtest}{backtest} sur barres, chaque fois que l'amplitude d'une barre atteint
+leur prix. Si l'on exige à la place que le cours traverse l'ordre d'un tick avant de compter une exécution, le même \omterm{def:rs:vectorised-backtests:backtest}{backtest} n'exécute plus que 55~\% aussi souvent et transforme
+un petit profit quotidien en une perte de 584~\$ par jour, les exécutions étant suivies d'un mouvement de deux ticks contre elles. Il suffit d'ajouter une latence de saisie des ordres de cinq secondes,
+et la réponse du \omterm{def:rs:vectorised-backtests:backtest}{backtest} dépend d'une question à laquelle les barres ne peuvent pas répondre~: le cours a-t-il touché l'ordre pendant qu'il était actif~? Le niveau~1 du
+chapitre~16 ne permet même pas d'exprimer une telle stratégie. Le \omterm{def:rs:event-driven-backtests:evbt}{backtest événementiel}, lui, le permet~: il simule les ordres sur une horloge, et il fait de chaque hypothèse
+sur les exécutions un modèle explicite et remplaçable. Ce chapitre le construit (\texttt{firm.evbt}) et montre quelle part du résultat d'une stratégie passive revient au
+\omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}.
+
+\section{Architecture~: horloge, événements, gestionnaires}
+
+\begin{definition}[Backtest événementiel, horloge simulée]\label{def:rs:event-driven-backtests:evbt}
+Un \emph{backtest événementiel}\index{backtest événementiel} traite un flux d'événements ordonnés dans le temps (données de marché, accusés de réception des ordres,
+exécutions, annulations, opérations sur titres) un à un, chacun modifiant l'état de la stratégie, de ses ordres et de son portefeuille. Son
+\emph{horloge simulée}\index{horloge simulée} est l'instant de l'événement en cours de traitement~; aucune information horodatée plus tard ne doit être utilisée.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,inner sep=4pt,minimum height=9mm,text width=2.7cm},
+  arr/.style={-Stealth,thick,draw=black!60}]
+\node[box] (q) at (0,0) {file d'événements\\ (instant, type, numéro de séquence)};
+\node[box] (d) at (3.6,0) {répartiteur~:\\ fait avancer l'horloge};
+\node[box] (m) at (7.2,0) {gestionnaire des ordres~:\\ cycle de vie};
+\node[box] (p) at (10.8,0) {portefeuille~:\\ position, trésorerie};
+\node[box] (s) at (7.2,2.0) {stratégie~:\\ on\_bar, on\_fill};
+\node[box] (f) at (7.2,-2.0) {modèle d'exécution~: contact,\\ pénétration, plafond};
+\draw[arr] (q) -- (d);
+\draw[arr] (d) -- (m);
+\draw[arr] (m) -- (p);
+\draw[arr] (d) |- (s);
+\draw[arr] (s) -- node[right,font=\footnotesize]{soumission, annulation} (m);
+\draw[arr] (m) -- (f);
+\draw[arr] (f) -| (p);
+\draw[arr,dashed] (s.north) -- ++(0,0.5) -| node[pos=0.25,above,font=\footnotesize]{accusés de réception et annulations, après la latence} (q.north);
+\end{tikzpicture}
+
+\omcaption{Architecture de \texttt{firm.evbt}~: une file d'événements ordonnée par instant, type et numéro de séquence, un répartiteur et des gestionnaires qui
+ne peuvent programmer des événements que dans le futur.}\label{fig:rs:event-driven-backtests:architecture}
+\end{omfigure}
+
+\texttt{firm.evbt} gère une seule file de priorité. À la fin de chaque barre, le répartiteur confronte d'abord les ordres actifs à la barre par le
+\omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}, puis valorise le portefeuille, puis appelle la stratégie, qui peut soumettre ou annuler des ordres~; une soumission ne devient un ordre actif qu'au moment où son
+accusé de réception arrive, après la latence de saisie des ordres, et une annulation ne prend effet que lorsque son propre événement arrive. Les événements au même
+instant sont classés par type (barres avant événements d'ordres), puis par numéro de séquence, de sorte qu'un passage du \omterm{def:rs:vectorised-backtests:backtest}{backtest} soit déterministe~: mêmes données, stratégie et
+modèles donnent les mêmes exécutions au dernier chiffre près. Le résultat est le \texttt{BacktestResult} du chapitre~16, avec les ordres et les exécutions qui y sont joints.
+
+\section{Ordres et exécutions à l'échelle de la barre}
+
+\begin{definition}[Cycle de vie de l'ordre, exécution partielle]\label{def:rs:event-driven-backtests:lifecycle}
+Le \emph{cycle de vie de l'ordre}\index{cycle de vie de l'ordre} est la suite des états par lesquels passe un ordre~: en attente (envoyé, pas encore accusé de réception),
+actif, partiellement exécuté, puis exécuté ou annulé. Une \emph{exécution partielle}\index{exécution partielle} exécute une partie de la quantité d'un ordre, laissant le
+reste actif.
+\end{definition}
+
+\begin{definition}[Modèle d'exécution, exécution au contact, exécution par pénétration, plafond de participation au volume]\label{def:rs:event-driven-backtests:fill}
+Un \emph{modèle d'exécution}\index{modèle d'exécution} décide, à partir des données de marché, si un ordre actif s'exécute, à quel prix et pour quelle quantité. La
+\emph{exécution au contact}\index{exécution au contact} exécute un ordre à cours limité en totalité lorsqu'une barre échange à son prix~; la \emph{exécution par pénétration}\index{exécution par pénétration}
+seulement lorsque la barre échange un nombre donné de ticks au-delà de ce prix~; un \emph{plafond de participation au volume}\index{plafond de participation au volume} limite la quantité
+exécutée dans une barre à une fraction du volume de la barre.
+\end{definition}
+
+Une barre enregistre quatre prix et un volume~; elle n'enregistre pas où se trouvait l'ordre de la stratégie dans la file à son prix, combien a été négocié à ce prix, ni
+si les transactions à ce prix ont eu lieu avant ou après l'arrivée de l'ordre. Chaque \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution} comble cette lacune par une hypothèse. L'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact} suppose
+que l'ordre était en tête de file. L'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration} suppose qu'il était en queue de file~: si le cours a traversé ce prix, tout ce qui le précédait a forcément été négocié.
+Le \omterm{def:rs:event-driven-backtests:fill}{plafond de participation au volume} suppose que l'ordre peut prendre une part fixe du volume de la barre~; le moteur de \omterm{def:rs:vectorised-backtests:backtest}{backtest} open source Zipline, avec son modèle \texttt{VolumeShareSlippage}
+modèle, par exemple, plafonne les exécutions à 2.5~\% du volume de chaque barre par défaut et les valorise à partir du cours de clôture de la barre avec un impact quadratique. La vérité se situe
+entre les \omterm{def:rs:event-driven-backtests:fill}{exécutions au contact} et par pénétration, et dépend de la file (chapitre~18).
+
+La stratégie du chapitre (\texttt{rs\_evbt.Quoter}) tourne sur des barres d'une minute construites à partir de quatre journées simulées de 6.5~heures de \texttt{firm.tape}~: à chaque
+clôture de barre, elle annule ses ordres et laisse reposer un lot (100 actions) à un tick sous le cours de clôture et un lot à un tick au-dessus, dans la limite d'un inventaire de cinq
+lots, en valorisant au cours de clôture. Par jour, en moyenne~:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{6.0cm}cccc@{}}
+\toprule
+\omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution} (sans latence) & lots exécutés & taux d'exécution & P\&L (\$) & mark-out (ticks)\\
+\midrule
+\omterm{def:rs:event-driven-backtests:fill}{exécution au contact} & 523 & 70~\% & $+17$ & $-0.16$\\
+\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration} d'un tick & 290 & 41~\% & $-584$ & $-2.00$\\
+\omterm{def:rs:event-driven-backtests:fill}{exécution au contact}, plafonnée à 2.5~\% du volume & 388 & 55~\% & $+20$ & $-0.18$\\
+niveau 1~: achat après une barre baissière, vente après une barre haussière & --- & --- & $-215$ & ---\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le mark-out (le cours de clôture cinq barres après une exécution, dans le sens de l'exécution) mesure la sélection adverse~: les \omterm{def:rs:event-driven-backtests:fill}{exécutions par pénétration} sont celles qui surviennent
+lorsque le cours traverse l'ordre, et elles perdent en moyenne deux ticks en cinq minutes (voir la \cref{fig:rs:event-driven-backtests:models}). Le
+P\&L quotidien de l'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact} (de $-\$333$ à $+\$206$ sur les quatre jours) reste dans son bruit autour de zéro~; celui de l'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration} est négatif chaque jour. Un taux
+d'exécution de 70~\% pour un ordre situé à un tick du cours est en soi un signal d'alarme~: un ordre réel rejoint la fin d'une file qui peut compter des milliers d'actions.
+
+\section{Instant de décision et latence}
+
+\begin{definition}[Latence et politique de l'ordre actif dans la barre]\label{def:rs:event-driven-backtests:latency}
+Avec une latence de saisie des ordres, un ordre envoyé à la clôture d'une barre est actif à partir d'un instant quelconque de la barre suivante. Une politique \emph{conservatrice} laisse un ordre
+s'exécuter dans une barre que s'il a été actif pendant toute la barre~; une politique \emph{optimiste}, s'il l'a été à un moment quelconque de celle-ci. Une barre ne peut dire laquelle des deux est juste,
+car elle ne dit pas à quel moment de la barre le cours a atteint l'ordre.
+\end{definition}
+
+Avec une latence de cinq secondes, les ordres du quoter, annulés et remplacés à chaque clôture de barre, ne sont jamais actifs pendant toute une barre~: sous la
+politique conservatrice, ils ne s'exécutent jamais. Sous la politique optimiste, ils s'exécutent plus souvent que sans latence (585 lots par jour pour l'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact}), et
+perdent davantage~: $-\$41$ par jour pour l'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact}, $-\$776$ pour l'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration}, $-\$190$ pour l'exécution plafonnée, le mark-out des exécutions plafonnées passant
+de $-0.18$ à $-0.87$ ticks. Les deux politiques encadrent la réponse, et une stratégie dont le résultat passe de rien à une perte entre les deux ne peut être
+jugée au niveau~2. C'est le signal qu'il faut passer au niveau~3, où l'arrivée de l'ordre, sa position dans la file et chaque transaction à son prix sont des événements
+à part entière.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=lots,width=7cm,height=5.4cm,ybar,bar width=9pt,title={\small lots exécutés par jour},tick label style={font=\footnotesize},
+  xtick={0,1,2,3,4,5},xticklabels={contact,pénétr.,plafonné,contact,pénétr.,plafonné},x tick label style={rotate=45,anchor=east},
+  xmin=-0.6,xmax=5.6,ymin=0,ymax=760,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=lots]{figdata/research/17-event-driven-backtests/models.csv};
+\draw[black!50,dashed] (axis cs:2.5,0) -- (axis cs:2.5,760);
+\node[font=\footnotesize,anchor=north] at (axis cs:1,750) {sans latence};
+\node[font=\footnotesize,anchor=north] at (axis cs:4,750) {5 s, optimiste};
+\end{axis}
+\begin{axis}[at={(lots.east)},anchor=west,xshift=1.4cm,width=7cm,height=5.4cm,ybar,bar width=9pt,title={\small P\&L par jour (\$)},
+  tick label style={font=\footnotesize},xtick={0,1,2,3,4,5,6},xticklabels={contact,pénétr.,plafonné,contact,pénétr.,plafonné,niveau 1},
+  x tick label style={rotate=45,anchor=east},ymin=-850,ymax=100,grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=pnl]{figdata/research/17-event-driven-backtests/models.csv};
+\draw[black!50,dashed] (axis cs:2.5,-850) -- (axis cs:2.5,100);
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le teneur de cotation passif sur quatre journées simulées sous chaque \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}, sans latence et avec une latence de cinq secondes sous la politique optimiste
+(sous la politique prudente, il n'est jamais exécuté), ainsi que la version au niveau 1 de la même idée. Données~: \texttt{rs\_evbt} sur les barres de \texttt{firm.tape}.}\label{fig:rs:event-driven-backtests:models}
+\end{omfigure}
+
+\section{Calendriers et opérations sur titres dans la boucle}
+
+Les événements qu'un \omterm{def:rs:vectorised-backtests:backtest}{backtest vectorisé} intègre dans les cours ajustés sont, dans un \omterm{def:rs:event-driven-backtests:evbt}{backtest événementiel}, des événements placés dans la file. Un split multiplie la position et les
+quantités des ordres en attente par son ratio et divise leurs cours limites par ce même ratio, au moment où il prend effet~; les barres conservent les cours tels qu'ils ont été échangés, de sorte que
+un ordre à cours limité qui a survécu à un split non ajusté se retrouverait au double du nouveau cours et serait exécuté instantanément. Un dividende verse un montant en espèces à la date de paiement aux positions
+détenues à la date d'enregistrement. Les demi-journées mettent fin à la séance plus tôt, les enchères remplacent la négociation en continu à l'ouverture et à la clôture (livre~1, chapitre~13), et une suspension
+gèle le carnet d'ordres~; chacun doit figurer dans le calendrier que lit le répartiteur, avec son propre gestionnaire, et chacun a déjà conduit un \omterm{def:rs:vectorised-backtests:backtest}{backtest} à trader à un moment où le marché
+était fermé. \texttt{firm.evbt} implémente les splits et laisse les autres pour la suite de la construction~; son test d'acceptation détient un lot à travers un split de
+deux pour un et vérifie que la position double et que le capital ne bouge pas.
+
+\section{Déterminisme}
+
+Un \omterm{def:rs:vectorised-backtests:backtest}{backtest} qui donne des réponses différentes d'une exécution à l'autre ne peut être ni débogué, ni comparé, ni relu. Le déterminisme exige trois choses~: un ordre total sur les événements
+(instant, puis nature, puis numéro de séquence~; jamais l'ordre dans lequel un dictionnaire se trouve itéré par hasard), aucun aléa sauf celui de générateurs initialisés par une graine passés
+explicitement, et aucune dépendance à l'horloge murale. Les tests de \texttt{firm.evbt} exécutent le même \omterm{def:rs:vectorised-backtests:backtest}{backtest} deux fois et comparent les rendements nets bit à bit. La
+même discipline permet de comparer un \omterm{def:rs:vectorised-backtests:backtest}{backtest} de niveau 2 et un \omterm{def:rs:vectorised-backtests:backtest}{backtest} de niveau 3 sur les mêmes événements, et de rejouer une exécution en direct à partir de ses journaux (chapitre~19).
+
+\section{Tutoriel~: l'ordre à cours limité qui était toujours exécuté}\label{tut:rs:event-driven-backtests:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Lancer le teneur de cotation passif dans \texttt{firm.evbt} sous trois \omterm{def:rs:event-driven-backtests:fill}{modèles d'exécution} et deux latences, avec les deux politiques de présence dans la barre, et comparer avec
+la version au niveau 1 de la même idée. \textbf{État final~:} la \cref{fig:rs:event-driven-backtests:models}~; le tableau.
+\begin{tutsteps}
+\item \textbf{Les \omterm{def:rs:event-driven-backtests:fill}{modèles d'exécution}}~: au contact, par pénétration, et un plafond sur le volume de la barre.
+\omcode{code/firm/evbt/firm_evbt.py}{70}{104}{Trois modèles d'exécution pour les barres.}\label{lst:rs:event-driven-backtests:fills}
+\item \textbf{Appariement}~: quels ordres étaient actifs dans la barre, et ce que le modèle exécute.
+\omcode{code/firm/evbt/firm_evbt.py}{151}{175}{Appariement des ordres en attente avec une barre.}\label{lst:rs:event-driven-backtests:match}
+\item \textbf{Exécuter} \texttt{summary()}, \texttt{level1()} et \texttt{fig\_evbt.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Placer les ordres à la clôture plutôt qu'à un tick de distance et observer le taux d'exécution du modèle au contact se rapprocher de 100~\%~; ajouter une
+règle d'annulation seulement si le cours a bougé, afin que les ordres survivent entiers aux barres sous latence.
+\end{tutorial}
+
+\section{Construction~: le backtester de niveau 2}\label{bld:rs:event-driven-backtests:evbt}
+
+\begin{build}
+\bfield{Rôle} Le backtester de la société pour les stratégies dont les ordres, les exécutions et le calendrier comptent à la résolution de la barre~: ordres à cours limité, ordres stop, calendriers
+intrajournaliers, opérations sur titres dans la boucle.
+\bfield{Interface} \texttt{Order}, \texttt{Fill}, \texttt{TouchFill()}, \texttt{PenetrationFill(ticks)}, \texttt{VolumeCapFill(inner, participation)},
+\texttt{Strategy.on\_bar(ctx, i, bar)}, \texttt{Strategy.on\_fill(ctx, fill)},
+\texttt{Engine(bars, strategy, fill\_model, latency, fee, capital, splits, policy).run()} renvoyant le \texttt{BacktestResult}, les ordres et les exécutions.
+\bfield{Règles} Les gestionnaires ne programment que des événements futurs~; les ordres ne sont exécutés qu'après leur accusé de réception~; toute hypothèse d'exécution réside dans un \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}~; la
+politique de présence dans la barre est énoncée~; l'exécution est déterministe.
+\bfield{Tests d'acceptation} \texttt{code/firm/evbt/tests/}~: \omterm{def:rs:event-driven-backtests:fill}{exécutions au contact}, par pénétration et plafonnées sur des barres témoins avec leurs cycles de vie~; un ordre au marché à
+l'ouverture suivante~; une latence qui manque une barre~; des annulations~; la politique optimiste exécutant un ordre présent pendant un instant~; les frais, le P\&L et un split~; deux exécutions identiques.
+\bfield{Pour aller plus loin} Dividendes, demi-journées, enchères et suspensions en événements de calendrier~; ordres stop~; plusieurs instruments sur une même horloge.
+\end{build}
+
+\begin{omsources}
+\item Zipline (backtester Python open source), \texttt{zipline/finance/slippage.py}~: \texttt{VolumeShareSlippage}, limite de volume par défaut de 2.5~\% de chaque barre.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:1}
+Un achat à cours limité à 99.00 est en attente. La barre suivante a un cours d'ouverture de 99.20, un plus haut de 99.30, un plus bas de 99.00 et un cours de clôture de 99.10. Est-il exécuté au contact~? Et sous une \omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration}
+d'un tick, le tick valant 0.01~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:2}
+Un ordre portant sur 5\,000 actions fait face à des barres de 40\,000, 10\,000 et 60\,000 actions avec un plafond de volume de 2.5~\%. Quelle quantité est exécutée dans chaque barre~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:event-driven-backtests:3}
+Dessiner le cycle de vie d'un ordre portant sur 300 actions, exécuté à hauteur de 100, puis annulé avec 200 restantes.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:4}
+Pourquoi les \omterm{def:rs:event-driven-backtests:fill}{exécutions par pénétration} suivies de mouvements défavorables du cours sont-elles plus nombreuses que les \omterm{def:rs:event-driven-backtests:fill}{exécutions au contact}~? Relier cela à la file au cours de l'ordre.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:5}
+Avec une latence de 5 secondes et des barres d'une minute, pourquoi le teneur de cotation n'est-il jamais exécuté sous la politique prudente~? Comment se comporterait une stratégie qui n'annule que lorsque
+le cours bouge~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:event-driven-backtests:6}
+Un split de deux pour un prend effet alors qu'un ordre de vente à cours limité à 120~\$ portant sur 100 actions est en attente et que la position est de 100 actions. Que doit faire le moteur, et que
+se passe-t-il s'il ne le fait pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:event-driven-backtests:7}
+\emph{Programmation.} Lancer le teneur de cotation avec des ordres au cours de clôture (et non à un tick de distance) sous les modèles au contact et par pénétration. Que deviennent les taux d'exécution et
+les mark-outs~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:event-driven-backtests:8}
+\emph{Trouver la faille.} «~Notre \omterm{def:rs:vectorised-backtests:backtest}{backtest} exécute les ordres à cours limité dès que le plus bas de la barre les atteint, et la stratégie a gagné de l'argent chaque semaine pendant deux ans.~»
+\end{exercise}
+
+\section{Problème~: l'ordre à cours limité qui était toujours exécuté}
+
+\begin{problem}[{Problème du week-end --- une stratégie passive, trois modèles d'exécution}]\label{pb:rs:event-driven-backtests:1}
+Le teneur de cotation du chapitre sur quatre journées simulées des barres d'une minute de \texttt{firm.tape}.
+
+\medskip\noindent\textbf{Partie I --- Le moteur.}
+\begin{enumerate}
+\item Dans quel ordre \texttt{firm.evbt} traite-t-il la clôture d'une barre~: exécutions, valorisations, stratégie~? Pourquoi cet ordre~?
+\item Quand un ordre soumis peut-il pour la première fois être exécuté~?
+\item Qu'est-ce qui rend deux exécutions identiques~?
+\item Que renvoie le moteur~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- \omterm{def:rs:event-driven-backtests:fill}{Modèles d'exécution}.}
+\begin{enumerate}[resume]
+\item Donner les lots exécutés, le taux d'exécution, le P\&L et le mark-out d'une journée sous chaque \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution} sans latence.
+\item Quelle hypothèse sur la file chaque modèle fait-il~?
+\item Pourquoi le P\&L de l'\omterm{def:rs:event-driven-backtests:fill}{exécution par pénétration} est-il négatif chaque jour alors que celui de l'\omterm{def:rs:event-driven-backtests:fill}{exécution au contact} ne l'est pas~?
+\item Quelle est la version au niveau 1 de l'idée, et que rapporte-t-elle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Latence.}
+\begin{enumerate}[resume]
+\item Que se passe-t-il avec une latence de 5 secondes sous la politique prudente~?
+\item Et sous la politique optimiste, pour chaque \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}~?
+\item Que vous apprend la différence entre les deux politiques sur la stratégie~?
+\item Comment modifieriez-vous la stratégie pour que la latence compte moins~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le taux d'exécution et le P\&L de la stratégie passive par barres sous \omterm{def:rs:event-driven-backtests:fill}{exécution au contact}, par pénétration et plafonnée, avec et sans
+latence.
+\item Quel résultat présenteriez-vous à un gérant de portefeuille, et avec quelle réserve~?
+\item Qu'apporterait un rejeu de niveau 3 (chapitre~18)~?
+\item Que signifie le plafond par défaut de Zipline pour une stratégie qui échange 5~\% du volume~?
+\item Quelles opérations sur titres doivent figurer dans la file d'événements pour cette stratégie~?
+\item Pourquoi un taux d'exécution de 70~\% pour des ordres situés à un tick de distance est-il suspect~?
+\item Que journaliseriez-vous lors d'une exécution en direct pour calibrer le \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}~?
+\item En une phrase~: qu'est-ce que le \omterm{def:rs:event-driven-backtests:fill}{modèle d'exécution}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:rs:event-driven-backtests:1}
+Décrivez l'architecture d'un \omterm{def:rs:event-driven-backtests:evbt}{backtest événementiel}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:rs:event-driven-backtests:2}
+Comment simuleriez-vous les exécutions d'ordres à cours limité sur des données en barres, et quels biais chaque approche comporte-t-elle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:rs:event-driven-backtests:3}
+Comment rendez-vous un \omterm{def:rs:vectorised-backtests:backtest}{backtest} déterministe~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:rs:event-driven-backtests:4}
+Qu'est-ce que la sélection adverse pour un ordre passif, et comment la mesureriez-vous dans un \omterm{def:rs:vectorised-backtests:backtest}{backtest}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:rs:event-driven-backtests:5}
+Comment un \omterm{def:rs:vectorised-backtests:backtest}{backtest} doit-il traiter une division d'actions pendant que des ordres sont en cours~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:rs:event-driven-backtests:6}
+Quand un \omterm{def:rs:vectorised-backtests:backtest}{backtest} de niveau 2 ne suffit-il pas~? Donnez un test qui le montre.
+\end{interviewq}

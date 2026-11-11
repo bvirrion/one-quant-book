@@ -1,0 +1,322 @@
+\chapter{Routage d'ordres intelligent}\label{ch:mx:smart-order-routing}
+
+Un routeur répartit un ordre entre cinq plateformes. Envoyées d'un coup, les fractions arrivent à quelques microsecondes d'intervalle, et les cotations des plateformes suivantes disparaissent entre-temps~:
+la première exécution a averti les traders rapides de ce qui arrivait. Ce chapitre construit un routeur sur le simulateur multiplateforme, mesure ce que l'ordre perd lorsque ses
+fractions arrivent les unes après les autres et ce qu'il conserve lorsqu'elles sont calibrées pour arriver ensemble, classe les plateformes selon ce qu'elles délivrent plutôt que selon ce qu'elles
+affichent, répartit un ordre passif entre plateformes grâce au programme de Cont et Kukanov, et se termine par les frais et les règles qui protègent un ordre contre le fait
+d'être lu.
+
+\section{Ce que décide un routeur}
+
+\begin{definition}[Routeur d'ordres intelligent]\label{def:mx:smart-order-routing:sor}
+Un \emph{routeur d'ordres intelligent}\index{routeur d'ordres intelligent} (smart order router) répartit un \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} entre plusieurs plateformes et décide, pour chaque fraction, la plateforme, le prix, la taille,
+le type d'ordre et l'instant de l'envoi, à partir de sa vision des cotations des plateformes, de leurs frais, de leurs latences et de leurs exécutions passées.
+\end{definition}
+
+Le chapitre~17 a décidé de se mettre au repos ou de croiser~; le routeur décide où. Ses données d'entrée sont les carnets des plateformes (le marché fragmenté du chapitre~8, les \omterm{def:mx:fragmentation-and-routing:protected}{cotations
+protégées} et la règle de protection des ordres du livre~1, chapitre~9), leurs frais (le \omterm{def:mx:fees-rebates-and-venue-economics:adjusted}{prix net des frais} du chapitre~7), sa latence propre vers chaque plateforme
+(latence de saisie des ordres du livre~7, chapitre~18) et les statistiques de ce qu'ont obtenu les ordres passés. Foucault et Menkveld (2008) ont étudié l'entrée de la
+London Stock Exchange face à Euronext sur des actions néerlandaises~: après l'entrée, le carnet consolidé était plus profond, et là où davantage de transactions passaient par les
+meilleures cotations de l'entrant, celui-ci fournissait moins de liquidité, ce qui explique pourquoi les routeurs qui atteignent réellement chaque \omterm{def:mx:fragmentation-and-routing:protected}{cotation protégée} comptent.
+
+L'expérience de ce chapitre utilise cinq plateformes, de A à E, dans \texttt{firm.exchsim}. Le routeur se trouve à côté de A et atteint les plateformes en 50, 120, 200,
+280 et 360 microsecondes. Chaque plateforme affiche 500 actions au cours vendeur de 100.01~: 200 provenant de fournisseurs lents et 300 provenant d'un fournisseur rapide, dont la machine se trouve
+en A et atteint les autres plateformes par des liaisons plus rapides (45, 95, 145 et 195 microsecondes). Derrière eux, chaque plateforme dispose de 1\,000 actions à 100.02. Le
+fournisseur rapide suit une règle~: lorsqu'un de ses ordres est exécuté, il annule ses ordres sur toutes les autres plateformes. Les frais de transaction diffèrent~: 0.30 cent par action en A,
+B et D, 0.10 en C, et une rémunération de 0.10 pour le preneur de liquidité en E (une plateforme inversée, chapitre~7).
+
+\section{Classement des plateformes et probabilités d'exécution}
+
+\begin{definition}[Classement des plateformes]\label{def:mx:smart-order-routing:ranking}
+Un \emph{classement des plateformes}\index{classement des plateformes} (venue ranking) ordonne les plateformes selon le coût espéré du routage d'une action vers chacune d'elles, à partir de la probabilité d'exécution
+mesurée par le routeur sur ses propres ordres, des frais et du coût de ce qui ne s'exécute pas.
+\end{definition}
+
+Un routeur qui croit aux cotations affichées classe les plateformes selon le \omterm{def:mx:fees-rebates-and-venue-economics:adjusted}{prix net des frais}. Celui qui tient des statistiques apprend ce que vaut l'affichage. Après 100
+\omterm{def:mx:smart-order-routing:spray}{ordres dispersés} (ci-dessous) avec une gigue de latence de 10~\%, les ordres propres du routeur se sont exécutés à 100~\% pour les actions envoyées en A, et à 44~\%, 41~\%, 40~\% et 40~\% pour celles envoyées en
+B, C, D et E. Une action non exécutée coûtant un tick de plus, le coût espéré d'une action envoyée vers chaque plateforme classe A en tête (0.30 cent), puis E (0.56),
+C (0.63), B (0.69) et D (0.72)~: la rémunération affichée de E vaut moins que la certitude de A. Calibrés pour arriver ensemble, les mêmes ordres se sont exécutés
+partout, et le classement revient aux frais~: E ($-0.10$), C (0.10), puis A, B et D (0.30). Un \omterm{def:mx:smart-order-routing:ranking}{classement des plateformes} est autant une affirmation sur le
+routage propre du routeur que sur les plateformes elles-mêmes.
+
+\omcode{code/firm/sor/firm_sor.py}{108}{121}{Les envois du routeur~: chaque jambe du balayage est programmée à l'instant de départ plus un délai nul pour un ordre dispersé et, pour un balayage synchronisé, l'écart entre la latence de la plateforme et celle de la plus éloignée.}\label{lst:mx:smart-order-routing:router}
+
+\section{Routage agressif et évanouissement de la cotation}
+
+\begin{definition}[Ordre dispersé, évanouissement de la cotation]\label{def:mx:smart-order-routing:spray}
+Un \emph{ordre dispersé}\index{ordre dispersé} (spray order) envoie des fractions exécutables vers plusieurs plateformes au même instant, de sorte qu'elles arrivent dans l'ordre des
+latences du routeur. L'\emph{évanouissement de la cotation}\index{evanouissement@Évanouissement de la cotation} (quote fade) désigne la disparition des cotations affichées entre le moment où un routeur les voit et celui où ses
+ordres arrivent, typiquement parce qu'un fournisseur de liquidité annule en constatant une exécution ailleurs.
+\end{definition}
+
+\begin{definition}[Routage synchronisé]\label{def:mx:smart-order-routing:sync}
+Le \emph{routage synchronisé}\index{routage synchronisé} (synchronised routing) retarde chaque fraction d'un ordre multiplateforme de la différence entre la latence de sa plateforme et la
+plus grande, de sorte que toutes les fractions arrivent sur leurs plateformes à peu près au même moment et qu'aucune exécution ne puisse prévenir qui que ce soit avant l'arrivée de la dernière fraction.
+\end{definition}
+
+La \Cref{fig:mx:smart-order-routing:race} montre la course. L'\omterm{def:mx:smart-order-routing:spray}{ordre dispersé} atteint A à 50 microsecondes et s'y exécute~; le fournisseur rapide apprend son exécution 5
+microsecondes plus tard, et ses annulations atteignent B à 100, C à 150, D à 200 et E à 250, chacune avant la fraction du routeur. Le routeur obtient les 500 actions de A et
+les 200 lentes sur chacune des autres plateformes~: 1\,300 sur 2\,500, soit un taux d'exécution de 52~\%. Les 1\,200 actions restantes passent au niveau suivant dans un balayage de nettoyage, et l'ordre entier
+coûte 0.73 cent par action au-dessus du cours vendeur affiché, frais compris. Synchronisées, toutes les fractions arrivent à 360 microsecondes~: le taux d'exécution vaut 100~\%
+et le coût 0.18 cent, soit les frais de transaction moyens.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5cm,xlabel={\small microsecondes après la décision du routeur},xmin=0,xmax=400,ymin=0.4,ymax=5.6,
+  ytick={1,2,3,4,5},yticklabels={E,D,C,B,A},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,only marks,mark=*,mark size=2.4pt] table[x=spray,y=i]{figdata/microstructure/18-smart-order-routing/race.csv};
+\addplot[omProp,only marks,mark=x,mark size=4pt,very thick] table[x=cancel,y=i]{figdata/microstructure/18-smart-order-routing/race.csv};
+\addplot[omThm,only marks,mark=square*,mark size=2.2pt] table[x=sync,y=i]{figdata/microstructure/18-smart-order-routing/race.csv};
+\legend{la dispersion arrive,l'annulation du fournisseur rapide arrive,l'arrivée synchronisée}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La course sur chaque plateforme~: moment où la fraction dispersée du routeur arrive, moment où l'annulation du fournisseur rapide arrive après son exécution en A, et moment où
+une fraction synchronisée arrive. Chaque annulation devance la dispersion (en E, les fractions dispersée et synchronisée arrivent ensemble)~; aucune ne peut devancer les fractions synchronisées. Données~: \texttt{mx\_sor.race}, à partir des latences
+de l'expérience.}\label{fig:mx:smart-order-routing:race}
+\end{omfigure}
+
+\omcode{code/firm/sor/firm_sor.py}{164}{170}{La règle du fournisseur rapide~: à la première exécution d'un de ses ordres, annuler tous ses autres ordres sur les autres plateformes.}\label{lst:mx:smart-order-routing:fader}
+
+La synchronisation ne fonctionne que dans la mesure où le routeur connaît ses latences. La \Cref{fig:mx:smart-order-routing:jitter} ajoute un facteur aléatoire à la latence de chaque
+fraction (lognormal, de moyenne un), 100 essais par niveau. Jusqu'à 10~\%, le balayage synchronisé exécute encore tout~; à 20~\%, il exécute 99.3~\% des actions en
+moyenne et la totalité du niveau dans 94~\% des essais~; à 40~\%, 90.3~\% et 37~\%. La dispersion profite du bruit, puisqu'elle rebat les arrivées, mais seulement jusqu'à
+68.6~\%. Royal Bank of Canada a breveté la méthode, dans des revendications qui décrivent des paramètres de calibrage déterminés à partir des latences «~afin de provoquer une
+arrivée synchronisée~» des fractions sur les plateformes (brevet américain 8\,489\,747, accordé en 2013)~; sa description désigne le problème comme celui d'ordres arrivant sur des plateformes plus
+rapides avant les plus lentes, où d'autres peuvent les détecter.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.4cm,height=5.4cm,xlabel={\small gigue de latence (écart-type lognormal $\sigma$)},ylabel={\small taux d'exécution au cours vendeur affiché (\%)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=-0.02,xmax=0.42,ymin=40,ymax=105,
+  xtick={0,0.05,0.1,0.2,0.4},xticklabels={0,0.05,0.1,0.2,0.4},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omProp,very thick,mark=*] table[x=jitter,y=spray]{figdata/microstructure/18-smart-order-routing/jitter.csv};
+\addplot[omDef,very thick,mark=square*] table[x=jitter,y=sync]{figdata/microstructure/18-smart-order-routing/jitter.csv};
+\legend{dispersion,synchronisé}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Taux d'exécution d'un balayage des 2\,500 actions affichées sur les cinq plateformes, en fonction de la gigue des latences du routeur~: 100 essais par niveau dans le
+marché simulé avec un fournisseur rapide qui s'évanouit. Données~: \texttt{mx\_sor.sweep\_study}.}\label{fig:mx:smart-order-routing:jitter}
+\end{omfigure}
+
+Un ordre plus petit que la liquidité affichée oblige le routeur à choisir ses plateformes. Pour 1\,000 actions (avec une gigue de 10~\%), un routeur qui retient les frais les plus bas
+se dirige vers E et C, les deux plateformes les plus éloignées, et ne perd presque rien même en dispersant (99.8~\%, 0.004 cent par action), parce que sa première exécution tombe
+là où les annulations du fournisseur rapide mettent du temps à parvenir. Un routeur qui retient les plateformes les plus proches se dirige vers A et B et, en dispersant, exécute 71.2~\% pour 0.59 cent~;
+en synchronisant, 100~\% pour 0.30. Quelle fraction arrive la première compte plus que la plateforme la moins chère.
+
+\section{Allocation passive entre plateformes}
+
+Un ordre passif fait face au problème inverse~: où se placer pour être exécuté. Cont et Kukanov (2017) l'ont écrit comme un programme convexe. Avec $X$ actions
+à acheter, un \omterm{def:mx:the-limit-order-book:orders}{ordre au marché} $M$ et des \omterm{def:mx:the-limit-order-book:orders}{ordres à cours limité} $L_k$ placés derrière les files $Q_k$, et $\xi_k$ les actions qui quitteront la tête de la file $k$ pendant
+l'horizon (\omterm{def:mx:the-limit-order-book:orders}{ordres au marché} et annulations, aléatoires), l'\omterm{def:mx:the-limit-order-book:orders}{ordre à cours limité} en $k$ s'exécute à hauteur de $\min(L_k,(\xi_k-Q_k)^+)$ et le coût par rapport au milieu vaut
+\[
+(h+f)M-\sum_k(h+r_k)\min\bigl(L_k,(\xi_k-Q_k)^+\bigr)+\lambda_u(X-A)^++\lambda_o(A-X)^+,
+\]
+avec $h$ la demi-fourchette, $f$ les frais de prise, $r_k$ la rémunération, $A$ les actions exécutées, et des pénalités $\lambda_u$, $\lambda_o$ pour une exécution trop faible ou
+trop forte. Son espérance est convexe lorsque les pénalités dépassent la fourchette et les frais~; \texttt{firm\_sor.ck\_allocate} minimise la moyenne empirique
+sur des scénarios simulés de sorties.
+
+\omcode{code/firm/sor/firm_sor.py}{178}{186}{Le coût de Cont et Kukanov d'une allocation sur un ensemble de scénarios de sorties~: chaque ordre à cours limité s'exécute à hauteur de ce qui quitte sa file au-delà des ordres qui le précèdent, et les pénalités valorisent les actions exécutées en trop ou en trop peu.}\label{lst:mx:smart-order-routing:ck}
+
+Prenons quatre plateformes cotées et une plateforme noire pour un achat de 1\,000 actions sur une minute~: des files de 1\,500, 2\,500, 300 et 800 actions aux cours acheteurs affichés, et aucune dans le
+dark pool~; des sorties de moyennes 2\,000, 2\,200, 900, 1\,000 et 400 actions (lognormales, avec un facteur commun)~; des rémunérations de 0.20, 0.25, $-0.05$ et 0.20
+cent (la troisième plateforme est inversée)~; la plateforme noire s'exécute au milieu, une demi-fourchette (0.5 cent) moins bien qu'une exécution au cours acheteur, sans frais~; des frais de prise de
+0.30 cent, et des pénalités de 1.2 cent par action dans les deux sens. L'optimum est ajusté sur 400 scénarios et chaque règle est évaluée sur 20\,000 scénarios neufs
+(voir le \cref{tab:mx:smart-order-routing:passive}).
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{1.6cm}p{6.0cm}@{}}
+\toprule
+règle & coût (cents par action) & exécuté & allocation (marché~; A, B, C, D, plateforme noire) \\
+\midrule
+\omterm{def:mx:the-limit-order-book:orders}{ordre au marché} & 0.80 & 100.0~\% & 1\,000~; 0, 0, 0, 0, 0 \\
+rémunération la plus élevée & 0.77 & 22.0~\% & 0~; 0, 1\,000, 0, 0, 0 \\
+file la plus courte & 0.74 & 38.7~\% & 0~; 0, 0, 0, 0, 1\,000 \\
+proportionnelle à la place disponible & 0.20 & 61.3~\% & 0~; 266, 171, 255, 140, 169 \\
+Cont--Kukanov & 0.03 & 76.4~\% & 0~; 405, 373, 406, 401, 193 \\
+Cont--Kukanov, sans plateforme noire & 0.06 & 69.7~\% & 0~; 544, 478, 522, 478, 0 \\
+\bottomrule
+\end{tabular}
+\caption{Un achat passif de 1\,000 actions sur cinq plateformes~: coût espéré par rapport au milieu, pénalités comprises, part de l'ordre exécutée et
+l'allocation, le tout évalué hors échantillon (out-of-sample). Données~: \texttt{mx\_sor.passive\_study}.}\label{tab:mx:smart-order-routing:passive}
+\end{table}
+
+L'optimum place 1\,778 actions pour 1\,000 demandées~: il sur-réserve, car chaque plateforme n'exécute qu'une partie de son ordre, et la pénalité pour un excès
+n'est payée que dans les scénarios où la plupart des plateformes s'exécutent. Il n'envoie rien au marché. Courir après la rémunération la plus élevée place l'ordre entier derrière la
+file la plus longue et n'exécute que 22~\%~; Battalio, Corwin et Jennings (2016) ont constaté sur données réelles que les \omterm{def:mx:the-limit-order-book:orders}{ordres à cours limité} routés vers les plateformes versant les rémunérations les plus élevées s'exécutent
+moins bien, et que les courtiers qui routent pour les rémunérations ne peuvent pas tout avoir. La plateforme noire vaut ici 0.03 cent par action~: ses exécutions sont moins bonnes que
+une exécution passive au cours acheteur, mais elles arrivent sans file d'attente. Maglaras, Moallemi et Zheng (2021) ont montré que, lorsque de nombreux traders routent de cette manière, les files des
+plateformes évoluent ensemble, et le marché se comporte comme une seule file agrégée.
+
+\section{Routage tenant compte des frais et logique anti-gaming}
+
+Un routeur attentif aux frais compare des prix nets de frais (chapitre~7)~: à prix affichés égaux, il se dirige d'abord vers la plateforme inversée et se met en attente sur la plateforme qui offre
+la meilleure rémunération. Les deux enseignements précédents tempèrent ces deux choix~: la plateforme la moins chère où prendre de la liquidité ne vaut rien si sa cotation s'est évanouie au moment où l'ordre
+arrive, et la meilleure rémunération ne vaut rien derrière une file qui ne se videra pas.
+
+\begin{definition}[Logique anti-gaming]\label{def:mx:smart-order-routing:antigaming}
+La \emph{logique anti-gaming}\index{logique anti-gaming} est la partie d'un routeur qui rend ses ordres difficiles à détecter et à exploiter~: arrivées synchronisées,
+\omterm{def:mx:dark-pools-and-blocks:minqty}{quantités minimales d'exécution} dans les plateformes noires, tailles et délais des \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres enfants} tirés au hasard, évitement des plateformes dont les exécutions sont suivies de mouvements défavorables, et refus de router
+vers les plateformes qui laissent d'autres participants apprendre l'existence d'ordres en attente.
+\end{definition}
+
+Le chapitre~9 a mesuré comment les \omterm{def:mx:dark-pools-and-blocks:ping}{ordres sondes} (pinging) détectent un grand \omterm{def:mx:order-types-and-their-uses:hidden}{ordre caché} et ce que coûte la fuite. Un routeur y répond par une jambe dark-first portant une \omterm{def:mx:dark-pools-and-blocks:minqty}{quantité minimale
+d'exécution}, de sorte qu'un sondage de 100 actions ne puisse pas s'y négocier, et par des tailles d'\omterm{def:mx:the-almgren-chriss-framework:parent}{ordres enfants} tirées autour de leur cible au lieu d'être répétées
+(\texttt{firm\_sor.dark\_first}, \texttt{child\_sizes})~; il répond à l'\omterm{def:mx:smart-order-routing:spray}{évanouissement de la cotation} (quote fade) par des arrivées synchronisées~; et il conserve, pour chaque plateforme, les markouts de ses
+exécutions (livre~7, chapitre~23) afin de cesser de router vers les plateformes où ils sont systématiquement mauvais. L'arbitrage de latence, activité du fournisseur rapide de ce chapitre,
+fait l'objet du livre~11.
+
+\section{Tutoriel~: un routeur sur cinq plateformes}\label{tut:mx:smart-order-routing:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Balayer cinq plateformes simulées face à un fournisseur rapide qui s'évanouit, avec et sans alignement des instants d'arrivée~; classer les plateformes~; allouer un
+ordre passif par le programme de Cont et Kukanov.
+\textbf{État final~:} les \cref{fig:mx:smart-order-routing:race,fig:mx:smart-order-routing:jitter}, le \cref{tab:mx:smart-order-routing:passive} et les nombres
+des sections 2 à 4.
+\begin{tutsteps}
+\item \textbf{Plateformes.} \texttt{mx\_sor.VENUES}, \texttt{race()}~; \texttt{firm\_sor.Venue}, \texttt{send\_delays}.
+\item \textbf{Balayage.} \texttt{trial(sync, jitter, seed)} avec \texttt{firm\_sor.Router} et \texttt{Fader}~; \texttt{sweep\_study()}.
+\item \textbf{Classement.} \texttt{VenueStats.add}, \texttt{fill\_ratio}, \texttt{rank}~; \texttt{partial\_study()}.
+\item \textbf{Passif.} \texttt{outflow(n, seed)}, \texttt{ck\_cost}, \texttt{ck\_allocate}~; \texttt{passive\_study()}~; tracer avec \texttt{fig\_sor.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Donner au fournisseur rapide une seconde machine en C~; laisser le routeur apprendre ses latences à partir des accusés de réception~; appliquer l'allocation passive
+à des plateformes simulées plutôt que sur des scénarios.
+\end{tutorial}
+
+\section{Construction~: routeur d'ordres intelligent}\label{bld:mx:smart-order-routing:sor}
+
+\begin{build}
+\bfield{Rôle} La couche de routage de l'\omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} du chapitre~28 et du desk du chapitre~20~: balayages, allocation passive et statistiques par plateforme.
+\bfield{Interface} \texttt{Venue(name, entry\_ns, take, make, dark)}, \texttt{send\_delays(venues, sync, margin\_ns)},
+\texttt{sweep(quotes, qty, fees)}, \texttt{VenueStats} (\texttt{add}, \texttt{fill\_ratio}, \texttt{rank}), \texttt{Router(legs, venues, t0\_ns, sync, cleanup)},
+\texttt{Fader(price, qty, venues, start\_ns)}, \texttt{ck\_cost}, \texttt{ck\_allocate}, \texttt{child\_sizes(qty, n, rng, spread)},
+\texttt{dark\_first(qty, dark, min\_qty)}.
+\bfield{Règles} Achats (les ventes en sont le miroir)~; frais par action, positifs lorsqu'ils sont payés~; identifiants d'ordres client uniques sur l'ensemble des plateformes (le simulateur les numérote
+par session)~; un balayage de nettoyage d'un \omterm{def:mx:the-limit-order-book:tick}{pas de cotation} plus haut une fois que toutes les jambes ont rendu compte.
+\bfield{Tests d'acceptation} \texttt{code/firm/sor/tests/}~: délais et ordre des frais~; statistiques et \omterm{def:mx:smart-order-routing:ranking}{classement des plateformes}~; sur deux plateformes simulées, la cotation du fournisseur
+rapide s'évanouit avant un balayage dispersé et non avant un balayage synchronisé, et le nettoyage achève l'ordre~; le coût de Cont et Kukanov sur un exemple calculé à la main
+et un optimum non moins bon que les allocations simples~; tailles anti-gaming.
+\bfield{Pour aller plus loin} Latences apprises~; table de routage par heure de la journée~; markouts par plateforme dans le \omterm{def:mx:smart-order-routing:ranking}{classement des plateformes}.
+\end{build}
+
+\begin{omsources}
+\item T.~Foucault et A.~J.~Menkveld, ``Competition for order flow and smart order routing systems'', \emph{Journal of Finance} 63(1), 2008.
+\item Royal Bank of Canada, ``Synchronized processing of data by networked computing resources'', brevet américain US 8\,489\,747 B2, 2013.
+\item R.~Battalio, S.~A.~Corwin et R.~Jennings, ``Can brokers have it all? On the relation between make-take fees and limit order execution
+quality'', \emph{Journal of Finance} 71(5), 2016.
+\item R.~Cont et A.~Kukanov, ``Optimal order placement in limit order markets'', \emph{Quantitative Finance} 17(1), 2017.
+\item C.~Maglaras, C.~C.~Moallemi et H.~Zheng, ``Queueing dynamics and state space collapse in fragmented limit order book markets'',
+\emph{Operations Research} 69(4), 2021.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:smart-order-routing:1}
+Avec les latences de l'expérience, combien de temps le routeur doit-il retenir la part destinée à A dans un balayage synchronisé, et la part destinée à C~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:smart-order-routing:2}
+La machine du prestataire rapide se déplace vers C. Ses liaisons atteignent A, B, D et E en 95, 50, 50 et 100 microsecondes, et il apprend ses exécutions en C en
+5 microsecondes. Laquelle de ses cotations une vague du routeur trouve-t-elle encore~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:smart-order-routing:3}
+Calculer le coût net des frais de la vague~: 1\,300 actions à 100.01 (500 en A, 200 dans chacune des autres plateformes) et un nettoyage de 1\,200 à 100.02 (1\,000
+en A et 200 en B), avec les frais de l'expérience.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:smart-order-routing:4}
+Pourquoi le taux d'exécution de la vague augmente-t-il avec la gigue de latence~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:smart-order-routing:5}
+Pourquoi l'optimum de Cont--Kukanov affiche-t-il plus d'actions qu'il n'en veut, et qu'est-ce qui l'empêche d'en afficher beaucoup plus~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:smart-order-routing:6}
+Un routeur classe les plateformes selon leur rémunération affichée. Que prévoit l'étude passive qu'il obtiendra, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:smart-order-routing:7}
+\emph{Programmation.} Relancer l'étude passive avec une pénalité de sur-exécution de 0.5 centime au lieu de 1.2. Qu'affiche l'optimum, et combien coûte-t-il hors
+échantillon~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:smart-order-routing:8}
+\emph{Trouver la faille.} «~La plateforme E affichait 500 actions et nous en avons obtenu 200~: les cotations de E sont factices, il faut arrêter d'y router.~»
+\end{exercise}
+
+\section{Problème~: L'ordre arrivé après la disparition des cotations}
+
+\begin{problem}[{Problème du week-end --- L'ordre arrivé après la disparition des cotations}]\label{pb:mx:smart-order-routing:1}
+Les balayages d'un desk n'exécutent que la moitié de ce que le carnet consolidé affiche. Il demande pourquoi, et ce qu'un meilleur routeur changerait.
+
+\medskip\noindent\textbf{Partie I --- Le problème du routeur.}
+\begin{enumerate}
+\item Définir un \omterm{def:mx:smart-order-routing:sor}{routeur d'ordres intelligent} et énumérer ce qu'il décide.
+\item Décrire les cinq plateformes, leurs latences et leurs frais, ainsi que le prestataire rapide.
+\item Définir l'\omterm{def:mx:smart-order-routing:spray}{évanouissement de la cotation} et un \omterm{def:mx:smart-order-routing:spray}{ordre dispersé}.
+\item Pourquoi les résultats de Foucault et Menkveld rendaient-ils important le routage vers chaque \omterm{def:mx:fragmentation-and-routing:protected}{cotation protégée}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le balayage.}
+\begin{enumerate}[resume]
+\item Tracer la course de la vague dans chaque plateforme.
+\item Quel taux d'exécution la vague obtient-elle, et combien coûte l'ordre entier~?
+\item Définir le \omterm{def:mx:smart-order-routing:sync}{routage synchronisé} et calculer les délais.
+\item \emph{Énoncer le résultat nommé}~: le taux d'exécution du balayage avec et sans alignement sur l'instant d'arrivée, et son coût net des frais.
+\item Comment la gigue de latence modifie-t-elle ces deux grandeurs~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Classement et choix des plateformes.}
+\begin{enumerate}[resume]
+\item Donner les taux d'exécution mesurés par plateforme après dispersion de la vague.
+\item Classer les plateformes avec et sans synchronisation, et expliquer l'écart.
+\item Pour 1\,000 actions, comparer le routage par frais et le routage par distance, dispersé et synchronisé.
+\item Pourquoi la vague dispersée, routée d'abord par frais, n'a-t-elle presque rien perdu~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Allocation passive et réponse.}
+\begin{enumerate}[resume]
+\item Écrire le coût de Cont--Kukanov.
+\item Donner le coût et l'exécution de l'\omterm{def:mx:the-limit-order-book:orders}{ordre au marché}, de la rémunération la plus élevée, de la file la plus courte, de la règle proportionnelle et de l'optimum.
+\item Que vaut ici la plateforme sombre~?
+\item Que constatent Battalio, Corwin et Jennings au sujet des rémunérations et de la qualité d'exécution~?
+\item Nommer trois règles anti-gaming et l'attaque à laquelle chacune répond.
+\item Que faut-il dire au desk~?
+\item En une phrase~: contre quoi un routeur se détourne-t-il~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:smart-order-routing:1}
+Votre balayage affiche 5\,000 actions réparties sur cinq plateformes et n'en exécute que 2\,600. Que s'est-il passé~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:smart-order-routing:2}
+Comment implémenteriez-vous la synchronisation sur l'instant d'arrivée dans un routeur, et où échoue-t-elle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:smart-order-routing:3}
+Comment estimeriez-vous la probabilité d'exécution d'un ordre passif sur une plateforme, et pourquoi est-ce difficile~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:smart-order-routing:4}
+Formulez l'allocation d'un ordre passif entre plateformes comme un problème d'optimisation.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{banque}]\label{iq:mx:smart-order-routing:5}
+Un client demande si votre routeur envoie ses \omterm{def:mx:the-limit-order-book:orders}{ordres à cours limité} vers les plateformes qui vous versent les rémunérations les plus élevées. Que répondez-vous, et comment le montrez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:mx:smart-order-routing:6}
+Concevez le magasin de statistiques par plateforme d'un routeur~: ce qu'il enregistre, comment il vieillit les données et comment le routeur les utilise.
+\end{interviewq}

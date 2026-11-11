@@ -30,9 +30,9 @@ ENTRY = {
 }
 
 LANGS = {n: ("en",) for n in range(1, 18)}
-# Books 1-5 ship a French pilot edition (2026-11-09). A translation adds its code here
+# Books 1-10 ship a French pilot edition (1-5 on 2026-11-09, 6-10 on 2026-11-11). A translation adds its code here
 # (and its tools/term_config/book<N>_<lang>.py).
-for _n in (1, 2, 3, 4, 5):
+for _n in range(1, 11):
     LANGS[_n] = ("en", "fr")
 
 

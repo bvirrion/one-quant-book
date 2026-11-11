@@ -1,0 +1,412 @@
+\chapter{Construction~: un marché multi-agents}\label{ch:mx:build-an-agent-based-market}
+
+Un \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:sim}{simulateur de bourse} sans personne dedans est une salle vide. Y placer quelques types de traders simples, certains qui ne savent rien, d'autres qui connaissent la valeur, d'autres
+qui suivent les tendances, et un teneur de marché, et il commence à ressembler à un marché~; lesquels d'entre eux lui sont nécessaires pour y ressembler est en soi un résultat.
+Ce chapitre décrit la bibliothèque d'agents que ce livre utilise depuis le chapitre~11, \texttt{firm.agentmkt}, ajoute les deux types d'agents qui lui manquaient (les \omterm{def:mx:build-an-agent-based-market:types}{agents chartistes}
+et un teneur de marché à décalage selon l'inventaire), calibre la population sur un marché cible par la \omterm{def:mx:build-an-agent-based-market:msm}{méthode des moments simulés}, puis la démonte, un type d'agent
+à la fois pour voir quel fait stylisé chacun porte.
+
+\section{Agents et leur information}
+
+\begin{definition}[Modèle multi-agents]\label{def:mx:build-an-agent-based-market:abm}
+Un \emph{modèle multi-agents}\index{modèle multi-agents} d'un marché est une simulation dans laquelle les prix et les volumes ne sont pas spécifiés mais émergent des
+ordres de nombreux traders simulés (les agents), chacun suivant sa propre règle avec sa propre information, à travers un mécanisme de négociation tel qu'un \omterm{def:mx:the-limit-order-book:lob}{carnet d'ordres
+à cours limité}.
+\end{definition}
+
+\begin{definition}[Agent fondamentaliste, agent chartiste]\label{def:mx:build-an-agent-based-market:types}
+Un \emph{agent fondamentaliste}\index{agent fondamentaliste} négocie vers une valeur qu'il croit être celle de l'actif~: il achète lorsque le cours est inférieur à cette
+valeur et vend lorsqu'il lui est supérieur, d'autant plus souvent que l'écart est grand. Un \emph{agent chartiste}\index{agent chartiste} négocie sur l'historique récent du cours lui-même,
+typiquement dans le sens de sa tendance récente.
+\end{definition}
+
+Les marchés multi-agents relèvent de deux traditions. La première donne aux agents des stratégies et demande quelle dynamique en découle~: Lux et Marchesi (1999) ont bâti un marché de
+fondamentalistes et de chartistes dont le processus d'information n'avait ni queues épaisses ni dépendance temporelle de la volatilité, et ont constaté que les interactions entre
+agents produisaient les deux. La seconde retire presque entièrement la stratégie~: Farmer, Patelli et Zovko (2005) laissent les agents placer et annuler des ordres au hasard
+(le \omterm{def:mx:the-limit-order-book:zi}{modèle à intelligence nulle} du chapitre~1) et, sur onze actions de la London Stock Exchange, expliquent 96~\% de la variance transversale du spread et 76~\% de
+celle du taux de diffusion des prix avec un seul paramètre libre. Chiarella et Iori (2002) introduisent des traders à règles hétérogènes dans un marché piloté par les ordres avec
+un mécanisme d'appariement central, et étudient comment leurs stratégies, le tick et la durée de vie des ordres façonnent les spreads, les volumes et la volatilité. La population
+présentée ici emprunte un peu à chacune~: la plus grande part de son flux d'ordres est aléatoire, et quelques règles lui donnent une direction.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.6cm,inner sep=3pt,align=center,text width=3.5cm}]
+\node[box,fill=gray!12,text width=2.6cm,minimum height=1.4cm] (x) at (0,0) {\textbf{simulateur de bourse}\\ \texttt{firm.exchsim}\\ un seul carnet, un seul flux};
+\node[box,fill=omDef!12] (lp) at (-4.9,1.5) {fournisseurs de liquidité\\ ordres à cours limité, annulations};
+\node[box,fill=omDef!12] (nz) at (-4.9,0) {preneurs de bruit\\ ordres au marché, séries de signes};
+\node[box,fill=omDef!12] (fd) at (-4.9,-1.5) {fondamentalistes\\ voient la valeur cachée $V$};
+\node[box,fill=omProp!14] (ch) at (4.9,1.5) {chartistes\\ suivent la tendance récente};
+\node[box,fill=omProp!14] (mm) at (4.9,0) {teneur de marché\\ décale selon l'inventaire};
+\node[box,fill=omThm!14] (ex) at (4.9,-1.5) {agents d'exécution\\ métaordres, algorithmes};
+\foreach \n in {lp,nz,fd} {\draw[->,thick] (\n.east) -- (x.west);}
+\foreach \n in {ch,mm,ex} {\draw[->,thick] (\n.west) -- (x.east);}
+\node[anchor=north] at (0,-2.3) {un agent Population~: horloges de Poisson indépendantes, latence nulle};
+\draw[dashed,omDef] (-6.8,-2.25) rectangle (-3.0,2.2);
+\end{tikzpicture}
+
+\omcaption{La population. Les trois types de gauche fonctionnent comme un seul agent, \texttt{Population}, sur des horloges de Poisson indépendantes~; les chartistes en font aussi partie, mais sont nouveaux dans ce chapitre~; le teneur de marché et les agents d'exécution
+sont des agents distincts, avec leurs propres sessions et une
+latence de 20~microsecondes.}\label{fig:mx:build-an-agent-based-market:pop}
+\end{omfigure}
+
+\texttt{Population} fait fonctionner ses traders comme des horloges dont les taux sont recalculés après chaque événement
+(\cref{fig:mx:build-an-agent-based-market:pop}). Les fournisseurs de liquidité ajoutent des \omterm{def:mx:the-limit-order-book:orders}{ordres à cours limité} d'un lot de chaque côté, la moitié à un tick du meilleur cours affiché
+en face et le reste jusqu'à dix ticks derrière, et chaque ordre au repos est annulé à taux constant. Les preneurs de bruit envoient des \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} dont les signes arrivent par séries
+(section suivante). Les fondamentalistes envoient des \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} vers une valeur cachée $V$, une marche aléatoire de sauts d'un tick, à un taux proportionnel à
+la distance entre $V$ et le milieu~: ce sont aussi les \omterm{def:mx:why-there-is-a-spread:informed}{traders informés} de ce marché (chapitre~4), puisque personne d'autre ne voit $V$. Les chartistes envoient des \omterm{def:mx:the-limit-order-book:orders}{ordres au marché}
+dans le sens de la variation du milieu sur les 30 dernières secondes, à un taux proportionnel à son ampleur. Les ordres de bruit et les sauts de $V$ sont tirés
+à l'avance à partir de la graine, de sorte que deux simulations qui ne diffèrent que par un agent les partagent (nombres aléatoires communs).
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{159}{187}{L'événement de la population~: un ordre de bruit exogène ou un saut de la valeur cachée, ou bien l'une de ses horloges choisie en proportion de son taux, un ordre à cours limité d'un fournisseur, une annulation, un ordre au marché d'un fondamentaliste ou d'un chartiste.}\label{lst:mx:build-an-agent-based-market:pop}
+
+\section{Fournisseurs de liquidité et leur inventaire}
+
+\begin{definition}[Agent teneur de marché]\label{def:mx:build-an-agent-based-market:mm}
+Un \emph{agent teneur de marché}\index{agent teneur de marché} cote en continu des deux côtés et gère l'inventaire que ses exécutions lui laissent, en général
+en déplaçant ses cotations contre cet inventaire afin d'attirer les transactions qui le réduisent (décalage selon l'inventaire).
+\end{definition}
+
+Les fournisseurs de la population ne détiennent jamais rien~: leurs ordres sont indépendants de ce qu'ils ont exécuté. Le nouveau \texttt{MarketMaker} le fait~: toutes les
+demi-secondes, il cote deux lots au meilleur cours acheteur et au meilleur cours vendeur des autres traders (à un tick à l'intérieur lorsque leur fourchette dépasse deux ticks), les deux déplacés contre son
+inventaire d'un décalage en ticks par lot détenu, et il cesse d'ajouter à une position au-delà de 20 lots. Sa référence exclut ses propres cotations~; une première version
+qui ne le faisait pas faisait descendre son propre cours acheteur, rafraîchissement après rafraîchissement, chaque fois qu'elle était longue, puisque chaque nouvelle cotation était fixée sous la précédente.
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{251}{272}{Le rafraîchissement du teneur de marché~: les meilleures cotations des autres, un déplacement égal au décalage multiplié par l'inventaire en lots, une cotation conservée si elle est déjà au bon prix et remplacée sinon.}\label{lst:mx:build-an-agent-based-market:mm}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+décalage (ticks par lot) & inventaire (lots, moyenne quadratique) & profit par heure (USD) & spread (ticks) \\
+\midrule
+0 & 14.5 & $-116$ (203) & 1.031 \\
+0.1 & 4.2 & 448 (98) & 1.023 \\
+0.3 & 1.6 & 545 (67) & 1.024 \\
+\bottomrule
+\end{tabular}
+\caption{Le teneur de marché sur le marché calibré à trois décalages d'inventaire, pendant trois heures chacun~: la moyenne quadratique pondérée par le temps de son inventaire,
+son profit (trésorerie après frais, plus l'inventaire valorisé au dernier milieu) avec l'écart type entre les heures, et le spread moyen du marché. Données~:
+\texttt{mx\_agents.maker\_study}.}\label{tab:mx:build-an-agent-based-market:mm}
+\end{table}
+
+Sans décalage, l'inventaire du teneur de marché erre (\cref{fig:mx:build-an-agent-based-market:inv}) et il perd de l'argent~: ses exécutions suivent les fondamentalistes,
+qui connaissent la valeur, si bien que l'inventaire qu'il accumule est du mauvais côté lorsque $V$ bouge (sélection adverse du chapitre~4). Avec un décalage de 0.3 tick par lot
+son inventaire reste à quelques lots près et son profit horaire est positif et plus régulier (\cref{tab:mx:build-an-agent-based-market:mm})~; le décalage est
+la forme pratique des modèles d'inventaire du chapitre~4 (et du livre~2, chapitre~30). Le spread du marché change à peine~: les fournisseurs le maintiennent près d'un tick
+quoi que fasse le teneur de marché.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.4cm,xlabel={\small secondes depuis l'ouverture},ylabel={\small inventaire (lots)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=3600,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,thick,const plot] table[x=t,y=lots]{figdata/microstructure/27-build-an-agent-based-market/inventory_skew0.csv};
+\addplot[omDef,thick,const plot] table[x=t,y=lots]{figdata/microstructure/27-build-an-agent-based-market/inventory_skew3.csv};
+\legend{sans décalage,décalage de 0.3 tick par lot}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'inventaire du teneur de marché pendant une heure du marché calibré, avec le même flux d'ordres, sans décalage et avec un décalage de 0.3 tick
+par lot. Sans décalage, il oscille d'une limite de 20 lots à l'autre. Données~: \texttt{mx\_agents.maker\_study}.}\label{fig:mx:build-an-agent-based-market:inv}
+\end{omfigure}
+
+\section{Agents d'exécution et métaordres}
+
+Un métaordre (livre~7, chapitre~9) découpé en enfants envoie de nombreux \omterm{def:mx:the-limit-order-book:orders}{ordres au marché} d'un même signe~; c'est le mécanisme que Lillo, Mike et Farmer (2005) ont proposé pour
+la mémoire longue des signes d'ordres~: si la taille des grands ordres a une queue en loi de puissance, $P(V > v) \propto v^{-\alpha}$, et s'ils sont exécutés en enfants de
+taille constante, l'autocorrélation des signes d'ordres décroît comme $\tau^{-(\alpha - 1)}$, ce qui constitue une mémoire longue (non sommable) lorsque $\alpha < 2$. Les preneurs
+de bruit de \texttt{firm.agentmkt} sont ce mécanisme en une ligne~: leurs signes arrivent par séquences dont les longueurs suivent une loi de Pareto de queue $\alpha$ (le paramètre
+\texttt{run\_tail}), chaque séquence étant un métaordre. Les agents d'exécution proprement dits, \texttt{Metaorder} pour un échéancier d'enfants à \omterm{def:mx:the-limit-order-book:orders}{ordres au marché}, et les algorithmes des
+chapitres 16 à 22, sont ajoutés au même simulateur en tant qu'agents distincts~; le chapitre~11 a mesuré leur impact par rapport à la même session sans eux.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=9.6cm,height=5.6cm,xlabel={\small délai (ordres)},ylabel={\small autocorrélation des signes},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0.8,xmax=120,ymin=0.001,ymax=0.5,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma,unbounded coords=discard]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=lag,y=runs]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[gray,very thick,mark=square*,mark size=1.3pt] table[x=lag,y=none]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[omProp,very thick,mark=triangle*,mark size=1.6pt] table[x=lag,y=excess]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\addplot[omThm,thick,dashed] table[x=lag,y=law]{figdata/microstructure/27-build-an-agent-based-market/signs.csv};
+\legend{avec séquences de signes,sans,excès dû aux séquences,pente $-(\alpha-1)=-1.5$}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Autocorrélation des signes des ordres agressifs sur le marché calibré (queue des séquences $\alpha = 2.5$), avec et sans les séquences de signes des preneurs
+de bruit, trois heures chacune~; l'excès que les séquences ajoutent, avec la loi de puissance que leur queue implique. L'excès est tracé jusqu'au délai 20, où il se noie dans le bruit. Données~:
+\texttt{mx\_agents.sign\_curves}.}\label{fig:mx:build-an-agent-based-market:signs}
+\end{omfigure}
+
+Le marché calibré a $\alpha = 2.5$, si bien que ses séquences prédisent une autocorrélation en excès décroissant comme $\tau^{-1.5}$~: mémoire courte. Mesuré sur les délais 1 à
+7, l'excès décroît avec une pente log-log de $-1.15$ (voir la \cref{fig:mx:build-an-agent-based-market:signs}), un peu plus plate que la loi asymptotique, et disparaît
+dès le délai 10. Ce qui subsiste sans les séquences, soit environ 0.07 à 0.09 jusqu'au délai 20, est l'œuvre des fondamentalistes~: tant que $V$ s'éloigne du milieu, ils
+envoient ordre après ordre dans le même sens.
+
+\section{Calibrer sur les faits stylisés}
+
+\begin{definition}[Méthode des moments simulés]\label{def:mx:build-an-agent-based-market:msm}
+La \emph{méthode des moments simulés}\index{méthode des moments simulés} estime les paramètres d'un modèle que l'on peut simuler mais dont les moments
+n'ont pas de forme close~: elle choisit les paramètres qui minimisent une distance pondérée entre les moments calculés sur les données et les mêmes moments moyennés
+sur des simulations du modèle, les simulations utilisant les mêmes tirages aléatoires pour chaque jeu de paramètres candidat.
+\end{definition}
+
+Franke et Westerhoff (2012) ont estimé de cette façon de petits modèles fondamentalistes-chartistes, avec des moments choisis parmi les faits stylisés
+des rendements quotidiens d'indices (livre~7, chapitre~5). Ici la cible est une heure du marché synthétique du livre~7, \texttt{firm.tape} sans sa fenêtre d'annonces, mesurée sur huit heures~:
+il comporte un flux de bruit à regroupement de type Hawkes, des métaordres, des \omterm{def:mx:why-there-is-a-spread:informed}{traders informés} et un niveau d'activité aléatoire, dont aucun n'existe tel quel dans la population d'agents. Les
+sept faits sont le kurtosis en excès des rendements de milieu de fourchette sur 30 secondes, leur autocorrélation au délai 1, le regroupement de volatilité (l'autocorrélation moyenne des
+valeurs absolues des rendements aux délais 1 à 5), l'autocorrélation des signes des ordres agressifs aux délais 1 et 10 (les transactions d'un même ordre comptées une seule fois), la
+fourchette moyenne pondérée par le temps et la profondeur moyenne au meilleur cours. La distance est la somme des carrés des écarts entre moyennes simulées et moyennes cibles, chaque terme
+étant normalisé par l'écart type de la cible sur ses huit heures.
+
+\omcode{code/firm/agentmkt/firm_agentmkt.py}{307}{322}{La méthode des moments simulés sur une grille~: la distance en écarts types de la cible, et la moyenne des faits obtenus avec les mêmes graines à chaque point de la grille.}\label{lst:mx:build-an-agent-based-market:msm}
+
+Trois paramètres sont calibrés, sur une grille de trois valeurs chacun~: le taux des preneurs de bruit (0.9, 1.2, 1.5 par seconde), leur queue de séquences (aucune, 1.5, 2.5) et
+le taux des chartistes (0, 0.05, 0.1 par seconde et par tick de tendance)~; les fournisseurs de liquidité, les fondamentalistes et le teneur de marché (skew 0.1) sont fixés. Chaque point est simulé
+pendant trois heures avec les mêmes trois graines.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.2cm,height=5.4cm,xlabel={\small taux des chartistes (par seconde et par tick de tendance)},ylabel={\small distance},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xtick={0,0.05,0.1},
+  xticklabel style={/pgf/number format/fixed},ymin=0,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,very thick,mark=square*,mark size=1.4pt] table[x=chart,y=tail0]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=1.6pt] table[x=chart,y=tail15]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=chart,y=tail25]{figdata/microstructure/27-build-an-agent-based-market/surface.csv};
+\legend{sans séquences de signes,queue 1.5,queue 2.5}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Distance entre les faits simulés et les faits cibles pour un taux de bruit de 1.2 ordres par seconde, selon le taux des chartistes et la queue des séquences, trois heures
+par point avec les mêmes graines. Données~: \texttt{mx\_agents.calibration}.}\label{fig:mx:build-an-agent-based-market:surface}
+\end{omfigure}
+
+Le meilleur point correspond à un taux de bruit de 1.2, une queue de séquences de 2.5 et un taux de chartistes de 0.05, à une distance de 10.1 sur ses trois heures de calibration~; le
+point de départ (bruit 0.9, sans séquences, sans chartistes) était à 27.9 (voir la \cref{fig:mx:build-an-agent-based-market:surface}). Sur six heures nouvelles, la
+population calibrée est à 5.4, et six heures nouvelles du marché cible lui-même sont à 1.7 de la moyenne cible~: ce que donne à lui seul le bruit d'échantillonnage.
+La \Cref{fig:mx:build-an-agent-based-market:facts} montre d'où vient le reste~: le marché calibré a trop peu de regroupement de volatilité et trop peu
+de profondeur, et un peu trop de mémoire des signes au délai 1.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.6cm,ybar,bar width=7pt,ylabel={\small simulé $-$ cible (écart type de la cible)},
+  xtick={0,1,2,3,4,5,6},xticklabels={kurtosis,FAC rendements,regroupement,FAC signes 1,FAC signes 10,fourchette,profondeur},
+  x tick label style={font=\footnotesize,rotate=25,anchor=north east},tick label style={font=\footnotesize},
+  grid=major,grid style={gray!25},enlarge x limits=0.08,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.42)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=gray!45,draw=gray] table[x=k,y=start]{figdata/microstructure/27-build-an-agent-based-market/facts.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=calibrated]{figdata/microstructure/27-build-an-agent-based-market/facts.csv};
+\legend{point de départ (heures de calibration),calibré (six heures nouvelles)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Écart de chaque fait à la cible, en écarts types de la cible, pour le point de départ et pour la population calibrée. Les carrés des
+barres calibrées s'additionnent pour donner la distance sur les heures nouvelles. Données~: \texttt{mx\_agents.calibration}.}\label{fig:mx:build-an-agent-based-market:facts}
+\end{omfigure}
+
+L'ablation prend la population calibrée et retire un type d'agent à la fois sur les six heures nouvelles, avec les mêmes graines~: les séquences de signes (les preneurs
+de bruit gardent leur taux mais leurs signes deviennent indépendants), les chartistes, les fondamentalistes, le teneur de marché. Le \Cref{tab:mx:build-an-agent-based-market:abl}
+donne pour chaque fait sa variation, en écarts types de la cible.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+retiré & kurtosis & rendement & regroupement & signe & signe & fourchette & profondeur \\
+ & & FAC & & FAC 1 & FAC 10 & & \\
+\midrule
+séquences de signes & $+1.32$ & $+0.02$ & $-0.63$ & $\mathbf{-2.77}$ & $-0.35$ & $-0.38$ & $+0.10$ \\
+ & (0.79) & (0.29) & (1.12) & (0.15) & (0.25) & (0.19) & (0.06) \\[2pt]
+chartistes & $\mathbf{+1.11}$ & $-0.10$ & $-0.72$ & $+0.02$ & $-0.18$ & $-0.29$ & $+0.09$ \\
+ & (0.55) & (0.20) & (0.67) & (0.10) & (0.27) & (0.11) & (0.02) \\[2pt]
+fondamentalistes & $\mathbf{+8.55}$ & $-0.47$ & $-0.73$ & $+0.87$ & $-2.42$ & $-1.29$ & $+0.96$ \\
+ & (2.65) & (0.25) & (0.88) & (0.14) & (0.40) & (0.15) & (0.05) \\[2pt]
+teneur de marché & $-0.79$ & $-1.77$ & $+0.31$ & $-0.69$ & $-1.00$ & $\mathbf{+9.44}$ & $-0.75$ \\
+ & (0.29) & (0.25) & (0.57) & (0.10) & (0.19) & (0.37) & (0.04) \\[2pt]
+\bottomrule
+\end{tabular}
+\caption{Ablation~: variation de chaque fait lorsqu'un type d'agent est retiré de la population calibrée, en écarts types de la cible, moyenne sur
+six heures avec les mêmes graines (erreurs types appariées entre parenthèses ci-dessous~; la plus grande variation de chaque type en gras). Données~:
+\texttt{mx\_agents.ablation}.}\label{tab:mx:build-an-agent-based-market:abl}
+\end{table}
+
+Chaque type porte quelque chose (\cref{tab:mx:build-an-agent-based-market:abl}). Les séries de signes portent la mémoire de signe à retard 1 ($-2.77$, erreur type de 0.15 écart type).
+Les fondamentalistes portent le mouvement du prix~: sans eux le mid est coincé entre des sauts rares, si bien que le kurtosis des rendements explose ($+8.6$) et la
+mémoire de signe à retard long chute ($-2.42$). Le teneur de marché porte la fourchette ($+9.4$)~: sans lui, la fourchette s'élargit de 0.15 tick. Les chartistes
+ne portent rien que ce test puisse voir~: leur plus grande variation, sur le kurtosis, est $+1.11$ avec une erreur type de 0.55, soit deux erreurs types. Retirer complètement les preneurs de bruit laisse un marché dans
+lequel seuls les fondamentalistes négocient, avec une autocorrélation de signe proche de un~; elle ne figure pas dans le tableau parce que tous les faits bougent.
+
+\section{Ce que les marchés multi-agents peuvent et ne peuvent pas dire}
+
+Un marché multi-agents est un outil pour les questions de mécanismes~: que se passe-t-il pour les spreads si le tick est divisé par deux (chapitre~6), si une bande de prix attire le
+cours (chapitre~25), comment le shortfall d'un algorithme dépend de la réaction des autres traders (chapitre~28). Rejouer une bande historique ne peut pas y répondre,
+car un marché rejoué ne réagit pas~; Vyetrenko et coauteurs (2020) ont comparé le rejeu de marché aux configurations interactives à agents sur une liste
+de métriques de réalisme tirées des faits stylisés, et ont trouvé les configurations interactives plus réalistes, et davantage encore lorsque la valeur fondamentale des agents provenait de
+données historiques plutôt que d'une marche aléatoire à retour à la moyenne. ABIDES (Byrd, Hybinette et Balch 2020), un simulateur open source de plusieurs dizaines de milliers
+d'agents dont l'agent bourse suit les messages ITCH et OUCH de Nasdaq, est conçu précisément pour cela.
+
+Ce qu'il ne peut pas dire, c'est pourquoi les traders réels font ce qu'ils font. Faire coïncider sept faits à moins de 5.4 n'identifie pas les agents~: d'autres populations,
+avec d'autres règles, coïncideraient aussi (ici les chartistes pourraient être retirés à peu de frais), et les faits restés non appariés, le regroupement de volatilité
+en premier lieu, indiquent que quelque chose dans la cible (son niveau d'activité aléatoire) manque à la population. La calibration répond à la question «~cette population est-elle assez
+bonne pour la question~?~», et non à «~est-ce ainsi que le marché fonctionne~?~»~; et la réponse dépend des faits retenus et de leurs poids. Le bon usage est
+comparatif~: la même population, avec et sans un algorithme, une règle ou un trader, et les mêmes graines.
+
+\section{Tutoriel~: un marché qui ressemble à un marché}\label{tut:mx:build-an-agent-based-market:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Peupler \texttt{firm.exchsim} d'agents, les calibrer sur les faits stylisés d'un marché cible et trouver le fait que porte chaque type
+d'agent. \textbf{État final~:} \cref{tab:mx:build-an-agent-based-market:mm,tab:mx:build-an-agent-based-market:abl},
+\cref{fig:mx:build-an-agent-based-market:inv,fig:mx:build-an-agent-based-market:signs,fig:mx:build-an-agent-based-market:surface,fig:mx:build-an-agent-based-market:facts}.
+\begin{tutsteps}
+\item \textbf{Peupler.} \texttt{PopulationConfig(lo\_rate, near, cancel, depth, noise, run\_tail, fund, v\_rate, chart, chart\_window)}~;
+\texttt{session(cfg, seconds, seed, agents=[MarketMaker(skew=0.1)])}~; le \texttt{Result}, dont \texttt{tape()} est au format de \texttt{firm.tape}.
+\item \textbf{Mesurer.} \texttt{facts(tape, 30.0)}~; \texttt{firm\_lobstats.report(tape)} du chapitre~3 pour les faits propres au livre (profil de profondeur,
+durées de vie, \omterm{def:mx:empirical-facts-of-order-books:life}{ordres fugaces}, résilience).
+\item \textbf{Calibrer.} \texttt{mx\_agents.target()}, \texttt{calibration()} (\texttt{msm} sur la grille avec des graines communes).
+\item \textbf{Démonter.} \texttt{ablation()}, \texttt{sign\_curves()}, \texttt{maker\_study()}~; dessiner avec \texttt{fig\_agents.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une règle de bascule entre fondamentalistes et chartistes (le mécanisme de Lux et Marchesi) et voir si l'écart de regroupement
+se referme~; viser les faits d'une bande réelle~; pondérer les moments par leur covariance simulée au lieu des variances de la cible.
+\end{tutorial}
+
+\section{Construction~: agentmkt}\label{bld:mx:build-an-agent-based-market:agentmkt}
+
+\begin{build}
+\bfield{Rôle} La bibliothèque d'agents et le lanceur de population sur \texttt{firm.exchsim}, utilisés depuis le chapitre~11 et par les tutoriels des livres~11 et~12~: un
+marché réagissant avec des ingrédients connus.
+\bfield{Interface} \texttt{PopulationConfig}, \texttt{Population(cfg, seed, seconds)} (\texttt{.exo}, \texttt{.v\_path}), \texttt{Metaorder(plan)},
+\texttt{MarketMaker(lots, skew, max\_lots, refresh\_s)}, \texttt{session(cfg, seconds, seed, agents, venue)}~; \texttt{facts(tape, sample\_s)},
+\texttt{FACTS}, \texttt{distance(sim, target, scale)}, \texttt{msm(run, grid, target, scale, seeds)}.
+\bfield{Règles} Déterministe et ensemencé par agent~; flux exogène tiré à l'avance pour que les passages le partagent~; sortie au format de \texttt{firm.tape}~; la
+population par défaut inchangée par les ajouts ultérieurs (les chartistes et la courbe d'activité sont désactivés par défaut).
+\bfield{Tests d'acceptation} \texttt{code/firm/agentmkt/tests/}~: la même graine donne la même bande et le flux exogène est partagé~; un métaordre exécute son
+plan~; la courbe d'activité façonne le flux~; le teneur de marché ne fait que reposer et borne son inventaire~; un signe par ordre agressif~; \texttt{msm} trouve le
+minimum d'une fonction connue.
+\bfield{Pour aller plus loin} Bascule de stratégie~; agents à règles d'apprentissage~; plusieurs instruments et plateformes dans une même population.
+\end{build}
+
+\begin{omsources}
+\item T.~Lux et M.~Marchesi, ``Scaling and criticality in a stochastic multi-agent model of a financial market'', \emph{Nature} 397, 1999.
+\item J.~D.~Farmer, P.~Patelli et I.~I.~Zovko, ``The predictive power of zero intelligence in financial markets'', \emph{Proceedings of the National
+Academy of Sciences} 102(6), 2005.
+\item C.~Chiarella et G.~Iori, ``A simulation analysis of the microstructure of double auction markets'', \emph{Quantitative Finance} 2(5), 2002.
+\item F.~Lillo, S.~Mike et J.~D.~Farmer, ``Theory for long memory in supply and demand'', \emph{Physical Review E} 71, 066122, 2005.
+\item R.~Franke et F.~Westerhoff, ``Structural stochastic volatility in asset pricing dynamics: estimation and model contest'', \emph{Journal of
+Economic Dynamics and Control} 36(8), 2012.
+\item D.~Byrd, M.~Hybinette et T.~H.~Balch, ``ABIDES: towards high-fidelity multi-agent market simulation'', Proceedings of the 2020 ACM SIGSIM
+Conference on Principles of Advanced Discrete Simulation.
+\item S.~Vyetrenko, D.~Byrd, N.~Petosa, M.~Mahfouz, D.~Dervovic, M.~Veloso et T.~H.~Balch, ``Get real: realism metrics for robust limit order book
+market simulations'', Proceedings of the First ACM International Conference on AI in Finance, 2020.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:1}
+L'autocorrélation de signe à retard 1 de la cible vaut 0.158, avec un écart type de 0.046 selon ses heures~; la population calibrée donne 0.212 sur des
+heures nouvelles. Combien d'écarts types de la cible représente l'écart, et de combien augmente-t-il la distance~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:2}
+D'après le résultat de Lillo, Mike et Farmer, à quel rythme l'autocorrélation de signe décroît-elle pour des queues de passage de 1.5 et de 2.5~? Laquelle relève de la mémoire longue~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-agent-based-market:3}
+Si la population était exactement juste et que les variances simulées des faits soient égales à celles de la cible, quelle distance peut-on attendre entre la moyenne de six
+heures simulées et la moyenne de huit heures cibles, avec sept faits~? Comparer-la à la distance sur des heures nouvelles et au plancher.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:4}
+Pourquoi la distance du point calibré sur ses trois heures de calibration est-elle plus grande que sur six heures nouvelles~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:5}
+Pourquoi le retrait des fondamentalistes fait-il exploser le kurtosis des rendements~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-agent-based-market:6}
+Pourquoi le teneur de marché perd-il de l'argent sans skew d'inventaire et en gagne-t-il avec lui, alors que ses cotations sont par ailleurs identiques~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-agent-based-market:7}
+\emph{Programmation.} Recalibrer sur les cinq seuls faits de rendements et de flux d'ordres (retirer la fourchette et la profondeur), à partir des faits stockés de la grille. Le meilleur point
+change-t-il, et quelle est sa distance~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-agent-based-market:8}
+\emph{Trouver la faille.} «~Notre marché multi-agents calibré reproduit les faits stylisés, donc les vrais traders sont fondamentalistes, chartistes et \omterm{def:mx:why-there-is-a-spread:informed}{noise
+traders} dans ces proportions.~»
+\end{exercise}
+
+\section{Problème~: Un marché qui ressemble à un marché}
+
+\begin{problem}[{Problème du week-end --- un marché qui ressemble à un marché}]\label{pb:mx:build-an-agent-based-market:1}
+Un responsable de recherche veut un marché simulé pour tester des \omterm{def:mx:benchmark-algorithms:algo}{algorithmes d'exécution}, et demande à quel point il est réaliste et ce qui le rend ainsi.
+
+\medskip\noindent\textbf{Partie I --- Agents.}
+\begin{enumerate}
+\item Définir un \omterm{def:mx:build-an-agent-based-market:abm}{modèle multi-agents}, un \omterm{def:mx:build-an-agent-based-market:types}{agent fondamentaliste} et un \omterm{def:mx:build-an-agent-based-market:types}{agent chartiste}.
+\item Que trouvent Lux et Marchesi, et que trouvent Farmer, Patelli et Zovko~?
+\item Décrire les fournisseurs de liquidité, les preneurs de bruit, les fondamentalistes et les chartistes de la population.
+\item Pourquoi les fondamentalistes sont-ils aussi ici les \omterm{def:mx:why-there-is-a-spread:informed}{traders informés}~?
+\item Pourquoi les ordres de bruit sont-ils tirés à l'avance à partir de la graine~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Inventaire et métaordres.}
+\begin{enumerate}[resume]
+\item Définir un \omterm{def:mx:build-an-agent-based-market:mm}{agent teneur de marché} et décrire les cotations de \texttt{MarketMaker}.
+\item Qu'est-ce qui n'a pas fonctionné lorsque la référence du teneur de marché incluait ses propres cotations~?
+\item Donner l'inventaire et le profit du teneur de marché aux trois skews.
+\item Énoncer le résultat de Lillo, Mike et Farmer, et expliquer comment les preneurs de bruit le mettent en œuvre.
+\item Que montre la figure d'autocorrélation des signes concernant la queue calibrée~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Calibration.}
+\begin{enumerate}[resume]
+\item Définir la \omterm{def:mx:build-an-agent-based-market:msm}{méthode des moments simulés}, et dire pourquoi les mêmes graines sont utilisées à chaque point de la grille.
+\item Quelle est la cible, et quels sont les sept faits~?
+\item Donner la grille et le meilleur point.
+\item \emph{Énoncer le résultat nommé}~: la distance entre les faits simulés et les faits cibles après calibration, dans l'échantillon et hors échantillon, par rapport au point de départ et au plancher, et le fait que porte chaque type d'agent.
+point de départ et au plancher, et le fait que porte chaque type d'agent.
+\item Quels faits la population calibrée ne reproduit-elle pas, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Que trouvent Vyetrenko et ses coauteurs au sujet du rejeu et des marchés multi-agents~?
+\item Pourquoi un flux rejoué ne peut-il pas répondre à une question d'exécution que peut traiter un marché multi-agents~?
+\item Pourquoi faire coïncider les faits ne permet-il pas d'identifier les agents~?
+\item Que diriez-vous au responsable de recherche sur l'usage de ce marché pour comparer des algorithmes~?
+\item En une phrase~: à quoi sert un marché multi-agents~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur}]\label{iq:mx:build-an-agent-based-market:1}
+Qu'est-ce qu'un marché à intelligence nulle, et que peut-il expliquer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:build-an-agent-based-market:2}
+Comment calibreriez-vous un marché multi-agents sur une action, et comment sauriez-vous que vous avez sur-ajusté~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:build-an-agent-based-market:3}
+Comment rendez-vous une simulation multi-agents déterministe, et pourquoi cela compte-t-il pour comparer deux algorithmes~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:build-an-agent-based-market:4}
+Pourquoi un teneur de marché devrait-il décaler ses cotations en fonction de son inventaire, et de combien~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:mx:build-an-agent-based-market:5}
+Vous entraînez une politique d'exécution par apprentissage par renforcement dans un marché multi-agents. Que peut-il mal se passer lorsqu'elle rencontre le marché réel~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{risque}]\label{iq:mx:build-an-agent-based-market:6}
+Un desk ne valide un nouvel algorithme que dans un simulateur multi-agents. Que demanderiez-vous avant de l'approuver~?
+\end{interviewq}

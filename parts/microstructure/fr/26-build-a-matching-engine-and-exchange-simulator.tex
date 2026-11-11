@@ -1,0 +1,247 @@
+\chapter{Construction~: un moteur d'appariement et un simulateur de bourse}\label{ch:mx:build-a-matching-engine-and-exchange-simulator}
+
+Chaque tutoriel des livres qui suivent a besoin d'une plateforme~: quelque chose qui reçoit des ordres, les apparie, publie ce qui s'est passé dans un flux pouvant perdre des
+paquets, et fait exactement la même chose à chaque exécution avec les mêmes entrées. Ce chapitre décrit celui que ce livre utilise depuis le
+chapitre~1, \texttt{firm.exchsim}~: ce que fait une bourse, en messages~; le \omterm{def:mx:the-limit-order-book:engine}{moteur d'appariement}~; le flux et sa reprise~; les \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{sessions de saisie des ordres}~; et
+l'horloge qui le rend déterministe. Il le certifie ensuite~: la suite de conformité, l'identité octet par octet de ses trois moteurs, et leur vitesse sur cet
+ordinateur portable.
+
+\section{Ce que fait une bourse, en messages}
+
+\begin{definition}[Simulateur de bourse]\label{def:mx:build-a-matching-engine-and-exchange-simulator:sim}
+Un \emph{simulateur de bourse}\index{simulateur de bourse} (exchange simulator) est un programme qui se comporte envers ses participants comme une plateforme le ferait~: il accepte et accuse réception
+des ordres par des \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{sessions de saisie des ordres}, les apparie selon les règles de la plateforme, et publie les \omterm{def:mx:the-limit-order-book:event}{événements du carnet} qui en résultent dans un flux de données de marché
+séquencé, avec les latences, les pertes et les pannes d'une connexion réelle, et avec des résultats qui ne dépendent que de ses entrées.
+\end{definition}
+
+\begin{definition}[Protocole de saisie des ordres, session de saisie des ordres, rapport d'exécution]\label{def:mx:build-a-matching-engine-and-exchange-simulator:oe}
+Un \emph{protocole de saisie des ordres}\index{protocole de saisie des ordres} (order-entry protocol) est l'ensemble des messages qu'un participant utilise pour envoyer, modifier et annuler des ordres, et que la plateforme utilise
+pour répondre. Une \emph{session de saisie des ordres}\index{session de saisie des ordres} (order-entry session) est une connexion authentifiée qui le porte, avec sa propre suite de messages, ses limites et
+son état. Un \emph{rapport d'exécution}\index{rapport d'exécution} (execution report) est le message de la plateforme, sur cette session, au sujet d'un ordre~: accepté, exécuté (partiellement ou totalement),
+annulé, rejeté, remplacé.
+\end{definition}
+
+\texttt{firm.exchsim} parle quatre protocoles binaires, tous générés à partir d'une seule table, \texttt{MESSAGES} dans le module de codage, avec une copie lisible par machine
+dans \texttt{schema.json} à partir de laquelle le livre~13 construit ses codecs. Le \emph{flux} compte quatorze types de messages dans une disposition de type ITCH (les messages d'ajout, d'exécution, d'annulation, de suppression et de transaction du livre~1
+octet par octet, plus ceux de remplacement, d'exécution à un prix, de croisement, de déséquilibre, d'événement système, d'action de négociation,
+de répertoire des valeurs, d'en-tête et de pied d'instantané)~; la saisie des ordres en compte cinq (nouvel ordre, remplacement, annulation, annulation de masse, cotation de masse)~; les \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{rapports d'exécution} six (accepté, exécuté,
+annulé, rejeté, remplacé, système)~; et un protocole de contrôle de dix messages pilote la plateforme (événements système, connexions et déconnexions, phases, bandes,
+indicatives, croisements, heures limites, échéances, cours de référence). \texttt{PROTOCOL.md} donne toutes les règles~; la spécification TotalView-ITCH~5.0 de Nasdaq sert de modèle pour le
+flux (entiers en gros-boutiste, un locate de valeur à la même place dans chaque message, horodatages en nanosecondes depuis minuit).
+
+Une journée de client, en processus (\texttt{mx\_exchsim.scenario}), montre les rapports~: un achat de 300 à 100.00 est accepté~; une vente de 100 à 100.00 issue de la
+même session s'apparie avec lui (la \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{prévention de l'auto-appariement} est désactivée pour cette session) et les deux côtés reçoivent une exécution~; une vente de 500 à
+99.99 en immédiat-ou-annulation exécute 200 contre le reste, et ses 300 restants sont annulés avec le motif «~I~»~; un achat de 200 à 100.02 en post-only se repose dans le carnet~; une vente de 100 à
+100.01 s'exécute contre lui à 100.02~; un achat à 100.015 est rejeté car hors de la grille de cotation («~X~»)~; une annulation de la vente déjà exécutée est rejetée car trop
+tardive («~L~»)~; en fin de journée, les 100 dernières actions de l'ordre post-only expirent («~E~»).
+
+\section{Le moteur d'appariement}
+
+Le moteur (\texttt{firm\_exchsim\_engine}) tient un carnet par instrument (le \texttt{firm.lob} du chapitre~1) et applique les types d'ordres du chapitre~2 par
+\texttt{firm.ordertypes}~: \omterm{def:mx:the-limit-order-book:orders}{ordres à cours limité} et au marché, immédiat-ou-annulation et tout-ou-rien, post-only, \omterm{def:mx:order-types-and-their-uses:hidden}{ordres cachés} et \omterm{def:mx:order-types-and-their-uses:hidden}{ordres iceberg}, pegs au prix milieu et au prix primaire,
+\omterm{def:mx:order-types-and-their-uses:stop}{ordres stop}, quantités minimales, et \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{prévention de l'auto-appariement}.
+
+\begin{definition}[Prévention de l'auto-appariement, annulation à la déconnexion]\label{def:mx:build-a-matching-engine-and-exchange-simulator:stp}
+La \emph{prévention de l'auto-appariement}\index{prévention de l'auto-appariement} (self-trade prevention) empêche deux ordres d'un même participant (ou groupe) de s'apparier entre eux, en annulant
+l'ordre au repos, l'ordre entrant, les deux, ou en décrémentant leurs quantités. L'\emph{annulation à la déconnexion}\index{annulation à la déconnexion} (cancel on disconnect) annule les ordres au repos d'une session
+lorsque celle-ci est perdue.
+\end{definition}
+
+L'appariement donne d'abord la priorité au prix, puis répartit un \omterm{def:mx:the-limit-order-book:tick}{niveau de prix} selon sa règle~: premier entré, premier sorti (priorité prix-temps, livre~1, chapitre~19), ou au prorata avec une
+part optionnelle réservée au premier ordre (\texttt{firm.match} du livre~1)~; il s'arrête à une bande de prix (chapitre~25) et à la limite de l'ordre.
+
+\omcode{code/firm/exchsim/firm_exchsim_engine.py}{331}{355}{La répartition d'un niveau de prix dans le moteur~: les ordres au repos éligibles (quantités minimales respectées), exécutés dans l'ordre temporel pour la priorité prix-temps ou selon la règle au prorata configurable du livre~1, chaque exécution se faisant au prix de l'ordre au repos.}\label{lst:mx:build-a-matching-engine-and-exchange-simulator:match}
+
+Les phases proviennent d'un calendrier~: pré-ouverture et call d'ouverture, négociation en continu ou \omterm{def:mx:auction-mechanics-and-theory:fba}{enchères par lots fréquentes} (chapitre~10), call et enchère de clôture, suspensions et
+pauses avec appels de réouverture (les politiques de \texttt{firm.halts} du chapitre~25 agissent par les mêmes contrôles), le tout croisé par l'enchère du chapitre~10
+(\texttt{firm.auctionsim}). Des limiteurs bornent le débit de messages de chaque session par un seau à jetons~; les frais sont prélevés par exécution selon l'indicateur de liquidité.
+
+\section{Le flux de données de marché~: séquencement, redondance, reprise}
+
+\begin{definition}[Lignes de flux redondantes, reprise par instantané, demande de retransmission]\label{def:mx:build-a-matching-engine-and-exchange-simulator:feed}
+Les \emph{lignes de flux redondantes}\index{lignes de flux redondantes} (redundant feed lines) transportent deux fois les mêmes paquets séquencés, par des chemins distincts, afin qu'un récepteur puisse prendre chaque paquet
+sur la ligne qui le livre en premier. La \emph{reprise par instantané}\index{reprise par instantané} (snapshot recovery) reconstruit un carnet à partir d'un instantané périodique de son état, étiqueté
+par le dernier numéro de séquence incrémental qu'il inclut, suivi des messages incrémentaux qui le suivent. Une \emph{demande de retransmission}\index{demande de retransmission} (retransmission request) s'adresse au
+service de reprise de la plateforme pour obtenir des messages par numéro de séquence.
+\end{definition}
+
+Le flux circule en paquets MoldUDP64 (un nom de session, le numéro de séquence du premier message, un nombre de messages~; un nombre nul est un battement de cœur) sur deux
+lignes, A et B, chacune avec ses propres perturbations tirées de flux aléatoires issus de générateurs à compteur~: pertes indépendantes, rafales de pertes par un canal Gilbert--Elliott
+à deux états, duplication, gigue, pannes. La documentation MDP~3.0 du CME décrit la même pratique~: traiter les deux flux, prendre chaque numéro de séquence
+sur celui qui arrive en premier, et traiter un trou sur les deux comme une perte qui exige une reprise~; ses messages d'instantané portent le dernier numéro de séquence incrémental traité
+afin qu'un récepteur puisse raccorder les deux.
+
+Dix minutes du flux synthétique du livre~7 passées par la plateforme (\texttt{mx\_exchsim.recovery}), avec des rafales de pertes tirées indépendamment sur chaque ligne et une
+panne de dix secondes sur la ligne B~: sur 5\,793 messages, la ligne A en a perdu 308 et la ligne B 517 (166 d'entre eux pendant la panne)~; en prenant chaque message sur l'une ou l'autre ligne, il en manquait encore 30, et 30 \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{demandes de retransmission} les ont comblés,
+de sorte que le récepteur a eu chaque message. Un instantané pris au milieu de la journée (la plateforme en prenait un toutes les 30 secondes), plus les messages incrémentaux qui le suivent,
+a reconstruit un carnet identique au moteur, dix niveaux de profondeur de chaque côté.
+
+\omcode{code/microstructure/26-build-a-matching-engine-and-exchange-simulator/python/mx_exchsim.py}{118}{123}{Les restes de l'arbitrage entre lignes~: les numéros de séquence qu'aucune ligne n'a livrés, demandés chacun au service de retransmission, dont le paquet MoldUDP64 porte le message manquant.}\label{lst:mx:build-a-matching-engine-and-exchange-simulator:gaps}
+
+\section{Le protocole de saisie des ordres et ses sessions}
+
+Les participants se connectent par des sessions~: un agent en processus en a une par plateforme, avec son propre modèle de latence (délais de saisie, d'accusé de réception et de données, gigue,
+pics)~; un client en direct se connecte au serveur C++20 de cette machine par SoupBinTCP, le protocole de session point à point de Nasdaq au-dessus de TCP (connexion avec un
+numéro de séquence demandé, données séquencées, battements de cœur), et reçoit le flux par multidiffusion en boucle locale. Les sessions portent les règles de la plateforme~: \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{annulation
+à la déconnexion}, groupes d'auto-appariement, limiteurs, et identifiants d'ordre client numérotés par session (un agent multi-plateforme doit rendre les siens uniques entre plateformes,
+comme le routeur du chapitre~18). Les \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{rapports d'exécution} ne vont qu'à la session qui possède l'ordre~; le flux va à tout le monde, et une copie de drop à qui la demande.
+
+\section{Horloge, latence et déterminisme}
+
+Le simulateur est une boucle à événements discrets sur une horloge simulée (livre~7, chapitre~17)~: chaque message, minuterie et contrôle est un événement à un instant en nanosecondes, et les égalités sont départagées
+par un ordre fixe des classes d'événements et par l'ordre d'insertion. Chaque nombre aléatoire (latences, perturbations du flux, flux de fond) provient d'un
+générateur à compteur (livre~4, chapitre~26) indexé par la graine et par son usage, de sorte qu'ajouter un participant ne modifie pas
+les nombres aléatoires que voient les autres. Relancer deux fois la même journée de deux minutes donne les mêmes octets~: le SHA-256 de l'enregistrement de la ligne A et celui du
+journal du moteur coïncident (\texttt{f7ede7cfa7b3\dots}).
+
+Le moteur existe en trois exemplaires~: la référence Python, un moteur C++20 et un moteur Rust. Un jeu d'essai commun (quatre minutes de flux de bande, plus un agent chaotique
+qui envoie chaque type de message et chaque contrôle~: 17\,059 enregistrements de journal) est rejoué par chacun, et chacun doit reproduire la sortie du moteur Python, les messages de flux,
+rapports et instantanés finaux, octet par octet. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés, le moteur Python
+traite le jeu d'essai à environ 60\,000 enregistrements par seconde~; le programme de test C++20 (qui décode aussi et vérifie 4\,866 messages de référence, et compare chaque octet)
+le parcourt à plus de 500\,000 par seconde. Le serveur C++20 en direct sert le même moteur aux clients en local.
+
+\section{Tutoriel~: journée de certification}\label{tut:mx:build-a-matching-engine-and-exchange-simulator:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Négocier sur le simulateur en processus et par son serveur, reprendre un flux avec pertes, et certifier les trois moteurs.
+\textbf{État final~:} les nombres des sections 1, 3 et 5.
+\begin{tutsteps}
+\item \textbf{En processus.} \texttt{Simulator(ExchangeConfig)}, un \texttt{Agent} avec \texttt{on\_report}~; \texttt{mx\_exchsim.scenario()}.
+\item \textbf{Flux.} \texttt{FeedConfig(burst\_loss, outages, snapshot\_every\_ns)}~; \texttt{res.recorded(line)}, \texttt{res.retransmit(venue, seq, count)},
+les instantanés~; \texttt{recovery()}.
+\item \textbf{Déterminisme et identité.} \texttt{determinism()}~; \texttt{code/firm/exchsim/cpp/exchsim\_engine\_test.cpp} et \texttt{cargo test} dans
+\texttt{code/firm/exchsim/rust} sur le jeu d'essai~; \texttt{throughput()}.
+\item \textbf{En direct.} \texttt{code/firm/exchsim/cpp/build.sh}, puis \texttt{bin/exchsim\_server --config cfg.json} et un client SoupBinTCP
+(\texttt{code/firm/exchsim/tests/test\_serve.py} en montre un en Python).
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter l'appariement implicite des calendar spreads (le chapitre~21 le tarifait hors du moteur)~; alimenter le simulateur avec les agents du chapitre~27
+en arrière-plan~; certifier un quatrième moteur par rapport au jeu d'essai.
+\end{tutorial}
+
+\section{Construction~: simulateur de bourse}\label{bld:mx:build-a-matching-engine-and-exchange-simulator:exchsim}
+
+\begin{build}
+\bfield{Rôle} Le lieu de négociation sous-jacent à chaque marché simulé des livres~10 à 13~: appariement, phases et enchères, suspensions, frais, flux, sessions.
+\bfield{Interface}
+\texttt{ExchangeConfig(venue, instruments, fees, phases, halts, throttle, engine\_ns, speed\_bump\_ns, batch\_interval\_ns, feed, faults, reference)}, \texttt{Simulator(venues, sip, seed)} avec \texttt{add\_background}, \texttt{add\_agent}, \texttt{add\_events},
+\texttt{schedule\_call}, \texttt{run}~; \texttt{Result} avec \texttt{tape}, \texttt{feed\_messages}, \texttt{recorded}, \texttt{retransmit},
+\texttt{snapshot\_bytes}, \texttt{reports}, \texttt{sip}~; préréglages~; le moteur, le codec et le serveur en C++20~; le moteur et le codec en Rust (contrat~:
+\texttt{code/firm/INTERFACES.md}, section~7).
+\bfield{Règles} Messages binaires en gros-boutiste générés à partir d'une seule table~; prix exprimés en 1/10\,000 d'unité monétaire~; aléa à compteur indexé par finalité~;
+aucune horloge murale nulle part dans le moteur.
+\bfield{Tests d'acceptation} \texttt{code/firm/exchsim/tests/}~: treize scénarios de règles du moteur~; allers-retours du codec et du schéma~; décodeur du livre~1 sur le
+flux~; déterminisme par empreinte~; le moteur Python face au SHA-256 du jeu de référence~; séquencement, pertes et reprise~; reconstruction à partir d'un instantané~; agents et export de la bande~;
+flux consolidé et plateformes obscures~; les moteurs C++20 et Rust identiques octet par octet sur le jeu de référence~; allers-retours des serveurs Python et C++20.
+\bfield{Pour aller plus loin} Spreads implicites~; une passerelle FIX~; une seconde disposition de flux en Simple Binary Encoding.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, spécification TotalView-ITCH 5.0 ; spécification du protocole MoldUDP64 ; spécification de SoupBinTCP.
+\item CME Group, MDP~3.0: incremental feed arbitration; market data snapshot full recovery (client systems wiki).
+\item FIX Trading Community, Simple Binary Encoding.
+\item E.~N.~Gilbert, ``Capacity of a burst-noise channel'', \emph{Bell System Technical Journal} 39(5), 1960.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:1}
+Un paquet MoldUDP64 porte le numéro de séquence 5\,001 et un compte de 12. Quel numéro de séquence porte le paquet de données suivant~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:2}
+Dans le run de reprise, quelle part des messages chaque ligne a-t-elle perdue, et quelle part les deux lignes ont-elles perdue en commun~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:3}
+Dans le scénario, pourquoi l'annulation à 7 secondes a-t-elle été rejetée, et quel motif recevrait l'annulation d'un ordre inconnu~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:4}
+Pourquoi chaque flux aléatoire doit-il être indexé par sa finalité, et non tiré d'un unique générateur dans l'ordre des événements~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:5}
+Pourquoi la \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{reprise par instantané} a-t-elle besoin du dernier numéro de séquence de l'instantané, et que se passe-t-il sans lui~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:6}
+Que prouve l'identité octet par octet de trois moteurs sur un jeu de référence, et que ne prouve-t-elle pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:7}
+\emph{Programmation.} Lancer la reprise avec l'interruption de la ligne B mais sans perte en rafale sur aucune des deux lignes. Combien de messages chaque ligne perd-elle, et combien de
+\omterm{def:mx:build-a-matching-engine-and-exchange-simulator:feed}{demandes de retransmission} sont-elles nécessaires~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-a-matching-engine-and-exchange-simulator:8}
+\emph{Trouver la faille.} «~Le moteur C++ est huit fois plus rapide que le moteur Python, donc les sessions du simulateur tourneront huit fois plus vite en C++.~»
+\end{exercise}
+
+\section{Problème~: Jour de certification}
+
+\begin{problem}[{Problème du week-end --- jour de certification}]\label{pb:mx:build-a-matching-engine-and-exchange-simulator:1}
+Avant que d'autres équipes s'appuient sur le simulateur, il doit être certifié~: règles, reprise, déterminisme, identité entre implémentations et vitesse.
+
+\medskip\noindent\textbf{Partie I --- Messages.}
+\begin{enumerate}
+\item Définir un \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:sim}{simulateur de bourse}, un \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{protocole de saisie des ordres}, une session et un \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:oe}{rapport d'exécution}.
+\item Énumérer les quatre protocoles et leurs nombres de messages.
+\item Parcourir les rapports du scénario.
+\item Définir la \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{prévention de l'auto-appariement} et l'\omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{annulation à la déconnexion}.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le moteur.}
+\begin{enumerate}[resume]
+\item Comment le moteur alloue-t-il un \omterm{def:mx:the-limit-order-book:tick}{niveau de prix} selon chaque règle~?
+\item Qu'est-ce qui arrête l'appariement~?
+\item Dans quelles phases la plateforme peut-elle se trouver, et qu'est-ce qui désapparie une enchère~?
+\item Comment les politiques \texttt{firm.halts} agissent-elles sur la plateforme~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le flux.}
+\begin{enumerate}[resume]
+\item Décrire un paquet MoldUDP64 et les deux lignes.
+\item Comment les pertes et les interruptions sont-elles tirées~?
+\item Donner les pertes du run de reprise, les trous après arbitrage et les retransmissions.
+\item Comment le carnet a-t-il été reconstruit à partir d'un instantané, et comment l'a-t-on vérifié~?
+\item Que recommande la documentation MDP~3.0 de CME pour ses flux A et B~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Certification.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qui rend le simulateur déterministe~?
+\item Décrire le jeu de référence.
+\item \emph{Énoncer le résultat nommé}~: la suite de conformité réussie par chaque moteur, l'identité octet par octet des flux des trois moteurs sur le jeu de référence, et le
+nombre de messages par seconde des moteurs sur ce portable.
+\item Pourquoi le chiffre du C++ est-il une borne inférieure de la vitesse du moteur~?
+\item Quelles parties du simulateur ne sont pas certifiées par le jeu de référence~?
+\item Que ajouteriez-vous avant qu'une équipe de trading en production l'utilise~?
+\item En une phrase~: pourquoi un simulateur doit-il être déterministe~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:1}
+Comment un gestionnaire de flux se rétablit-il après un trou dans un flux UDP en multidiffusion~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:2}
+Concevriez-vous les structures de données d'un \omterm{def:mx:the-limit-order-book:engine}{moteur d'appariement} en priorité prix-temps avec des annulations rapides~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:3}
+Comment rendriez-vous un simulateur de marché reproductible à l'octet près, aléa compris~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:4}
+Votre ordre IOC a été partiellement exécuté et le reste annulé. Quels rapports recevez-vous, et dans quel ordre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risque}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:5}
+Pourquoi les plateformes proposent-elles l'\omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{annulation à la déconnexion} et la \omterm{def:mx:build-a-matching-engine-and-exchange-simulator:stp}{prévention de l'auto-appariement}, et quels risques chacune de ces protections contrôle-t-elle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:mx:build-a-matching-engine-and-exchange-simulator:6}
+Deux implémentations du même moteur divergent sur un message sur un million. Comment découvririez-vous laquelle a tort~?
+\end{interviewq}

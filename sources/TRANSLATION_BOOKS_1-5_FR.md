@@ -7,7 +7,7 @@ read sentence by sentence, figures sampled, solutions not recomputed.
 | | |
 |---|---|
 | **Model** | `claude-haiku-5-5` (Haiku 5.5, effort medium), pilot method: one headless call per section; glossaries, toolchain port and coordinators `claude-opus-5-5` (Opus 5.5) |
-| Run shape (user ruling 2026-11-09) | The main session ported the toolchain and wrote all five glossaries; then one Opus coordinator agent per book, **at most three at once** (Books 1–3, then 4 and 5 as slots free), each `run.py --workers 3` |
+| Run shape (user ruling 2026-11-09) | The main session ported the toolchain and wrote all five glossaries; then one Opus coordinator agent per book, **at most three at once** (Books 1–3, then 4 and 5 as slots free), each `run.py --workers 3`. **Note (2026-11-10):** the user chose among options the main session framed, all with one coordinator per book; the pilot method has one coordinator for the whole run and no subagents, so this shape broke it and made most of the run's ~13 % of a weekly plan |
 | Terminology (user ruling 2026-11-09) | **Desk usage**: the French term where French practitioners use one, the English word where French desks say it in English; English in parentheses at the definition |
 
 ## What the main session did (Phase 0–1, 2026-11-09)

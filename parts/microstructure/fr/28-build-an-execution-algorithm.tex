@@ -1,0 +1,336 @@
+\chapter{Construction~: un algorithme d'exécution}\label{ch:mx:build-an-execution-algorithm}
+
+Un trader confie à l'algorithme un ordre d'achat de 200\,000 actions avant trois heures, assorti d'un cours limite. Tout ce que ce livre a construit, le calendrier,
+le placement, le routage, la mesure, doit fonctionner simultanément, et continuer de fonctionner lorsque le marché fait quelque chose que la conception n'avait pas prévu~: une suspension, un pic de cours,
+une annulation ordonnée par le desk. Ce chapitre assemble \texttt{firm.execalgo}, un \omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall}, à partir des chapitres 14, 17, 18 et 25, fait passer
+200 \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres parents} dans le marché d'agents du chapitre~27 face à une référence TWAP sur le même flux d'ordres, et mesure les deux avec la boîte à outils du chapitre~19. La
+réponse à la question que se pose tout desk, «~de combien fait-il mieux que le TWAP~?~», s'avère dépendre de l'ordre.
+
+\section{L'algorithme comme machine à états}
+
+Un \omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} (chapitre~16) est un programme qui détient un \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre parent} et décide, sans cesse, quels \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres enfants} doivent se trouver sur le marché.
+Écrit comme une machine à états, il compte peu d'états et beaucoup d'événements (\cref{fig:mx:build-an-execution-algorithm:states})~: un nouvel ordre passe à l'état \emph{en cours}
+à son heure de début et enregistre le milieu à l'arrivée~; il est \emph{suspendu} tant que son titre est arrêté ou suspendu, et reprend dès que la négociation reprend~; il se termine \emph{exécuté}
+lorsqu'il est rempli, \emph{expiré} lorsque son échéance passe avec des actions restantes, ou \emph{annulé} lorsque le desk ou un contrôle de risque l'arrête. Chaque transition et
+chaque refus est consigné dans un journal d'audit avec son heure, l'état et la raison~: ce journal est le moyen par lequel le desk, la conformité et le développeur reconstituent ce que
+l'algorithme a fait et pourquoi.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,st/.style={draw,rounded corners=3pt,minimum width=1.7cm,minimum height=0.65cm,fill=omDef!12},
+  end/.style={st,fill=gray!15},>=stealth]
+\node[st] (n) at (-0.6,0) {nouveau};
+\node[st] (w) at (3.2,0) {en cours};
+\node[st] (p) at (3.2,-2.2) {suspendu};
+\node[end] (d) at (8.4,1.3) {exécuté};
+\node[end] (e) at (8.4,0) {expiré};
+\node[end] (k) at (8.4,-1.3) {annulé};
+\draw[->,thick] (n) -- node[above,align=center] {heure\\de début} (w);
+\draw[->,thick] ([xshift=-4mm]w.south) -- node[left] {arrêt, suspension} ([xshift=-4mm]p.north);
+\draw[->,thick] ([xshift=4mm]p.north) -- node[right] {négociation} ([xshift=4mm]w.south);
+\draw[->,thick] (w) -- node[above,sloped,pos=0.65] {exécution} (d);
+\draw[->,thick] (w) -- node[above] {échéance} (e);
+\draw[->,thick] (w) -- node[above,sloped,pos=0.6] {annulation} (k);
+\draw[->,thick] (p) -- node[below,sloped] {annulation} (k);
+\path[->,thick] (w) edge[loop above,looseness=6] node[above,align=center] {chaque seconde~:\\ calendrier, bande,\\ croisement, affichage} (w);
+\end{tikzpicture}
+
+\omcaption{Les états de l'algorithme. Un ordre en cours vérifie son calendrier chaque seconde~; une suspension ou un arrêt annule ses ordres et arrête l'horloge~; les trois
+états terminaux sont définitifs, et chaque transition est consignée.}\label{fig:mx:build-an-execution-algorithm:states}
+\end{omfigure}
+
+\section{Calendrier, placement et routage conjoints}
+
+Le calendrier est celui du chapitre~14~: la trajectoire d'Almgren--Chriss des positions $x(t) = X \sinh(\kappa(T - t))/\sinh(\kappa T)$, l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} étant donnée sous la forme
+$\kappa T$ (nulle pour une trajectoire rectiligne) par l'interface de l'ordonnanceur de \texttt{firm.acexec} (Almgren et Chriss 2001~; le manuel de Kissell décrit la même
+famille d'\omterm{def:mx:benchmark-algorithms:is}{algorithmes d'implementation shortfall}). Chaque seconde, l'algorithme calcule la quantité que le calendrier prévoit d'avoir exécutée à cet instant
+et celle qu'il prévoit d'avoir exécutée un peu plus tard (20 secondes), et borne les deux par la \omterm{def:mx:build-an-execution-algorithm:band}{bande de participation}.
+
+\begin{definition}[Bande de participation]\label{def:mx:build-an-execution-algorithm:band}
+Une \emph{bande de participation}\index{bande de participation} est une borne inférieure et une borne supérieure sur la part du volume de marché échangé depuis le début
+de l'ordre~: quel que soit son calendrier, l'algorithme négocie au moins assez pour rester au-dessus de la borne inférieure, et jamais assez pour dépasser
+la borne supérieure.
+\end{definition}
+
+\begin{definition}[Prix «~I would~»]\label{def:mx:build-an-execution-algorithm:iwould}
+Un \emph{prix «~I would~»}\index{prix «~I would~»} est un prix, fixé par le trader, à partir duquel, ou à un niveau meilleur, un algorithme doit négocier davantage que ce que
+prévoit son calendrier, jusqu'à sa borne supérieure de participation, car le trader serait ravi de terminer l'ordre à ce prix.
+\end{definition}
+
+Le placement est la leçon du chapitre~17 rendue opérationnelle~: afficher passivement au meilleur cours proche ce que le calendrier prévoit un peu plus loin, et ne franchir la fourchette que pour ce
+dont l'ordre retarde de plus d'une tolérance (20 secondes de calendrier), afin que l'ordre passif ait le temps de s'exécuter avant d'être dépassé. Le croisement passe
+par le balayage du chapitre~18 lorsque le titre se négocie sur plusieurs plateformes~: les cours affichés à la touche éloignée, au meilleur prix d'abord, chaque jambe étant un
+\omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} immediate-or-cancel. Un cours limite plafonne chaque enfant~; un \omterm{def:mx:build-an-execution-algorithm:iwould}{prix «~I would~»} fait passer l'algorithme au bord supérieur de sa bande tant que la touche éloignée offre un prix égal ou
+meilleur.
+
+\omcode{code/firm/execalgo/firm_execalgo.py}{170}{209}{La décision de l'algorithme à chaque seconde~: terminé ou non, l'échéance (croiser ce qui reste, ou faire expirer), le calendrier borné par la bande de participation, le prix «~I would~», un croisement pour ce qui retarde de plus que la tolérance, et un ordre passif unique pour le calendrier à venir.}\label{lst:mx:build-an-execution-algorithm:check}
+
+\section{Limites, suspensions et exceptions}
+
+Chaque \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} passe des contrôles préalables à la négociation avant d'être envoyé~: aucun ne dépasse une taille maximale, aucun prix ne s'écarte du milieu au-delà d'un collar, et jamais le total des ordres
+en cours et exécutés ne dépasse celui de l'\omterm{def:mx:the-almgren-chriss-framework:parent}{ordre parent}. Ce sont là la part de l'algorithme dans les contrôles qu'un courtier doit placer devant le marché.
+
+\begin{dated}{2026-09}{Contrôles d'accès au marché}\label{dat:mx:build-an-execution-algorithm:access}
+La SEC a adopté la Rule 15c3-5 le 3 novembre 2010, mettant fin à l'accès au marché sans filtre. Un broker-dealer disposant d'un accès au marché doit disposer de contrôles raisonnablement
+conçus pour empêcher la saisie d'ordres qui dépassent des seuils de crédit ou de capital préétablis, pris globalement pour chaque client et pour l'établissement lui-même, ainsi que
+des ordres erronés, en rejetant les ordres qui dépassent des paramètres de prix ou de taille, ordre par ordre ou sur une courte période, ou qui indiquent
+des ordres en double (17 CFR 240.15c3-5).
+\end{dated}
+
+\omcode{code/firm/execalgo/firm_execalgo.py}{94}{108}{Les contrôles préalables que passe chaque enfant~: sa taille, son prix au regard d'un collar autour du milieu consolidé, et le total de l'ordre~; un refus est consigné avec sa raison.}\label{lst:mx:build-an-execution-algorithm:controls}
+
+Les exceptions sont déclenchées par le flux de données et par le desk. Un message d'action de négociation qui fait sortir l'état \emph{négociation} (arrêts et suspensions du chapitre~25)
+annule chaque enfant en cours et arrête l'horloge du calendrier~; lorsque la négociation reprend, le calendrier est décalé de la durée de la pause, de sorte que l'ordre ne se précipite
+pas pour rattraper son retard, et il ne perd pas son échéance. Une annulation, envoyée par le desk ou par un moniteur de risque via les appels programmés du simulateur, annule tout et met fin à l'ordre.
+Trois simulations du même achat de 16\,000 actions les illustrent (la \cref{fig:mx:build-an-execution-algorithm:stress}, le \cref{tab:mx:build-an-execution-algorithm:log}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.6cm,height=5.8cm,xlabel={\small secondes depuis le début de l'ordre},ylabel={\small exécutées (milliers d'actions)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},xmin=0,xmax=720,ymin=0,ymax=17,
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.28)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[gray,very thick] table[x=t,y=base]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omDef,very thick] table[x=t,y=halt]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omProp,very thick,dashed] table[x=t,y=spike]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\addplot[omThm,very thick] table[x=t,y=kill]{figdata/microstructure/28-build-an-execution-algorithm/stress.csv};
+\legend{journée normale,suspension de 60 secondes,pic de cours avec cours limite,annulé à 300 s}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Un achat de 16\,000 actions sur dix minutes, à faible \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence}, sur le même flux d'ordres~: une journée normale, une suspension de 200 à 260 secondes, un pic de cours
+provoqué par un autre acheteur avec un cours limite dix \omterm{def:mx:the-limit-order-book:tick}{pas de cotation} au-dessus du milieu d'arrivée, et une annulation à 300 secondes. Données~: \texttt{mx\_execalgo.stress}.}\label{fig:mx:build-an-execution-algorithm:stress}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrll@{}}
+\toprule
+scénario & temps (s) & événement & détail \\
+\midrule
+suspension & 200.0 & suspension & état de négociation H \\
+ & 260.0 & reprise & calendrier décalé de 60 s \\
+ & 661.0 & fin & croisement des 600 dernières actions \\
+ & 662.0 & exécuté & 16\,000 actions exécutées \\
+pic & 252.0 & cours limite & touche éloignée à 100.18, au-delà du cours limite 100.105 \\
+ & 465.0 & cours limite levé & touche éloignée à 100.07 \\
+ & 587.0 & exécuté & 16\,000 actions exécutées \\
+annulation & 299.6 & annulation & 8\,500 sur 16\,000 actions exécutées \\
+\bottomrule
+\end{tabular}
+\caption{Extraits du journal d'audit des trois scénarios sous tension (temps depuis le début de l'ordre). Après l'annulation, 200 actions de plus ont été exécutées~: un \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant}
+déjà en transit au moment où l'annulation a été envoyée. Données~: \texttt{mx\_execalgo.stress}.}\label{tab:mx:build-an-execution-algorithm:log}
+\end{table}
+
+L'ordre suspendu s'est achevé avec une minute de retard, comme prévu, et a coûté 2.62 points de base, contre 2.31 le jour normal. Lors du pic, les 60\,000
+actions d'un autre acheteur ont fait franchir la limite au far touch en douze secondes~; l'algorithme a cessé de croiser pendant 213 secondes et a maintenu son ordre passif à la limite,
+et a coûté 3.79 points de base, contre 4.31 pour le même ordre sans limite. L'ordre interrompu par le kill s'est arrêté à 8\,500 actions et s'est terminé à 8\,700~: un kill
+annule ce qui reste au repos, et non ce qui a déjà été envoyé, ce qui explique pourquoi la position du desk après un kill se lit dans les exécutions, jamais dans l'ordre.
+
+\section{Mesurer la performance}
+
+La mesure est celle du chapitre~19~: l'implementation shortfall (Perold 1988) par rapport au mid d'arrivée, tout compris (frais et rebates inclus), décomposée par
+\texttt{firm.tca} en fourchette, impact (la poussée propre de l'ordre, mesurée sur une copie de la séance sans cet ordre), timing (le mouvement propre du marché) et frais. Cette
+expérience est un test A/B à nombres aléatoires communs~: 200 \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres parents}, quatre tailles (de 4\,000 à 32\,000 actions sur dix minutes, de 2.4~\% à 15.9~\% du
+volume du marché), croisées avec deux \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgences} ($\kappa T$ de 0.5 et 3) et 25 graines, chaque simulation avec l'algorithme complet et avec une référence TWAP de même taille sur la
+même graine (une droite, un \omterm{def:mx:the-limit-order-book:orders}{ordre au marché} toutes les dix secondes jusqu'à atteindre la quantité prévue).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.6cm,xlabel={\small taille de l'ordre (en actions)},ylabel={\small économie par rapport au TWAP (pb)},
+  xtick={0,1,2,3},xticklabels={4\,000,8\,000,16\,000,32\,000},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  xmin=-0.4,xmax=3.4,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,error bars/.cd,y dir=both,y explicit] table[x=k,y=u0,y error=se0]{figdata/microstructure/28-build-an-execution-algorithm/saved.csv};
+\addplot[omThm,very thick,mark=square*,error bars/.cd,y dir=both,y explicit] table[x expr=\thisrow{k}+0.08,y=u1,y error=se1]{figdata/microstructure/28-build-an-execution-algorithm/saved.csv};
+\addplot[gray,dashed,domain=-0.4:3.4] {0};
+\legend{urgence faible ($\kappa T = 0.5$),urgence élevée ($\kappa T = 3$)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'économie tout compris de l'\omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall} par rapport au TWAP sur le même flux d'ordres, selon la taille de l'ordre et l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence}~: la moyenne de 25
+ordres appariés, avec son erreur type. Données~: \texttt{mx\_execalgo.ab\_study}.}\label{fig:mx:build-an-execution-algorithm:saved}
+\end{omfigure}
+
+Sur les 200 ordres, l'algorithme économise $-0.15$ point de base par rapport au TWAP, avec un intervalle à 95~\% de $[-0.44, 0.14]$ groupé par graine~: aucune économie en
+moyenne. La moyenne masque une pente (\cref{fig:mx:build-an-execution-algorithm:saved}). Une régression de l'économie sur le doublement de la taille et une
+indicatrice d'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} élevée donne $1.25 - 0.70\,\log_2(Q/4000) - 0.69\,h$, où $h$ vaut 1 en \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} élevée (erreurs types 0.08, 0.04 et 0.22)~: l'algorithme économise
+1.06 points de base sur les plus petits ordres à faible \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} et perd 1.96 sur les plus grands en \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} élevée, et s'annule vers 13\,700 actions, soit environ 8~\% de
+volume, à faible \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence}.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.6cm,height=5.4cm,ybar,bar width=12pt,ylabel={\small ticks par action},
+  xtick={0,1,2,3},xticklabels={fourchette,impact,timing,frais},tick label style={font=\footnotesize},
+  grid=major,grid style={gray!25},enlarge x limits=0.15,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=is]{figdata/microstructure/28-build-an-execution-algorithm/attribution.csv};
+\addplot[fill=gray!45,draw=gray] table[x=k,y=twap]{figdata/microstructure/28-build-an-execution-algorithm/attribution.csv};
+\legend{algorithme d'implementation shortfall,algorithme TWAP}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Décomposition des coûts des deux bras par \texttt{firm.tca}, moyennés sur les 200 paires (un tick vaut environ un point de base pour un titre à 100~USD). Données~:
+\texttt{mx\_execalgo.ab\_study}.}\label{fig:mx:build-an-execution-algorithm:attr}
+\end{omfigure}
+
+L'attribution en dit la raison (\cref{fig:mx:build-an-execution-algorithm:attr}). Rester au repos dans le carnet rapporte à l'algorithme ce que paie le TWAP~: $-0.15$ ticks de
+fourchette contre $+0.51$, et les rebates contre les frais, $-0.02$ contre $+0.30$. Il le rend en impact, 1.73 ticks contre 0.93~: un achat au repos absorbe les
+ordres de vente qui auraient fait baisser le cours, les croisements de rattrapage arrivent par rafales, et l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} concentre l'ordre en début de parcours dans la mémoire du marché.
+La fourchette et les frais croissent avec le nombre d'actions, l'impact aussi avec la taille de l'ordre, si bien que la conception passive l'emporte sur les petits ordres et perd sur les
+grands ordres. Ce n'est pas un échec de la construction~: c'est la mesure qui indique au desk quels ordres lui confier, et quels paramètres modifier pour les
+autres (une \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} plus faible, une tolérance plus petite, une bande plus large).
+
+\section{Déploiement}
+
+Un nouvel algorithme atteint les clients comme tout modèle (livre~7, chapitre~21)~: d'abord en simulation (ce chapitre), puis sur un canary, une petite part
+du flux propre du desk, avec un critère d'abandon rédigé à l'avance, puis dans un test A/B randomisé face à l'algorithme en place, et seulement ensuite comme valeur par défaut. Le
+dimensionnement du test découle de la dispersion appariée~: l'écart entre les bras a un écart-type de 1.33 points de base par ordre même avec
+des nombres aléatoires communs, donc détecter une économie moyenne de 0.15 avec une puissance de 80~\% au seuil de 5~\% exige $(1.96 + 0.84)^2 \times 1.33^2 / 0.15^2
+\approx 620$ ordres, et les ordres réels, qui ne partagent pas leur marché avec un contrefactuel, en demandent bien davantage. Un effet par ordre qui dépend de la taille
+est plus simple~: stratifier par taille, et tester au sein de la strate où l'algorithme est censé l'emporter.
+
+\section{Tutoriel~: battre le TWAP}\label{tut:mx:build-an-execution-algorithm:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Assembler un \omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall}, le soumettre au marché du chapitre~27 face au TWAP, mesurer les deux avec \texttt{firm.tca},
+et le soumettre à un test de stress. \textbf{État final~:} \cref{tab:mx:build-an-execution-algorithm:log},
+\cref{fig:mx:build-an-execution-algorithm:stress,fig:mx:build-an-execution-algorithm:saved,fig:mx:build-an-execution-algorithm:attr}.
+\begin{tutsteps}
+\item \textbf{Construction.} \texttt{firm\_execalgo.Params(side, qty, start\_s, horizon\_s, urgency, limit, i\_would, band, look\_s, tol\_s)}~;
+\texttt{ISAlgo(params, venues)}~; ses \texttt{.log}, \texttt{.fills}, \texttt{.state}.
+\item \textbf{Lancement.} \texttt{mx\_execalgo.simulate(seed, agents, controls, calls)}, \texttt{run(params, seed)}, les bras \texttt{IS(qty, urgency)} et
+\texttt{TWAP(qty)}.
+\item \textbf{Mesure.} \texttt{ab\_study()}~: les économies appariées, \texttt{firm\_tca.cluster\_ols}, l'attribution~; \texttt{stress()}~; tracer avec
+\texttt{fig\_execalgo.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer la règle de tolérance par le placement en programmation dynamique du chapitre~17~; laisser l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} dépendre de la taille~; acheminer
+les ordres passifs entre plateformes avec l'allocation du chapitre~18~; lancer le test A/B sur les courbes de volume du chapitre~16.
+\end{tutorial}
+
+\section{Construction~: execalgo}\label{bld:mx:build-an-execution-algorithm:execalgo}
+
+\begin{build}
+\bfield{Rôle} L'\omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall} de la maison sur \texttt{firm.exchsim}, pour ce chapitre et pour le travail d'exécution des livres~11 et~13.
+\bfield{Interface} \texttt{Params} (les champs du tutoriel), \texttt{ISAlgo(params, name, venues)} (un agent \texttt{firm.exchsim}~; \texttt{.kill(t\_ns)} pour
+\texttt{Simulator.schedule\_call}), \texttt{shortfall\_bp(side, fills, arrival, qty, last\_mid)}.
+\bfield{Règles} Une décision par seconde~; chaque \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} passe par les contrôles pré-trade~; les suspensions annulent les ordres en cours et arrêtent l'horloge simulée~; les états finaux sont définitifs~; chaque
+transition et refus consignés dans le journal d'audit.
+\bfield{Tests d'acceptation} \texttt{code/firm/execalgo/tests/}~: l'ordre s'achève et l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} le concentre en tête~; le TWAP ne fait que prélever~; une suspension met en pause et décale
+le calendrier~; rien ne se négocie pendant la suspension~; aucune exécution au-delà de la limite~; le collar refuse et consigne~; un kill met fin à l'ordre~; le \omterm{def:mx:build-an-execution-algorithm:iwould}{prix «~I would~»}
+s'exécute en avance sur le calendrier~; un croisement balaie les cotations affichées sur deux plateformes.
+\bfield{Pour aller plus loin} Le placement en programmation dynamique du chapitre~17~; les dark pools en premier~; un calendrier fondé sur une courbe de volume~; un moniteur de risque en temps réel qui envoie le kill.
+\end{build}
+
+\begin{omsources}
+\item R.~Almgren and N.~Chriss, ``Optimal execution of portfolio transactions'', \emph{Journal of Risk} 3(2), 2001.
+\item A.~F.~Perold, ``The implementation shortfall: paper versus reality'', \emph{Journal of Portfolio Management} 14(3), 1988.
+\item R.~Kissell, \emph{The Science of Algorithmic Trading and Portfolio Management}, Academic Press, 2014.
+\item SEC Rule 15c3-5, Risk management controls for brokers or dealers with market access, 17 CFR 240.15c3-5 (adopté dans Release 34-63241, 2010).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:1}
+Un ordre d'achat de 10\,000 actions sur 600 secondes avec $\kappa T = 0$~: combien d'actions doivent être exécutées au bout de 300 secondes
+et, avec une tolérance de 20 secondes, de combien l'algorithme est-il en retard lorsqu'il croise~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:2}
+Le marché a échangé 40\,000 actions depuis le début de l'ordre, dont 8\,000 pour l'algorithme. Avec une bande de 0 à 30~\%, combien d'actions supplémentaires peut-il encore échanger
+avant de négocier davantage~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:build-an-execution-algorithm:3}
+D'après la régression, quelle est l'économie attendue pour un ordre de 16\,000 actions à forte \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence}, et à partir de quelle taille un ordre à faible \omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} atteint-il le seuil de rentabilité~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:4}
+Pourquoi un ordre d'achat passif a-t-il un impact alors qu'il ne croise jamais la fourchette~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:5}
+Pourquoi l'algorithme décale-t-il son calendrier de la durée d'une suspension au lieu de rattraper le retard~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:build-an-execution-algorithm:6}
+Après un kill, l'ordre comptait 200 actions de plus que lorsque le kill a été consigné. Que doivent faire les systèmes du desk à ce sujet~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-execution-algorithm:7}
+\emph{Programmation.} À partir des paires de l'étude, calculer l'économie globale avant prise en compte des frais, et expliquer l'écart avec le chiffre tout compris.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:build-an-execution-algorithm:8}
+\emph{Trouver la faille.} «~Notre nouvel algorithme a battu le TWAP de 1 point de base sur les 200 ordres que nous lui avons confiés le mois dernier, donc il fait économiser 1 point de base à nos clients.~»
+\end{exercise}
+
+\section{Problème~: de combien bat-on le TWAP~?}
+
+\begin{problem}[{Problème du week-end --- de combien bat-on le TWAP~?}]\label{pb:mx:build-an-execution-algorithm:1}
+Le responsable du desk d'exécution veut savoir si le nouvel \omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall} doit remplacer le TWAP comme option par défaut.
+
+\medskip\noindent\textbf{Partie I --- La machine.}
+\begin{enumerate}
+\item Dessiner les états et les transitions de l'algorithme.
+\item Que consigne le journal d'audit, et à l'intention de qui~?
+\item Définir une \omterm{def:mx:build-an-execution-algorithm:band}{bande de participation} et un \omterm{def:mx:build-an-execution-algorithm:iwould}{prix «~I would~»}.
+\item Comment le calendrier, le placement et le balayage sont-ils combinés à chaque seconde~?
+\item Que fait la tolérance, et que se passe-t-il à l'échéance~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Contrôles et exceptions.}
+\begin{enumerate}[resume]
+\item Quels contrôles pré-trade chaque \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} doit-il franchir~?
+\item Qu'exige la Rule 15c3-5 d'un courtier disposant d'un accès au marché~?
+\item Que fait l'algorithme lors d'une suspension, et pourquoi décaler le calendrier~?
+\item Que fait la limite lors du pic, et quelle économie a-t-elle permise~?
+\item Pourquoi l'ordre tué s'est-il terminé avec davantage d'actions qu'au moment du kill~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'expérience.}
+\begin{enumerate}[resume]
+\item Décrire les 200 \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres parents} et la référence TWAP.
+\item Pourquoi faire tourner les deux bras sur les mêmes graines~?
+\item À quoi \texttt{firm.tca} attribue-t-il les coûts~?
+\item \emph{Énoncer le résultat nommé}~: le shortfall économisé par rapport au TWAP, avec son intervalle de confiance, et sa dépendance à l'\omterm{def:mx:the-almgren-chriss-framework:urgency}{urgence} et à la taille de l'ordre.
+\item Pourquoi le dispositif passif l'emporte-t-il sur les petits ordres et perd-il sur les grands~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Combien d'ordres un test A/B en production exigerait-il, et pourquoi davantage qu'en simulation~?
+\item Comment déployer l'algorithme~?
+\item Quels ordres lui confier, et que changer pour les autres~?
+\item Que dire au responsable du desk~?
+\item En une phrase~: de combien bat-il le TWAP~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:build-an-execution-algorithm:1}
+Votre algorithme accuse 30~\% de retard sur le calendrier, à une heure de la clôture, et le titre s'éloigne. Que faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:build-an-execution-algorithm:2}
+Comment structureriez-vous le code d'un \omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} pour qu'il soit testable, et que consigneriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:build-an-execution-algorithm:3}
+Comment mesureriez-vous qu'un nouvel algorithme bat l'ancien, et combien d'ordres vous faut-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risque}]\label{iq:mx:build-an-execution-algorithm:4}
+Quels contrôles pré-trade doivent figurer dans l'algorithme, et lesquels dans une couche que l'algorithme ne peut pas contourner~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{banque}]\label{iq:mx:build-an-execution-algorithm:5}
+Un client demande pourquoi votre \omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall} a coûté plus cher que le TWAP sur ses gros ordres. Que répondez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{ingénieur ML}]\label{iq:mx:build-an-execution-algorithm:6}
+Vous voulez apprendre les paramètres de l'algorithme à partir de son propre historique d'ordres. Quels biais affectent les données, et comment les corriger~?
+\end{interviewq}

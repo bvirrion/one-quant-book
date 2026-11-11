@@ -1,0 +1,269 @@
+\chapter{Exécution au-delà des actions}\label{ch:mx:execution-beyond-equities}
+
+Acheter la même quantité de risque passe par un ordre sur un contrat à terme sur indice, une demande de cotation sur obligations, un flux de prix last look sur devises et
+une plateforme qui ne ferme jamais en crypto-actifs. L'objectif reste le même, le shortfall~; ce sont les règles du marché qui déterminent ce que l'algorithme peut faire. Ce chapitre fait passer un même
+transfert de risque, de 50~millions de dollars, à travers quatre marchés simulés, au moyen d'adaptateurs d'exécution construits à partir des composants de marché des livres~1 à~3, et
+mesure le coût total dans chacun d'eux ainsi que la part de ce coût qu'expliquent les règles propres à ce marché.
+
+Les quatre marchés sont stylisés~: leurs fourchettes, leurs volatilités et leurs volumes (\cref{tab:mx:execution-beyond-equities:markets}) sont des hypothèses
+d'un ordre de grandeur réaliste, choisies pour mettre en évidence les mécanismes, et non des mesures portant sur des instruments particuliers. L'impact de chaque ordre suit la loi en racine carrée
+du chapitre~11, $Y\sigma\sqrt{Q/V}$ avec $Y=0.7$, où $\sigma$ désigne la volatilité quotidienne et $V$ le volume quotidien.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+marché & demi-fourchette (pb) & volatilité quotidienne (pb) & volume quotidien (USD) \\
+\midrule
+contrat à terme sur indice & 0.25 & 100 & 200~milliards \\
+EUR/USD & 0.08 & 50 & 300~milliards \\
+obligation d'entreprise & 5 & 40 & 20~millions \\
+bitcoin (une plateforme) & 0.5 & 300 & 5~milliards \\
+\bottomrule
+\end{tabular}
+\caption{Paramètres des marchés simulés (hypothèses). Données~: \texttt{mx\_xexec.MARKETS}.}\label{tab:mx:execution-beyond-equities:markets}
+\end{table}
+
+\section{Contrats à terme~: un seul carnet, liquidité implicite, roll}
+
+Un contrat à terme sur indice se négocie dans un carnet central unique, avec un tick qui représente souvent l'essentiel de la fourchette et une profondeur qui écrase celle de n'importe quelle action isolée. Les 50~millions de dollars représentent
+200 contrats à 5\,000 points et 50~dollars le point. Son impact est faible (1.11 points de base) et sa fourchette plus réduite encore (0.25). Ce que le contrat à terme ajoute, c'est le roll
+(livre~1, chapitre~21)~: une position détenue au-delà de l'échéance doit être vendue dans l'échéance la plus proche et achetée dans la suivante, et le calendar spread entre
+les deux possède son propre carnet (livre~1, chapitre~19). Les bourses relient les carnets par des prix implicites~: un ordre sur spread peut s'exécuter contre les deux carnets outright à la
+fois (implied in), et les ordres sur spread forment des prix dans les outrights (implied out)~; le CME décrit les ordres implicites comme supprimant le risque de legging, et la
+quantité implicite ne se confronte jamais à une autre quantité implicite.
+
+Pour faire le roll de 200 contrats à travers les carnets de ce chapitre (front 4\,999.75 au cours acheteur pour 150, back 5\,010.25 au cours vendeur pour 100, le carnet du spread à $-10.25$ au cours acheteur pour 60,
+chaque niveau étant adossé à la même taille un tick moins favorable)~: vendre le front et acheter le back en deux ordres coûte 0.44 point par contrat par rapport au
+mid du spread, soit $-10.25$, 0.88 point de base. Vendre le spread dans son propre carnet pour les 60 premiers contrats et exécuter le reste en legging coûte 0.23 point, soit 0.45
+point de base~: deux fois moins. Avec les prix implicites, les 140 derniers contrats s'échangent au même prix qu'en legging, mais en un seul ordre atomique, sans risque que le marché
+bouge entre les deux jambes (\texttt{firm\_xexec.roll}, sur \texttt{firm.match} du livre~1).
+
+\omcode{code/firm/xexec/firm_xexec.py}{76}{88}{Roll d'une position longue sur contrats à terme~: legging à travers les deux carnets outright, vente du spread dans son propre carnet, ou utilisation du carnet que révèlent les prix implicites, puis legging du reliquat.}\label{lst:mx:execution-beyond-equities:roll}
+
+\section{Devises~: flux, last look et agrégation}
+
+\begin{definition}[Agrégateur de liquidité, demande de flux de prix, liquidité ferme]\label{def:mx:execution-beyond-equities:aggregator}
+Un \emph{agrégateur de liquidité}\index{agrégateur de liquidité} rassemble les cotations en streaming de plusieurs fournisseurs de liquidité dans un seul carnet et achemine chaque
+demande vers le meilleur prix. Une \emph{demande de flux de prix}\index{demande de flux de prix} (request for stream, RFS) demande aux fournisseurs de commencer à diffuser des prix exécutables pour une taille donnée
+à destination d'un seul client. La \emph{liquidité ferme}\index{liquidité ferme} (firm liquidity) est une liquidité dont les cotations s'exécutent dès qu'elles sont frappées, sans fenêtre de last look pendant laquelle le fournisseur
+pourrait refuser.
+\end{definition}
+
+Le change se négocie pour l'essentiel de gré à gré, hors bourse, sur les flux des fournisseurs (livre~2, chapitre~15). Le principe~17 du FX Global Code demande aux fournisseurs
+qui ont recours au last look d'être transparents à ce sujet et de l'utiliser comme un contrôle de risque, et non pour collecter de l'information. L'adaptateur envoie les 50~millions de dollars sous forme de 20
+demandes de 2.5~millions de dollars (calendrier linéaire de \texttt{firm.acexec}) à un agrégateur de quatre flux en last look (demi-fourchettes de 0.08 à 0.11
+point de base, délais de maintien de 20 à 80 millisecondes, seuils asymétriques de 0.05 à 0.08 point de base) et à un flux ferme à 0.15. Une demande rejetée perd
+le mouvement qui a provoqué le rejet et passe au flux suivant, au nouveau prix (\texttt{firm.lastlook} du livre~2).
+
+\omcode{code/firm/xexec/firm_xexec.py}{101}{113}{Une demande passée par l'agrégateur~: le flux le moins cher d'abord~; chaque rejet, après son délai de maintien, coûte au client le mouvement que le fournisseur a refusé d'honorer, et la demande passe au suivant.}\label{lst:mx:execution-beyond-equities:fx}
+
+Sur 2\,000 ordres simulés, les rejets représentent 7.7~\% des demandes, et le coût moyen de l'agrégateur s'élève à 0.087 point de base, contre
+0.080 pour le meilleur cours affiché~: le last look coûte ici 0.007 point de base, et l'agrégateur bat malgré tout le flux ferme (0.15). Le coût du last look n'apparaît pas dans la fourchette
+que voit le client, mais dans les mouvements qu'il rend sur les demandes qu'il perd~; Oomen (2017) a analysé cette pratique en détail. Avec un impact de 0.45 point de base
+le coût total en change s'établit à 0.54 point de base, le plus bas des quatre.
+
+\begin{dated}{2026-09}{Comment le change se négocie}\label{dat:mx:execution-beyond-equities:bis}
+La BIS Triennial Survey d'avril 2025 a constaté que le trading électronique représentait 59~\% du volume du change, une part voisine de celle de l'enquête précédente, et a relevé que
+les clients recourant au trading électronique multi-dealer avec divulgation pouvaient, en théorie, choisir entre plus de 15 plateformes (BIS Quarterly Review, décembre 2025).
+\end{dated}
+
+\section{Obligations~: demandes de cotation et listes de portefeuille}
+
+\begin{definition}[Prix de transfert de risque]\label{def:mx:execution-beyond-equities:rtp}
+Un \emph{prix de transfert de risque}\index{prix de transfert de risque} est un prix auquel un dealer prend en principal un bloc entier d'un seul coup, en facturant le coût et
+le risque de son débouclage, au lieu de l'exécuter en agent.
+\end{definition}
+
+Une obligation d'entreprise ne se négocie que quelques fois par jour~: 50~millions de dollars représentent deux jours et demi du volume de cette obligation, et un ordre exécuté sur une journée ferait bouger le
+prix de 44.3 points de base selon la loi en racine carrée, en plus d'une demi-fourchette de 5 points de base. Le client demande plutôt aux dealers un \omterm{def:mx:execution-beyond-equities:rtp}{prix de transfert de risque} par
+demande de cotation (RFQ) (livre~2, chapitre~22). L'adaptateur le calcule avec \texttt{firm.rfq} du livre~2~: chaque dealer cote la valeur diminuée d'une marge (ici
+49.3 points de base que le dealer prévoit de payer pour le débouclage), plus un terme privé dont la dispersion vaut 8 points de base (son inventaire et ses axes)~; chaque dealer qui
+voit la demande et perd coûte au client 1.5 points de base de \omterm{def:mx:dark-pools-and-blocks:leakage}{fuite d'information}. Interroger un seul dealer coûte 49.3~; en interroger trois, 45.5 (6.8 de concurrence moins 3.0
+de fuite)~; au-delà, la fuite croît plus vite que la concurrence, si bien que trois est le meilleur choix. Hendershott et Madhavan (2015) ont montré que ces enchères électroniques unilatérales
+constituent une source de liquidité viable, même pour des obligations peu échangées.
+
+\section{Crypto-actifs~: en continu, limites de débit et jambes on-chain}
+
+Le bitcoin se négocie sur de nombreuses plateformes et dans des teneurs de marché automatisés (AMM), à toute heure de tous les jours. Sur une seule plateforme, avec les paramètres de ce chapitre, 50~
+millions de dollars coûtent 0.5 point de base de fourchette et 21.0 d'impact. Un pool à produit constant (livre~3, chapitre~20) disposant de 1~milliard de dollars de chaque côté et
+d'une commission de 5 points de base offre une autre jambe~: son prix évolue selon $xy=k$ à mesure que l'ordre retire des coins. L'adaptateur envoie $x$ au pool et le reste à
+la plateforme, et choisit $x$ pour minimiser la somme, le prix du pool partant du mid de la plateforme (\texttt{cex\_amm\_split}, sur le
+\texttt{firm.amm} du livre~3, en arithmétique entière)~: le meilleur choix consiste à envoyer 1.375~millions de dollars au pool, ce qui fait économiser 0.36 point de base. Le pool est bon marché pour les premiers dollars et cher pour
+le reste~: son coût marginal croît deux fois plus vite que son coût moyen.
+
+Les limites de débit d'une plateforme (livre~3, chapitre~15) bornent ce que l'algorithme peut envoyer~: les limites publiées par une grande plateforme au comptant autorisent 100 ordres en dix
+secondes. Douze \omterm{def:mx:the-almgren-chriss-framework:parent}{ordres enfants} en une heure sont loin de ce plafond~; 120 en une seconde sont refusés (\texttt{orders\_allowed} sur
+\texttt{firm.ratelimit} du livre~3). Les limites de débit ne contraignent que les stratégies qui cotent et annulent, pas des calendriers comme celui-ci~; le marché ouvert en permanence ne
+supprime pas le profil de volume de la journée, il déplace les heures creuses vers la nuit.
+
+\section{Un ordre, quatre marchés}
+
+Le \Cref{tab:mx:execution-beyond-equities:allin} met en regard les quatre exécutions.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}rr>{\centering\arraybackslash}p{1.9cm}rp{4.6cm}@{}}
+\toprule
+marché & fourchette & impact & règle du marché & coût total & la règle \\
+\midrule
+contrat à terme sur indice & 0.25 & 1.11 & 0.45 & 1.81 & roll par le carnet du spread (legging~: 0.88) \\
+EUR/USD & 0.08 & 0.45 & 0.007 & 0.54 & rejets en last look \\
+obligation d'entreprise & --- & 49.27 & $-3.77$ & 45.50 & RFQ à trois dealers \\
+bitcoin & 0.50 & 21.00 & $-0.36$ & 21.14 & une jambe de pool \\
+\bottomrule
+\end{tabular}
+\caption{Le coût total (points de base) de l'achat de 50~millions de dollars de risque dans les quatre marchés simulés, et la part de ce coût que chaque règle de marché
+explique. Pour l'obligation, la marge du dealer tient lieu de fourchette et d'impact. Données~: \texttt{mx\_xexec.table}.}\label{tab:mx:execution-beyond-equities:allin}
+\end{table}
+
+La règle explique un quart du coût du contrat à terme (le roll, 25~\%), 1.3~\% de celui de la devise, et elle fait économiser 8.3~\% de celui de l'obligation (la concurrence nette
+de la \omterm{def:mx:dark-pools-and-blocks:leakage}{fuite d'information}) et 1.7~\% de celui du bitcoin. Les coûts eux-mêmes couvrent deux ordres de grandeur, et la raison tient à la profondeur du marché par rapport à l'ordre, non à ses
+règles~: les mêmes 50~millions de dollars ne sont qu'une erreur d'arrondi sur le contrat à terme sur indice, et deux jours de volume sur l'obligation. Un \omterm{def:mx:benchmark-algorithms:is}{algorithme d'implementation shortfall}
+(chapitre~16) écrit pour l'ordonnanceur de \texttt{firm.acexec} peut piloter les quatre marchés au moyen d'adaptateurs~; ce qui change, c'est ce qu'est un «~\omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant}~»~:
+un \omterm{def:mx:the-limit-order-book:orders}{ordre à cours limité}, une \omterm{def:mx:execution-beyond-equities:aggregator}{demande de flux de prix}, une enchère entre dealers, ou un swap contre un pool.
+
+\section{Tutoriel~: un ordre, quatre marchés}\label{tut:mx:execution-beyond-equities:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Exécuter le même transfert de risque à travers quatre adaptateurs d'exécution et décomposer chaque coût total en fourchette, impact et règle du marché.
+\textbf{État final~:} \cref{tab:mx:execution-beyond-equities:allin} et les nombres des sections~1 à~4.
+\begin{tutsteps}
+\item \textbf{Contrats à terme.} \texttt{firm\_xexec.roll(front, back, spread, lots, tick)} sur \texttt{firm.match}, avec son \texttt{Quote}~; \texttt{mx\_xexec.futures()}.
+\item \textbf{Change.} \texttt{LP}, \texttt{fx\_child}, \texttt{children(notional, scheduler, n)}~; \texttt{fx()}.
+\item \textbf{Obligations.} \texttt{rfq(n, markup, sigma, leak)}~; \texttt{bonds()}.
+\item \textbf{Cryptomonnaies.} \texttt{amm\_cost\_bp}, \texttt{cex\_amm\_split}, \texttt{orders\_allowed}~; \texttt{crypto()}~; \texttt{table()}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer la marge de l'obligation par un modèle du débouclage propre au dealer~; donner aux flux de change un last look symétrique~; acheminer
+l'ordre sur bitcoin entre deux plateformes et le pool.
+\end{tutorial}
+
+\section{Construction~: adaptateurs d'exécution}\label{bld:mx:execution-beyond-equities:xexec}
+
+\begin{build}
+\bfield{Rôle} La couche propre aux marchés, sous l'\omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} du chapitre~28~: un seul ordonnanceur, plusieurs façons de négocier une tranche.
+\bfield{Interface} \texttt{Market(name, half\_spread\_bp, sigma\_day\_bp, adv, y)}, \texttt{sqrt\_impact\_bp},
+\texttt{children(notional, scheduler, n)}, \texttt{roll(front, back, spread, lots, tick)}, \texttt{LP(name, half\_bp, hold\_ms, threshold\_bp, policy)},
+\texttt{fx\_child(lps, sigma, rng)}, \texttt{rfq(n, markup, sigma, leak)}, \texttt{amm\_cost\_bp}, \texttt{cex\_amm\_split},
+\texttt{orders\_allowed(governor, horizon\_ms, n)}.
+\bfield{Règles} Coûts en points de base du notionnel par rapport au milieu de départ~; les adaptateurs composent les composants des livres~1 à~3 au lieu de les recopier.
+\bfield{Tests d'acceptation} \texttt{code/firm/xexec/tests/}~: le roll sur les livres du chapitre et l'implied-in au prix de legging~; le coût d'un flux de la firme
+est sa demi-fourchette, et un flux qui rejette toujours transmet la demande~; le coût du last look par rapport à la formule du livre~2~; la décomposition de la RFQ s'additionne~; une petite
+transaction sur pool paie les frais~; la répartition fait économiser~; la frontière de la limite de débit.
+\bfield{Pour aller plus loin} Contrats à terme dans \texttt{firm.exchsim} avec appariement implicite~; last look symétrique~; plusieurs pools et plateformes.
+\end{build}
+
+\begin{omsources}
+\item Global Foreign Exchange Committee, \emph{FX Global Code}, principe~17 (last look).
+\item R.~Oomen, «~Last look~», \emph{Quantitative Finance} 17(7), 2017.
+\item T.~Hendershott et A.~Madhavan, «~Click or call~? Auction versus search in the over-the-counter market~», \emph{Journal of Finance} 70(1),
+2015.
+\item CME Group, Globex matching algorithms and implied orders (wiki des systèmes clients).
+\item BIS, «~The FX trade execution landscape through the prism of the 2025 BIS Triennial Survey~», \emph{BIS Quarterly Review}, décembre 2025.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:1}
+Calculer l'impact de 50~millions de dollars sur le contrat à terme sur indice et sur l'obligation par la loi en racine carrée avec les paramètres du tableau.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:2}
+Vérifier à partir des livres le coût de legging du roll de 0.44 point par contrat.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:mx:execution-beyond-equities:3}
+Quel est le coût de l'obligation par demande de cotation auprès d'un, deux et quatre dealers~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:4}
+Pourquoi la liquidité implicite n'améliore-t-elle pas le prix du roll ici, et qu'améliore-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:5}
+Pourquoi un agrégateur de flux à last look peut-il être moins cher qu'un flux de la firme, et quand ne le serait-il pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:mx:execution-beyond-equities:6}
+Pourquoi le pool n'absorbe-t-il que 1.4~million de dollars de l'ordre sur bitcoin~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:execution-beyond-equities:7}
+\emph{Programmation.} Avec une \omterm{def:mx:dark-pools-and-blocks:leakage}{fuite d'information} de 3 points de base par dealer perdant au lieu de 1.5, combien de dealers le client doit-il interroger, et combien coûte l'obligation~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:mx:execution-beyond-equities:8}
+\emph{Trouver la faille.} «~Notre algorithme de change a payé 0.08 point de base en moyenne~: exactement le meilleur cours de l'agrégateur, donc le last look ne nous a rien coûté.~»
+\end{exercise}
+
+\section{Problème~: un ordre, quatre marchés}
+
+\begin{problem}[{Problème du week-end --- un ordre, quatre marchés}]\label{pb:mx:execution-beyond-equities:1}
+Un fonds multi-actifs doit ajouter 50~millions de dollars de risque et peut le faire sur un contrat à terme sur indice, une devise, une obligation d'entreprise ou du bitcoin. Le desk demande ce que
+coûte chacune d'elles, et pourquoi.
+
+\medskip\noindent\textbf{Partie I --- Contrats à terme.}
+\begin{enumerate}
+\item Pourquoi l'impact d'un contrat à terme est-il si faible pour cet ordre~?
+\item Décrire les prix implied-in et implied-out.
+\item Donner le coût du roll par legging et à travers le carnet de spread.
+\item Qu'apporte le carnet implicite~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Change.}
+\begin{enumerate}[resume]
+\item Définir un agrégateur, une \omterm{def:mx:execution-beyond-equities:aggregator}{demande de flux de prix} (request for stream, RFS) et la \omterm{def:mx:execution-beyond-equities:aggregator}{liquidité ferme}.
+\item Que demande le principe~17 du FX Global Code au sujet du last look~?
+\item Comment l'adaptateur modélise-t-il un rejet, et combien coûte-t-il~?
+\item Donner le taux de rejet et le coût du last look.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Obligations et cryptomonnaies.}
+\begin{enumerate}[resume]
+\item Définir un \omterm{def:mx:execution-beyond-equities:rtp}{prix de transfert de risque}.
+\item Décomposer le coût de la RFQ à trois dealers en marge, concurrence et \omterm{def:mx:dark-pools-and-blocks:leakage}{fuite d'information}.
+\item Pourquoi trois dealers est-il le meilleur nombre ici~?
+\item Comment l'ordre sur bitcoin se répartit-il entre la plateforme et le pool, et que fait-il économiser~?
+\item Quand les limites de débit d'une plateforme deviennent-elles contraignantes~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- La comparaison.}
+\begin{enumerate}[resume]
+\item \emph{Énoncer le résultat nommé}~: le coût total tout compris du même transfert de risque sur les contrats à terme, le FX, les obligations et la crypto dans le simulateur, et la part de ce coût qu'explique la règle de chaque marché.
+la règle propre à chaque marché l'explique.
+\item Pourquoi les coûts s'étendent-ils sur deux ordres de grandeur~?
+\item Qu'est-ce qu'un \omterm{def:mx:the-almgren-chriss-framework:parent}{ordre enfant} sur chaque marché~?
+\item Comment construiriez-vous un seul algorithme qui négocie les quatre~?
+\item Quelle hypothèse du chapitre vérifieriez-vous en premier face aux données réelles~?
+\item Que dit l'encadré daté sur la manière dont le FX est négocié~?
+\item En une phrase~: qu'est-ce qui change lorsqu'un \omterm{def:mx:benchmark-algorithms:algo}{algorithme d'exécution} quitte le livre des actions~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{trader}]\label{iq:mx:execution-beyond-equities:1}
+Vous devez faire rouler une position importante en contrats à terme. Comment vous y prenez-vous, et que peut-il mal tourner~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:mx:execution-beyond-equities:2}
+Un fournisseur de liquidité rejette 10~\% de vos demandes de cotation en FX. Comment calculez-vous ce que cela vous coûte~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:execution-beyond-equities:3}
+Combien de teneurs de marché un client doit-il interroger pour obtenir un prix sur une obligation d'entreprise, et de quoi dépend la réponse~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:mx:execution-beyond-equities:4}
+Concevez une interface d'adaptateur d'exécution qui permet à un seul ordonnanceur de négocier des actions, des flux de prix FX et des demandes de cotation (RFQ).
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:mx:execution-beyond-equities:5}
+Comment répartiriez-vous un gros ordre en crypto entre une plateforme centralisée et un pool AMM~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{banque}]\label{iq:mx:execution-beyond-equities:6}
+Un client demande à votre banque un \omterm{def:mx:execution-beyond-equities:rtp}{prix de transfert de risque} sur 50 millions de dollars d'une obligation qui se traite à hauteur de 20 millions de dollars par jour. Comment fixez-vous ce prix~?
+\end{interviewq}

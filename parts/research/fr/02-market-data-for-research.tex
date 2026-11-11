@@ -1,0 +1,440 @@
+\chapter{Données de marché pour la recherche}\label{ch:rs:market-data-for-research}
+
+Deux chercheurs mesurent la volatilité d'une même action le même jour à partir de rendements à la seconde. L'un utilise les prix des transactions,
+l'autre les mid, et la variance du premier est 3.6 fois celle du second. Échantillonnés toutes les cinq minutes, les deux résultats concordent à 2~\% près.
+Aucun des deux chercheurs n'a commis d'erreur~; chacun a choisi une représentation du marché, et toute représentation conserve une partie de ce qui
+s'est produit et détruit le reste. Ce chapitre porte sur ces choix~: ce qu'un flux de messages enregistre, les horloges selon lesquelles un
+flux de transactions est découpé en \omterm{def:rs:market-data-for-research:bar}{barres}, ce que perdent respectivement les prix de transaction, les mid et les \omterm{def:rs:market-data-for-research:bar}{barres}, comment un historique continu se construit à partir
+de contrats à terme qui expirent, et quelle quantité de données tout cela représente. Ses données sont une journée de marché simulée par le simulateur de marché du livre,
+construite dans ce chapitre, et neuf années de prix de règlement-livraison des contrats à terme sur le pétrole brut.
+
+\section{Ce que contient un flux de messages}
+
+Le livre~1, chapitre~28, a décrit les niveaux de données de marché~: les meilleurs prix (niveau 1), la profondeur par prix (niveau 2)
+et le carnet ordre par ordre (niveau 3), avec les horodatages de bourse et de réception, les numéros de séquence et les conditions de transaction. Un entrepôt de recherche
+part du plus riche d'entre eux, un flux ordre par ordre, parce que toute vue plus grossière peut être reconstruite à partir de lui et qu'aucune vue plus fine
+ne peut être reconstruite à partir d'une vue plus grossière.
+
+Le simulateur du livre, \texttt{firm.tape}, écrit trois types de messages dans le style du flux TotalView-ITCH de Nasdaq (le tableau
+ci-dessous). Un ordre est ajouté avec un identifiant, un côté, un prix et une quantité~; il est ensuite annulé en totalité ou en partie, ou exécuté
+contre un ordre entrant. Les transactions ne sont pas des faits distincts~: ce sont les exécutions, et le côté de l'agresseur est l'opposé de
+celui de l'ordre au repos. La journée simulée utilisée tout au long du chapitre compte 1\,555\,872 messages et 55\,542 transactions, soit 28 messages par
+transaction~: la plupart des messages sont des cotations placées puis retirées sans jamais donner lieu à une transaction.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.4cm}p{7.2cm}@{}}
+\toprule
+type & champs & signification \\
+\midrule
+\texttt{A} ajout & heure, identifiant, côté, prix, quantité & un ordre à cours limité rejoint la fin de la file à son prix \\
+\texttt{X} annulation & heure, identifiant, quantité & une partie ou la totalité d'un ordre au repos est retirée \\
+\texttt{E} exécution & heure, identifiant, quantité, agresseur, identifiant de transaction & un ordre au repos est exécuté par un ordre entrant~; une ligne par ordre au repos exécuté \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le mécanisme du simulateur est assez simple pour tenir en un paragraphe, et chaque chapitre ultérieur qui l'utilise s'appuie dessus. Un
+prix efficient, que personne n'observe, saute d'un ou deux pas de cotation à des instants aléatoires. Les fournisseurs de liquidité ajoutent des ordres aux dix meilleurs
+niveaux de chaque côté et les annulent à un rythme régulier, plus vite lorsque le prix efficient a traversé leur niveau. Les traders de bruit
+envoient des ordres au marché dont les arrivées se regroupent (un processus de Hawkes, voir le livre~4, chapitre~7) et dont les signes persistent,
+car la plupart sont des fragments d'ordres parents plus importants. Les traders informés envoient des ordres au marché en direction du prix efficient lorsque le
+mid en est éloigné. Un niveau d'activité aléatoire, persistant sur plusieurs minutes, et un profil intrajournalier en U font varier ensemble tous ces
+taux, et une rafale d'annonces en milieu de séance accélère le mouvement du prix efficient pendant quatre-vingt-dix secondes. Le simulateur
+enregistre la vérité que les données réelles dissimulent~: le prix efficient, et quelles transactions étaient informées.
+
+\begin{dated}{2026-09}{Quelle est la taille d'une journée de données ordre par ordre~?}\label{dat:rs:market-data-for-research:itch}
+Nasdaq publie sur un serveur public des fichiers d'exemple de journées complètes de son flux TotalView-ITCH 5.0. Les fichiers compressés (gzip) pour
+des journées isolées de 2019 et du début de 2020 pèsent de 3.5 à 5.6 milliards d'octets (30 janvier 2019~: 4.8~Go~; 30 janvier 2020~: 5.6~Go)~; les
+fichiers publiés entre août 2025 et juin 2026 pèsent de 4.7 à 17.9~Go. Il s'agit du flux d'une seule bourse, pour chaque action qu'elle négocie, pour
+une journée, compressé.
+\end{dated}
+
+\section{Horloges d'échantillonnage}
+
+Une stratégie qui ne négocie pas à chaque message observe le marché à travers des \omterm{def:rs:market-data-for-research:bar}{barres}~: des synthèses des transactions comprises entre deux
+instants. Ces instants sont fixés par une horloge, et celle-ci n'a pas besoin d'être l'horloge murale.
+
+\begin{definition}[Barre, barre temporelle, barre de ticks, barre de volume, barre de montant, VWAP]\label{def:rs:market-data-for-research:bar}
+Une \emph{barre}\index{barre} résume une suite de transactions consécutives par ses prix d'ouverture, plus haut, plus bas et de clôture, son volume, sa valeur
+échangée et son nombre de transactions. Une \emph{barre temporelle}\index{barre temporelle} couvre un intervalle fixe de temps d'horloge murale~; une \emph{barre de
+ticks}\index{barre de ticks} un nombre fixe de transactions~; une \emph{barre de volume}\index{barre de volume} se ferme à la transaction où son volume cumulé
+atteint un seuil, et une \emph{barre de montant}\index{barre de montant} (dollar bar) se ferme à la transaction où sa valeur échangée cumulée atteint le sien.
+Le \emph{prix moyen pondéré par les volumes}\index{prix moyen pondéré par les volumes} (VWAP) d'un ensemble de transactions est $\sum_i p_iq_i/\sum_i q_i$.
+\end{definition}
+
+\begin{definition}[Barre de déséquilibre]\label{def:rs:market-data-for-research:imbalance}
+Une \emph{barre de déséquilibre}\index{barre de déséquilibre} se ferme lorsque la somme en valeur absolue des signes de transaction depuis son début, $|\theta| =
+|\sum b_i|$, atteint un seuil fixé à partir des \omterm{def:rs:market-data-for-research:bar}{barres} déjà fermées~: le nombre espéré de transactions par \omterm{def:rs:market-data-for-research:bar}{barre} multiplié par
+l'espérance du déséquilibre absolu par transaction (\omterm{def:rs:market-data-for-research:bar}{barre} de déséquilibre de ticks de López de Prado), minorée par la racine carrée du nombre espéré de transactions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=1.25cm,y=0.22cm]
+\draw[->,>=Stealth] (0,0) -- (10.4,0) node[right] {temps};
+\foreach \x/\h in {0.3/2,0.5/1,0.7/3,0.9/2,1.1/1,1.3/2,2.6/1,4.2/1,5.8/2,6.1/3,6.3/2,6.5/1,6.7/2,6.9/3,7.1/1,8.8/1,9.5/2}
+  \draw[omDef,line width=1.6pt] (\x,0) -- (\x,\h*2);
+\foreach \x in {2,4,6,8} \draw[black!60,dashed] (\x,-3.5) -- (\x,8.5);
+\draw[omThm,very thick] (0.7,-8.5) -- (0.7,-4.5) (2.6,-8.5) -- (2.6,-4.5) (6.1,-8.5) -- (6.1,-4.5) (6.9,-8.5) -- (6.9,-4.5);
+\node[black!70,anchor=west] at (0,10) {horloge temporelle~: une barre toutes les deux unités};
+\node[omThm,anchor=west] at (0,-10.5) {horloge de volume~: une barre chaque fois que six unités de volume ont été échangées};
+\node[omDef,anchor=west] at (7.2,10) {transactions (hauteur = quantité)};
+\end{tikzpicture}
+
+\omcaption{Les mêmes dix-sept transactions découpées par deux horloges. L'horloge temporelle ferme cinq intervalles égaux (en pointillés)~: trois presque
+vides, l'une contient la rafale initiale, l'autre celle de la rafale entre $t = 6$ et 7. L'horloge de volume (en trait plein, en bas) ferme quatre
+\omterm{def:rs:market-data-for-research:bar}{barres}~: deux courtes à l'intérieur des rafales, qui se terminent en 0.7 et 6.9, et deux longues qui absorbent les périodes calmes~; les trois
+dernières transactions attendent la \omterm{def:rs:market-data-for-research:bar}{barre} suivante.}\label{fig:rs:market-data-for-research:schematic}
+\end{omfigure}
+
+Le plancher est nécessaire en pratique. Lorsque les achats et les ventes se compensent, le déséquilibre espéré par transaction est proche de zéro, et il en va de même du
+seuil, et chaque transaction fermerait une \omterm{def:rs:market-data-for-research:bar}{barre}~; la racine carrée de $\E[T]$ est le niveau qu'une marche aléatoire de signes atteint pour la première fois après
+environ $\E[T]$ transactions.
+
+Pourquoi échantillonner selon l'activité plutôt que selon le temps~? Parce que la variance d'une variation de prix croît avec la quantité de transactions qui la sous-tend,
+et que ces transactions sont inégalement réparties.
+
+\begin{proposition}[Les barres temporelles sont un mélange de variances]\label{prop:rs:market-data-for-research:mixture}
+Supposons que, étant donné le volume $V$ échangé dans une \omterm{def:rs:market-data-for-research:bar}{barre}, le rendement logarithmique de la \omterm{def:rs:market-data-for-research:bar}{barre} soit $\mathcal N(0, \sigma^2V)$. Alors le kurtosis des
+rendements des \omterm{def:rs:market-data-for-research:bar}{barres temporelles} est
+\[
+\frac{\E[r^4]}{\E[r^2]^2} = \frac{3\,\E[V^2]}{\E[V]^2} = 3\bigl(1 + \mathrm{CV}(V)^2\bigr),
+\]
+avec $\mathrm{CV}$ le coefficient de variation des volumes des \omterm{def:rs:market-data-for-research:bar}{barres}, tandis que les \omterm{def:rs:market-data-for-research:bar}{barres} de même volume ont des rendements gaussiens.
+\end{proposition}
+
+\begin{proof}
+$\E[r^2] = \sigma^2\E[V]$ et $\E[r^4] = 3\sigma^4\E[V^2]$ en conditionnant sur $V$. Une \omterm{def:rs:market-data-for-research:bar}{barre de volume} a un $V$ constant, à un dépassement près dû à la
+dernière transaction.
+\end{proof}
+
+Clark (1973) a proposé cette subordination des prix au volume des transactions pour expliquer les rendements quotidiens à queue épaisse, et Ané et Geman
+(2000) ont constaté que les rendements échantillonnés sur une horloge du nombre de transactions étaient proches de la loi gaussienne. Le jour simulé, les \omterm{def:rs:market-data-for-research:bar}{barres} d'une minute
+dont les volumes ont un coefficient de variation de 0.94, de sorte que la proposition prédit un kurtosis de 5.67~; les rendements des mid d'une minute
+ont un kurtosis de 5.44, et les rendements de clôture à clôture de 5.47. Les \omterm{def:rs:market-data-for-research:bar}{barres} découpées par les autres horloges, avec le même nombre de \omterm{def:rs:market-data-for-research:bar}{barres} dans la journée (environ
+390), ont des kurtosis de 3.58 (tick), 4.04 (volume) et 3.92 (montant)~: pas 3, parce que dans le simulateur la volatilité suit le
+niveau d'activité et non exactement le volume, mais on en est bien plus proche. Les horloges événementielles concentrent leurs \omterm{def:rs:market-data-for-research:bar}{barres} là où les transactions ont lieu
+(la \cref{fig:rs:market-data-for-research:clocks})~: entre 2 et 42 \omterm{def:rs:market-data-for-research:bar}{barres} par quart d'heure, contre un rythme stable de 15 pour l'horloge temporelle.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xlabel={minutes après l'ouverture},ylabel={barres par quart d'heure},
+  tick label style={font=\small},label style={font=\small},xmin=0,xmax=390,ymin=0,ymax=45,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!60,very thick,const plot mark mid] table[x=minute,y=time]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[omDef,very thick,const plot mark mid] table[x=minute,y=volume]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[omThm,thick,dashed,const plot mark mid] table[x=minute,y=tick]{figdata/research/02-market-data-for-research/clocks.csv};
+\addplot[black,thin,sharp plot] coordinates {(210,0) (210,45)};
+\legend{barres temporelles,barres de volume,barres de ticks}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:rs:market-data-for-research:bar}{Barres} fermées par quart d'heure sur la journée simulée, chaque horloge découpant environ 390 \omterm{def:rs:market-data-for-research:bar}{barres}. L'horloge temporelle ferme 15 \omterm{def:rs:market-data-for-research:bar}{barres}
+à chaque quart d'heure~; les horloges de volume et de ticks suivent l'activité~: nourries après l'ouverture, calmes au milieu de la journée,
+nourries autour de la rafale d'annonces à la minute 210 (ligne verticale) et avant la clôture. Les \omterm{def:rs:market-data-for-research:bar}{barres de montant} coïncident avec les \omterm{def:rs:market-data-for-research:bar}{barres de volume} à cette
+échelle. Données~: \texttt{firm.tape}, la journée du chapitre, graine fixée.}\label{fig:rs:market-data-for-research:clocks}
+\end{omfigure}
+
+\section{Ce que chaque représentation détruit}
+
+\begin{definition}[Série des mid]\label{def:rs:market-data-for-research:midquote}
+Une \emph{série des mid}\index{série des mid} est le prix milieu $\tfrac12(b_t + a_t)$ échantillonné à des instants choisis, chaque valeur étant le
+dernier mid à l'instant d'échantillonnage ou avant lui (un échantillon as-of).
+\end{definition}
+
+Un prix de transaction vaut le mid plus ou moins la moitié de la fourchette, selon l'initiateur de la transaction. Échantillonné trop finement, il rebondit.
+
+\begin{proposition}[Le rebond ajoute une demi-fourchette au carré par rendement]\label{prop:rs:market-data-for-research:bounce}
+Soit le prix de transaction $p = m + \tfrac s2 b$, avec une fourchette constante $s$ et des signes de transaction $b = \pm1$ indépendants entre eux et
+du mid. Entre deux transactions, $\E[(\Delta p)^2] = \E[(\Delta m)^2] + s^2/2$.
+\end{proposition}
+
+\begin{proof}
+$\Delta p = \Delta m + \tfrac s2(b_2 - b_1)$, et $\E[(b_2 - b_1)^2] = 2$ lorsque les signes sont indépendants et de moyenne nulle.
+\end{proof}
+
+C'est le modèle de Roll, dont l'estimateur de la fourchette est dérivé au livre~4, chapitre~21~; le signature plot de ce même chapitre trace la
+variance réalisée en fonction de l'intervalle d'échantillonnage. Ici, le graphique répond à l'accroche
+(la \cref{fig:rs:market-data-for-research:signature}). À une seconde, la variance du prix de transaction de la journée vaut 0.83 (en pour cent au
+carré) et celle du mid 0.23~; à cinq minutes, elles valent 0.84 et 0.85. Le prix de transaction surestime à haute fréquence, comme l'annonce la
+proposition. Le mid, lui, sous-estime, pour une raison que la proposition ne voit pas~: dans le simulateur, comme sur les marchés réels, le mid
+rattrape le prix efficient par paliers, une cotation périmée à la fois, de sorte que ses rendements à court horizon sont positivement
+autocorrélés et que leurs carrés s'additionnent pour donner moins que la variance sur des horizons plus longs. Aucune de ces deux séries n'est le prix efficient.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=10cm,height=5.2cm,xlabel={intervalle d'échantillonnage (secondes)},ylabel={variance réalisée (\%$^2$)},
+  tick label style={font=\small},label style={font=\small},xmin=1,xmax=900,ymin=0,ymax=1.2,grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=seconds,y=trade]{figdata/research/02-market-data-for-research/signature.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.2pt] table[x=seconds,y=mid]{figdata/research/02-market-data-for-research/signature.csv};
+\legend{dernier prix de transaction,mid}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Signature plot de la journée simulée~: variance réalisée des log-rendements en fonction de l'intervalle d'échantillonnage, à partir des prix de transaction
+et à partir des mid. À une seconde, 0.83 contre 0.23~; à partir d'environ une minute, les deux s'accordent, et le bruit
+de l'estimation sur une seule journée domine. Données~: \texttt{firm.tape}, la journée du chapitre, graine fixée.}\label{fig:rs:market-data-for-research:signature}
+\end{omfigure}
+
+Le rebond n'est qu'une perte parmi d'autres, et un entrepôt de recherche doit savoir laquelle chaque représentation subit~:
+\begin{itemize}
+\item \emph{Les prix de transaction} portent le rebond, et les transactions marquées de conditions particulières (lots irréguliers, comptes rendus hors séquence,
+prix d'enchères, corrections tardives~: livre~1, chapitre~28) se mêlent aux transactions ordinaires. Le prix de l'enchère d'ouverture est un prix auquel un
+volume important s'est échangé à un instant unique~; le traiter comme une transaction parmi d'autres fausse la première \omterm{def:rs:market-data-for-research:bar}{barre} de chaque journée.
+\item \emph{Les mid} ne voient ni ce qui a été échangé ni en quelle quantité, et, lorsque la fourchette est large, le mid peut bouger sans aucune transaction.
+\item \emph{Les \omterm{def:rs:market-data-for-research:bar}{barres}} perdent l'ordre des événements à l'intérieur de la \omterm{def:rs:market-data-for-research:bar}{barre}, le carnet d'ordres, et tous les événements entre deux échantillons~; le plus haut et le plus bas conservent une
+trace du chemin suivi, que les estimateurs d'étendue du chapitre~7 exploitent.
+\item \emph{Les \omterm{def:rs:market-data-for-research:bar}{barres temporelles} sur plusieurs instruments} sont alignées dans le temps mais pas dans l'information~: la dernière transaction d'un instrument peu liquide
+peut dater de plusieurs minutes (transactions non synchrones et effet Epps, livre~4, chapitre~21).
+\item \emph{Toute série horodatée par une seule horloge} masque l'écart entre l'horodatage de la bourse et l'instant où les données
+sont arrivées~; un backtest doit utiliser le second (chapitre~3).
+\end{itemize}
+
+\section{Séries continues de contrats à terme}
+
+Un contrat à terme arrive à échéance, et son successeur se négocie à un autre prix. Un historique assez long pour la recherche doit raccorder des
+contrats successifs, et ce raccordement est un choix.
+
+\begin{definition}[Série continue de contrats à terme, ajustement rétroactif, ajustement proportionnel]\label{def:rs:market-data-for-research:continuous}
+Une \emph{série continue de contrats à terme}\index{série continue de contrats à terme} suit le contrat que détiendrait une position selon une règle de roll~:
+le contrat le plus proche jusqu'à une date de roll quelques jours avant son dernier jour de négociation, puis le contrat suivant. L'\emph{ajustement rétroactif}\index{ajustement rétroactif} (back-adjustment)
+ajoute, à chaque prix antérieur à un roll, l'écart entre le nouveau et l'ancien contrat à la date de roll, de sorte que la série n'ait aucun
+saut au roll et que ses derniers prix sont réels. L'\emph{ajustement proportionnel}\index{ajustement proportionnel} (ratio adjustment) multiplie chaque prix antérieur par
+le rapport entre le prix du nouveau contrat et celui de l'ancien à la date de roll, à la place.
+\end{definition}
+
+\begin{proposition}[Ce que préserve chaque ajustement]\label{prop:rs:market-data-for-research:adjust}
+L'\omterm{def:rs:market-data-for-research:continuous}{ajustement proportionnel} préserve les rendements en pourcentage de la position roulée à chaque jour~; l'\omterm{def:rs:market-data-for-research:continuous}{ajustement rétroactif} préserve ses
+variations de prix, le profit d'un contrat. Aucun des deux ne préserve les niveaux de prix passés, et les prix ajustés rétroactivement peuvent être négatifs.
+\end{proposition}
+
+\begin{proof}
+Entre deux dates de roll, les deux ajustements agissent sur les prix du contrat détenu par une constante~: une constante additive laisse les différences
+inchangées, une constante multiplicative laisse les rapports inchangés. Au passage d'une date de roll, l'ajustement est choisi de sorte que la variation de prix du nouveau contrat
+(ou le rendement) soit enregistrée, et non le saut entre contrats. Les constantes additives s'accumulent avec les écarts de roll et peuvent dépasser
+un prix passé.
+\end{proof}
+
+Les règlements-livraisons des contrats à terme sur pétrole brut publiés par la US Energy Information Administration rendent ce choix concret
+(\cref{fig:rs:market-data-for-research:wti}). Du 2 janvier 2015 au 5 avril 2024, le contrat le plus proche est passé de USD~52.69 à
+USD~86.91 le baril, en hausse de 65~\%. Une position longue, roulée cinq jours de négociation avant chacune des 111 échéances de la période, comme doit le faire un
+fonds détenant le contrat le plus proche, a perdu 27~\%~: la plupart de ces années étaient en contango, et chaque roll vendait un contrat moins cher pour
+acheter un contrat plus cher (le rendement de roll, dans le livre~3, chapitre~10). La série ajustée proportionnellement raconte l'histoire du fonds~; son premier prix est
+USD~118.33. La série ajustée rétroactivement commence à USD~70.23 et, la backwardation de 2021--2023 ayant rendu négatifs les
+écarts ultérieurs, atteint $-5.89$ le 21 avril 2020, jour où le contrat détenu réellement (juin 2020) a réglé à USD~11.57. La série
+brute du contrat le plus proche affiche $-37.63$ le 20 avril 2020, soit le règlement d'un contrat arrivant à échéance qu'aucune position roulée ne détenait.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={année},ylabel={USD par baril},tick label style={font=\small},
+  label style={font=\small},xmin=2015,xmax=2024.3,ymin=-40,ymax=130,grid=major,grid style={gray!25},
+  xtick={2015,2016,2017,2018,2019,2020,2021,2022,2023,2024},xticklabels={2015,2016,2017,2018,2019,2020,2021,2022,2023,2024},
+  scaled x ticks=false,legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[black!45,thin] table[x=year,y=front]{figdata/research/02-market-data-for-research/wti.csv};
+\addplot[omDef,thick] table[x=year,y=ratio]{figdata/research/02-market-data-for-research/wti.csv};
+\addplot[omThm,thick,dashed] table[x=year,y=back]{figdata/research/02-market-data-for-research/wti.csv};
+\legend{contrat le plus proche (tel que publié),ajusté proportionnellement,ajusté rétroactivement}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Contrats à terme sur pétrole brut WTI, 2015 à avril 2024~: le contrat le plus proche tel que publié (avec $-37.63$ le 20 avril 2020), et
+série continue roulée cinq jours de négociation avant chaque échéance, ajustée proportionnellement (partant de 118.33) et ajustée rétroactivement (partant de
+70.23, négative en avril 2020). Les trois séries se terminent au même prix. Données~: US Energy Information Administration, règlements-livraisons NYMEX,
+contrats 1 et 2.}\label{fig:rs:market-data-for-research:wti}
+\end{omfigure}
+
+\begin{remark}[Quelle série pour quelle question]\label{rem:rs:market-data-for-research:which}
+Rendements d'une stratégie roulée~: série ajustée proportionnellement. Profit d'un nombre fixe de contrats~: différences de la série ajustée rétroactivement. Un signal sur
+niveaux de prix (une moyenne mobile du prix, une cassure au-dessus d'un plus haut passé)~: aucune des deux sans précaution, car les deux réécrivent le passé
+à chaque roll~; calculer le signal sur le contrat détenu à ce moment-là. La forme de la courbe (carry, livre~8)~: les contrats non ajustés,
+jamais une série ajustée.
+\end{remark}
+
+\section{Volumes, stockage et formats}
+
+Une journée simulée d'un instrument de 1.56 million de messages à 36 octets (la taille d'un message ITCH add-order) représente 56~Mo avant
+compression~; l'encadré daté montre ce que pèse une journée complète de bourse. Trois règles permettent de garder un entrepôt de recherche exploitable.
+
+\begin{method}[Stocker les données de marché pour la recherche]\label{met:rs:market-data-for-research:store}
+\begin{enumerate}
+\item Conserver les messages bruts tels que reçus, immuables, avec leurs deux horodatages, partitionnés par date et par instrument~; chaque table
+dérivée (carnets, \omterm{def:rs:market-data-for-research:bar}{barres}, variables) est reconstruite à partir d'eux par du code versionné.
+\item Stocker les tables dérivées dans un format en colonnes, compressé, et les partitionner selon la manière dont elles sont lues~: par date pour
+les analyses en coupe transversale, par instrument pour les analyses de séries temporelles.
+\item Consigner pour chaque table dérivée la version du code, les partitions brutes qu'elle a lues et ses paramètres (l'horloge, le
+seuil, la règle de roll), afin qu'un résultat puisse nommer les données exactes qu'il a utilisées (chapitre~29).
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: une journée, quatre horloges}\label{tut:rs:market-data-for-research:clocks}
+
+\begin{tutorial}
+\textbf{Objectif.} Simuler une journée de négociation, la découper selon quatre horloges et mesurer ce que chaque horloge et chaque prix font aux rendements.
+\textbf{État final~:} les \cref{fig:rs:market-data-for-research:clocks,fig:rs:market-data-for-research:signature}~; kurtosis de 5.47 (temps),
+3.58 (tick), 4.04 (volume), 3.92 (montant)~; le ratio de variance à une seconde, égal à 3.6.
+\begin{tutsteps}
+\item \textbf{La journée.} \texttt{simulate(TapeConfig(seconds=23\,400, u\_shape=1.5, news\_at=12\,600, seed=3))} renvoie les
+messages, les transactions, le meilleur niveau du carnet après chaque message et le prix efficient (environ 10 secondes).
+\item \textbf{\omterm{def:rs:market-data-for-research:bar}{Barres} à seuil.} Une \omterm{def:rs:market-data-for-research:bar}{barre} se clôt sur la transaction qui franchit le seuil~; les transactions ne sont jamais scindées entre deux \omterm{def:rs:market-data-for-research:bar}{barres}.
+\omcode{code/firm/bars/firm_bars.py}{65}{90}{Les barres de volume et de montant se clôturent sur la transaction qui franchit le seuil.}\label{lst:rs:market-data-for-research:cuts}
+\item \textbf{Deux prix, une journée.} Échantillonner la dernière transaction et le mid sur des grilles de 1 à 900 secondes et sommer les carrés
+des rendements logarithmiques~; comparer le kurtosis à la prédiction du mélange issue des volumes des \omterm{def:rs:market-data-for-research:bar}{barres}.
+\omcode{code/research/02-market-data-for-research/python/rs_marketdata.py}{45}{78}{Variance réalisée à partir des transactions et des mid~; le kurtosis du mélange.}\label{lst:rs:market-data-for-research:rv}
+\item \textbf{Exécuter} \texttt{summary()} et \texttt{fig\_marketdata.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Poser \texttt{act\_vol=0} (sans activité aléatoire) et observer le kurtosis des \omterm{def:rs:market-data-for-research:bar}{barres temporelles} décroître vers la
+valeur du mélange de la seule forme en U~; découper des \omterm{def:rs:market-data-for-research:imbalance}{barres de déséquilibre} et suivre leur longueur au fil de la journée (exercice~7).
+\end{tutorial}
+
+\section{Construction~: le simulateur de marché et les constructeurs de barres}\label{bld:rs:market-data-for-research:tape}
+
+\begin{build}
+\bfield{Rôle} Les données intrajournalières standard de ce livre, avec la vérité jointe~: \texttt{firm.tape} écrit un flux ordre par ordre
+à partir d'un mécanisme connu (prix efficient, flux informé et flux de bruit, annulations de cotations périmées)~; \texttt{firm.bars} transforme les transactions
+en \omterm{def:rs:market-data-for-research:bar}{barres}. Les chapitres 8 à 10 mesurent des prédicteurs sur le tape, le chapitre~18 le rejoue, le chapitre~19 négocie contre lui.
+\bfield{Interface} \texttt{TapeConfig} (durée, tick, niveaux, taux, paramètres de Hawkes et de métaordres, fréquence des sauts
+du prix efficient, fenêtre d'annonce, profil intrajournalier, processus d'activité, graine)~; \texttt{simulate(cfg, v\_path)} renvoyant un \texttt{Tape} de
+tableaux structurés \texttt{msgs}, \texttt{trades} (avec les vrais signes et un indicateur d'information), \texttt{top}, et les trajectoires \texttt{v\_t},
+\texttt{v}, \texttt{act}~; \texttt{simulate\_pair(cfg, latency)}~; \texttt{Book().apply(msg)}. \texttt{time\_bars},
+\texttt{tick\_bars}, \texttt{volume\_bars}, \texttt{dollar\_bars}, \texttt{imbalance\_bars}, \texttt{vwap}, \texttt{asof},
+\texttt{continuous(c1, c2, expiry, days\_before)}.
+\bfield{Règles} Déterministe pour une graine. Les taux sont constants par morceaux entre deux événements, sauf l'intensité de Hawkes, simulée exactement
+par amincissement. Le carnet d'ouverture est un instantané à l'instant zéro. Les prix sont exprimés en nombres entiers de ticks, les tailles en nombres entiers d'actions.
+\bfield{Tests d'acceptation} \texttt{code/firm/tape/tests/} et \texttt{code/firm/bars/tests/}~: sortie identique pour une graine~;
+les messages reconstruisent le meilleur niveau enregistré du carnet à chaque étape et le carnet ne se croise jamais~; les exécutions égalent les transactions~; le mid suit
+le prix efficient~; agrégé sur six graines, le déséquilibre prédit le mouvement du mid suivant et les transactions informées font perdre de l'argent au
+côté passif, tandis que les transactions de bruit le paient~; les \omterm{def:rs:market-data-for-research:bar}{barres} se clôturent sur la transaction de franchissement~; un roll vérifié à la main.
+\bfield{Pour aller plus loin} Plusieurs instruments partageant un facteur dans leurs prix efficients~; des enchères à l'ouverture et à la clôture~; un portage en C++20
+de la boucle d'événements.
+\end{build}
+
+\begin{omsources}
+\item P.~K.~Clark, ``A subordinated stochastic process model with finite variance for speculative prices'',
+\emph{Econometrica} 41(1), 1973.
+\item T.~Ané et H.~Geman, ``Order flow, transaction clock, and normality of asset returns'', \emph{Journal of Finance} 55(5),
+2000.
+\item D.~Easley, M.~López de Prado et M.~O'Hara, ``The volume clock: insights into the high-frequency paradigm'',
+\emph{Journal of Portfolio Management} 39(1), 2012.
+\item M.~López de Prado, \emph{Advances in Financial Machine Learning}, Wiley, 2018, chapitre 2 (barres guidées par l'information).
+\item R.~Roll, ``A simple implicit measure of the effective bid--ask spread in an efficient market'', \emph{Journal of Finance}
+39(4), 1984.
+\item Nasdaq, spécification de \emph{TotalView-ITCH 5.0}, et les fichiers d'exemple sur \texttt{emi.nasdaq.com}.
+\item US Energy Information Administration, prix des contrats à terme NYMEX, contrats sur pétrole brut 1--4 (quotidiens).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:1}
+Transactions de 300 actions à 20.00, 500 à 20.02 et 200 à 19.99. Quel est leur VWAP~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:2}
+Une action cotée à USD~20 présente une fourchette d'un cent, se négocie 20\,000 fois par jour et affiche une volatilité quotidienne vraie de 2~\%. D'après
+la \cref{prop:rs:market-data-for-research:bounce}, quelle volatilité quotidienne la somme des carrés des rendements logarithmiques transaction à transaction affiche-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:rs:market-data-for-research:3}
+Un flux représente en moyenne 40 octets par message, et un instrument actif émet 1.5 million de messages par jour. Quelle quantité brute de données produisent
+5\,000 instruments de ce type sur une année de 252 jours~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:4}
+Les volumes à la minute ont un coefficient de variation de 0.8. Quelle kurtosis prédit la \cref{prop:rs:market-data-for-research:mixture}
+pour les rendements à la minute~? Quel coefficient de variation donne une kurtosis de 6~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:5}
+Le contrat de l'échéance la plus proche se règle à 70, 71 et 72 sur trois jours, et le suivant à 73, 74 et 76~; la position est transférée lors du roll à la clôture du
+deuxième jour. Donner la série détenue, puis celle issue de l'\omterm{def:rs:market-data-for-research:continuous}{ajustement rétroactif} (back-adjustment) et celle de l'\omterm{def:rs:market-data-for-research:continuous}{ajustement proportionnel} (ratio adjustment).
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:rs:market-data-for-research:6}
+Une action se négociait à USD~10 en 2015 et à USD~100 en 2025, pour une même valeur échangée chaque jour. Un seuil de \omterm{def:rs:market-data-for-research:bar}{barres de volume} exprimé en
+actions donne combien de \omterm{def:rs:market-data-for-research:bar}{barres} par jour en 2015 par rapport à 2025~? Et pour un seuil de \omterm{def:rs:market-data-for-research:bar}{barres de montant} (dollar bars)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:market-data-for-research:7}
+\emph{Programmation.} Découper la journée du chapitre en \omterm{def:rs:market-data-for-research:imbalance}{barres de déséquilibre}, à partir d'un nombre attendu de 142 transactions par \omterm{def:rs:market-data-for-research:bar}{barre}. Combien de \omterm{def:rs:market-data-for-research:bar}{barres} se ferment, combien
+de transactions contiennent-elles en moyenne, et quelle est la kurtosis de leurs rendements des mid~? Pourquoi les \omterm{def:rs:market-data-for-research:bar}{barres} se resserrent-elles au fil de la journée~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:rs:market-data-for-research:8}
+\emph{Trouver la faille.} «~Notre signal de carry est le rapport logarithmique annualisé entre la série du deuxième mois à \omterm{def:rs:market-data-for-research:continuous}{ajustement rétroactif} et
+la série de l'échéance la plus proche à \omterm{def:rs:market-data-for-research:continuous}{ajustement rétroactif}, et notre signal de tendance est la variation en pourcentage de cette dernière sur
+douze mois.~»
+\end{exercise}
+
+\section{Problème~: Quelle horloge~?}
+
+\begin{problem}[{Problème du week-end --- une journée, quatre horloges et deux prix}]\label{pb:rs:market-data-for-research:1}
+La journée simulée du chapitre~: 6.5 heures, un profil en U, un niveau d'activité aléatoire et une rafale de nouvelles à 12\,600 secondes, graine 3.
+
+\medskip\noindent\textbf{Partie I --- Le flux.}
+\begin{enumerate}
+\item Combien de messages et de transactions compte la journée, et combien de messages par transaction~?
+\item Quelle est, à peu près, la part des ajouts, des annulations et des exécutions parmi les messages, et pourquoi les ajouts
+et les annulations sont-ils presque égaux~?
+\item Quelle est la taille brute de la journée à 36 octets par message~?
+\item Pourquoi un entrepôt de recherche conserve-t-il les messages plutôt que les \omterm{def:rs:market-data-for-research:bar}{barres}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Horloges.}
+\begin{enumerate}[resume]
+\item Combien de \omterm{def:rs:market-data-for-research:bar}{barres} chaque horloge découpe-t-elle, avec des seuils choisis pour environ 390~?
+\item Quelles sont les kurtosis des rendements clôture à clôture pour les quatre horloges~?
+\item Quel est le coefficient de variation des volumes des \omterm{def:rs:market-data-for-research:bar}{barres} d'une minute, et quelle kurtosis la proposition relative au mélange
+prédit-elle pour elles~?
+\item Pourquoi les kurtosis des horloges événementielles sont-elles supérieures à 3~?
+\item Où dans la journée se concentrent les \omterm{def:rs:market-data-for-research:bar}{barres de volume}, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Prix.}
+\begin{enumerate}[resume]
+\item Quelles sont les variances réalisées à partir des transactions et des mid, à 1, 5, 60 et 300 secondes~?
+\item Quel effet rend la série des transactions trop élevée à une seconde~?
+\item Lequel rend la \omterm{def:rs:market-data-for-research:midquote}{série des mid} trop basse~?
+\item À partir de quel intervalle les deux séries concordent-elles à moins de 5~\%~?
+\item Quel estimateur employer pour évaluer la variance de la journée à partir des données à la seconde (livre~4, chapitre~21)~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Jugement.}
+\begin{enumerate}[resume]
+\item Quelle horloge retenir pour une estimation de la volatilité quotidienne, et laquelle pour un modèle des mouvements de prix à court terme~?
+\item Qu'est-ce qu'une \omterm{def:rs:market-data-for-research:bar}{barre temporelle} d'une minute perd et qu'une \omterm{def:rs:market-data-for-research:bar}{barre de volume} conserve~?
+\item Qu'est-ce qu'une \omterm{def:rs:market-data-for-research:bar}{barre de volume} perd et qu'une \omterm{def:rs:market-data-for-research:bar}{barre temporelle} conserve~?
+\item Énoncer le \emph{résultat nommé}~: la kurtosis des rendements des \omterm{def:rs:market-data-for-research:bar}{barres temporelles} d'une minute, comparée à celle des rendements des \omterm{def:rs:market-data-for-research:bar}{barres de montant} sur la journée, et le
+rapport de variance transactions/mid à une seconde~?
+\item Qu'est-ce qui, dans le simulateur, rend les \omterm{def:rs:market-data-for-research:bar}{barres temporelles} à queue épaisse, et qu'est-ce qui la supprimerait~?
+\item En une phrase~: quelle représentation est «~le~» prix~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, trader}]\label{iq:rs:market-data-for-research:1}
+Pourquoi pourriez-vous échantillonner les prix selon le volume plutôt que selon le temps~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:rs:market-data-for-research:2}
+Votre volatilité réalisée calculée sur les prix des transactions à la seconde est le double de celle calculée sur les prix à cinq minutes. Que se passe-t-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:rs:market-data-for-research:3}
+Comment construiriez-vous une \omterm{def:rs:market-data-for-research:continuous}{série continue de contrats à terme} pour un backtest de suivi de tendance, et qu'est-ce qui ne va pas avec les prix à \omterm{def:rs:market-data-for-research:continuous}{ajustement rétroactif}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:rs:market-data-for-research:4}
+Concevez le stockage d'une année de données ordre par ordre pour 5\,000 instruments, à usage de recherche.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:rs:market-data-for-research:5}
+Le modèle d'un collègue utilise des \omterm{def:rs:market-data-for-research:bar}{barres} d'une minute sur cinquante actions. Qu'est-ce qui peut aller de travers parce que ces \omterm{def:rs:market-data-for-research:bar}{barres} sont temporelles~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:rs:market-data-for-research:6}
+Montrez que si les rendements sont gaussiens conditionnellement au volume échangé, les rendements des \omterm{def:rs:market-data-for-research:bar}{barres temporelles} ont une kurtosis de $3(1 + \mathrm{CV}^2)$.
+\end{interviewq}

@@ -28,6 +28,12 @@ $out_dir = 'build';
     'one_quant_book_03_markets_3_fr.tex',
     'one_quant_book_04_methods_fr.tex',
     'one_quant_book_05_derivatives_fr.tex',
+    # French pilot editions (2026-11-11)
+    'one_quant_book_06_rates_credit_risk_fr.tex',
+    'one_quant_book_07_research_fr.tex',
+    'one_quant_book_08_strategies_1_fr.tex',
+    'one_quant_book_09_strategies_2_fr.tex',
+    'one_quant_book_10_microstructure_fr.tex',
 );
 # Many TikZ/pgfplots figures exceed pdfTeX's default main memory.
 $pdflatex = 'pdflatex -cnf-line=main_memory=12000000 -cnf-line=extra_mem_top=6000000 -cnf-line=extra_mem_bot=6000000 -interaction=nonstopmode -halt-on-error %O %S';
