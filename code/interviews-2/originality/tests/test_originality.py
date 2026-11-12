@@ -46,9 +46,15 @@ def shingles(toks: list[str]) -> set[tuple[str, ...]]:
     return out
 
 
+def is_translation(f: pathlib.Path) -> bool:
+    """A file under a language directory (parts/<book>/fr/, parts/<book>/solutions/fr/) is a translation of an English
+    file the gate already reads: comparing French with French would flag the target language's common phrases."""
+    return any(len(part) == 2 and part.isalpha() and part.islower() for part in f.relative_to(REPO / "parts").parts[1:-1])
+
+
 def our_texts():
     for f in sorted(OURS.rglob("*.tex")):
-        if f.name == "tracks.tex":
+        if f.name == "tracks.tex" or is_translation(f):
             continue
         for m in OUR_ENV.finditer(f.read_text(encoding="utf-8")):
             yield f.relative_to(REPO), m.group(2)
@@ -57,6 +63,8 @@ def our_texts():
 def book_texts():
     for book in sorted(p for p in (REPO / "parts").iterdir() if p.is_dir() and not p.name.startswith("interviews")):
         for f in sorted(book.rglob("*.tex")):
+            if is_translation(f):
+                continue
             for m in ENV.finditer(f.read_text(encoding="utf-8")):
                 yield f"{f.relative_to(REPO)}", m.group(2)
 
