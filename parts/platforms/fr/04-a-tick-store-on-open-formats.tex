@@ -1,0 +1,424 @@
+\chapter{Une base de ticks sur des formats ouverts}\label{ch:pl:a-tick-store-on-open-formats}
+
+À 16~h~05, les fichiers de capture de la journée se ferment. À 16~h~40, ils doivent être compactés, triés et interrogeables, car la recherche nocturne
+commence à 17~h~00, et un chercheur qui demande la cotation en vigueur avant chacune des transactions de cette semaine ne doit pas remarquer
+quels jours proviennent des fichiers écrits pendant la séance et lesquels de l'historique compacté. Une semaine dans la vie d'une telle base
+est l'objet de ce chapitre~: cinq jours simulés traversent la capture, une \omterm{def:pl:a-tick-store-on-open-formats:split}{base intrajournalière} écrite au fil de la séance, un compactage à la
+clôture, une \omterm{def:pl:a-tick-store-on-open-formats:split}{base historique} de fichiers colonnaires partitionnés, et une couche de requête unique au-dessus des deux. Le quatrième jour, les cotations gagnent un
+champ, et la base doit continuer à fonctionner. Rien ici n'exige de base de données propriétaire~: la base est construite à partir des formats ouverts du
+chapitre~3, d'un moteur de requête embarqué et d'une bibliothèque de dataframes, avec un fichier plat projeté en mémoire pour les données les plus sollicitées, lu de la même
+façon depuis Python, C++ et Rust (\texttt{firm.tickstore}).
+
+\section{Capture en direct~: fichiers en ajout seul}
+
+\begin{definition}[Base de ticks, fichier en ajout seul]\label{def:pl:a-tick-store-on-open-formats:store}
+Une \emph{base de ticks}\index{base de ticks} (tick store) est le système qui conserve les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} d'une société de trading et répond aux requêtes sur elles, depuis la séance en cours
+jusqu'à l'année la plus ancienne conservée. Un \emph{fichier en ajout seul}\index{fichier en ajout seul} (append-only file) est un fichier dont le writer ajoute des octets
+uniquement à sa fin et ne modifie jamais ce qu'il a déjà écrit, de sorte qu'un lecteur peut exploiter chaque enregistrement complet déjà présent pendant que le writer
+poursuit son écriture.
+\end{definition}
+
+Pendant la séance, la base écrit les données au fur et à mesure de leur arrivée~: dans l'ordre temporel, sans tri, sans compression ni
+indexation. Les événements du chapitre~2 --- l'heure de réception suivie de l'événement de 48~octets du feed handler --- sont écrits dans un fichier plat de
+enregistrements de largeur fixe~; les cotations et les transactions qui en sont dérivées (le meilleur niveau du carnet après chaque modification, issu du constructeur de carnet (book builder) du livre~13,
+et chaque exécution avec son prix) sont écrites dans des flux Arrow IPC, le format colonnaire en mémoire du chapitre~3, sous forme d'une suite de
+lots d'enregistrements.
+
+\begin{definition}[Format de fichier plat, version de schéma]\label{def:pl:a-tick-store-on-open-formats:flat}
+Un \emph{format de fichier plat}\index{format de fichier plat} (flat file format) range des enregistrements d'une même largeur fixe les uns après les autres, après un en-tête qui
+décrit leur disposition, de sorte que l'enregistrement $i$ se trouve à un décalage calculable et qu'il n'est besoin d'analyser aucune donnée pour l'atteindre. La
+\emph{version de schéma}\index{version de schéma} (schema version) de l'en-tête identifie la disposition~; un lecteur refuse une version qu'il ne connaît pas.
+\end{definition}
+
+Le fichier plat de la base (\cref{fig:pl:a-tick-store-on-open-formats:flat}) commence par un nombre magique, la version, la largeur
+des enregistrements et la disposition au format JSON, complétés jusqu'à 64~octets afin que chaque enregistrement qui suit soit aligné de la même manière~; les enregistrements de la version~1 font
+56~octets, la version~2 ajoute une plateforme, des indicateurs et un remplissage pour atteindre 64. Le \Cref{lst:pl:a-tick-store-on-open-formats:flat} présente l'écrivain et
+le lecteur.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{55}{83}{Le fichier plat~: un en-tête versionné complété à 64~octets, des enregistrements ajoutés
+à la fin, et un lecteur qui projette les enregistrements en mémoire au lieu de les lire.}\label{lst:pl:a-tick-store-on-open-formats:flat}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.55cm,inner sep=2pt,align=center}]
+\node[f,fill=gray!15,minimum width=1.0cm] (m) at (0.5,0) {OQTS};
+\node[f,fill=gray!15,minimum width=1.3cm,anchor=west,font=\tiny] (v) at (m.east) {v, largeur};
+\node[f,fill=gray!10,minimum width=3.1cm,anchor=west,font=\tiny] (s) at (v.east) {schéma JSON, remplissage};
+\foreach \i/\c in {0/omDef,1/omMeth,2/omDef,3/omMeth,4/omDef} {\node[f,fill=\c!18,minimum width=1.2cm,anchor=west] at (5.4+\i*1.2,0) {enr.~\i};}
+\node at (11.8,0) {\dots};
+\draw[decorate,decoration={brace,amplitude=4pt}] (0,0.35) -- (5.4,0.35) node[midway,above=4pt]{en-tête~: multiple de 64~octets};
+\draw[decorate,decoration={brace,amplitude=4pt}] (5.4,0.35) -- (11.5,0.35) node[midway,above=4pt]{56 ou 64~octets chacun, ajoutés};
+\foreach \x in {5.4,9.4} {\draw[dashed,omThm] (\x,-0.35) -- (\x,-0.9);}
+\node[omThm,anchor=north] at (7.4,-0.9) {une page de la projection, lue au premier accès};
+\draw[omThm,<->] (5.4,-0.75) -- (9.4,-0.75);
+\end{tikzpicture}
+
+\omcaption{Le fichier plat de la base~: un en-tête d'une taille multiple de 64~octets (nombre magique, version, largeur des enregistrements, disposition en JSON),
+puis des enregistrements de largeur fixe ajoutés au fur et à mesure de leur arrivée. Un lecteur projette le fichier en mémoire~; le système d'exploitation lit une page depuis le disque la première
+fois qu'un enregistrement y est touché.}\label{fig:pl:a-tick-store-on-open-formats:flat}
+\end{omfigure}
+
+\begin{remark}[Pourquoi deux formes intrajournalières]\label{rem:pl:a-tick-store-on-open-formats:twoforms}
+Le fichier plat est le format le plus rapide à écrire et à parcourir, et la disposition déjà utilisée par le chemin de négociation~; le flux IPC porte un
+schéma, des colonnes nullables et de type chaîne, et il se lit dans n'importe quel outil parlant Arrow sans conversion. Une base a besoin des deux, car
+ses lecteurs intrajournaliers diffèrent~: un outil de rejeu en C++ veut les enregistrements plats, le notebook d'un chercheur veut une table. Chacune est écrite
+une seule fois~; rien n'est converti pendant la séance.
+\end{remark}
+
+\section{Compactage de fin de journée}
+
+\begin{definition}[Compactage de fin de journée, clé de tri]\label{def:pl:a-tick-store-on-open-formats:compaction}
+Le \emph{compactage de fin de journée}\index{compactage de fin de journée} (end-of-day compaction) réécrit les fichiers intrajournaliers d'une journée dans la disposition historique~: partitionnés,
+triés, encodés et compressés pour la lecture. La \emph{clé de tri}\index{clé de tri} (sort key) d'un fichier est la liste des colonnes selon lesquelles ses lignes sont
+ordonnées~; les \omterm{def:pl:columnar-formats:pushdown}{cartes de zones} (zone maps) du chapitre~3 élaguent bien sur ses premières colonnes.
+\end{definition}
+
+Le compactage de \texttt{firm.tickstore} (\cref{lst:pl:a-tick-store-on-open-formats:compact}) trie chaque table par symbole et
+par heure, et écrit un fichier Parquet par partition, sous \texttt{<table>/date=YYYY-MM-DD/symbol=S/}~: les noms des répertoires portent
+les valeurs de partition, une convention que les moteurs de requête lisent comme des colonnes. C'est la \cref{met:pl:columnar-formats:layout} du
+chapitre~3 rendue concrète~: partitionner par date et par symbole, trier par heure à l'intérieur.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{147}{161}{Compactage de fin de journée~: tri par symbole puis par heure, et écriture d'un fichier Parquet
+par date et par symbole, les valeurs de partition figurant dans les noms de répertoires.}\label{lst:pl:a-tick-store-on-open-formats:compact}
+
+La \Cref{fig:pl:a-tick-store-on-open-formats:sizes} compte les octets de la semaine simulée sous chaque forme. La journée la plus chargée, le lundi,
+compte 258\,535 événements~; ses fichiers intrajournaliers occupent 17.5~Mo (les événements plats et les deux flux IPC), ses partitions compactées 6.15~Mo,
+2.85 fois moins, avec des événements de 20.0 octets chacun dans leurs partitions. Le compactage de cette journée a pris 0.12~s sur l'ordinateur portable~:
+soit environ 2.2 millions d'événements par seconde sur un seul cœur, tri, \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitionnement}, encodage et compression inclus.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,ybar,bar width=8pt,ylabel={Mo},xlabel={jour de négociation (mois-jour)},
+  xtick={0,1,2,3,4},xticklabels from table={figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv}{day},
+  tick label style={font=\small},label style={font=\small},ymin=0,ymax=16,grid=major,grid style={gray!20},
+  legend columns=1,legend style={font=\footnotesize,cells={anchor=west},at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=k,y=flat]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\addplot[fill=omMeth!45,draw=omMeth] table[x=k,y=ipc]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=parquet]{figdata/platforms/04-a-tick-store-on-open-formats/sizes.csv};
+\legend{événements plats (intrajournaliers),flux IPC de cotations et de transactions (intrajournaliers),partitions Parquet (historiques)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Octets de chaque jour de la semaine simulée sous les formes intrajournalières et, pour les quatre jours compactés, dans les
+partitions Parquet historiques (événements, cotations et transactions réunis). Le cinquième jour est celui en cours et n'a pas encore de forme historique~; ses
+enregistrements plats font 64~octets, la disposition de la version~2. Données~: \texttt{fig\_tickstore.py}.}\label{fig:pl:a-tick-store-on-open-formats:sizes}
+\end{omfigure}
+
+\begin{method}[Compactage sûr]\label{met:pl:a-tick-store-on-open-formats:safe}
+(1) Écrire les partitions de la journée dans de nouveaux fichiers placés dans un répertoire de préparation, jamais par-dessus les fichiers intrajournaliers. (2) Les vérifier par rapport aux
+données intrajournalières~: même nombre de lignes par table et par symbole, même plage de numéros de séquence avec les mêmes trous, les mêmes
+sommes de quantités. (3) Les rendre visibles en une seule étape atomique --- un renommage du répertoire de préparation, ou une nouvelle version d'un
+manifeste qui liste les fichiers de la journée. (4) Alors seulement, on supprime les fichiers intrajournaliers, ou on les conserve pour la durée de rétention de la
+\omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} (chapitre~2).
+\end{method}
+
+Un lecteur qui liste un répertoire pendant que le compacteur y écrit voit une demi-journée~; un lecteur passant par un manifeste voit soit l'ancienne
+journée, soit la nouvelle. L'étape de vérification est peu coûteuse, car les fichiers intrajournaliers sont encore là, et c'est le dernier moment
+où une partition perdue peut être reconstruite sans revenir à la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}~; le chapitre~7 transforme ces contrôles en règles de qualité
+des données de la maison.
+
+\begin{dated}{2026-09}{La conception propriétaire que celui-ci reprend}\label{dat:pl:a-tick-store-on-open-formats:kdb}
+La séparation entre intrajournalier et historique est la conception de l'architecture kdb+tick de la base propriétaire kdb+, longtemps répandue dans les banques
+et les sociétés de trading~: dans sa documentation (consultée en septembre 2026), un tickerplant écrit les enregistrements entrants dans un journal et les
+transmet à une base temps réel, qui conserve la journée en cours en mémoire et l'écrit dans la \omterm{def:pl:a-tick-store-on-open-formats:split}{base historique} en fin de journée~; la \omterm{def:pl:a-tick-store-on-open-formats:split}{base historique}
+donne accès à tous les jours précédents. Ce livre enseigne la version à format ouvert de la même conception.
+\end{dated}
+
+\section{La base intrajournalière et la base historique}
+
+\begin{definition}[Base intrajournalière, base historique]\label{def:pl:a-tick-store-on-open-formats:split}
+La \emph{base intrajournalière}\index{base intrajournalière} conserve les données de la séance en cours sous les formes écrites pendant celle-ci, optimisées pour
+l'ajout et pour les lectures récentes~; la \emph{base historique}\index{base historique} conserve chaque journée compactée, optimisée pour
+la lecture de plages couvrant plusieurs jours et plusieurs symboles.
+\end{definition}
+
+La séparation n'est invisible pour un lecteur que si une seule couche de requête couvre les deux. \texttt{Store} ouvre une base DuckDB embarquée et crée une
+vue par table~: les partitions Parquet historiques, lues avec leurs noms de répertoire comme colonnes, et les tables IPC de la journée en cours,
+enregistrées en mémoire, réunies par une union qui associe les colonnes par leur nom (\cref{lst:pl:a-tick-store-on-open-formats:store}). Une
+requête sur \texttt{quotes} couvre alors le lundi au vendredi, quelle que soit la base qui détient chaque journée.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{165}{187}{La couche de requête~: une vue par table sur les partitions historiques et la
+table intrajournalière de la journée en cours, associées par nom de colonne.}\label{lst:pl:a-tick-store-on-open-formats:store}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box] (feed) at (0,0.1) {lignes du flux\\(capture)};
+\node[box,fill=omMeth!15] (flat) at (3.3,0.7) {événements plats\\(ajout seul)};
+\node[box,fill=omMeth!15] (ipc) at (3.3,-0.5) {IPC cotations, transactions\\(lots d'enregistrements)};
+\draw[dashed,gray] (1.9,-1.15) rectangle (4.7,1.35);
+\node[font=\scriptsize\itshape,anchor=south] at (3.3,1.35) {base intrajournalière};
+\node[box,fill=omThm!12] (cmp) at (3.3,-2.4) {compactage\\de fin de journée};
+\node[box,fill=omProp!15,text width=2.6cm] (hist) at (7.2,-2.4) {Parquet\\date=D/symbol=S\\triés par temps};
+\node[font=\scriptsize\itshape,anchor=north] at (7.2,-3.15) {base historique};
+\node[box] (q) at (10.4,0.1) {couche de requête\\(DuckDB, Polars)};
+\node[box,fill=gray!10] (u) at (10.4,1.5) {recherche, rejeu};
+\draw[->] (feed) -- (flat);
+\draw[->] (feed) -- (ipc);
+\draw[->] (3.3,-1.15) -- (cmp);
+\draw[->] (cmp) -- (hist);
+\draw[->] (hist.east) -| (q.south);
+\draw[->] (4.7,0.1) -- node[above]{aujourd'hui} (q.west);
+\draw[->] (q) -- (u);
+\end{tikzpicture}
+
+\omcaption{La \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}~: la capture alimente la \omterm{def:pl:a-tick-store-on-open-formats:split}{base intrajournalière} pendant la séance~; le compactage à la clôture transforme chaque journée en
+fichiers colonnaires triés et partitionnés~; une couche de requête unique lit ensemble les partitions historiques et la journée en cours.}\label{fig:pl:a-tick-store-on-open-formats:arch}
+\end{omfigure}
+
+\begin{example}[Une fenêtre, deux bases]\label{ex:pl:a-tick-store-on-open-formats:window}
+Le nombre de changements de cotation de SIM2 entre 09~h~32 et 09~h~35 pour chaque jour de la semaine donne 12\,291, 996, 1\,388, 1\,197 et
+4\,473~: quatre jours proviennent des partitions Parquet, le cinquième de la table IPC intrajournalière, en une seule requête SQL qui ne nomme ni l'une ni l'autre.
+La requête a pris 18~ms sur l'ordinateur portable.
+\end{example}
+
+\section{Jointures as-of à grande échelle}
+
+La jointure as-of du livre~7, chapitre~3 --- chaque ligne d'une table avec la dernière ligne d'une autre connue à son instant --- est
+la requête la plus fréquente de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}~: chaque transaction avec la cotation qui prévalait au moment où elle a eu lieu, pour les spreads
+effectifs, les signes de transaction et les mark-outs. La base la calcule de trois façons, qui doivent concorder ligne à ligne~: \texttt{ASOF JOIN}
+de DuckDB, \texttt{join\_asof} de Polars, et \texttt{firm.pit.asof\_join} du livre~7 appliqué à chaque journée et chaque symbole.
+
+\omcode{code/firm/tickstore/firm_tickstore.py}{190}{202}{La jointure as-of en SQL~: chaque transaction avec la dernière cotation de sa journée et
+de son symbole ayant un numéro de séquence antérieur (clé \texttt{seq}), ou à l'instant ou avant son horodatage (clé \texttt{ts}).}\label{lst:pl:a-tick-store-on-open-formats:asof}
+
+La première version du chapitre joignait sur l'horodatage, et les trois moteurs n'étaient pas d'accord. La raison est dans les données~: une
+exécution et le changement de cotation qu'elle provoque portent le même horodatage de la bourse, de sorte que «~la dernière cotation à l'instant de la
+transaction ou avant~» peut être la cotation que la transaction a elle-même produite, et le moteur ne précise pas laquelle de deux cotations de même horodatage
+il renvoie. La cotation qui prévalait \emph{avant} la transaction est la dernière d'un numéro de séquence antérieur, et le numéro de séquence du flux
+ordonne totalement les événements.
+
+\begin{proposition}[Jointure sur le numéro de séquence]\label{prop:pl:a-tick-store-on-open-formats:seq}
+Si chaque ligne de cotation et de transaction porte le numéro de séquence de l'événement qui l'a produite, la jointure as-of stricte sur le
+numéro de séquence renvoie, pour chaque transaction, le meilleur niveau du carnet immédiatement avant l'événement qui l'a exécutée, et le résultat
+ne dépend pas de l'algorithme de jointure.
+\end{proposition}
+
+\begin{proof}
+Les numéros de séquence sont distincts d'un événement à l'autre et croissent dans l'ordre où le carnet les a traités. Les lignes de cotation d'un symbole
+dont le numéro de séquence est inférieur à celui de la transaction sont les états de son carnet avant l'exécution~; la dernière d'entre elles est l'état
+juste avant celle-ci. Des clés distinctes ne laissent aucune égalité à départager pour un algorithme.
+\end{proof}
+
+Sur les 17\,281 transactions de la semaine, les trois moteurs concordent sur chaque ligne avec la jointure sur le numéro de séquence. La jointure sur l'horodatage
+renvoie une cotation différente pour 223 d'entre elles, soit 1.3~\%, à chaque fois la cotation que l'exécution venait elle-même de produire~: exactement les
+transactions dont un chercheur mesurerait un spread effectif nul ou négatif. Sur ces données, la jointure de DuckDB a pris 16~ms, celle de Polars 45~ms, et
+la référence Python 0.17~s (\cref{fig:pl:a-tick-store-on-open-formats:times}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.8cm,height=6.2cm,xbar,bar width=8pt,xmode=log,log origin=infty,xmin=0.0005,xmax=1,
+  xlabel={secondes, meilleur de plusieurs essais (échelle logarithmique)},y dir=reverse,
+  ytick={0,1,2,3,4,5,6},yticklabels={compactage du jour le plus chargé,{fenêtre~: SIM2 09~h~32--09~h~35~; cinq jours},jointure as-of~; DuckDB,jointure as-of~; Polars,jointure as-of~; référence (Python),lecture d'un jour~; fichier plat (mmap),lecture d'un jour~; Parquet},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  point meta=explicit,nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=4},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=seconds,y expr=\coordindex,meta=seconds]{figdata/platforms/04-a-tick-store-on-open-formats/measured_tickstore.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Durée des principales tâches de la base sur la semaine simulée~: le compactage de la journée la plus chargée (258\,535 événements), la requête
+sur la fenêtre de cinq jours, la jointure as-of de 17\,281 transactions par trois moteurs, et un parcours d'une colonne d'une journée depuis le fichier plat
+et depuis Parquet. Mesurées sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution, machine par ailleurs inactive. Données~:
+\texttt{bench\_tickstore.py}.}\label{fig:pl:a-tick-store-on-open-formats:times}
+\end{omfigure}
+
+\section{Fichiers plats et projection en mémoire}
+
+\begin{definition}[Fichier projeté en mémoire]\label{def:pl:a-tick-store-on-open-formats:mmap}
+Un \emph{fichier projeté en mémoire}\index{fichier projeté en mémoire} est un fichier mis en correspondance avec l'espace d'adressage virtuel d'un processus, de sorte que ses octets
+sont lus comme de la mémoire~: le système d'exploitation charge chaque page depuis le disque (ou depuis son cache) la première fois qu'elle est touchée, et
+les processus qui projettent le même fichier partagent une seule copie de ses pages.
+\end{definition}
+
+Un fichier à largeur fixe et une projection en mémoire s'accordent parfaitement~: l'enregistrement $i$ se trouve à une adresse connue, rien n'est analysé, et seules les pages
+qu'une requête touche sont lues. Les jeux de données projetés en mémoire du livre~12 (chapitre~23) utilisent le même mécanisme pour les données d'entraînement. Le lecteur de la base
+en Python est \texttt{numpy.memmap}~; le lecteur C++20 (\cref{lst:pl:a-tick-store-on-open-formats:cpp}) appelle \texttt{mmap}
+lui-même, et le jumeau Rust déclare \texttt{mmap} et \texttt{munmap} depuis la bibliothèque C, puisque le Rust de la série n'utilise aucune
+crate externe. Les trois calculent le même résumé par instrument --- nombre d'enregistrements, quantité exécutée, dernier numéro de séquence --- sur les mêmes
+jeux d'essai des deux versions. Le parcours d'une colonne des événements du lundi a pris 0.8~ms depuis le fichier plat projeté et 2.1~ms depuis
+ses partitions Parquet~: le fichier plat se parcourt plus de deux fois plus vite, mais il occupe 2.8 fois plus de place.
+
+\omcode{code/firm/tickstore/cpp/firm_tickstore.hpp}{29}{62}{Le lecteur C++20~: projeter le fichier, vérifier l'en-tête et lire un enregistrement
+à un décalage calculé~; la page qui se trouve sous ce décalage est chargée par le système d'exploitation au premier accès.}\label{lst:pl:a-tick-store-on-open-formats:cpp}
+
+\section{Évolution de schéma}
+
+Le jeudi, la plateforme a ajouté un champ à ses cotations, et les cotations de la base le portent à partir de ce jour. Du lundi au mercredi, aucune
+colonne de ce type n'existe.
+
+\begin{definition}[Évolution de schéma]\label{def:pl:a-tick-store-on-open-formats:evolution}
+L'\emph{évolution de schéma}\index{evolution de schema@évolution de schéma} est la modification de la disposition d'un jeu de données au fil du temps, selon des règles qui permettent à tout
+lecteur de lire toutes les versions~: ici, des champs peuvent être ajoutés en fin de structure avec une valeur par défaut, et ne sont jamais supprimés, renommés, retypés ni réordonnés.
+\end{definition}
+
+Selon cette règle, un lecteur de la nouvelle version lit un ancien fichier en remplissant les nouveaux champs avec leurs valeurs par défaut, et un lecteur de l'ancienne
+version lit un fichier récent en ignorant les champs qu'il ne connaît pas~; le fichier plat fait les deux grâce à son numéro de version
+(\texttt{upgrade}), et la couche de requêtes en mettant les colonnes en correspondance par leur nom (une colonne absente se lit comme nulle). La requête sur la fenêtre
+de la même semaine compte la plateforme sur aucune des trois premières journées et sur chaque cotation des deux dernières. La vérification du registre
+(\texttt{check\_evolution}) refuse les modifications qui casseraient les anciens lecteurs~: un champ retypé de 32 à 64 bits, un champ
+supprimé, deux champs permutés, un champ inséré avant des champs existants.
+
+\begin{method}[Faire évoluer le schéma d'une base de ticks]\label{met:pl:a-tick-store-on-open-formats:evolve}
+(1) Ajouter le champ en fin de structure, avec une valeur par défaut qui signifie «~non connu~». (2) Augmenter la version dans l'en-tête et enregistrer la nouvelle
+disposition à côté de l'ancienne. (3) Écrire chaque lecteur de façon à accepter toutes les versions enregistrées. (4) Ne jamais réécrire l'historique dans la nouvelle
+version, sauf si les anciens lecteurs sont retirés~; si une correction est nécessaire, écrire les journées corrigées comme de nouvelles versions (chapitre~7).
+\end{method}
+
+\section{Tutoriel~: une semaine dans la base}\label{tut:pl:a-tick-store-on-open-formats:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Faire passer cinq journées simulées par la capture, la \omterm{def:pl:a-tick-store-on-open-formats:split}{base intrajournalière}, le compactage et la couche de requêtes, avec un changement
+de schéma le quatrième jour, et vérifier la jointure as-of de trois façons. \textbf{État final~:} la \cref{fig:pl:a-tick-store-on-open-formats:sizes},
+la fenêtre de l'\cref{ex:pl:a-tick-store-on-open-formats:window}, et trois jointures identiques de 17\,281 transactions.
+\begin{tutsteps}
+\item \textbf{Construire la semaine}~: \texttt{pl\_tickstore.build(root)} capture chaque journée (\texttt{capture\_day}~: les événements vers un
+fichier plat, les cotations et les transactions vers des flux IPC, un vidage toutes les 20\,000 événements) et compacte les quatre premières
+(le \cref{lst:pl:a-tick-store-on-open-formats:compact}).
+\item \textbf{Interroger}~: \texttt{window(root)} compte les cotations de SIM2 pendant les mêmes trois minutes de chaque journée.
+\item \textbf{Joindre}~: \texttt{asof\_all(root)} exécute DuckDB, Polars et la référence~; puis relancer DuckDB avec l'horodatage comme clé
+et compter les transactions dont la cotation change.
+\item \textbf{Projeter}~: construire et exécuter \texttt{firm\_tickstore\_test.cpp} et \texttt{cargo test} dans \texttt{code/firm/tickstore/rust}
+sur les jeux d'essai~; comparer avec \texttt{flat\_summary}.
+\item \textbf{Mesurer}~: \texttt{bench\_tickstore.py} chronomètre le compactage et les requêtes.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une troisième \omterm{def:pl:a-tick-store-on-open-formats:flat}{version de schéma} avec un code de condition et lire la semaine entière~; faire écrire au compactage
+deux ordres de tri (symbole puis temps, et temps puis symbole) et comparer une requête transversale sur chacun.
+\end{tutorial}
+
+\section{Construction~: la base de ticks}\label{bld:pl:a-tick-store-on-open-formats:tickstore}
+
+\begin{build}
+\bfield{Rôle} La \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} de la société~: chaque chapitre ultérieur de ce livre qui lit des données de marché les lit ici, le moteur de backtest
+du chapitre~11 par sa couche d'accès aux données, les règles de qualité du chapitre~7 sur ses partitions.
+\bfield{Interface} \texttt{EVENT\_V1}, \texttt{EVENT\_V2}, \texttt{SCHEMAS}~; \texttt{FlatWriter(path, version)},
+\texttt{flat\_open(path) -> (version, memmap)}, \texttt{upgrade}~; \texttt{IpcWriter}, \texttt{ipc\_read}~;
+\texttt{quotes\_trades(events, symbols)}~; \texttt{compact(tables, root, date, row\_group\_size)}~;
+\texttt{Store(root, intraday, date).sql(q)}~; \texttt{asof\_duckdb}, \texttt{asof\_polars}, \texttt{asof\_reference}~; \texttt{check\_evolution}. C++20
+\texttt{firm::tickstore::FlatFile}, \texttt{summarise}~; Rust \texttt{FlatFile::open}, \texttt{get}, \texttt{summarise}.
+\bfield{Règles} Les fichiers intrajournaliers sont en ajout seul~; l'en-tête indique la version, et un lecteur refuse une version inconnue~; les
+fichiers historiques sont écrits une fois par jour et partitionnés~; chaque cotation et chaque transaction porte le numéro de séquence de son événement~; la
+jointure as-of est stricte sur le numéro de séquence~; les schémas ne font que s'agrandir en fin de structure.
+\bfield{Tests d'acceptation} \texttt{code/firm/tickstore/tests/}, \texttt{cpp/firm\_tickstore\_test.cpp}, \texttt{rust/}~: fichiers plats des
+deux versions, écrits, projetés et refusés lorsqu'ils sont étrangers~; le lecteur Python égal au jeu d'essai que vérifient les jumeaux~; cotations et transactions
+d'un carnet établi à la main~; un aller-retour IPC~; la couche de requêtes sur deux journées historiques aux schémas différents et sur la journée courante~;
+trois jointures identiques et l'égalité de la jointure sur l'horodatage~; les règles d'évolution.
+\bfield{Pour aller plus loin} Un second ordre de tri écrit par le compactage~; une fusion triée des lignes intrajournalières et historiques sans union~;
+un compactage d'une journée pendant que la capture de la journée suivante tourne.
+\end{build}
+
+\begin{omsources}
+\item KX, \emph{kdb+tick} documentation (tickerplant, bases de données temps réel et historiques).
+\item DuckDB, \emph{AsOf Join} (documentation)~; Polars, \texttt{DataFrame.join\_asof} (référence de l'API).
+\item Apache Arrow, \emph{IPC streaming format} (spécification)~; \texttt{mmap(2)}, page de manuel Linux.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:1}
+Le fichier plat du lundi fait 14\,478\,152 octets pour 258\,535 enregistrements de version~1. Quelle est la taille de son en-tête, et quelle serait celle du fichier
+en version~2~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:2}
+Pourquoi un lecteur peut-il utiliser un \omterm{def:pl:a-tick-store-on-open-formats:store}{fichier en ajout seul} pendant que l'écrivain y écrit encore, et que doit-il faire d'un dernier enregistrement incomplet~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:a-tick-store-on-open-formats:3}
+Les fichiers intrajournaliers du lundi occupent 17.5~Mo et ses partitions compactées 6.15~Mo. Quel est le rapport, et d'où vient
+l'économie~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:4}
+Un chercheur calcule des fourchettes effectives à l'aide d'une jointure as-of sur l'horodatage. Sur les données de la semaine, combien de transactions reçoivent la mauvaise
+cotation, et dans quel sens leurs fourchettes sont-elles biaisées~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:5}
+À la cadence de compactage mesurée, combien d'événements le magasin peut-il compacter entre 16~h~05 et 16~h~40 sur un cœur, et
+comment ce chiffre se compare-t-il aux 311 milliards de messages par jour prévus pour le flux d'options au chapitre~2~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:a-tick-store-on-open-formats:6}
+Un nouveau champ est inséré au milieu de l'enregistrement au lieu d'être ajouté en fin. Que voit un ancien lecteur, et que
+signale \texttt{check\_evolution}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:a-tick-store-on-open-formats:7}
+\emph{Programmation.} Avec \texttt{flat\_summary} et le lecteur C++, vérifiez le fichier plat du jour courant~: combien d'enregistrements contient chaque
+instrument, et quelle quantité a été exécutée sur l'instrument~2~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:a-tick-store-on-open-formats:8}
+\emph{Trouver la faille.} «~Pour économiser de l'espace, on compacte la journée sur place~: le compacteur lit les fichiers intrajournaliers, écrit les partitions Parquet
+par-dessus, et une requête pendant le compactage lit ce qui s'y trouve.~»
+\end{exercise}
+
+\section{Problème~: La date limite de 16~h~40}
+
+\begin{problem}[{Problème du week-end --- une semaine dans le magasin de ticks}]\label{pb:pl:a-tick-store-on-open-formats:1}
+La semaine simulée du chapitre, son magasin et les mesures de \texttt{bench\_tickstore.py}.
+
+\medskip\noindent\textbf{Partie I --- Intrajournalier.}
+\begin{enumerate}
+\item Combien d'événements, de cotations et de transactions la semaine contient-elle~?
+\item Que contient l'en-tête d'un fichier plat, et pourquoi est-il complété jusqu'à 64~octets~?
+\item Pourquoi la \omterm{def:pl:a-tick-store-on-open-formats:split}{base intrajournalière} écrit-elle deux formes, et quels lecteurs utilisent lesquelles~?
+\item Quelle est la taille d'un enregistrement dans la version~1 et dans la version~2~?
+\item Pourquoi rien n'est-il trié ni compressé pendant la séance~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Compactage.}
+\begin{enumerate}[resume]
+\item Quelle \omterm{def:pl:a-tick-store-on-open-formats:compaction}{clé de tri} et quelle \omterm{def:pl:capturing-and-storing-tick-data:partition}{clé de partition} le compactage utilise-t-il, et pourquoi celles-là~?
+\item Combien d'octets le lundi occupe-t-il avant et après le compactage~?
+\item Combien de temps le compactage du lundi a-t-il pris sur l'ordinateur portable, et à quel débit~?
+\item Combien d'événements les 35 minutes entre 16~h~05 et 16~h~40 pourraient-elles absorber à ce débit sur un cœur~?
+\item Que changeriez-vous pour compacter un flux d'options complet dans cette fenêtre~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Requêtes.}
+\begin{enumerate}[resume]
+\item Comment une seule instruction SQL lit-elle les deux bases~?
+\item Combien de changements de cotation SIM2 connaît-il entre 09~h~32 et 09~h~35 chaque jour~?
+\item Pourquoi la jointure as-of doit-elle utiliser le numéro de séquence plutôt que l'horodatage~?
+\item Combien de transactions changent de cotation entre les deux jointures, et quels moteurs s'accordent~?
+\item Combien de temps les trois jointures ont-elles pris~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le débit de compactage et la réduction de taille du jour le plus chargé, les latences des requêtes, et le
+plus grand jour que la fenêtre absorbe.
+\item Comment les anciennes et les nouvelles cotations coexistent-elles après le changement de schéma de jeudi~?
+\item Qu'apporte le fichier plat projeté en mémoire par rapport à Parquet pour le jour courant, et que coûte-t-il~?
+\item Quelle partie de cette conception vient des \omterm{def:pl:a-tick-store-on-open-formats:store}{bases de ticks} propriétaires, et laquelle des formats ouverts~?
+\item En une phrase~: qu'est-ce qui fait paraître les deux moitiés d'un magasin de ticks comme une seule~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:a-tick-store-on-open-formats:1}
+Pourquoi les magasins de ticks séparent-ils le jour courant de l'historique~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:a-tick-store-on-open-formats:2}
+Vous joignez les transactions aux cotations à l'instant de la transaction, et certaines fourchettes effectives ressortent négatives. Qu'est-ce qui cloche~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:a-tick-store-on-open-formats:3}
+Qu'apporte la projection d'un fichier en mémoire, et quand est-ce une mauvaise idée~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:a-tick-store-on-open-formats:4}
+Une plateforme ajoute un champ à son flux. Comment modifiez-vous le magasin sans casser cinq années de lecteurs~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:a-tick-store-on-open-formats:5}
+Comment partitionneriez-vous et trieriez-vous une année de cotations pour 8\,000 symboles, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:a-tick-store-on-open-formats:6}
+Concevez un magasin de ticks sur formats ouverts pour une société sans base de données propriétaire~: capture, intrajournalier,
+compactage, disposition de l'historique, couche de requêtes, et ce que vous mesureriez en premier.
+\end{interviewq}

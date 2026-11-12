@@ -1,0 +1,342 @@
+\chapter{Tester et déployer des systèmes à faible latence}\label{ch:ll:testing-and-deploying-low-latency-systems}
+
+Une version d'un système de trading peut passer tous les tests fonctionnels et rester pourtant moins bonne que celle qu'elle remplace~: une instruction de journalisation
+placée désormais dans la boucle critique, un conteneur qui alloue de la mémoire, un verrou pris sur un chemin qui était libre auparavant. Aucun de ces
+changements ne modifie une sortie, donc aucun test fonctionnel n'échoue~; chacun ajoute pourtant des dizaines ou des centaines de nanosecondes au 99\up{e}~centile, c'est-à-dire
+là où vit une stratégie sensible à la latence. Les détecter demande un autre type de test, qui mesure sur une machine qui
+n'est jamais parfaitement calme, et décide si un écart est réel. Ce chapitre rassemble les tests dont un système à faible latence
+a besoin, depuis ceux qui vérifient ce qu'il calcule (propriétés, différences, entrées aléatoires, scripts propres à la plateforme) jusqu'à celui
+qui vérifie à quelle vitesse il calcule, et il s'achève sur la façon dont une version parvient en production~: progressivement, de manière réversible, et seulement sur
+des machines qui ont été contrôlées.
+
+\section{La pyramide des tests pour un système de trading}
+
+\begin{definition}[Test par propriétés, test différentiel, test par fuzzing]\label{def:ll:testing-and-deploying-low-latency-systems:tests}
+Un \emph{test par propriétés}\index{test par propriétés} génère de nombreuses entrées aléatoires et vérifie qu'une propriété énoncée est vraie
+pour chacune d'elles, plutôt que de comparer une entrée à une sortie attendue unique. Un \emph{test
+différentiel}\index{test différentiel} exécute deux implémentations d'une même spécification sur les mêmes entrées et vérifie que leurs
+sorties sont identiques. Le \emph{test par fuzzing}\index{test par fuzzing} soumet à un programme un grand nombre d'entrées malformées ou mutées
+afin de trouver celles qui le font planter, se bloquer ou violer ses invariants.
+\end{definition}
+
+Les composants de ce livre ont été testés de ces façons depuis le début. La passerelle du chapitre~21 est vérifiée par des propriétés sur
+des entrelacements aléatoires face au moteur d'appariement (aucun ordre n'est exécuté au-delà de la quantité demandée, aucune position ne dépasse la limite)~; le
+\omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} du chapitre~19 et les moteurs des chapitres~20 à 24 par des \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{tests différentiels}, puisque la référence en Python, les implémentations C++ et
+Rust doivent concorder sur chaque jeu de données, octet pour octet ou empreinte pour empreinte. Le \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{test par propriétés} reprend l'idée de
+QuickCheck (Claessen et Hughes, 2000)~: la propriété tient lieu de spécification, et le générateur explore des entrées que personne n'aurait
+écrites à la main. La \Cref{fig:ll:testing-and-deploying-low-latency-systems:pyramid} range les types de tests dans l'ordre où une
+version les rencontre~: beaucoup de tests peu coûteux en bas, exécutés à chaque modification, et quelques tests coûteux en haut, exécutés avant
+la mise en production.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize]
+\foreach \y/\w/\t/\c in {0/11/{tests unitaires, de propriétés et différentiels~:\\ chaque modification, quelques secondes}/omDef,
+  0.9/9.2/{fuzzing avec sanitizers~: chaque modification, quelques minutes}/omDef,
+  1.8/7.4/{scénarios sur simulateur et\\ rejeux de journées enregistrées}/omMeth,
+  2.7/5.6/{scripts de certification sur le\\ système de test de la plateforme}/omMeth,
+  3.6/3.8/{barrière de performance~:\\ exécutions entrelacées}/omThm,
+  4.5/2.2/{déploiement\\ progressif}/omThm} {
+  \fill[\c!18,draw=\c!60] (-\w/2,\y) rectangle (\w/2,\y+0.8);
+  \node[align=center] at (0,\y+0.4) {\t};
+}
+\draw[->] (6.3,0.2) -- node[right,align=left]{moins nombreux, plus lents,\\ plus proches de la production} (6.3,5.1);
+\end{tikzpicture}
+
+\omcaption{Les tests qu'un système de trading à faible latence rencontre avant la production. Les couches inférieures vérifient ce qu'il calcule et
+s'exécutent à chaque modification~; les couches supérieures vérifient son comportement face à la plateforme et sa vitesse, et s'exécutent sur les candidats à
+la mise en production.}\label{fig:ll:testing-and-deploying-low-latency-systems:pyramid}
+\end{omfigure}
+
+\section{Tests appuyés sur le simulateur de bourse}
+
+Les tests unitaires s'arrêtent à la frontière du processus~; les bogues qui coûtent de l'argent se trouvent précisément à cette frontière~: un rapport qui arrive avant l'accusé de réception
+de son ordre, une annulation qui croise une exécution, une session qui tombe au milieu d'une rafale, une plateforme qui rejette un message que la
+firme jugeait valide. Le simulateur du livre~10 rend ces situations reproductibles~: la même graine donne le même entrelacement, une panne programmée
+(une session coupée, une suspension, une pause) survient au même instant, et le moteur d'appariement applique les règles de la plateforme à la lettre.
+Les \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{tests par propriétés} du chapitre~21 et la table de \omterm{def:ll:resilience:failover}{bascule} du chapitre~24 sont des tests appuyés sur le simulateur au sens où l'entend ce texte~: un scénario, un ensemble de
+graines ou de points de coupure, et des propriétés vérifiées après chaque exécution. Les rejeux de journées enregistrées (chapitre~23) les complètent~: ils vérifient
+qu'une nouvelle construction prend les décisions que prenait l'ancienne, sauf là où une modification était voulue.
+
+Les entrées aléatoires atteignent des endroits que les scénarios ne couvrent pas. Le \Cref{lst:ll:testing-and-deploying-low-latency-systems:trusting} est un lecteur de somme de
+contrôle affecté d'un bogue classique~: il fait confiance au champ BodyLength du message et lit la somme de contrôle à l'endroit indiqué par ce champ, sans
+vérifier que le message est aussi long. Le fuzzer du chapitre mute les messages FIX de référence du chapitre~15 (un octet retourné,
+un chiffre modifié, un champ dupliqué, une queue coupée) et recopie chacun dans un tampon de sa taille exacte, de sorte que
+AddressSanitizer détecte toute lecture au-delà de celui-ci. Face à ce lecteur, il s'arrête au premier message tronqué, en 12 entrées au plus pour
+chacune des dix graines. Face à l'analyseur propre à la firme, il a exécuté un million d'entrées sans lecture fautive. Il y a pourtant trouvé un vrai bogue,
+par un invariant plutôt que par un plantage~: deux mutations, un tag 11 transformé en 10 et un numéro de séquence augmenté de un, ont laissé la
+somme de contrôle inchangée, et l'analyseur a accepté un message dont un champ CheckSum se trouvait au milieu de son corps. Les analyseurs Python, C++ et Rust
+de \texttt{firm.fixengine} le refusent désormais, et un test conserve ce message.
+
+\omcode{code/low-latency/25-testing-and-deploying-low-latency-systems/cpp/ll_fuzz.hpp}{67}{78}{Un lecteur de somme de contrôle qui fait confiance à
+BodyLength~: le premier message tronqué trouvé par le fuzzer le fait lire au-delà du tampon.}\label{lst:ll:testing-and-deploying-low-latency-systems:trusting}
+
+\section{Certification par la bourse et conformité}
+
+\begin{definition}[Certification par la bourse]\label{def:ll:testing-and-deploying-low-latency-systems:cert}
+La \emph{certification par la bourse}\index{certification par la bourse} est la procédure par laquelle une plateforme vérifie, avant d'accorder l'accès à
+la production, que le système d'un client traite correctement ses protocoles~: le client exécute un script de scénarios sur le système de test
+de la plateforme, qui contrôle chaque message et chaque réponse.
+\end{definition}
+
+Les plateformes certifient les systèmes qui se connectent à elles, et les régulateurs demandent aux firmes de tester leur conformité à chaque plateforme avant
+de négocier et après chaque changement important (l'encadré daté). Un script de certification est une liste d'étapes, chacune étant un message et les
+réponses qu'il doit produire~: un ordre accepté, un remplacement, une annulation, une annulation arrivée trop tard, un identifiant réutilisé, un prix
+hors du pas de cotation, un ordre exécuter-ou-annuler sans rien à exécuter, un ordre post-only qui croiserait le carnet, une
+\omterm{def:ll:pre-trade-risk-and-kill-switches:mass}{annulation de masse} (mass cancel), une déconnexion qui annule les ordres au repos. Le lanceur de \texttt{firm.perfgate} joue un tel script contre le moteur d'appariement du livre~10
+(\cref{lst:ll:testing-and-deploying-low-latency-systems:certify})~; les dix-sept étapes de la construction réussissent, et un script qui attend
+le mauvais comportement d'une seule étape échoue à cette étape et à aucune autre. Le même lanceur, pointé vers une nouvelle version du
+simulateur de bourse ou de la passerelle de la firme, constitue un test de conformité au sens du régulateur.
+
+\omcode{code/firm/perfgate/firm_perfgate.py}{121}{142}{Le lanceur de certification~: chaque étape envoie un message et compare les
+réponses, dans l'ordre, avec celles du script.}\label{lst:ll:testing-and-deploying-low-latency-systems:certify}
+
+\begin{dated}{2026-09}{Test de conformité et certification}\label{dat:ll:testing-and-deploying-low-latency-systems:cert}
+Dans l'Union européenne (consulté en septembre 2026), le Commission Delegated Regulation (EU) 2017/589 exige des firmes qu'elles établissent
+des méthodologies pour développer et tester les systèmes de trading algorithmique avant leur déploiement ou une mise à jour substantielle~; qu'elles testent
+leur conformité au système d'une plateforme de négociation lorsqu'elles deviennent membres, lorsqu'elles se connectent par accès sponsorisé pour la première fois,
+lorsque les systèmes de la plateforme changent de manière importante, et avant de déployer ou de mettre à jour de manière importante un algorithme, en vérifiant
+qu'il interagit avec la logique d'appariement de la plateforme comme prévu~; et qu'elles testent dans un environnement séparé de la production. CME Group
+exige que les systèmes des clients qui envoient des ordres à sa plateforme Globex, ou qui traitent les données de marché qui en proviennent, soient certifiés avec AutoCert+,
+son outil de test automatisé.
+\end{dated}
+
+\section{Barrières de régression de performance}
+
+\begin{definition}[Barrière de régression de performance]\label{def:ll:testing-and-deploying-low-latency-systems:gate}
+Une \emph{barrière de régression de performance}\index{barrière de régression de performance} est un test qui exécute un indice de référence sur la construction en cours
+et sur un candidat, sur la même machine, et qui refuse le candidat si une statistique de latence se dégrade de plus que la
+tolérance énoncée, avec un niveau de confiance énoncé.
+\end{definition}
+
+La \Cref{fig:ll:testing-and-deploying-low-latency-systems:runs} montre 800
+essais du benchmark de la porte (le moteur de stratégie sur la journée à petit tick du chapitre~19, mesuré par événement), en alternant entre le
+build courant et un build porteur d'une régression plantée. Le 99\up{e}~percentile d'un essai varie de dizaines de pour cent d'un essai à
+l'autre sous l'effet de l'activité propre au système d'exploitation et à l'hyperviseur~; la régression, qui ajoute environ 18~\% à la médiane des
+essais, est invisible dans
+n'importe quelle paire isolée. La porte est conçue pour résister à ce bruit. Elle entrelace les essais (A, B, B, A, \dots), de sorte qu'une lente dérive de la
+machine touche de la même façon les deux builds~; elle retient une statistique par essai, le 99\up{e}~percentile, et compare leurs médianes sur l'ensemble des essais~;
+elle décide par un test de permutation, qui ne suppose rien sur la distribution, et rapporte un intervalle de bootstrap de la hausse
+(\cref{lst:ll:testing-and-deploying-low-latency-systems:compare})~; et elle ne signale une régression que si la hausse est à la fois significative
+et supérieure à une tolérance de 2~\%, afin qu'un changement réel mais négligeable ne bloque pas une mise en production.
+
+\omcode{code/firm/perfgate/firm_perfgate.py}{62}{83}{La décision de la porte~: la hausse de la médiane des 99\up{e}~percentiles, un test de permutation unilatéral,
+un intervalle de bootstrap et une tolérance.}\label{lst:ll:testing-and-deploying-low-latency-systems:compare}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=0,xmax=800,ymin=150,ymax=700,xlabel={essai (entrelacé~: A B B A \dots)},
+  ylabel={99\up{e}~percentile de l'essai (ns)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend pos=north east,legend style={font=\scriptsize},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.7pt,omDef,restrict expr to domain={\thisrow{isb}}{0:0}]
+  table[x=run,y=p99_ns]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate_runs_plot.csv};
+\addlegendentry{A~: build courant}
+\addplot[only marks,mark=*,mark size=0.7pt,omThm,restrict expr to domain={\thisrow{isb}}{1:1}]
+  table[x=run,y=p99_ns]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate_runs_plot.csv};
+\addlegendentry{B~: régression plantée}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le 99\up{e}~percentile de chacun des 800 essais du benchmark de la porte (18\,000 événements mesurés par essai), en alternant entre
+le build courant et un build porteur d'une régression plantée, sur un portable (Intel Core Ultra 7 155H, WSL2), la machine étant par ailleurs inactive.
+Données~: \texttt{bench\_gate.py}.}\label{fig:ll:testing-and-deploying-low-latency-systems:runs}
+\end{omfigure}
+
+Combien d'essais la porte exige-t-elle~? La \Cref{fig:ll:testing-and-deploying-low-latency-systems:power} répond à partir du bruit propre
+à la machine. Elle trace des portes de $n$ essais par côté, tirés des échantillons mesurés~: deux tirages disjoints dans les essais du build courant donnent
+le taux de fausses alarmes, qui reste voisin du niveau du test, soit 5~\% (de 3 à 9~\% sur une centaine de portes)~; deux tirages dont l'un est décalé de
+5~\% de la médiane donnent le taux de détection d'une hausse de 5~\%~; et la régression plantée, comparée au build courant, donne son
+taux de détection. La régression plantée, d'environ 18~\%, est détectée dans 99~\% des cas avec 40 essais par côté. Une hausse de 5~\% en exige bien
+davantage~: 73~\% à 120 essais, 84~\% à 160 et 91~\% à 200, soit environ 200 essais par côté pour 90~\%~; l'approximation normale de
+\texttt{runs\_needed}, à partir de la dispersion des essais d'environ 14~\%, en donne 220. À environ 30 millisecondes par essai, cela représente une douzaine
+de secondes de benchmark par porte sur ce portable, et sur
+une machine proche de la production, dotée de cœurs isolés (chapitre~13), dont les essais varient moins, il en faut bien moins.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.5cm,height=5.6cm,xmode=log,xmin=4,xmax=250,ymin=0,ymax=1.05,
+  xlabel={essais par côté},ylabel={fraction des portes qui signalent B},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=outer north east,legend style={font=\scriptsize,cells={anchor=west}},
+  table/col sep=comma,xtick={5,10,20,40,80,200},xticklabels={5,10,20,40,80,200}]
+\addplot[omThm,thick,mark=*] table[x=runs,y=detect_planted]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{régression plantée (d'environ 18~\%)}
+\addplot[omMeth,thick,mark=square*] table[x=runs,y=detect_5pct]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{une hausse de 5~\%}
+\addplot[omDef,thick,mark=triangle*] table[x=runs,y=false_alarm]{figdata/low-latency/25-testing-and-deploying-low-latency-systems/gate.csv};
+\addlegendentry{aucune variation (fausses alarmes)}
+\addplot[gray,dashed] coordinates {(4,0.9) (250,0.9)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les taux de détection et de fausses alarmes de la porte en fonction du nombre d'essais par côté, à partir de 100 portes tirées des
+essais mesurés de la \cref{fig:ll:testing-and-deploying-low-latency-systems:runs} pour chaque point~; la ligne en pointillés correspond à une puissance de 90~\%.
+Données~: \texttt{fig\_gate.py} (déterministe, à partir des échantillons mesurés).}\label{fig:ll:testing-and-deploying-low-latency-systems:power}
+\end{omfigure}
+
+\section{Déploiements progressifs et retour arrière}
+
+Une version qui a franchi la porte subit encore une mise en production graduelle~: le déploiement canari et le déploiement progressif du
+livre~7 (chapitre~21), avec du trading simulé lorsque la stratégie le permet. Les systèmes à faible latence ajoutent trois réflexes. L'hôte est contrôlé
+avant le démarrage du processus~: \texttt{firm.perfgate.preflight} exécute l'audit de réglage du chapitre~13 contre le plan de placement des cœurs
+et interrompt le déploiement à la moindre anomalie, car une stratégie testée sur des cœurs isolés et déployée sur un hôte dont les interruptions tombent sur
+ces cœurs n'est pas la stratégie qui a été testée (ce portable échoue sur 7 des 11 règles de l'audit, raison pour laquelle ses mesures portent
+la mention «~pas de cœurs isolés~»). Le nouveau build tourne d'abord à côté de l'ancien, sur les mêmes entrées, en mode shadow~: le rejeu
+du chapitre~23 rendu réel, dont les sorties sont comparées puis écartées. Et le retour arrière est un déploiement comme les autres, préparé et
+testé avant d'être nécessaire, car le moment où il le devient est celui où l'équipe dispose du moins de temps~; la \omterm{def:ll:resilience:failover}{bascule} (failover)
+du chapitre~24 illustre la même leçon pour les machines.
+
+\section{Tutoriel~: fuzzer, certifier, encadrer}\label{tut:ll:testing-and-deploying-low-latency-systems:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Fuzzer l'analyseur FIX sous les sanitiseurs, lancer un script de certification contre le simulateur et soumettre à la porte une
+régression plantée sur ce portable. \textbf{État final~:} les résultats du fuzzing, une certification réussie et la
+\cref{fig:ll:testing-and-deploying-low-latency-systems:power}.
+\begin{tutsteps} \sloppy
+\item \textbf{Fuzzing.} \texttt{ll\_fuzz\_test.cpp} exécute 200\,000 mutations à travers l'analyseur de la maison et vérifie que chaque
+message accepté tient dans son tampon et porte une somme de contrôle correcte~; \texttt{python bench\_fuzz.py} compile le fuzzer avec AddressSanitizer et
+UndefinedBehaviorSanitizer et le lance contre les deux analyseurs.
+\item \textbf{Certification.}\newline \texttt{firm\_perfgate.certify(load\_script(\textquotedbl{}data/cert\_script.json\textquotedbl{}))}
+joue les dix-sept étapes contre le moteur du livre~10.
+\item \textbf{Porte.} \texttt{python bench\_gate.py} mesure 400 paires entrelacées~; \texttt{python fig\_gate.py} les transforme
+en taux de détection et de fausses alarmes.
+\item \textbf{Contrôle préalable.} \texttt{firm\_perfgate.preflight} sur les deux hôtes de test de l'audit de réglage~: l'hôte réglé réussit, l'hôte
+mal réglé échoue.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Faire reposer la porte sur la médiane des médianes des essais au lieu de leurs 99\up{e}~percentiles et comparer le nombre
+d'essais nécessaires~; ajouter une étape au script de certification pour le bridage de la plateforme.
+\end{tutorial}
+
+\section{Construction~: la porte de performance}\label{bld:ll:testing-and-deploying-low-latency-systems:perfgate}
+
+\begin{build}
+\bfield{Rôle} Les dernières vérifications avant la production pour chaque composant du livre~: sa vitesse par rapport au build courant,
+son comportement face au script de la plateforme, et l'hôte sur lequel il tournera.
+\bfield{Interface} Python \texttt{firm\_perfgate}~: \texttt{interleave}, \texttt{run\_pairs(cmd\_a, cmd\_b, n\_pairs, parse)},
+\texttt{compare(a, b, tolerance, alpha)} renvoyant un \texttt{Verdict} avec \texttt{rise}, \texttt{p\_value}, \texttt{low},
+\texttt{high}, \texttt{regression} et \texttt{report()}~; \texttt{power}, \texttt{runs\_needed}~; \texttt{certify(script)},
+\texttt{load\_script}~; \texttt{preflight(root, plan)}.
+\bfield{Règles} Essais entrelacés, jamais tous les A puis tous les B~; une statistique par essai~; un test de permutation et une tolérance~; le
+nombre d'essais fixé à partir du bruit mesuré de la machine~; aucun déploiement sur un hôte qui échoue à l'audit.
+\bfield{Tests d'acceptation} \texttt{code/firm/perfgate/}~: une hausse nette doit être signalée, alors que ni le bruit ni une hausse sous la tolérance ne doivent l'être~; des fausses
+alarmes proches du niveau du test sur du bruit synthétique~; une puissance qui croît avec le nombre d'essais~; le script de certification réussi,
+et échouant précisément à l'étape altérée~; le contrôle préalable réussi sur l'hôte de test réglé et échouant sur l'hôte mal réglé.
+\bfield{Pour aller plus loin} Une porte sur toute la distribution de latence (un test à deux échantillons sur des échantillons regroupés, avec attention à la dépendance au sein des
+essais)~; des étapes de certification pour les sessions et les bridages~; la porte en intégration continue sur une machine dédiée.
+\end{build}
+
+\begin{omsources}
+\item K.~Claessen et J.~Hughes, «~QuickCheck: a lightweight tool for random testing of Haskell programs~», \emph{ICFP}, 2000.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS 6), articles 5 à 7.
+\item CME Group Client Systems Wiki, \emph{Client Application Testing and Certification}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:1}
+Énoncer deux propriétés qu'un test sur des entrelacements aléatoires doit vérifier pour la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres} du chapitre~21, et une
+qu'il ne peut pas vérifier sans le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} de la plateforme.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:2}
+Pourquoi le fuzzer copie-t-il chaque entrée dans un tampon de sa taille exacte avant de l'analyser~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:3}
+Les exécutions de A et de B sont entrelacées A, B, B, A. Qu'est-ce qui ne va pas si toutes les exécutions de A viennent d'abord, puis toutes celles de B~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:4}
+Avec des exécutions dont les 99\up{e}~centiles varient de 14~\%, combien d'exécutions par côté l'approximation normale demande-t-elle pour détecter une hausse de 10~\%
+avec une puissance de 90~\%, puis une hausse de 2.5~\%~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:5}
+Une barrière s'exécute 20 fois par jour à un niveau de 5~\%. Combien de fausses alarmes l'équipe doit-elle attendre sur un mois de 21 jours de bourse, et
+que change la tolérance de 2~\%~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:6}
+Deux mutations ont fait passer un tag de 11 à 10 et un numéro de séquence de 2 à 3, et la somme de contrôle n'a pas changé. Expliquer pourquoi, et
+dire ce que la somme de contrôle FIX protège et ne protège pas.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:7}
+\emph{Programmation.} Ajouter des étapes de certification pour le bridage de la plateforme~: configurer le moteur avec un débit, envoyer une rafale et vérifier les
+rejets de motif \texttt{T}. De quoi l'étape a-t-elle besoin que les autres n'exigeaient pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:testing-and-deploying-low-latency-systems:8}
+\emph{Trouver la faille.} «~Notre test de performance lance le benchmark une seule fois sur le candidat à la mise en production et échoue si le 99\up{e}~centile
+dépasse de plus de 5~\% celui de la semaine dernière, que nous conservons dans un fichier.~»
+\end{exercise}
+
+\section{Problème~: quelques centaines de nanosecondes}
+
+\begin{problem}[{Problème du week-end --- combien d'exécutions une barrière demande sur une machine bruitée}]\label{pb:ll:testing-and-deploying-low-latency-systems:1}
+Utiliser les \cref{fig:ll:testing-and-deploying-low-latency-systems:runs,fig:ll:testing-and-deploying-low-latency-systems:power}
+(\texttt{measured\_gate\_runs.csv}, \texttt{gate.csv}, \texttt{gate\_summary.csv}).
+
+\medskip\noindent\textbf{Partie I --- Le bruit.}
+\begin{enumerate}
+\item Quelle est la médiane du 99\up{e}~centile des exécutions de la version courante, et de combien varient les exécutions (le coefficient de variation
+robuste)~?
+\item Qu'ajoute la régression plantée, à la médiane des exécutions~?
+\item Pourquoi le 99\up{e}~centile d'une exécution est-il beaucoup plus bruité que sa médiane~?
+\item Pourquoi une seule paire A/B est-elle inutile sur cette machine~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La barrière.}
+\begin{enumerate}[resume]
+\item Pourquoi comparer des médianes entre exécutions plutôt que des moyennes~?
+\item Que suppose le test de permutation, et que ne suppose-t-il pas~?
+\item Quel est le taux de fausses alarmes pour chaque $n$, et pourquoi est-il proche du niveau du test~?
+\item Combien d'exécutions par côté détectent la régression plantée dans 99~\% des cas~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Puissance.}
+\begin{enumerate}[resume]
+\item Lire le taux de détection d'une hausse de 5~\% à 80, 120 et 160 exécutions par côté.
+\item Interpoler le nombre d'exécutions pour une puissance de 90~\%.
+\item Comparer avec l'approximation normale, et expliquer l'écart.
+\item Combien de temps dure une barrière de cette taille sur cet ordinateur portable, à environ 30 millisecondes par exécution~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le nombre d'exécutions entrelacées dont la barrière a besoin pour détecter une hausse de 5~\% du 99\up{e}~centile
+avec une puissance de 90~\%, au bruit mesuré de cette machine.
+\item Que changeraient les cœurs isolés (chapitre~13), et pourquoi~?
+\item Pourquoi faut-il une tolérance en plus du test~?
+\item De quoi aurait besoin une barrière sur la latence médiane, et pourquoi ne suffit-elle pas~?
+\item Comment faire de la barrière une étape routinière de l'intégration continue sans que chaque modification attende~?
+\item Quels types de régression aucun benchmark du seul moteur ne peut-il détecter~?
+\item Pourquoi conserver les ensembles d'exécutions comme données versionnées~?
+\item En une phrase~: qu'est-ce qui rend une barrière de performance fiable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:testing-and-deploying-low-latency-systems:1}
+Qu'est-ce qu'un \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{test par propriétés}~? Donnez un exemple pour un carnet d'ordres.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:testing-and-deploying-low-latency-systems:2}
+Comment mèneriez-vous un \omterm{def:ll:testing-and-deploying-low-latency-systems:tests}{test par fuzzing} sur un analyseur de données de marché, et que vérifieriez-vous en plus des plantages~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:testing-and-deploying-low-latency-systems:3}
+Votre benchmark indique que la nouvelle version est plus lente de 3~\% au 99\up{e}~centile. Comment décidez-vous s'il faut la croire~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:testing-and-deploying-low-latency-systems:4}
+Que teste la \omterm{def:ll:testing-and-deploying-low-latency-systems:cert}{certification par la bourse}, et que ne teste-t-elle pas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:ll:testing-and-deploying-low-latency-systems:5}
+Comment déploieriez-vous une nouvelle version d'un moteur de stratégie, et comment la feriez-vous revenir en arrière~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:testing-and-deploying-low-latency-systems:6}
+Concevez le pipeline de tests et de mise en production d'un système de trading à faible latence, depuis un commit jusqu'à la production, et dites ce que chaque étape
+détecte.
+\end{interviewq}

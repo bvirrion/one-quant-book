@@ -1,0 +1,370 @@
+\chapter{Le constructeur de carnet d'ordres}\label{ch:ll:the-order-book-builder}
+
+Sur un instrument à petit tick, un carnet tenu dans des arbres équilibrés demande environ \qty{70}{\nano\second} par mise à jour sur
+l'ordinateur portable de ce livre~; un tableau de niveaux de prix autour des meilleurs cours en demande environ \qty{30}{\nano\second}. Le tableau l'emporte, jusqu'au jour où
+l'action varie de trente pour cent~: un tableau de 256 ticks doit alors être déplacé et rempli à nouveau presque vingt mille fois, et le
+carnet de la journée coûte \qty{0.7}{\second} de temps processeur au lieu de quatre millisecondes. Le \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} transforme les événements du \omterm{def:ll:the-feed-handler:handler}{feed
+handler} en la réponse que chaque stratégie demande en premier, quel est le meilleur prix et quelle quantité s'y trouve, et la réponse
+doit être juste, rapide, et rester rapide le jour qui compte. Ce chapitre précise à quoi le carnet doit répondre, compare les
+structures qui y répondent selon le type de flux et le régime de tick, construit un carnet ordre par ordre sur une table des ordres à \omterm{def:ll:the-order-book-builder:open}{adressage ouvert} et une
+échelle de prix à recentrage, et le teste face à deux \omterm{def:ll:the-order-book-builder:builder}{constructeurs de carnet} écrits plus tôt dans la série.
+
+\section{Ce que le carnet doit fournir, et à quelle vitesse}
+
+\begin{definition}[Constructeur de carnet]\label{def:ll:the-order-book-builder:builder}
+Un \emph{constructeur de carnet}\index{constructeur de carnet} (book builder) maintient le carnet d'ordres à cours limité (livre~10, chapitre~1) d'un instrument à partir des
+événements du \omterm{def:ll:the-feed-handler:handler}{feed handler}~: avec un flux market-by-order (livre~1, chapitre~19), il conserve chaque ordre au repos et les
+agrège en niveaux de prix~; avec un flux market-by-price, il conserve directement les niveaux. Il répond aux requêtes de niveau 1 et de niveau 2
+(livre~1, chapitre~28) après chaque événement, et sait quand son carnet ne mérite plus confiance.
+\end{definition}
+
+Une stratégie pose trois types de question. Niveau~1~: les meilleurs cours acheteur et vendeur, avec leurs tailles, après chaque événement. Le microprix du
+livre~7, chapitre~8, n'a besoin de rien d'autre. Niveau~2, les premiers niveaux de chaque côté, pour le déséquilibre de profondeur et les estimations de
+la position dans la file. Et, pour ses propres ordres, niveau~3~: où se trouve mon ordre dans sa file. Le constructeur sert les trois à partir d'une seule structure,
+au rythme d'une mise à jour par événement du flux, et la mise à jour est sur le chemin critique du budget du chapitre~1~: un carnet qui
+met \qty{100}{\nano\second} de plus par événement retarde chaque décision d'autant, et à l'ouverture, quand les événements arrivent
+par rafales (chapitre~18), il les retarde de la file d'événements qui les précède.
+
+Chaque événement désigne un ordre par sa référence, si bien que chaque mise à jour commence par une recherche~: quel ordre, à quel prix et de quel côté.
+Il modifie ensuite un niveau de prix~: il y ajoute une quantité, la réduit, ou le retire lorsqu'il se vide. Un ajout à un nouveau prix crée un niveau~;
+un remplacement (spécification de Nasdaq~: l'ordre d'origine «~les actions restantes \dots\ doivent être retirées~» et une nouvelle référence
+«~sera utilisée désormais~») retire un ordre et en ajoute un autre. Les deux coûts d'un carnet sont donc la recherche de l'ordre et la
+mise à jour du niveau, et les structures ci-dessous diffèrent sur ces deux points.
+
+\section{Structures selon le type de flux et le régime de tick}
+
+\begin{definition}[Échelle de prix dense]\label{def:ll:the-order-book-builder:ladder}
+Une \emph{échelle de prix dense} conserve les niveaux de prix d'un carnet dans un tableau indexé par la distance en ticks à un prix
+de référence, une case par tick, qu'un niveau y soit présent ou non, couvrant une fenêtre autour des meilleurs cours~; les niveaux hors de la fenêtre
+vivent dans une structure éparse, et la fenêtre est déplacée (recentrée) lorsque les meilleurs cours approchent de son bord.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\def\u{0.38}
+\foreach \i in {0,...,23} {
+  \pgfmathtruncatemacro{\q}{(\i==6)||(\i==8)||(\i==9)||(\i==11)}
+  \pgfmathtruncatemacro{\a}{(\i==13)||(\i==14)||(\i==16)||(\i==19)}
+  \ifnum\q=1 \draw[fill=omDef!40] (\u*\i,0) rectangle ++(\u,0.5);
+  \else\ifnum\a=1 \draw[fill=omThm!35] (\u*\i,0) rectangle ++(\u,0.5);
+  \else \draw[fill=gray!6,draw=gray!50] (\u*\i,0) rectangle ++(\u,0.5); \fi\fi
+}
+\fill[gray!25,opacity=0.5] (0,0) rectangle (\u*6,0.5);
+\fill[gray!25,opacity=0.5] (\u*18,0) rectangle (\u*24,0.5);
+\draw[decorate,decoration={brace,amplitude=4pt},thick] (\u*6,0.6) -- (\u*18,0.6) node[midway,above=5pt]{moitié centrale~: les meilleurs cours restent ici};
+\draw[->,omDef,thick] (\u*11.5,-0.7) node[below left=-2pt]{meilleur bid (indice 11)} -- (\u*11.5,-0.05);
+\draw[->,omThm,thick] (\u*13.5,-0.7) node[below right=-2pt]{meilleur ask (indice 13)} -- (\u*13.5,-0.05);
+\node[draw,rounded corners=2pt,fill=gray!8,align=center,anchor=west] (far) at (\u*24+0.4,0.25) {table éparse~:\\ niveaux éloignés};
+\node[draw,rounded corners=2pt,fill=omMeth!15,align=center,anchor=north west] (map) at (0,-1.6) {table des ordres (adressage ouvert)~:\\ référence $\to$ emplacement dans le pool};
+\node[draw,rounded corners=2pt,fill=omMeth!8,align=center,anchor=west] (pool) at ([xshift=0.8cm]map.east) {pool d'ordres~:\\ prix, quantité, côté};
+\draw[->] (map) -- (pool);
+\node[anchor=north west,align=left] at (0,-2.7) {prix $=$ base $+$ indice $\times$ tick};
+\end{tikzpicture}
+
+\omcaption{Le carnet du constructeur. Les niveaux vivent dans un tableau dense indexé par les ticks à partir d'un prix de référence (bleu~: bids, rouge~: asks, gris~:
+vides)~; les meilleurs bid et ask sont des indices tenus à jour. Lorsqu'un meilleur prix quitte la moitié centrale du tableau, la base est
+déplacée pour recentrer les meilleurs cours, et les ordres sont de nouveau rangés. Les ordres sont retrouvés par une table à \omterm{def:ll:the-order-book-builder:open}{adressage ouvert} qui relie leur
+référence à un emplacement dans un pool de taille fixe.}\label{fig:ll:the-order-book-builder:ladder}
+\end{omfigure}
+
+Trois structures se disputent les niveaux. Un arbre équilibré par côté, la réponse classique des manuels (\texttt{std::map}, dont la recherche,
+la suppression et l'insertion sont logarithmiques et qui est «~généralement implémenté sous forme d'arbres rouge-noir~»), alloue un nœud pour chaque nouveau
+niveau et en parcourt quelques-uns à chaque mise à jour. Un vecteur de niveaux, trié du meilleur au moins bon, trouve un niveau par recherche dichotomique et garde
+les meilleurs cours en tête, mais insérer un niveau au milieu décale tous les niveaux qui suivent. Une échelle dense
+(la \cref{fig:ll:the-order-book-builder:ladder}) trouve un niveau par une soustraction et une division, sans jamais allouer de mémoire~; ses
+coûts se situent ailleurs~: la mémoire de toute la fenêtre, le balayage jusqu'au niveau non vide suivant lorsque le meilleur se vide, et le
+recentrage lorsque les meilleurs cours dérivent.
+
+Le type de flux et le régime de tick décident. Sur un instrument à grand tick, dont la fourchette vaut un tick la plupart du temps et dont
+les niveaux sont tous occupés près des meilleurs cours, toutes les structures sont rapides, car le carnet est petit et les meilleurs cours bougent rarement~: sur la
+minute du simulateur du chapitre~18, les trois constructeurs mettent environ \qty{28}{\nano\second} (échelle), \qty{36}{\nano\second}
+(vecteur trié) et \qty{37}{\nano\second} (arbre) à la médiane. Sur un instrument à petit tick, dont les ordres s'étalent sur des centaines
+de ticks avec des trous entre eux, l'arbre et le vecteur paient le coût d'un carnet plus grand, de 65 à \qty{72}{\nano\second}, tandis que
+l'échelle reste autour de \qty{31}{\nano\second} (la \cref{fig:ll:the-order-book-builder:update}). La queue de l'échelle, environ
+\qty{150}{\nano\second} au p99 sur le flux à grand tick, est son balayage~: lorsque le meilleur niveau se vide, le suivant peut être
+à plusieurs cases vides de distance.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=9pt,ymin=0,ymax=320,
+  symbolic x coords={large-tree,large-vector,large-ladder,small-tree,small-vector,small-ladder},xtick=data,
+  xticklabels={{arbre},{vecteur\\ trié},{échelle},{arbre},{vecteur\\ trié},{échelle}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.1,ylabel={ns par événement},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=q50]{figdata/low-latency/19-the-order-book-builder/measured_update_keyed.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=q99]{figdata/low-latency/19-the-order-book-builder/measured_update_keyed.csv};
+\legend{médiane,p99}
+\node[font=\scriptsize,anchor=north] at (axis cs:large-vector,315) {grand tick (simulateur)};
+\node[font=\scriptsize,anchor=north] at (axis cs:small-vector,315) {petit tick (synthétique)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Temps d'application d'un événement avec trois structures de carnet, sur la minute du simulateur du chapitre~18 (un
+instrument à grand tick, environ 190\,000 événements) et sur 100\,000 événements synthétiques à petit tick (ordres jusqu'à 300 ticks du mid). Le
+coût propre du chronomètre est soustrait. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~:
+\texttt{bench\_books.py}.}\label{fig:ll:the-order-book-builder:update}
+\end{omfigure}
+
+\section{Recherche d'ordres~: tables de hachage et adressage ouvert}
+
+\begin{definition}[Adressage ouvert]\label{def:ll:the-order-book-builder:open}
+L'\emph{adressage ouvert}\index{adressage ouvert} range les entrées d'une table de hachage dans un seul tableau plat~: une clé va à l'emplacement que désigne son hachage
+ou, si cet emplacement est déjà pris, au premier emplacement libre d'une séquence de sondage fixée (sondage linéaire~: les emplacements qui suivent), et une
+recherche suit la même séquence jusqu'à trouver la clé ou un emplacement vide.
+\end{definition}
+
+\texttt{std::unordered\_map}, la table de hachage de la bibliothèque standard, conserve chaque entrée dans un nœud qui lui est propre, alloué à l'insertion
+et atteint par le pointeur d'un seau~: une allocation par ordre et un pointeur à suivre à chaque recherche. L'\omterm{def:ll:the-order-book-builder:open}{adressage ouvert} conserve
+les références aux ordres et leurs emplacements dans le pool dans deux tableaux plats, dimensionnés une fois pour toutes au démarrage à au moins le double du nombre maximal
+d'ordres vivants attendus~; une recherche se réduit à une multiplication, un masque et, en général, une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}. La suppression est la partie délicate~: vider
+un emplacement couperait les séquences de sondage qui le traversent~; la construction décale donc vers l'arrière les entrées suivantes de la suite dans le trou
+lorsque leur emplacement d'origine le permet, au lieu de laisser une pierre tombale, et les recherches restent aussi brèves après une journée d'annulations que
+à l'ouverture.
+
+\omcode{code/firm/bookbuilder/cpp/firm_bookbuilder.hpp}{37}{53}{Suppression par décalage arrière~: les séquences de sondage restent intactes
+sans pierres tombales.}\label{lst:ll:the-order-book-builder:erase}
+
+Les ordres eux-mêmes résident dans un pool d'enregistrements de taille fixe alloués au démarrage, avec une \omterm{def:ll:cpp-for-latency-i-memory:pool}{liste libre} (\omterm{def:ll:cpp-for-latency-i-memory:pool}{liste libre} (free list), chapitre~6)~; la table stocke
+un indice d'emplacement, non un pointeur. Après le démarrage, appliquer un événement n'alloue rien~: le test de la construction compte les allocations du tas
+pendant que les deux jeux de test sont appliqués, et n'en trouve aucune.
+
+\section{Exactitude en présence de trous, de carnets croisés et de reprise}
+
+\begin{definition}[Invariant de carnet]\label{def:ll:the-order-book-builder:invariant}
+Un \emph{invariant de carnet} est une propriété que tout carnet correct vérifie après chaque événement, contrôlée par le constructeur dans ses versions de débogage~:
+la quantité de chaque niveau égale la somme des quantités de ses ordres, aucun niveau vide n'est signalé, et le meilleur cours acheteur est inférieur
+au meilleur cours vendeur.
+\end{definition}
+
+Un carnet est bien plus souvent faux à cause de ses entrées que de sa structure. Un événement peut désigner un ordre inconnu (une
+référence perdue dans un trou), réduire un ordre de plus qu'il ne contient, ou arriver alors que le \omterm{def:ll:the-feed-handler:handler}{feed handler} a marqué le carnet comme périmé.
+Les règles de la construction suivent le \omterm{def:ll:the-feed-handler:handler}{feed handler} du chapitre~18~: pendant un instantané (entre ses événements de début et de fin), le carnet est
+vidé, reconstruit à partir des ordres de l'instantané et marqué comme périmé~; un événement pour un ordre inconnu est ignoré et compté~; une
+réduction supérieure à l'ordre retire l'ordre. Les invariants attrapent le reste~: la référence Python les vérifie après chaque
+événement des deux jeux de test, et la méthode \texttt{check()} du constructeur C++ recalcule chaque niveau à partir du pool.
+
+Un carnet croisé mérite un mot. La plateforme n'en publie jamais en négociation continue, donc un carnet croisé dans le constructeur signifie
+un événement perdu ou un bogue, et doit être traité comme périmé, sans négocier dessus. Lors des enchères et dans certaines vues consolidées, les croisements sont
+légitimes~; le constructeur les signale alors au lieu de les corriger.
+
+L'échelle présente un seul risque d'exactitude qui lui est propre, le recentrage. Lorsque le meilleur cours quitte la moitié centrale de la fenêtre, le constructeur
+déplace la base pour que le mid soit au centre et reclasse chaque ordre vivant~: le seul parcours de tous les ordres, effectué
+sur place.
+
+\omcode{code/firm/bookbuilder/cpp/firm_bookbuilder.hpp}{220}{244}{Recentrage~: lorsqu'un meilleur prix quitte la moitié centrale, centrer
+l'échelle sur le mid et reclasser les ordres vivants.}\label{lst:ll:the-order-book-builder:recentre}
+
+À quelle fréquence~? Pour un prix qui évolue comme un mouvement brownien, un seul temps de sortie moyen suffit à y répondre.
+
+\begin{proposition}[Recentrages d'une échelle]\label{prop:ll:the-order-book-builder:recentre}
+Soit le prix, en ticks, un mouvement brownien d'écart type $\sigma$ par jour, et soit l'échelle recentrée
+chaque fois que le prix s'écarte de $a$ ticks du centre ($a$ est le quart de la largeur). Le temps entre deux recentrages a pour moyenne
+$a^2/\sigma^2$ jours, donc le taux à long terme est de $\sigma^2/a^2$ recentrages par jour. Un prix qui suit une tendance de $D$ ticks en une journée provoque
+environ $D/a$ recentrages.
+\end{proposition}
+
+\begin{proof}
+Soit $X_t$ le déplacement depuis le centre et $\tau$ le premier instant où $|X_\tau| = a$. Comme $X_t^2 - \sigma^2 t$ est une martingale et
+$\tau$ admet une moyenne finie, le théorème d'arrêt optionnel donne $\E[X_\tau^2] = \sigma^2 \E[\tau]$, et $X_\tau^2 = a^2$, donc $\E[\tau] =
+a^2/\sigma^2$. Les recentrages forment un processus de renouvellement dont le taux à long terme est $1/\E[\tau]$. Une tendance régulière parcourt $a$ ticks
+entre deux recentrages, soit $D/a$ d'entre eux pour $D$ ticks.
+\end{proof}
+
+Une action à 100 avec un tick de $10^{-4}$ qui évolue de 1~\% par jour a $\sigma = 10\,000$ ticks~: une échelle de 4\,096 ticks
+($a = 1\,024$) recentre environ 95 fois par jour, une de 65\,536 ticks environ une fois tous les trois jours. La même action qui évolue de trente
+pour cent en une journée parcourt 300\,000 ticks~: environ 290 recentrages avec l'échelle la plus étroite, et chacun d'eux reclasse chaque
+ordre vivant. La \Cref{fig:ll:the-order-book-builder:width}
+mesure ce jour-là, sur des événements synthétiques dont le mid dérive de trente pour cent~: 256 recentrages avec 4\,096 ticks, quinze avec
+65\,536, aucun avec un million, et un temps de traitement total qui tombe de \qty{0.7}{\second} avec une échelle de 256 ticks à
+\qty{4}{\milli\second} pour 65\,536 ticks, puis remonte à mesure que l'échelle dépasse les caches.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log basis x=2,xmin=180,xmax=12000000,ymin=1,ymax=3000,
+  xlabel={largeur de l'échelle (ticks, échelle logarithmique)},ylabel={ms pour la journée (échelle logarithmique)},
+  xtick={256,1024,4096,16384,65536,262144,1048576,4194304},
+  xticklabels={256,1\,024,4\,096,16\,384,65\,536,$2^{18}$,$2^{20}$,$2^{22}$},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,point meta=explicit symbolic,every node near coord/.append style={font=\scriptsize,anchor=south west},
+  table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.6pt] table[x=width,y=total_ms,meta=recentrings]{figdata/low-latency/19-the-order-book-builder/measured_width.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La journée où une action à petit tick évolue de trente pour cent (100\,000 événements synthétiques, le mid dérivant de 300\,000 ticks)~:
+temps de traitement du carnet en échelle par largeur, chaque point étant annoté de son nombre de recentrages. Mesuré sur un ordinateur portable (Intel
+Core Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~: \texttt{bench\_books.py}.}\label{fig:ll:the-order-book-builder:width}
+\end{omfigure}
+
+\section{Tester un carnet}
+
+Un \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} se teste contre d'autres carnets. La référence Python du constructeur, un dictionnaire d'ordres et un de niveaux par côté
+sans rien d'astucieux, est comparée événement par événement au carnet du livre~1, chapitre~28 (\texttt{firm.feed}),
+sur son échantillon de messages ordre par ordre~: les mêmes dix niveaux de chaque côté après chaque message. Elle est comparée au carnet
+qui alimente le moteur de variables du livre~7 (\texttt{firm.lobfeat}) sur le jeu de test de ce moteur~: les mêmes meilleurs prix et tailles après
+chaque message. Les échelles C++ et Rust sont ensuite comparées à la référence Python sur deux jeux de test, les événements du simulateur
+et un flux synthétique à petit tick, par un hachage 64 bits des cinq premiers niveaux de chaque côté, enchaîné sur chaque événement~; la
+comparaison est menée avec l'échelle ordinaire et avec une échelle étroite qui recentre et déverse des ordres dans sa table creuse, car
+c'est dans les chemins rares d'une structure que vivent ses bogues. Et les constructions à arbre et à vecteur trié du banc d'essai sont vérifiées
+contre l'échelle de la même façon avant que l'une d'elles soit chronométrée.
+
+\section{Tutoriel~: trois carnets, deux régimes}\label{tut:ll:the-order-book-builder:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire le carnet en échelle, le valider face aux carnets précédents, et le chronométrer face à un arbre et à un vecteur trié sur un
+instrument à grand tick et un instrument à petit tick. \textbf{État final~:}
+les \cref{fig:ll:the-order-book-builder:update,fig:ll:the-order-book-builder:width}, et des tests au vert en Python, C++ et Rust.
+\begin{tutsteps}
+\item \textbf{Les jeux de test.} \texttt{make\_book\_fixtures.py} écrit les événements du \omterm{def:ll:the-feed-handler:handler}{feed handler} pour les trois secondes du simulateur
+(chapitre~18) et 6\,000 événements synthétiques à petit tick, ainsi que les hachages de niveau 2 que la référence calcule sur ceux-ci.
+\item \textbf{Tests différentiels.} La référence face à \texttt{firm.feed} du livre~1 et à \texttt{firm.lobfeat} du livre~7~: les échelles C++
+et Rust face à la référence (hachage après chaque événement), avec des largeurs de 4\,096 et 256 ticks~; la suppression dans la table des ordres
+sur des clés qui entrent en collision~; les invariants après chaque événement~; zéro allocation après l'instanciation.
+\item \textbf{Mesurer} avec \texttt{python bench\_books.py}~: les trois structures sur la minute du simulateur et sur 100\,000
+événements à petit tick, puis l'échelle par largeur sur la journée où le mid dérive de trente pour cent.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer le parcours de l'échelle à la recherche du prochain niveau non vide par une bitmap des niveaux occupés et une
+instruction count-trailing-zeros, et mesurer à nouveau le p99 sur le flux à grand tick.
+\end{tutorial}
+
+\section{Construction~: le constructeur de carnet}\label{bld:ll:the-order-book-builder:bookbuilder}
+
+\begin{build}
+\bfield{Rôle} Le carnet qui sous-tend chaque stratégie du système de trading~: il consomme les événements du \omterm{def:ll:the-feed-handler:handler}{feed handler} (chapitre~18) et
+sert le niveau 1 et le niveau 2 au moteur de stratégies (chapitre~20) ainsi qu'à la barrière de risque (chapitre~22).
+\bfield{Interface} Référence Python \texttt{firm\_bookbuilder.Book}~: \texttt{apply(event)}, \texttt{best()},
+\texttt{depth(side, n)}, \texttt{stale}, \texttt{check()}~; \texttt{l2\_hash}~; \texttt{recentrings},
+\texttt{expected\_recentrings}. C++20 \texttt{firm::book::LadderBook(tick, width, max\_orders)}~: \texttt{apply},
+\texttt{best}, \texttt{depth}, \texttt{check}, \texttt{stale}, \texttt{recentrings}~; \texttt{OrderMap}~; \texttt{l2\_hash}. Rust
+\texttt{firm\_bookbuilder::LadderBook} et \texttt{OrderMap}, avec les mêmes.
+\bfield{Règles} Recherche d'ordres par \omterm{def:ll:the-order-book-builder:open}{adressage ouvert} dans un pool de taille fixe~; niveaux dans une échelle dense avec un repli épars~;
+échelle recentrée lorsqu'un meilleur prix quitte sa moitié centrale~; carnet vidé et marqué périmé du début à la fin
+d'un instantané~; aucune allocation par événement après la construction, sauf si un ordre tombe hors de l'échelle.
+\bfield{Tests d'acceptation} \texttt{code/firm/bookbuilder/}~: niveau 2 identique au \texttt{firm.feed} du livre~1 après chaque message
+de son échantillon et au \texttt{firm.lobfeat} du livre~7 après chaque message de son jeu de test (référence)~; les échelles C++ et Rust
+égales à la référence après chaque événement des deux jeux, avec une échelle normale et une échelle étroite~; invariants après chaque événement~; zéro
+allocation~; la suppression par décalage arrière de la table des ordres~; le modèle de recentrage face à un prix suivant un mouvement brownien simulé.
+\bfield{Pour aller plus loin} Une bitmap des niveaux occupés pour le parcours~; le niveau~3 avec les positions dans la file pour les propres ordres de la société~;
+un mode market-by-price~; un recentrage en arrière-plan dans une seconde échelle.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, spécification de \emph{TotalView-ITCH 5.0}, section 1.4.5 (Order Replace).
+\item cppreference.com, \texttt{std::map}.
+\item Les carnets d'ordres des livres précédents~: \texttt{firm.feed} (livre~1, chapitre~28) et \texttt{firm.lobfeat} (livre~7,
+chapitre~8).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:1}
+Une échelle de 4\,096 ticks avec un tick de 0.01 est centrée sur 50.00. Quel est son prix de base, quel indice contient 49.73, et où
+doit se trouver le meilleur cours acheteur pour que l'échelle reste en place~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:2}
+Quelle mémoire occupe une échelle de 65\,536 ticks avec 16 octets par niveau et deux côtés~? Tient-elle dans le cache de deuxième niveau
+du chapitre~3~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-order-book-builder:3}
+Un ordre de 500 à 20.10 est remplacé par un ordre de 300 à 20.11. Quels événements le carnet applique-t-il, et que devient
+la place de l'ordre dans sa file~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:4}
+Les clés 1\,024, 2\,048 et 3\,072 ont le même emplacement initial, la case 5, dans une table de 16. Elles sont insérées dans cet ordre, puis
+1\,024 est effacée. Montrer la table avant et après le décalage arrière. Qu'aurait coûté une pierre tombale à la place~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:5}
+Un titre se négocie à 40 avec un tick de 0.01 et une volatilité quotidienne de 2~\%. Avec une échelle de 1\,024 ticks, combien de
+recentrages par jour prévoit la \cref{prop:ll:the-order-book-builder:recentre}~? Et avec 4\,096~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-order-book-builder:6}
+Le constructeur reçoit une réduction de 300 pour un ordre qui en détient 200. Que fait-il, et que signale-t-il à la surveillance~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-order-book-builder:7}
+\emph{Programmation.} Ajouter une bitmap des niveaux occupés à l'échelle C++ (un bit par tick et par côté) et utiliser count-trailing-zeros pour
+trouver le prochain meilleur niveau~; vérifier les hachages des jeux de test et mesurer le p99 à grand tick.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-order-book-builder:8}
+\emph{Trouver la faille.} «~Nous avons dimensionné l'échelle à 512 ticks parce qu'elle tient dans le cache de premier niveau, et nos tests
+un jour calme n'ont montré aucun recentrage.~»
+\end{exercise}
+
+\section{Problème~: l'action qui a bougé de trente pour cent}
+
+\begin{problem}[{Problème du week-end --- quelle largeur pour une échelle}]\label{pb:ll:the-order-book-builder:1}
+Une action à petit tick se négocie à 100 avec un tick de $10^{-4}$. Un jour ordinaire, sa volatilité est de 1.5~\%~; le jour de ce
+problème, elle bouge de trente pour cent. Utiliser la \cref{prop:ll:the-order-book-builder:recentre} et les mesures de la
+\cref{fig:ll:the-order-book-builder:width} (\texttt{measured\_width.csv}).
+
+\medskip\noindent\textbf{Partie I --- Le jour ordinaire.}
+\begin{enumerate}
+\item Quelle est la valeur de $\sigma$ en ticks par jour~?
+\item Combien de recentrages par jour une échelle de 4\,096 ticks prévoit-elle~? Et une de 65\,536~?
+\item Quelle largeur correspond à un recentrage par jour~?
+\item Pourquoi le jour ordinaire est-il un mauvais guide pour le dimensionnement~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le jour qui compte.}
+\begin{enumerate}[resume]
+\item Combien de ticks le prix parcourt-il, et combien de recentrages une tendance régulière provoque-t-elle avec 4\,096 ticks~?
+\item Combien la mesure en a-t-elle compté, et pourquoi moins~?
+\item Avec 256 ticks, la mesure en compte bien plus que la seule tendance n'en prévoit. Pourquoi~?
+\item Que coûte un recentrage, d'après les mesures à 4\,096 et à 65\,536 ticks~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le compromis.}
+\begin{enumerate}[resume]
+\item Quelle largeur minimise le total mesuré de la journée, et que coûte-t-elle~?
+\item Pourquoi le total remonte-t-il au-delà~?
+\item Quelle mémoire cette largeur occupe-t-elle pour les deux côtés~?
+\item Que dit le temps médian de mise à jour sur la largeur~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la largeur de l'échelle face aux recentrages de la journée et à son coût total, et la largeur qui
+le minimise.
+\item Comment choisir la largeur pour chaque instrument~?
+\item Que changerait un recentrage en arrière-plan, dans une seconde échelle~?
+\item Pourquoi les tests doivent-ils inclure une échelle étroite~?
+\item Comment un instrument à grand tick modifie-t-il la réponse~?
+\item Que doit signaler le constructeur à la surveillance au sujet des recentrages~?
+\item Que coûte la journée avec un arbre équilibré à la place~?
+\item En une phrase~: qu'apporte une échelle dense, et contre quoi faut-il la protéger~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:the-order-book-builder:1}
+Concevriez-vous un carnet d'ordres pour un flux market-by-order~? Quelles opérations doivent être rapides, et à quelle vitesse~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-order-book-builder:2}
+Arbre, vecteur trié ou tableau de niveaux de prix~: quand choisiriez-vous chacun~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-order-book-builder:3}
+Comment retrouveriez-vous des ordres par référence sans allouer de mémoire~? Comment supprimez-vous dans une table à \omterm{def:ll:the-order-book-builder:open}{adressage ouvert}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-order-book-builder:4}
+Votre carnet est croisé. Qu'a-t-il pu se passer, et que faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-order-book-builder:5}
+Comment testez-vous un \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} pour lui faire confiance le jour qui compte~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:the-order-book-builder:6}
+Une échelle dense est rapide jusqu'à ce que le prix s'éloigne beaucoup. Quantifiez à partir de quand, et concevez en conséquence.
+\end{interviewq}

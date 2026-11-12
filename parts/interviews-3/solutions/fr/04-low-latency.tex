@@ -1,0 +1,446 @@
+\section*{Chapitre \ref{ch:iv3:low-latency} --- Faible latence}
+\markboth{\protect\omTocMark{}{Réponses~: Faible latence}}{\protect\omTocMark{}{Réponses~: Faible latence}}
+
+\begin{solution}{iq:iv3:low-latency:1}
+Il affiche \texttt{24 16 64 192} sur une ligne et \texttt{16 13} sur la suivante.
+
+Sur cette plateforme, \texttt{double} a un alignement de 8 et \texttt{int} un alignement de 4. Dans \texttt{A}, \texttt{c} occupe l'octet 0, 7 octets de remplissage placent \texttt{d} à l'octet 8, \texttt{e} est à 16, 3 octets de remplissage supplémentaires placent \texttt{i} à 20, et la taille totale est de 24. Dans \texttt{B}, le membre le plus grand vient en premier~: \texttt{d} à 0, \texttt{i} à 8, \texttt{c} à 12, \texttt{e} à 13, puis remplissage jusqu'à un multiple de 8, ce qui donne 16. \texttt{alignas(64)} force la taille de \texttt{C} à un multiple de 64, car chaque élément d'un tableau doit être aligné, si bien que trois d'entre eux occupent 192.
+
+La norme fixe l'ordre des membres, le fait que \texttt{sizeof(C)} soit un multiple de 64 et que \texttt{row} vaut \texttt{3 * sizeof(C)}. L'alignement de \texttt{double} et de \texttt{int}, et donc les autres nombres, dépend de la plateforme.
+
+\iqwhy{Les 8 octets économisés permettent à 4 objets de tenir dans une ligne de cache de 64 octets au lieu de 2, et le remplissage qui les gaspille n'apparaît pas dans le code source.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:2}
+Le comportement du programme est indéfini, donc aucune sortie ne peut être garantie. Avec ce compilateur, il a affiché 0, et le thread de lecture n'a pas attendu.
+
+Les deux variables \texttt{ready} et \texttt{value} sont lues et écrites par deux threads sans synchronisation, il s'agit donc d'une course aux données\index{course aux données}, et C++ qualifie toute course aux données de comportement indéfini. Voici ce qui s'est passé ici~: avec \texttt{-O2}, g++ active \texttt{-ffinite-loops}, ce qui lui permet de supposer que la boucle se termine et de la supprimer, si bien que le thread de lecture affiche \texttt{value} immédiatement. Avec \texttt{-fno-finite-loops}, le test s'est bloqué, en tournant sur une seule lecture déplacée hors de la boucle. À \texttt{-O0}, il a affiché 42. Ces trois résultats sont des observations faites avec g++ 11.4, non des garanties.
+
+\texttt{volatile bool} a affiché 42 avec \texttt{-O2}, mais ThreadSanitizer signale toujours la course, car \texttt{volatile} n'établit aucun ordre entre les threads et ne rend pas l'accès atomique. La correction consiste à utiliser \texttt{std::atomic<bool>}~: le programme a affiché 42 et ThreadSanitizer n'a rien signalé.
+
+\iqwrong{«~Le programme reste bloqué indéfiniment, parce que le compilateur met le drapeau en cache.~» C'est un résultat possible d'un comportement indéfini, mais pas celui que ce compilateur a choisi avec \texttt{-O2}.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:3}
+Il affiche 8, 16, 8, 8, 8, 16, 16, 24, 24, 1. Les trois tailles pour \texttt{Option<NonZeroU64>}, \texttt{Option<Box<u64>{}>} et \texttt{Option<\&[u8]>} sont garanties~; \texttt{Option<Vec<u8>{}>} et \texttt{Option<bool>} ne prennent cette taille que de fait.
+
+\texttt{Option<u64>} a besoin d'une étiquette, car toute configuration de bits de \texttt{u64} est une valeur valide, si bien qu'il occupe 16 octets avec un alignement de 8. Un \texttt{Box} et une référence ne sont jamais nuls et \texttt{NonZeroU64} n'est jamais nul, si bien que \texttt{None} peut utiliser cette configuration de bits inutilisée. La documentation de \texttt{std::option} garantit cette optimisation du pointeur nul pour exactement ces familles. \texttt{\&[u8]} est un pointeur et une longueur, soit 16 octets. \texttt{Vec<u8>} occupe 24 octets, et \texttt{bool} possède lui aussi des configurations inutilisées, que le compilateur utilise, mais aucun de ces deux cas ne figure dans la liste garantie.
+
+\iqwhy{Un tableau de \texttt{Option<u64>} fait le double de la taille d'un tableau de \texttt{u64}. Un prix qui ne peut jamais valoir zéro, stocké en \texttt{NonZeroU64}, garde le tableau petit et l'encombrement en cache réduit.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:4}
+Il ne compile plus~: rustc signale l'erreur E0373, selon laquelle la fermeture pourrait survivre à l'emprunt que \texttt{main} fait de \texttt{prices}.
+
+\texttt{thread::spawn} exige une fermeture de durée de vie \texttt{\textquotesingle{}static}, car la signature doit valoir pour tout appelant, et un appelant peut abandonner le handle et ne jamais attendre la fin du thread. Le vérificateur d'emprunts lit cette signature. Il ne raisonne pas sur le \texttt{join} de la ligne suivante.
+
+Avec \texttt{move}, la fermeture possède le vecteur, et \texttt{main} ne peut plus l'utiliser. La correction sans compteur de références consiste en un thread scopé, \cref{lst:iv3:ll:scoped}~: la portée rejoint chaque thread qu'elle a lancé avant de rendre la main, si bien qu'un simple emprunt est sûr, et cette exécution a affiché \texttt{300 3}.
+\enlargethispage{-6\baselineskip}%
+\omcode{code/interviews-3/04-low-latency/rust/src/bin/spawn_scoped.rs}{3}{9}{Le même travail dans un thread scopé.\protect\hfil\protect\break}\label{lst:iv3:ll:scoped}
+\iqwrong{«~Il compile et échoue à l'exécution si le thread survit à \texttt{prices}.~» Le Rust sûr rejette cela avant même que le programme n'existe.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:5}
+Le budget est de 4000 cycles, soit 8000 instructions. Onze défauts de cache prennent 990 ns et remplissent ce budget. Cinq défauts de cache prennent 450 ns, soit 45~\% du budget, le temps de 3600 instructions.
+
+Le calcul est $1000\text{ ns} \times 4 = 4000$ cycles, et $4000 \times 2 = 8000$ instructions. Puis $1000 / 90 \approx 11$ défauts de cache, et $5 \times 90 = 450$ ns, soit $450 \times 4 = 1800$ cycles, ou 3600 instructions.
+
+L'intérêt de l'exercice est la comparaison. Un chemin critique (hot path) de quelques centaines d'instructions est peu coûteux, et une poignée de pointeurs froids le domine~; le travail sur la latence consiste donc largement à limiter le nombre de lignes de cache qu'un message touche, et à savoir si elles sont déjà en cache. Les chiffres donnés ici sont les hypothèses de la question~; il faut mesurer sa propre machine avant de citer quoi que ce soit.
+
+\iqfollow{Une mise à jour du carnet d'ordres suit une table de hachage jusqu'à un niveau, puis une file jusqu'à un ordre~: trois pointeurs froids, chacun un défaut de cache. Quel en est le coût~?}{$3 \times 90 = 270$ ns, soit plus d'un quart du budget, avant que la moindre logique ait été exécutée.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:6}
+Il s'agit d'un faux partage\index{faux partage}. Les huit compteurs de 8 octets se trouvent sur une ou deux lignes de cache de 64 octets, si bien que chaque incrément arrache la ligne au cœur qui la détenait. Il faut donner à chaque compteur sa propre ligne, comme dans le \cref{lst:iv3:ll:padded}~; la structure passe de 64 à 512 octets.
+\omcode{code/interviews-3/04-low-latency/cpp/counters.cpp}{19}{25}{Chaque compteur sur sa propre ligne.}\label{lst:iv3:ll:padded}
+
+La cohérence de cache fonctionne ligne par ligne, non variable par variable. Un incrément verrouillé exige que son cœur possède la ligne en exclusivité, si bien que la ligne passe d'un cœur à l'autre à presque chaque opération, même si les threads ne partagent aucune donnée. Mesuré une fois ici, à titre d'illustration, sur un Intel Core Ultra 7 155H sous WSL2 avec g++ 11.4 et 4 threads non épinglés~: environ 60 ns par incrément sur la ligne partagée, environ 5 ns chacun sur sa propre ligne.
+
+La correction coûte huit fois la mémoire et huit lignes d'encombrement en cache, et un thread qui additionne tous les compteurs subit désormais jusqu'à huit défauts de cache au lieu d'un. Sur certains processeurs Intel, un préchargeur spatial charge des paires de lignes, si bien que certaines bibliothèques remplissent jusqu'à 128 octets. Pour le confirmer, il faut comparer les deux versions à mesure qu'on ajoute des threads et, sur un matériel qui le permet, utiliser \texttt{perf c2c}, qui signale les lignes disputées. Une VM ne donne parfois pas accès à ces compteurs.
+
+\iqfollow{Avec un seul écrivain par compteur, avez-vous encore besoin de l'incrément verrouillé~?}{Non. Un chargement relâché suivi d'un stockage relâché suffit, et sur x86-64 chacun se réduit à une simple instruction move. La ligne circule toujours lorsque quelqu'un la lit, si bien que le remplissage reste utile. Un compteur non atomique par thread, publié de temps en temps, coûte encore moins cher.}
+\iqfollow{\texttt{std::hardware\_destructive\_interference\_size} peut-elle donner la valeur 64~?}{Non, pas avec g++ 11.4~: le test a constaté que sa macro de fonctionnalité y était indéfinie.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:7}
+Les trois chargements, les stockages relâché et release, et \texttt{++plain} sont des instructions ordinaires (\texttt{movq}, ou un ajout non verrouillé). Le stockage à cohérence séquentielle est \texttt{xchgq}, et le \texttt{fetch\_add} relâché est un ajout préfixé par \texttt{lock}.
+
+Deux besoins distincts expliquent ce motif. Atomicité~: une opération de lecture-modification-écriture doit garder la ligne pendant toute l'opération, si bien qu'elle est verrouillée quel que soit l'ordre demandé, et «~relâché~» ne la rend pas bon marché. Ordre~: x86-64 ne permet à un chargement ultérieur de dépasser qu'un stockage antérieur encore tamponné, si bien que seul un stockage à cohérence séquentielle doit faire davantage, et \texttt{xchg} est implicitement verrouillé et vide le tampon de stockage. Acquire et release ne demandent aucune instruction. Leur rôle restant est d'empêcher le compilateur de réordonner des instructions.
+
+Sur un processeur à ordre faible, ces ordres coûtent bel et bien des instructions. La correspondance publiée pour ARMv7 transforme un chargement acquire en \texttt{ldr; dmb ish} et un stockage release en \texttt{dmb ish; str}, et POWER utilise les formes \texttt{isync} et \texttt{lwsync}.
+
+\iqwrong{«~Relâché signifie sans coût.~» Il supprime l'ordre, et non l'atomicité. Sur ce listing, \texttt{fetch\_add(1, relaxed)} porte tout de même le préfixe \texttt{lock}.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:8}
+La liste \texttt{a} parcourt la mémoire dans l'ordre des adresses, tandis que \texttt{b} la parcourt dans un ordre aléatoire, si bien que presque chaque pas de \texttt{b} est un défaut de cache.
+
+Les nœuds de \texttt{a} sont alloués dans l'ordre de la liste, si bien que les voisins se trouvent côte à côte et que le préchargeur suit. \texttt{b} alloue ses nœuds dans un ordre mélangé, et \texttt{sort} se contente de relier à nouveau les nœuds, sans les déplacer. Ainsi l'ordre de la liste est trié alors que les adresses sont mélangées.
+
+Deux contrôles ne demandent aucun compteur. D'abord, il faut mesurer à quelle fréquence deux nœuds successifs se trouvent à moins de 64 octets l'un de l'autre~: le programme du listing a trouvé une proportion de 1.0000 pour \texttt{a} et de 0.0000 pour \texttt{b}. Ensuite, il faut réduire la liste et observer l'écart se résorber à mesure qu'elle commence à tenir dans le cache. Mesuré une fois ici sur un Intel Core Ultra 7 155H sous WSL2, avec g++ 11.4, en ns par nœud pour \texttt{a} et \texttt{b}~: environ 1.2 et 2.5 pour $n = 2000$, 1.3 et 5.5 pour $20\,000$, 3 et 18 pour $200\,000$, 3 et 150 pour deux millions.
+
+La correction consiste à trier un \texttt{std::vector}, qui déplace les valeurs, ou à reconstruire la liste après le tri si une liste est vraiment nécessaire.
+
+\iqwrong{«~Trier rend la liste plus lente.~» Les mêmes valeurs, dans le même ordre, ne coûtent un temps différent qu'à cause de l'emplacement des nœuds.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:9}
+Les résultats sont~: string 15, 0~; string 16, 1~; push 1000, 11~; reserved, 1~; function 16, 0~; function 24, 1~; shared new, 2~; make\_shared, 1~; map 10, 10.
+
+La chaîne utilise son tampon des petites chaînes jusqu'à 15 caractères, ici. Le vecteur double sa capacité de 1 à 1024, soit 11 allocations, et \texttt{reserve} les remplace par une seule. \texttt{std::function} conserve en son sein un objet appelable petit et trivialement copiable, ce qui contient la lambda de 16 octets mais pas celle de 24 octets. \texttt{shared\_ptr<long>(new long(1))} alloue l'objet, puis un bloc de contrôle, et \texttt{make\_shared} place les deux dans une seule allocation. Le conteneur map alloue un nœud par élément.
+
+La norme laisse toutes ces tailles à la bibliothèque~: la capacité des petites chaînes, le tampon de \texttt{std::function} et le facteur de croissance. Une autre bibliothèque peut afficher d'autres nombres. Le nombre d'allocations par nœud du map et les deux allocations de \texttt{shared\_ptr<long>(new long(1))} découlent de ce que ces types doivent faire sur toute implémentation courante, mais aucun des deux n'est une garantie, et la norme autorise même un compilateur à fusionner ou à supprimer des appels à \texttt{new}. Ce compilateur n'a fait ni l'un ni l'autre ici.
+
+\iqfollow{Comment empêchez-vous les allocations de réapparaître insidieusement dans le chemin critique~?}{Dans une compilation de test, il faut faire échouer un \texttt{operator new} qui compte les appels si un drapeau signale que le chemin critique tourne, puis rejouer une journée de messages sous ce contrôle.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:10}
+\texttt{ts\_copy} est correct et \texttt{ts\_cast} a un comportement indéfini, pourtant avec \texttt{-O2} les deux se compilent en la même instruction unique, \texttt{movq 8(\%rdi), \%rax}, sans appel.
+
+\texttt{ts\_cast} échoue sur l'alignement. \texttt{Header} a un alignement de 8 et l'adresse se trouve 3 octets après une adresse alignée sur 8, si bien qu'aucun \texttt{Header} ne peut y résider, même avec la règle de C++20 selon laquelle un tableau d'octets crée implicitement des objets là où cela rendrait le programme défini. La lecture passe donc par un type que le stockage ne contient pas, ce que la règle d'accessibilité du type rend indéfini. Compilé avec \texttt{-fsanitize=alignment}, le programme signale une adresse mal alignée à la ligne 12 et rien sur la ligne du \texttt{memcpy}.
+
+Il semble fonctionner parce que x86-64 tolère un \texttt{mov} non aligné et que le compilateur en a utilisé un par hasard. Rien ne l'y oblige~: une fois le code indéfini, le compilateur peut supposer l'alignement lorsqu'il optimise, y compris lorsqu'il vectorise une boucle sur de tels pointeurs.
+
+Un \texttt{memcpy} de taille petite et connue ne coûte rien, comme le montre l'instruction identique, si bien qu'aucune raison de performance ne justifie de préférer le transtypage.
+
+\iqfollow{\texttt{std::start\_lifetime\_as} de C++23 résout-elle le problème~?}{Elle résout l'absence d'objet, pas l'alignement~: son pointeur doit toujours être convenablement aligné, et ici ce n'est pas le cas.}
+\iqwhy{Chaque feed handler analyse des en-têtes dans des tampons d'octets à des décalages quelconques, et ce transtypage est la ligne classique qui réussit tous les tests sur x86-64.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:11}
+Le compilateur a supprimé le travail. Le résultat de \texttt{work} n'est pas utilisé et la fonction n'a aucun effet de bord, si bien que \texttt{main} ne contient ni appel à elle ni boucle. Il ne reste que le temps entre deux lectures d'horloge~: de 67 à 69 ns dans nos exécutions.
+
+Le \Cref{lst:iv3:ll:benchgood} force le travail à être effectué~: \texttt{noinline} empêche la disparition de l'appel, les instructions \texttt{asm} vides masquent l'entrée et conservent le résultat, et le code de \texttt{main} contient alors bien l'appel.
+\omcode{code/interviews-3/04-low-latency/cpp/bench_good.cpp}{7}{33}{La même mesure, maintenue en vie.}\label{lst:iv3:ll:benchgood}
+
+Les autres défauts~: une seule exécution ne donne aucune distribution, il faut donc en collecter beaucoup et rapporter la médiane, la queue et le maximum. La première exécution est à froid. Un benchmark de latence qui boucle serré réchauffe aussi les caches et les prédicteurs de branchement d'une façon qu'un message réel, arrivant rarement, ne fera pas. Le thread n'est pas épinglé. Sur notre machine, cette version a affiché une médiane proche de 65~µs et un maximum plusieurs fois supérieur, pour 100\,000 itérations.
+
+\texttt{rdtsc} n'est pas sérialisante~: elle peut lire le compteur avant la fin des instructions précédentes, et les suivantes peuvent commencer avant la lecture. On utilise donc habituellement \texttt{lfence; rdtsc} au début et \texttt{rdtscp; lfence} à la fin. Il faut aussi convertir les cycles en temps, ce qui suppose de connaître la fréquence du compteur~; il convient donc de vérifier que cette fréquence est constante sur votre processeur.
+
+\iqwrong{«~L'horloge doit être défectueuse.~» L'horloge est le seul code qui reste.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:12}
+Ce n'est pas correct. Il existe une course aux données sur \texttt{payload}, si bien que le comportement est indéfini, quel que soit le nombre d'exécutions qui affichent 42. Sur ARM ou POWER, l'ordre incorrect est aussi autorisé par le matériel.
+
+Une écriture et une lecture relaxed rendent le drapeau lui-même atomique, mais ne créent aucune relation happens-before\index{happens-before} entre les threads~: l'écriture ordinaire et la lecture ordinaire de \texttt{payload} sont donc en conflit. ThreadSanitizer le signale. Sur x86-64, le matériel conserve bien l'ordre de deux écritures et de deux lectures, ce qui explique que les exécutions semblent correctes. Même sur ce processeur, le compilateur peut encore réordonner l'écriture ordinaire et l'écriture relaxed, puisque rien ne l'interdit. Sur ARM et POWER, ce schéma de passage de message peut effectivement être observé dans le désordre sans barrière.
+
+La correction consiste à écrire \texttt{store(true, release)} dans l'écrivain et \texttt{load(acquire)} dans le lecteur. L'écriture release se synchronise avec la lecture acquire qui la lit, si bien que l'écriture de \texttt{payload} précède la lecture. Avec ces deux modifications, ThreadSanitizer ne signale plus rien et le programme affiche 42. Sur x86-64, le code machine ne contient aucune barrière supplémentaire, puisque acquire et release y sont de simples mouvements.
+
+\iqwrong{«~x86 est à ordre fort, donc relaxed convient là-bas.~» Les règles du langage s'appliquent d'abord~: elles lient le compilateur sur tous les processeurs.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:13}
+La faute de justesse~: \texttt{lock} et \texttt{unlock} utilisent l'ordre relaxed, si bien qu'elles ne protègent rien selon les règles de C++. La faute de performance~: les attentes tournent sur \texttt{exchange}, qui est une écriture, si bien que la ligne de cache du verrou circule entre elles.
+
+Un verrou doit faire en sorte que la section critique du détenteur précédent précède celle du suivant. Les ordres relaxed n'offrent pas un tel edge, si bien que les incréments de \texttt{counter} se disputent. ThreadSanitizer le signale, même si le total affiché valait 80\,000 sur x86-64, où \texttt{exchange} est une instruction verrouillée et où le compilateur n'a pas fait de mouvement nuisible cette fois. La correction~: acquisition sur l'\texttt{exchange} réussi, libération sur l'écriture de \texttt{unlock}.
+
+Sous contention, chaque \texttt{exchange} échoué exige la ligne en état exclusif, si bien que les attentes ralentissent aussi le détenteur. Le remède habituel consiste à tourner sur une lecture relaxed, ce qui permet à toutes les attentes de partager la ligne, et à ne tenter l'\texttt{exchange} que lorsque le verrou semble libre, avec \texttt{pause} dans la boucle d'attente. Le \Cref{lst:iv3:ll:ttas} est cette version~: elle affiche 80\,000 et ThreadSanitizer reste silencieux. \texttt{pause} indique au processeur qu'il s'agit d'une attente active, ce qui évite une lourde pénalité à la sortie de la boucle et économise de l'énergie.
+\omcode{code/interviews-3/04-low-latency/cpp/spinlock_ttas.cpp}{7}{18}{Attente active sur une lecture.}\label{lst:iv3:ll:ttas}
+\iqfollow{Pourquoi un spinlock est-il risqué sur une machine ayant plus de threads exécutables que de cœurs~?}{Si le détenteur est désordonnancé, chaque attente consomme une tranche de temps entière et personne ne progresse. Un spinlock suppose que le détenteur s'exécute.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:14}
+Cela signifie que chaque opération sur les types de 16 et 24~octets est un appel à libatomic, sans garantie de progression~; aucun de ces types ne doit donc figurer sur un chemin critique. Le programme affiche \texttt{1 1}, \texttt{0 0}, \texttt{0 0}, puis \texttt{99.5 100.5}.
+
+Pour \texttt{Quote}, le binaire contient les symboles indéfinis \texttt{\_\_atomic\_load\_16} et \texttt{\_\_atomic\_store\_16}, et sans \texttt{-latomic} l'édition de liens échoue sur eux. Chaque lecture est donc un appel de fonction, et le fait que \texttt{is\_lock\_free()} renvoie 0 signifie qu'aucune garantie de progression n'existe. libatomic dispose d'un repli reposant sur une table de mutex indexée par adresse, si bien qu'un lecteur peut attendre derrière un thread désordonnancé. Même lorsque la compare-and-swap de 16~octets est utilisée, cette instruction effectue toujours un cycle d'écriture sur sa cible~; une lecture de 16~octets faite ainsi prendrait donc la ligne en exclusif, et les lecteurs se disputeraient entre eux.
+
+Il faut plutôt faire tenir la cotation dans 8~octets~: deux prix sur 32~bits en ticks entiers, et un seul mouvement ordinaire publie les deux. Si cela ne suffit pas, utiliser un verrou à séquence, ou publier un pointeur vers un instantané immuable.
+
+\iqwrong{«~Le processeur possède \texttt{cmpxchg16b}, donc c'est sans verrou.~» Le compilateur ne l'a pas intégrée ici, et le rapport d'exécution indique 0.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:15}
+Voici le tableau, vérifié en compilant chaque combinaison avec rustc 1.97.
+
+\begin{center}\small
+\begin{tabular}{lcc}
+Type & \texttt{Send} & \texttt{Sync}\\\hline
+\texttt{Rc<u64>} & non & non\\
+\texttt{Arc<u64>} & oui & oui\\
+\texttt{Arc<Cell<u64>{}>} & non & non\\
+\texttt{Cell<u64>}, \texttt{RefCell<u64>} & oui & non\\
+\texttt{Mutex<Cell<u64>{}>} & oui & oui\\
+\texttt{Mutex<Rc<u64>{}>} & non & non\\
+\texttt{\&\textquotesingle{}static Cell<u64>} & non & non\\
+\texttt{*mut u64} & non & non\\
+\texttt{MutexGuard<\textquotesingle{}static, u64>} & non & oui\\
+\texttt{AtomicU64} & oui & oui
+\end{tabular}
+\end{center}
+
+La règle est que \texttt{T} est \texttt{Sync} exactement lorsque \texttt{\&T} est \texttt{Send}. \texttt{Rc} possède un compteur non synchronisé, il n'est donc ni l'un ni l'autre. \texttt{Cell} et \texttt{RefCell} peuvent passer à un autre thread, puisque la propriété est exclusive, mais ne peuvent pas être partagés. \texttt{Arc<T>} exige \texttt{T: Send + Sync}, si bien que \texttt{Arc<Cell>} échoue. \texttt{Mutex} fournit \texttt{Sync} à partir de \texttt{Send}, il sauve donc \texttt{Cell}, mais il ne peut pas sauver \texttt{Rc}, dont les clones peuvent vivre en dehors du mutex. Une référence à un \texttt{Cell} n'est pas \texttt{Send}, car \texttt{Cell} n'est pas \texttt{Sync}. Les pointeurs bruts sont exclus de ces deux traits par défaut. \texttt{MutexGuard} doit être déverrouillé sur le thread qui l'a verrouillé, il n'est donc pas \texttt{Send}, alors que partager une référence à celui-ci est sans danger.
+
+\iqwrong{«~\texttt{Arc} rend thread-safe n'importe quoi.~» Il rend thread-safe le compteur. Le contenu doit encore satisfaire les conditions.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:16}
+Il peut afficher n'importe quelle valeur de 2 à 4\,000\,000~: en pratique, une valeur bien inférieure à 4\,000\,000, entre environ un million et 1.35 million dans nos exécutions. Il n'y a ni course aux données ni comportement indéfini. C'est une condition de course, que le Rust sûr ne prévient pas.
+
+Chaque \texttt{load} et chaque \texttt{store} est atomique, si bien qu'aucun accès n'est déchiré et que le résultat est défini. Mais la lecture et l'écriture sont deux opérations distinctes, si bien qu'un incrément d'un autre thread survenant entre elles est écrasé. Telle est la différence~: une course aux données est un accès conflictuel non synchronisé, que Rust exclut~; une mise à jour perdue est une erreur de logique, qu'il n'exclut pas.
+
+La borne inférieure est 2. Prenons la dernière écriture dans \texttt{COUNT} selon son ordre de modification, faite par le thread $T$. Il s'agit de la dernière itération de $T$, et $T$ avait déjà écrit une fois~; la cohérence interdit donc à sa lecture de voir la valeur initiale 0~; toute autre valeur écrite vaut au moins 1. La valeur finale est donc au moins 2. Une recherche exhaustive sur les entrelacements de petits cas confirme que 2 est atteint.
+
+La correction tient en un seul appel, \texttt{COUNT.fetch\_add(1, Relaxed)}, qui a affiché exactement 4\,000\,000.
+
+\iqwhy{Un compteur à un seul écrivain est l'usage légitime de ce motif lecture-puis-écriture, et il évite une instruction verrouillée. Si l'on ajoute un second écrivain, il casse en silence, sans aucun avertissement du compilateur.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:17}
+\texttt{Vec::new} 0, \texttt{with\_capacity(8)} 1, \texttt{String::new} 0, \texttt{to\_string} 1, \texttt{Box<()>} 0, \texttt{Box<u64>} 1, 1000 push 9, clear puis remplissage 0, \texttt{Arc::clone} 0.
+
+La documentation garantit plusieurs de ces valeurs. \texttt{Vec::new} n'alloue rien tant qu'aucun élément n'est ajouté. \texttt{Box::new} n'alloue rien pour un type de taille nulle. \texttt{clear} conserve la capacité, et mille éléments tiennent dans la capacité réservée plus tôt. \texttt{Arc::clone} se contente d'incrémenter un compteur.
+
+Le 9 n'est pas garanti. Il provient d'une allocation pour une capacité de 4, puis de huit réallocations jusqu'à 1024, mais \texttt{Vec} ne donne explicitement aucune garantie sur sa stratégie de croissance, seulement un \texttt{push} amorti à temps constant. \texttt{to\_string} sur un entier nécessite une \texttt{String} allouée sur le tas, si bien que ce 1 est ce qu'il faut attendre, sans que ce soit un contrat sur le décompte.
+
+\iqfollow{Comment garantissez-vous l'absence d'allocation dans un chemin critique~?}{Installer dans le build de test un allocateur comptant les allocations, comme celui-ci, et vérifier que le compteur reste stable pendant un rejeu. Réutiliser les tampons avec \texttt{clear}, et passer un espace de travail \texttt{\&mut} au lieu de renvoyer de nouvelles valeurs.}
+\iqwhy{\texttt{to\_string} et \texttt{format!} sont les appels qui se glissent dans les lignes de journal d'un chemin critique. Le décompte les rend visibles.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:18}
+\texttt{sum\_b} et \texttt{pick\_f} conservent encore une vérification de bornes. \texttt{sum\_c} et \texttt{sum\_d} ont une seule vérification au début, issue de la tranche et de l'\texttt{assert!}, et aucune dans la boucle. \texttt{sum\_a}, \texttt{diff\_e} et \texttt{pick\_g} ne comportent aucun contrôle de panique. Rien de tout cela n'est garanti.
+
+L'optimiseur n'élimine une vérification que lorsqu'il peut prouver que l'indice est dans les bornes. Dans \texttt{sum\_a}, les bornes sont la longueur propre de la tranche. Dans \texttt{sum\_b}, rien ne relie \texttt{n} à la longueur, si bien que la vérification subsiste et que la boucle doit paniquer au bon élément. Dans \texttt{sum\_c}, le redécoupage rend la longueur exactement égale à \texttt{n}. Dans \texttt{sum\_d}, l'\texttt{assert!} indique à l'optimiseur que la borne est respectée. Dans \texttt{diff\_e}, $i$ et $i - 1$ sont tous deux prouvablement dans les bornes. \texttt{pick\_f} ramène l'indice entre 0 et 7 par masquage, mais la tranche pourrait être plus courte que 8, si bien que sa vérification demeure, alors que \texttt{pick\_g} prend un tableau de longueur exactement 8, de sorte que le masque le prouve.
+
+Ces résultats proviennent de la lecture de l'assembleur de rustc 1.97 avec \texttt{-C opt-level=3}. L'élimination des vérifications de bornes est une optimisation, non une fonctionnalité du langage~; une autre version pourrait donc se comporter différemment. Il faut vérifier en lisant le résultat lorsque cela compte.
+
+\iqwrong{«~Rust vérifie toujours, donc utiliser \texttt{get\_unchecked}.~» Une tranche ou un assert placé en amont est sûre, et il a donné la même boucle sans vérification ici.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:19}
+Avec des pages de 4~KiB, le TLB couvre 8~MiB, le taux de défaut est d'environ 99.9~\%, et la traduction coûte environ 30~ns par lecture. Avec des pages de 2~MiB, il couvre 4~GiB, le taux de défaut est de 50~\%, et le coût est de 15~ns. Les entrées du dernier niveau occupent respectivement 16~MiB et 32~KiB.
+
+Le calcul~: $2048 \times 4\text{ KiB} = 8$ MiB, face à 8 GiB, si bien qu'une lecture aléatoire ne trouve son entrée qu'environ une fois sur mille, et $0.999 \times 30 \approx 30$ ns. Avec 2~MiB, $2048 \times 2\text{ MiB} = 4$ GiB, soit la moitié de la table, donc $0.5 \times 30 = 15$ ns. La table comporte $2^{21}$ pages de 4~KiB, soit 16~MiB d'entrées, et seulement 4096 pages de 2~MiB, soit 32~KiB. Les entrées elles-mêmes tiennent donc bien plus facilement dans le cache, et le parcours réel devient moins coûteux que les 30~ns fixes supposés par la question.
+
+Les pièges~: les pages géantes réservées explicitement (le pool \texttt{hugetlb}) se réservent de préférence au démarrage, car les réservations ultérieures peuvent échouer lorsque la mémoire est fragmentée. Leur mise en correspondance exige des privilèges ou une configuration particulière. Les pages géantes transparentes évitent la réservation, mais un défaut de page peut se bloquer pendant la compaction si le mode le permet, et un démon du noyau regroupe les pages en arrière-plan à des moments qu'on ne choisit pas. Enfin, une page de 2~MiB impose une granularité de page entière pour la protection comme pour le placement sur un nœud NUMA.
+
+\iqfollow{Et si vous disposez de pages de 1~GiB~?}{Huit entrées couvrent la table~; avec ce modèle, les défauts de traduction disparaissent donc une fois ces entrées chargées.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:20}
+Dans (a) et (b), les deux registres peuvent tous deux finir à 0, en C++20 comme sur x86-64. En (c), ce n'est pas possible. L'acquisition et la libération n'y changent rien, et l'instruction qui fait la différence est le \texttt{xchg} du stockage à cohérence séquentielle.
+
+Dans tout entrelacement des quatre opérations qui respecte l'ordre de chaque thread, la dernière opération est une lecture, et à ce moment-là les deux écritures ont eu lieu, si bien qu'elle lit 1~; une petite énumération le confirme. C'est ce que promet (c). La libération et l'acquisition n'ordonnent une libération qu'avec une acquisition qui lit sa valeur. Ici, chaque lecture porte sur une valeur que l'autre thread n'a pas encore stockée, si bien qu'aucune synchronisation ne se produit, et le langage autorise les deux zéros.
+
+Le matériel le fait aussi. Sur x86-64, chaque écriture peut attendre dans un tampon d'écriture FIFO\index{tampon d'écriture} pendant que la lecture suivante, portant sur l'autre variable, va en mémoire. Une instruction verrouillée comme \texttt{xchg} vide d'abord le tampon.
+
+Pour le montrer, on exécute la paire dans une boucle serrée, avec une libération des deux threads à chaque manche, et on compte les double zéros. Notre exécution, sur un Intel Core Ultra 7 155H sous WSL2 avec g++ 11.4 et \texttt{-O2}, a donné environ 3600 pour relaxed et 4400 pour acquire-release, sur 200\,000 manches, et 0 pour la cohérence séquentielle. Le compte varie d'une exécution à l'autre~; la règle, elle, ne varie pas.
+
+\iqfollow{Deux écrivains modifient \texttt{x} et \texttt{y}~; deux lecteurs les lisent dans l'ordre inverse. Les lecteurs peuvent-ils être en désaccord sur l'ordre des écritures~?}{En C++, tout ce qui est plus faible que la cohérence séquentielle le permet. x86-TSO l'interdit, et il est permis sur POWER. La cohérence séquentielle l'interdit, ce que confirme l'énumération.}
+\iqwhy{C'est le schéma «~je lève mon drapeau, puis je regarde celui de l'autre~», au cœur de l'exclusion mutuelle par drapeaux et des pointeurs de danger. L'écrire avec release et acquire est le bogue classique que les tests sur x86 détectent parfois, et parfois non.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:21}
+Le \Cref{lst:iv3:ll:spsc} est le tampon circulaire. Chaque côté possède un indice~: il lit le sien avec relaxed, lit celui de l'autre avec acquire, écrit la case, puis publie son indice avec release.
+\omcode{code/interviews-3/04-low-latency/cpp/spsc.cpp}{7}{29}{Une file à un producteur et un consommateur.}\label{lst:iv3:ll:spsc}
+
+Les points qui assurent la correction, chacun confirmé en affaiblissant cet unique ordre et en lançant ThreadSanitizer, qui signale alors une course aux données~:
+\begin{itemize}
+\item \texttt{tail\_.store(release)} dans \texttt{push}~: publie la case. En relaxed, le consommateur peut lire la case avant que l'écriture soit visible.
+\item \texttt{tail\_.load(acquire)} dans \texttt{pop}~: se synchronise avec cette libération. En relaxed, la lecture de la case par le consommateur n'est pas ordonnée après l'écriture du producteur.
+\item \texttt{head\_.store(release)} dans \texttt{pop}~: rend la case. En relaxed, le producteur peut écraser la case alors que la lecture du consommateur n'est pas terminée.
+\item \texttt{head\_.load(acquire)} dans \texttt{push}~: se synchronise avec celui-ci.
+\end{itemize}
+La lecture par un thread de son propre indice peut être relaxed, puisqu'aucun autre thread ne l'écrit. Aucune opération de lecture-modification-écriture n'est nécessaire, car chaque indice n'a qu'un seul écrivain, si bien que x86-64 n'émet aucune instruction verrouillée. Les indices croissent librement et ne sont masqués que pour choisir une case, de sorte que les $N$ cases sont toutes utilisables (le test insère 8 éléments dans un tampon de 8 cases, et le neuvième échoue) et \texttt{t - h} reste correct au bouclage.
+
+\iqwrong{«~Cohérence séquentielle partout, par précaution.~» C'est correct, mais chaque écriture devient un \texttt{xchg} verrouillé sur x86-64, pour un ordre que cet algorithme n'utilise jamais.}
+\iqfollow{Pourquoi cela ne doit-il pas être utilisé par deux producteurs~?}{Deux producteurs liraient le même \texttt{tail\_} et écriraient dans la même case. Un second producteur a besoin d'une étape de réservation de case, qui relève d'une structure différente et plus difficile.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:22}
+Les deux mécanismes sont le faux partage entre les indices et les lectures superflues de l'indice de l'autre côté. La modification suivante donne à chaque côté une copie privée de l'indice de l'autre, comme dans le \cref{lst:iv3:ll:cached}.
+\omcode{code/interviews-3/04-low-latency/cpp/spsc_layout.cpp}{52}{79}{Chaque côté met en cache l'indice de l'autre.}\label{lst:iv3:ll:cached}
+
+Dans le listing, \texttt{head}, \texttt{tail} et les premières cases se partagent une seule ligne, si bien que chaque écriture d'un thread arrache cette ligne à l'autre, qui en a besoin pour sa lecture suivante. Le rembourrage (padding) donne à chaque indice sa propre ligne. Mais chaque opération lit encore l'indice de l'autre côté, et comme cette ligne est écrite sans cesse, chaque lecture est un défaut de cache. Avec une copie privée, le producteur ne relit \texttt{head} que lorsque la file paraît pleine, et le consommateur ne relit \texttt{tail} que lorsqu'elle paraît vide. La copie réside sur la ligne du propriétaire, n'est écrite que par lui, et ne coûte donc rien à conserver.
+
+Le coût est faible~: quelques lignes de code de plus, et une branche supplémentaire. Une copie périmée ne peut que faire paraître la file plus pleine ou plus vide qu'elle ne l'est, et le chemin lent vérifie alors l'état réel, si bien que les ordres mémoire et la correction ne changent pas (ThreadSanitizer ne signale rien sur les trois).
+
+Mesuré quelques fois ici, à titre d'illustration, sur un Intel Core Ultra 7 155H sous WSL2 avec g++ 11.4, avec des threads non épinglés et un résultat bruité~: contigus, 13 à 24 ns par élément~; avec rembourrage, environ 9.5~; avec copie, environ 3. Pour confirmer, il faut exécuter les trois sur des cœurs épinglés et comparer, et utiliser \texttt{perf c2c} lorsque le matériel le permet.
+
+\iqfollow{Dans quel cas la mise en cache aide-t-elle le moins~?}{Lorsque la file reste presque vide, comme doit le faire une file à faible latence. Le consommateur relit alors \texttt{tail} à presque chaque scrutation. Les lignes des cases circulent aussi d'un cœur à l'autre, et seul le traitement par lots permet de les réduire.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:23}
+Le problème peut apparaître pour la première fois après environ 72 minutes, lorsque \texttt{tail} déborde au-delà de $2^{32}$, et seulement si plus de 296 éléments se trouvent dans la file à ce moment-là. \texttt{tail - head} est correct. La correction la plus simple consiste à prendre une capacité égale à une puissance de deux, par exemple 1024.
+
+L'arithmétique non signée boucle proprement, si bien que \texttt{tail - head} est juste à travers le bouclage, et 72 minutes valent $2^{32} / 10^6$ secondes. Le bogue est dans l'indice de case. $2^{32} \bmod 1000 = 296$, donc l'indice passe de $\dots, 2^{32} - 1$ à 0 tandis que \texttt{\% capacity} saute de la case 295 à la case 0, en sautant 704 cases. Si les éléments à cheval sur le saut sont plus de 296, les nouveaux éléments atterrissent sur des cases encore occupées. Le programme du fichier garde 500 éléments à cheval sur le saut, 400 avant et 100 après, et affiche \texttt{100 wrong of 500}.
+
+Avec une capacité de 1024, $2^{32}$ est un multiple de la capacité, si bien que la suite des cases reste continue, et la même exécution donne 0 erreur. Il en va de même avec des indices de 64 bits et une capacité de 1000~: ils mettraient environ 584 ans à boucler à un milliard de messages par seconde.
+
+Ce bogue passe les tests parce qu'il faut des heures pour l'atteindre, et, à la plupart des instants, la file est courte~: la condition est donc rarement réunie, même à ce moment-là.
+
+\iqwrong{«~Le débordement non signé est un comportement indéfini.~» C'est le débordement signé. Le bouclage non signé est défini, et la soustraction s'appuie dessus.}
+\iqfollow{Comment testez-vous une telle chose sans attendre des heures~?}{Partez d'indices juste en dessous du bouclage, comme le fait le fichier. Le test ne prend alors que quelques microsecondes.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:24}
+On utilise un histogramme log-linéaire\index{histogramme log-linéaire}~: 64 classes par doublement, 1600 classes au total, soit 12\,800 octets à raison de 8 octets chacun, avec une erreur relative d'au plus $1/64 \approx 1.6\%$.
+
+À partir de 128, chaque plage de puissances de deux est découpée en 64 parties égales, si bien que la largeur d'une classe, rapportée à sa borne inférieure, est au plus $1/64$. En dessous de 128, il y a une classe par valeur. Cela donne 2~\%, ce qui laisse de la marge~; 32 parties donneraient 3.1~\%, trop grossier. Les valeurs jusqu'à $2^{30}$, soit environ 1.07~s, demandent $(30 - 6 + 1) \times 64 = 1600$ classes. Une classe par nanoseconde exigerait $2^{30}$ compteurs, soit 8~GiB.
+\omcode{code/interviews-3/04-low-latency/cpp/hist.cpp}{8}{28}{Indexation par largeur en bits, en temps constant.}\label{lst:iv3:ll:hist}
+
+L'erreur relative maximale relevée sur un balayage dense des valeurs est de 1.53~\%. En enregistrant les valeurs de 1 à un million et en lisant le 99\up{e}~centile, on obtient 983\,040 au lieu d'une valeur exacte de 990\,000, soit 0.70~\% de moins, car un centile est donné par la borne inférieure de sa classe.
+
+Le coût par enregistrement est constant~: un calcul de largeur en bits, un décalage et un incrément, sans boucle. Le tableau étant fixe, il n'y a aucune allocation.
+
+\iqfollow{Un second thread doit lire l'histogramme pendant qu'il est écrit. Qu'est-ce qui change~?}{On rend les compteurs atomiques, et on les écrit avec un chargement relaxed et un stockage relaxed, puisqu'il n'y a qu'un seul écrivain. Sur x86-64, cela se compile en simples instructions mov. Le lecteur voit un instantané légèrement incohérent, ce qui convient pour un centile.}
+\iqfollow{Pouvez-vous faire la moyenne des 99\up{e}~centiles de dix serveurs~?}{Non, un centile ne se moyenne pas. On additionne les histogrammes classe par classe, puis on lit le centile de la somme.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:25}
+Notre exécution a affiché \texttt{malloc 1, first pass 16383, second pass 0} puis \texttt{vector 16385, first pass 0}. Ainsi, \texttt{malloc} touche à peine la mémoire~: le premier accès à chaque page déclenche un défaut de page, et les défauts du vecteur se produisent tous dans son constructeur, qui met la mémoire à zéro.
+
+64~MiB représentent 16\,384 pages de 4~KiB. Un grand \texttt{malloc} obtient de l'espace d'adressage et aucune mémoire physique. Chaque page subit un défaut mineur au premier accès, si bien que le premier passage les paie toutes et le second n'en paie aucune. La construction du vecteur initialise chaque octet, ce qui touche chaque page, et les défauts passent donc à cet endroit.
+
+Ainsi, les premiers messages qui atteignent un tampon froid subissent chacun un défaut de page, en plus des caches froids. Au démarrage, il faut mapper la mémoire avec \texttt{MAP\_POPULATE}, ou toucher chaque page soi-même, appeler \texttt{mlockall} avec \texttt{MCL\_CURRENT | MCL\_FUTURE} pour la garder en place, et faire passer quelques faux messages par le chemin pour le réchauffer.
+
+Sur deux sockets, la politique par défaut alloue une page sur le nœud NUMA du processeur qui la touche en premier, au moment du défaut. Ainsi, le vecteur construit dans \texttt{main} réside sur le nœud de \texttt{main}, et le thread épinglé sur l'autre socket paie un accès distant à chaque lecture, sauf si l'équilibrage automatique NUMA migre plus tard les pages, avec un coût propre et à un moment qu'on ne choisit pas. Il faut construire et toucher les données dans le thread épinglé.
+
+\iqwrong{«~\texttt{malloc} est la partie lente.~» Il rend la main après un seul défaut. La facture arrive plus tard, dans le chemin critique (hot path).}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:26}
+L'outil affiche environ 1 ms pour les deux centiles et environ 1 s pour le maximum. Un client qui suit son calendrier voit un 99\up{e}~centile proche de 500 ms et un 99.9\up{e}~centile proche de 950 ms. Il faut croire la seconde~: le blocage de l'outil lui-même a masqué les retards. Cette erreur est connue sous le nom d'omission coordonnée\index{omission coordonnée} (coordinated omission).
+
+L'outil~: il envoie 500 requêtes par seconde, soit 50\,000 en 100~s, moins les 500 qu'il n'envoie jamais pendant l'attente, ce qui laisse 49\,500 échantillons. Un seul d'entre eux a duré environ 1~s, et le reste environ 1~ms. Un échantillon sur 49\,500 dépasse le 99.9\up{e}~centile.
+
+Le client qui suit son calendrier~: quand le blocage prend fin, 500 requêtes s'accumulent en file, avec des attentes allant de 1~s à presque 0. Le serveur se vide alors à un rythme net de 500 par seconde, soit $1000 - 500$, si bien que le retard se résorbe en une seconde de plus, pendant laquelle 500 requêtes supplémentaires arrivent et attendent. Au total, 1000 requêtes sur 50\,000, soit 2~\%, attendent entre 0 et 1~s, à peu près uniformément. Le pire 1~\% correspond à la moitié supérieure de celles-ci, si bien que le 99\up{e}~centile est proche de 500~ms, et le pire 0.1~\% aux 50 valeurs les plus élevées, proches de 950~ms. La moyenne passe d'environ 1.02~ms à environ 11~ms. Une simulation des deux clients confirme ce calcul.
+
+La correction consiste à mesurer à partir de l'heure d'envoi prévue, et à tenir le calendrier sur son propre thread quoi que fasse le serveur, de sorte qu'un blocage soit imputé à chaque requête qu'il retarde.
+
+\iqwhy{Le même piège guette une boucle interne qui horodate chaque message au retrait de la file~: un blocage dans la boucle ne produit que peu d'échantillons, tous d'apparence normale.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:27}
+On obtient 67.2~ns par paquet, soit environ 202 cycles à 3~GHz, pour 14.88 millions de paquets par seconde. Un appel par paquet traite 1.5 million par seconde, soit environ un dixième du besoin~; un appel par 32 paquets en traite environ 6 millions. Pour cette contrainte, on choisit \texttt{AF\_XDP}.
+
+Chaque trame occupe $84 \times 8 = 672$ bits sur le fil, soit $10^{10} / 672 \approx 14.88$ millions de trames par seconde. Un appel par paquet coûte $500 + 150 = 650$ ns. Le traitement par lots répartit les 500 ns sur 32 paquets, soit $15.6 + 150 = 165.6$ ns, ou 6.04 millions par seconde. Dans ces hypothèses, le coût par paquet de la pile réseau est ce qui bloque tout chemin par sockets, quelle que soit la taille du lot. Les flux réels ne tournent pas en permanence au débit de ligne minimal, mais les rafales fixent la profondeur de file, si bien que c'est le bon pire cas.
+
+Les choix~:
+\begin{itemize}
+\item Des sockets avec \texttt{SO\_BUSY\_POLL}~: rien ne change dans les outils, et l'option peut réduire la latence de réveil au prix de plus de temps processeur et de consommation, mais le coût de pile subsiste. Elle améliore la latence, mais pas ce débit.
+\item \texttt{AF\_XDP}~: un programme XDP redirige certaines trames vers un tampon circulaire en espace utilisateur et renvoie tout le reste au noyau, si bien que le trafic de gestion continue de fonctionner sur le même port. Le zero-copy exige la prise en charge par le pilote, et il bascule sinon en mode copie.
+\item DPDK~: les pilotes en mode scrutation (poll-mode) lisent les descripteurs directement sur un cœur dédié, sans interruption. La plupart des périphériques doivent d'abord être détachés de leur pilote noyau, si bien que les outils et le trafic ordinaires du noyau ne voient plus ce port sans dispositif séparé. Cette solution convient à un port dédié, pas à celui-ci.
+\end{itemize}
+
+\iqfollow{Et à 25~Gbit/s avec les mêmes trames~?}{Environ 37.2 millions de paquets par seconde, soit moins de 27~ns chacun. Un seul cœur n'y suffira pas, et il faudrait plusieurs files de réception.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:28}
+Retirer un cœur de l'ordonnanceur empêche d'autres tâches d'y tourner, et presque rien d'autre~: les interruptions, le tick du minuteur, les tâches de maintenance du noyau, les vidages demandés par d'autres threads et le micrologiciel peuvent tous encore occuper le cœur. On les examine dans cet ordre, on mesure d'abord, et on ne change qu'une chose à la fois.
+
+On commence par un outil qui attribue le bruit. Le traceur \texttt{osnoise} exécute une boucle d'échantillonnage par processeur et compte le temps perdu par source~: NMI, interruption, softirq, thread, ou matériel si rien dans le noyau ne l'explique. Dans une VM, les interférences de l'hôte apparaissent comme du bruit matériel. Ensuite~:
+\begin{itemize}
+\item Interruptions~: lire \texttt{/proc/interrupts} au fil du temps pour le cœur, et éloigner les périphériques de ce cœur. L'option \texttt{managed\_irq} de \texttt{isolcpus} n'aide qu'au mieux.
+\item Le tick~: \texttt{isolcpus} ne l'arrête pas. \texttt{nohz\_full} évite le tick sur un cœur n'ayant qu'une tâche exécutable, même si environ un par seconde peut subsister, et un autre cœur doit continuer à assurer le tick.
+\item Maintenance du noyau~: \texttt{nohz\_full} exige que les rappels RCU soient délégués avec \texttt{rcu\_nocbs}, et ces threads doivent être épinglés ailleurs.
+\item Le processus lui-même~: sur x86, un \texttt{munmap} dans un autre thread force le noyau à invalider les traductions du TLB sur chaque processeur qui exécute ce processus, y compris le cœur isolé, si bien qu'il faut l'éviter après le démarrage. Il faut verrouiller la mémoire, sinon un défaut de page tombera dans la boucle.
+\item Micrologiciel~: les interruptions de gestion système (SMI) sont invisibles pour le noyau et peuvent durer des millisecondes. Le traceur \texttt{hwlat} les détecte en tournant en boucle serrée, interruptions masquées, et en cherchant des trous. Cela correspondrait aux valeurs aberrantes d'une milliseconde, et le remède, s'il existe, relève des réglages du micrologiciel.
+\end{itemize}
+
+\iqwrong{«~Il est isolé, donc rien ne peut le toucher.~» Le mot recouvre l'équilibrage de charge de l'ordonnanceur. Il ne couvre pas les autres sources.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:29}
+Les deux premières lignes sont \texttt{16 12} et \texttt{16 24}. Les tailles de \texttt{Wire}, \texttt{Packed} et \texttt{Fixed} sont fixées par leur \texttt{repr}~; le 16 de \texttt{Free} n'est pas garanti. \texttt{ts\_cast} est un comportement indéfini~: la version de débogage s'interrompt avec «~misaligned pointer dereference~», et la version de production affiche la valeur que donne le code correct.
+
+\texttt{repr(C)} dispose les champs dans l'ordre de déclaration, si bien que \texttt{Fixed} contient du bourrage autour de son \texttt{u64} et occupe 24. La représentation par défaut peut réordonner les champs, et ici elle a ramené \texttt{Free} à 16, mais les seules garanties qu'elle donne portent sur l'alignement et l'absence de recouvrement. \texttt{repr(C, packed)} supprime le bourrage, donc \texttt{Packed} occupe 12.
+
+\texttt{ts\_cast} lit un \texttt{u64} à travers un pointeur qui n'est pas aligné pour ce type. La version de débogage de Rust insère une vérification qui l'a détecté~; la version de production n'en a aucune, et la valeur affichée ne prouve rien.
+
+\texttt{\{ p.ts \}} produit une copie, et le compilateur sait qu'un champ compacté exige une lecture non alignée. \texttt{\&p.ts} créerait une référence qui peut être mal alignée, ce qui est indéfini quel que soit l'usage qu'on en fait~; le compilateur la rejette donc avec l'erreur E0793, et \texttt{unsafe} n'y change rien.
+
+Écrire \texttt{ts\_cast} comme on écrit \texttt{ts\_read}~: \texttt{u64::from\_le\_bytes} sur un intervalle d'octets, ce qui précise aussi l'ordre des octets sur le fil. Ou utiliser \texttt{read\_unaligned} sur un pointeur brut.
+
+\iqwhy{Ce bogue résiste à tous les tests de la version de production sur x86-64, alors que la vérification de débogage le trouve sans coût. Il faut aussi lancer les tests de l'analyseur en débogage.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:30}
+Il y a deux failles de sûreté et deux façons de perdre une valeur. La borne sur \texttt{Sync} manque, si bien que des types non sûrs pour les threads peuvent franchir la frontière. \texttt{put} et \texttt{take} prennent \texttt{\&self}, donc deux threads peuvent entrer en course aux données sur l'emplacement. Une valeur laissée dans la boîte n'est jamais détruite, et une valeur déposée dans une boîte pleine est détruite.
+
+Première faille. \texttt{unsafe impl<T> Sync} promet que le partage est sûr pour tout \texttt{T}, y compris \texttt{Rc}. Le \texttt{main} du listing, sans aucun \texttt{unsafe}, envoie un \texttt{Rc} à un autre thread, et les deux threads le clonent. ThreadSanitizer, sur le compilateur nightly, signale une course aux données dans le compteur de \texttt{Rc}. Avec \texttt{unsafe impl<T: Send> Sync}, le même \texttt{main} ne compile plus et échoue avec E0277.
+
+Seconde faille. Rien ne limite qui appelle \texttt{put}. Deux threads peuvent tous deux voir \texttt{full} à faux et écrire tous deux dans l'emplacement~; deux appelants de \texttt{take} peuvent lire la même valeur, d'où une double destruction pour un type qui possède de la mémoire. Un test où deux threads appellent les deux méthodes déclenche une course aux données dans \texttt{Mailbox}. La correction consiste soit en un compare-and-swap sur un drapeau à trois états, soit en la voie au niveau des types~: scinder la boîte aux lettres en un émetteur et un récepteur dont les méthodes prennent \texttt{\&mut self}.
+
+La fuite~: \texttt{MaybeUninit} n'exécute jamais de destructeur, si bien qu'une valeur encore présente quand la boîte aux lettres est détruite est perdue. Un compteur de destructions reste à 0. C'est sûr, car une fuite n'est pas un comportement indéfini, et la correction consiste en un \texttt{impl Drop} qui teste \texttt{full}.
+
+La valeur perdue~: \texttt{put} prend la valeur par déplacement, et sur une boîte pleine la détruit et renvoie \texttt{false}, si bien que l'appelant n'a plus rien pour réessayer. Une valeur dont le destructeur affiche un message affiche sa destruction avant que \texttt{false} ne revienne. Renvoyer plutôt \texttt{Result<(), T>}.
+
+\iqwrong{«~Les blocs \texttt{unsafe} sont corrects, donc c'est sûr.~» La sûreté est une propriété de l'API entière~: les appelants sûrs doivent être incapables de rompre ce que les blocs \texttt{unsafe} supposent.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:31}
+Ce n'est pas correct. La course aux données sur \texttt{data\_} la rend indéfinie, même si une copie déchirée serait jetée, et deux réordonnancements sont permis que x86-64 masque par hasard. Le \Cref{lst:iv3:ll:seqfixed} donne la réécriture~: les champs deviennent des atomiques relaxed, avec une barrière release après la première écriture de l'écrivain et une barrière acquire avant la seconde lecture du lecteur.
+\omcode{code/interviews-3/04-low-latency/cpp/seqlock_fixed.cpp}{11}{36}{Le verrou à séquence selon les règles de C++20.}\label{lst:iv3:ll:seqfixed}
+
+Les trois défauts. D'abord, une lecture simple qui chevauche une écriture simple est une course aux données\index{course aux données}, quoi qu'on fasse du résultat~; ThreadSanitizer le signale à la ligne 17. Ensuite, côté écrivain, une écriture release ordonne ce qui la précède, et ne dit rien de ce qui la suit, si bien que l'écriture des données peut devenir visible avant la valeur impaire. Enfin, côté lecteur, une lecture acquire ordonne ce qui la suit, et n'empêche donc pas les lectures de données de glisser après la seconde lecture. Sur x86-64, le matériel conserve l'ordre des écritures et celui des lectures, si bien que seul le compilateur peut faire cela là-bas.
+
+La défense de la réécriture. Si la lecture des données du lecteur voit une valeur écrite après la barrière release de l'écrivain, la paire de barrières se synchronise, et sa seconde lecture ne peut alors pas manquer la valeur impaire, donc \texttt{s1 != s2}. Si la première lecture acquire lit la valeur paire d'une écriture achevée, elle voit toutes les données de cette écriture. Les champs doivent être des mots atomiques~: le compilateur ne peut ni déchirer ni inventer des lectures de ceux-ci. Le test a exécuté la réécriture avec 0 lecture déchirée et sans signalement de ThreadSanitizer. Ce rapport ne vérifie cependant que les courses aux données~: le manuel de GCC indique que ThreadSanitizer ne prend pas en charge \texttt{atomic\_thread\_fence}, si bien que les barrières reposent sur cet argument.
+
+Les coûts. L'écrivain n'attend jamais, et sur x86-64 son \texttt{write} se compile en simples écritures, sans instruction verrouillée. Les lecteurs n'écrivent rien, donc ils ne se disputent pas entre eux, alors qu'un mutex ferait écrire à chacun son mot de verrou. Ils coûtent tout de même des défauts de cache (cache miss) à l'écrivain~: chaque lecture fait passer les lignes en état partagé, et l'écriture suivante de l'écrivain doit les reprendre. Et un lecteur peut réessayer aussi longtemps que l'écrivain continue d'écrire. La charge utile doit pouvoir être copiée mot par mot, et plus d'un écrivain demande un verrou propre.
+
+\iqfollow{Pourquoi ne pas faire un \texttt{memcpy} de la cotation dans la boucle de nouvelle tentative~?}{\texttt{memcpy} n'est pas atomique, donc c'est encore une course aux données en C++20, quoi que fasse la machine. C'est pourquoi le listing copie des mots atomiques.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:32}
+Les deux défauts sont une utilisation après libération à la ligne 23 et le problème ABA\index{problème ABA}. Le premier survient parce que \texttt{pop} lit \texttt{n->next} alors qu'un autre thread a peut-être déjà supprimé \texttt{n}. Le second survient parce que le compare-and-swap vérifie une adresse, et non l'historique qui se cache derrière elle.
+
+Utilisation après libération. Les threads 1 et 2 chargent tous deux la même tête. Le thread 2 gagne, dépile celle-ci et appelle \texttt{delete}. Le thread 1 évalue alors \texttt{n->next} sur de la mémoire libérée, ce qui peut provoquer une faute si la page a disparu. Sous charge avec quatre threads, AddressSanitizer signale un heap-use-after-free à cette ligne, et ThreadSanitizer, selon l'ordonnancement, signale une course aux données entre la lecture et le \texttt{delete}, ou l'utilisation après libération elle-même.
+
+ABA. La pile contient A, B, C. Le thread 1 lit la tête A et le suivant B, puis s'arrête. Le thread 2 dépile A, dépile B et le libère, puis repousse A, dont l'adresse est réutilisée. Le compare-and-swap du thread 1 voit A, réussit, et met la tête sur B, qui est libre. Le \Cref{lst:iv3:ll:aba} rejoue exactement ce scénario sans threads, et il affiche que l'échange a réussi, que la tête vaut 1 (B) et que son drapeau d'occupation vaut 0.
+\omcode{code/interviews-3/04-low-latency/cpp/aba_replay.cpp}{32}{43}{L'enchaînement, rejoué à la main sur un pool.\protect\hfil\protect\break}\label{lst:iv3:ll:aba}
+
+Les correctifs, avec leurs coûts~:
+\begin{itemize}
+\item Un pool de nœuds qui ne sont jamais rendus au système, indexés, avec un compteur à côté de l'indice, dans un mot de 64~bits. Cela corrige les deux défauts~: la lecture reste dans une mémoire valide, et l'étiquette change à chaque mise à jour, à condition que \texttt{next} soit lui-même un atomique, lu en relaxed~: une lecture périmée est alors sans danger, car l'étiquette fait échouer cet échange. Dans le même rejeu, l'échange échoue. Le coût est un pool de taille fixe, et une étiquette de 32~bits peut revenir à son point de départ~: à 10~millions de mises à jour par seconde, elle repasse à zéro toutes les 430~secondes, mais un échange périmé ne réussit alors que si le compte tombe juste.
+\item Pointeurs de danger (hazard pointers)~: chaque thread publie ce qu'il s'apprête à lire, et un nœud n'est libéré que lorsque personne ne l'a publié. Le coût est une écriture et une lecture ordonnées à chaque lecture, et un parcours périodique.
+\item Époques~: les nœuds sont libérés une fois que chaque thread a traversé une période de grâce. Les lectures sont peu coûteuses, mais un seul thread bloqué suspend toute la récupération de mémoire.
+\item Éviter la structure~: sur un chemin critique (hot path), donner à chaque thread son propre pool, ce qu'il faut généralement faire.
+\end{itemize}
+
+\iqwrong{«~Le compare-and-swap est atomique, donc \texttt{pop} est sûr.~» L'échange est atomique. La lecture de \texttt{next} qui le précède n'est protégée par rien.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:33}
+Non, pas si achever une opération revient à livrer un élément. Pendant que ce producteur est bloqué, les autres producteurs peuvent remplir les emplacements restants, 7 si la file était par ailleurs vide. Une fois que les consommateurs ont pris tout ce qui précède la position bloquée, chaque \texttt{try\_pop} renvoie vide, alors que des insertions terminées attendent derrière l'emplacement bloqué. L'attente d'un consommateur dure aussi longtemps que la suspension.
+
+Le rejeu du fichier réserve la position 0 et ne valide pas. Un second producteur réussit alors 7 fois de plus et se voit signaler que la file est pleine. Un consommateur obtient vide, parce que le \texttt{seq} de la position 0 indique qu'elle n'est pas prête, et les consommateurs prennent les positions dans l'ordre. Quand le premier producteur reprend et valide, le consommateur obtient sa valeur aussitôt, et le reste s'écoule ensuite. Sous charge, le code est sûr~: ThreadSanitizer reste muet, et la somme sur deux producteurs et deux consommateurs est exacte.
+
+Au sens étroit, chaque appel \texttt{try} rend bien la main, et c'est pour cela que ce mot est employé. Mais signaler «~vide~» alors que d'autres insertions se sont terminées n'est pas le dépilage qu'une file promet, et aucun appel ne peut livrer un élément tant que ce thread-là ne reprend pas, quels que soient les autres threads en cours. Un dépilage bloquant bâti là-dessus l'attendrait. Qualifier une telle file de sans verrou (lock-free) parce qu'elle ne détient aucun mutex est courant, et trompeur.
+
+Le pire cas n'est donc pas borné par la file~: il dépend de ce que le système d'exploitation fait de ce thread, et le défaut classique du mutex revient sans mutex. Pour le resserrer, empêcher les producteurs d'être préemptés, avec des threads épinglés sur des cœurs isolés, ce qui réduit la probabilité sans l'exclure. Ou repenser la conception~: donner à chaque producteur son propre tampon circulaire à un seul producteur, et laisser le consommateur les scruter à tour de rôle. Un producteur bloqué ne retarde alors que ses propres éléments. Le coût est l'ordre global~: si l'ordre entre producteurs compte, on fusionne par horodatage ou par numéro de séquence, et le consommateur fait davantage de travail à chaque interrogation.
+
+\iqfollow{En quoi est-ce meilleur qu'un mutex, au juste~?}{Le cas courant ne fait aucun appel système, et les lectures et les écritures sur des emplacements différents ne touchent pas à un mot de verrou partagé. Sans blocage, c'est rapide. Son mode de défaillance est de même nature que celui d'un mutex détenu par un thread qui a été désordonnancé.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:34}
+Scinder la file en un \texttt{Producer} et un \texttt{Consumer}, ni l'un ni l'autre n'étant \texttt{Clone}, dont les méthodes prennent \texttt{\&mut self}. \texttt{peek} renvoie une garde qui emprunte le consommateur de façon mutable, et l'impl \texttt{Sync} de l'état partagé est bornée par \texttt{T: Send}. Les \Cref{lst:iv3:ll:split,lst:iv3:ll:peek} donnent le cœur du code.
+\omcode{code/interviews-3/04-low-latency/rust/src/spsc_split.rs}{8}{41}{État partagé, poignées et insertion.}\label{lst:iv3:ll:split}
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/04-low-latency/rust/src/spsc_split.rs}{53}{73}{Un peek sans copie.}\label{lst:iv3:ll:peek}
+
+Chacune des trois erreurs a été compilée, et chacune échoue. Cloner un \texttt{Producer} donne E0599, car cette méthode n'existe pas. En placer un dans un \texttt{Arc} puis appeler \texttt{push} donne E0596, car on ne peut pas obtenir de \texttt{\&mut} à travers une poignée partagée. Appeler \texttt{pop} alors qu'un \texttt{Peek} est vivant donne E0499, un second emprunt mutable. Envoyer un \texttt{Producer<Rc<u64>{}>} à un thread donne E0277.
+
+Seule la ligne \texttt{Sync} est nécessaire, car \texttt{UnsafeCell} n'est pas \texttt{Sync}, et c'est ce qui bloque le partage. \texttt{Send} découle automatiquement de \texttt{T: Send}. La promesse qui rend la ligne correcte est que chaque emplacement n'est accédé que par un côté à la fois. La borne \texttt{T: Send} est requise, car les éléments franchissent réellement les threads. \texttt{T: Sync} n'est pas nécessaire à la file elle-même, qui transmet les éléments entiers. Mais \texttt{peek} délivre des \texttt{\&T}, donc \texttt{Peek} porte un \texttt{PhantomData<\&\textquotesingle a T>}, et un \texttt{Peek} ne peut atteindre un autre thread que si \texttt{T: Sync}. Sans ce champ, du code sûr partage un \texttt{Peek<Cell<u64>{}>} entre deux threads et entre en course aux données sur la cellule. Avec lui, le même code donne E0277.
+
+Ce que le compilateur ne détectera pas~: les ordres mémoire. Remplacer \texttt{Release} par \texttt{Relaxed} compile sans erreur. Il en va de même d'un décalage d'une unité dans les indices, et de l'oubli de détruire les éléments non lus, qui est ici l'impl \texttt{Drop} sur \texttt{Shared}, testée pour détruire chaque élément non lu exactement une fois. Une exécution sous charge avec ThreadSanitizer, sur le compilateur nightly, ne produit aucun rapport dans ce module, bien qu'avec une bibliothèque standard précompilée il faille ignorer les rapports issus de la destruction finale de \texttt{Arc}, qui utilise une barrière que l'outil ne voit pas. Par ailleurs, le masquage de l'indice ne supprime pas la vérification de bornes sur \texttt{slots}, comme le montre l'assembleur de \texttt{push}, parce que la longueur de la tranche n'est connue qu'à l'exécution.
+
+\iqwhy{En C++, «~exactement un producteur~» n'est qu'un commentaire. Ici, c'est vérifié à chaque point d'appel, et les vérifications elles-mêmes ne coûtent rien à l'exécution.}
+\end{solution}
+
+\begin{solution}{iq:iv3:low-latency:35}
+Pour \texttt{Clone}, le \texttt{Relaxed} est correct, et pour \texttt{Drop} il ne l'est pas. La décrémentation doit être \texttt{Release}, et le thread qui libère doit d'abord effectuer un \texttt{Acquire}, comme dans le \Cref{lst:iv3:ll:arcdrop}. C'est le même schéma que dans le \texttt{Arc} de la bibliothèque standard.
+\omcode{code/interviews-3/04-low-latency/rust/src/my_arc.rs}{35}{43}{La décrémentation qui peut libérer.}\label{lst:iv3:ll:arcdrop}
+
+\texttt{Clone} est sûr, car un thread ne peut cloner qu'une poignée qu'il atteint déjà, et quelle que soit la manière dont il a obtenu cette poignée, celle-ci portait déjà la synchronisation nécessaire, si bien que le compteur ne peut pas être en train de tomber à zéro entre-temps. Aucun ordre sur l'incrémentation n'est nécessaire.
+
+Ce qui ne va pas. Le thread A lit la valeur à travers sa poignée, puis décrémente à 1. Le thread B décrémente à 0 et libère. Avec des décrémentations relaxed, rien ne fait passer la lecture de A avant la libération de B, si bien qu'elles entrent en conflit~: c'est une course aux données, donc un comportement indéfini. Un programme de charge avec une valeur allouée sur le tas obtient, sur le compilateur nightly, un rapport de ThreadSanitizer qui désigne ce code.
+
+Pourquoi les deux côtés. Le \texttt{Release} de chaque décrémentation fait que les usages de ce thread ont lieu avant sa décrémentation. Le \texttt{Acquire} avant la libération réunit tous ces usages dans le thread qui libère. La barrière n'est prise que par le dernier propriétaire, si bien que les autres décrémentations ne paient rien de plus. ThreadSanitizer ne modélise pas les barrières~: le test remplace donc la barrière par une lecture acquire du compteur, ce que fait la bibliothèque standard dans la même situation, et cette forme est propre. La version avec barrière repose sur l'argument ci-dessus et sur l'usage qu'en fait la bibliothèque standard.
+
+Les bornes. \texttt{T: Sync}, car des poignées sur plusieurs threads distribuent des \texttt{\&T}. \texttt{T: Send}, car la dernière destruction peut s'exécuter sur n'importe quel thread, ce qui y transfère la propriété de \texttt{T}. Envoyer un \texttt{MyArc<Rc<u64>{}>} à un thread échoue avec E0277.
+
+Le coût sur x86-64~: la décrémentation est une instruction verrouillée quel que soit son ordre, et un acquire ne demande aucune instruction, si bien que la correction n'ajoute rien ici, à part ce que le compilateur ne peut plus déplacer. Sur un processeur à ordre faible, le release et l'acquire demandent chacun une instruction plus forte ou une barrière. Utiliser une barrière seulement sur la dernière décrémentation évite l'acquire sur les autres.
+
+\iqwrong{«~\texttt{AcqRel} sur chaque décrémentation est plus simple.~» C'est correct aussi, mais cela impose un acquire à chaque décrémentation, alors que la dernière seule en a besoin.}
+\end{solution}

@@ -1,0 +1,292 @@
+\chapter{La grille de risque}\label{ch:pl:the-risk-grid}
+
+Le batch de risque nocturne --- chaque transaction, chaque scénario historique --- démarre à 04~h~30 et doit être terminé à 06~h~00, moment où les rapports de risque du matin
+sont produits. Il s'est achevé à 06~h~51. Doubler le nombre de machines a avancé la fin à 06~h~25 et pas davantage, car la dernière heure appartenait à
+une seule tâche, en attente d'une seule transaction dont le pricing était deux cents fois plus lent que son estimation, et l'ordonnanceur, qui croyait à cette estimation,
+avait lancé cette tâche avec retard. Rien n'était cassé~; la grille avait été planifiée d'après le nombre de transactions, et non d'après le coût. Ce chapitre planifie, exécute et répare
+une telle grille sur le cluster simulé du chapitre~13, avec les coûts de la bibliothèque de pricing réelle mesurés sur cet ordinateur portable.
+
+\section{Réévaluation nocturne à grande échelle}
+
+\begin{definition}[Grille de risque, fenêtre de batch]\label{def:pl:the-risk-grid:grid}
+Une \emph{grille de risque}\index{grille de risque} est l'infrastructure qui réévalue les transactions d'une firme sous de nombreux scénarios de marché sur de nombreuses machines~: le
+plan qui découpe le travail en tâches, l'ordonnanceur et le cluster qui les exécutent, et la base qui recueille les résultats pour que le moteur de risque les agrège. Sa
+\emph{fenêtre de batch}\index{fenêtre de batch} est l'intervalle entre le moment où ses entrées sont prêtes (les positions de fin de journée et
+l'instantané de marché) et le moment où les sorties sont nécessaires.
+\end{definition}
+
+Le moteur de risque du livre~6 (chapitre~29) calcule les vecteurs de P\&L d'un portefeuille sous des scénarios historiques, par réévaluation complète, par grille de réévaluation ou par
+approximation delta--gamma, puis les agrège en VaR et en expected shortfall (ES) le long de la hiérarchie de risque. À la taille d'une firme, le
+calcul est une grille de transactions par scénarios --- soit ici 105\,000 transactions et 1\,000 scénarios, 105~millions d'appels de pricing --- et le moteur
+devient un problème d'ordonnancement.
+
+Le portefeuille du chapitre~: 60\,000 swaps et 20\,000 swaptions (instruments de taux du livre~6), 20\,000 options sur actions et 5\,000 autocallables
+valorisés par Monte-Carlo avec les 100\,000 trajectoires de la bibliothèque (livre~5). Un appel de pricing de chacun, mesuré sur cet ordinateur portable avec la bibliothèque réelle,
+coûte 14.5, 10.2 et 5.1~microsecondes pour les trois premiers et 22.2~millisecondes pour un autocallable~: les 5\,000 autocallables représentent 99~\% des
+112.2~secondes de pricing du portefeuille par scénario. Une tâche coûte un forfait fixe de cinq secondes (chargement de l'instantané et des transactions, écriture des résultats)
+plus son pricing. La grille compte 32 cœurs (huit nœuds de quatre), et la fenêtre dure 90~minutes.
+
+\section{Distribution des scénarios}
+
+\begin{definition}[Distribution des scénarios, granularité des tâches]\label{def:pl:the-risk-grid:fanout}
+La \emph{distribution des scénarios}\index{distribution des scénarios} (scenario fan-out) est le découpage des scénarios en lots, afin que la réévaluation d'un lot de transactions s'exécute comme
+plusieurs tâches en parallèle. La \emph{granularité des tâches}\index{granularité des tâches} (task granularity) est la taille des tâches qui en résultent --- ici le nombre de scénarios
+par lot, les transactions étant regroupées en lots d'environ une demi-seconde de pricing par scénario --- ce qui arbitre la liberté d'ordonnancement contre
+le coût fixe de chaque tâche.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \r in {0,...,4} {\foreach \c in {0,...,7} {\draw[fill=omDef!12] (\c*1.1,-\r*0.55) rectangle ++(1.0,0.45);}}
+\foreach \c in {0,...,7} {\node at (\c*1.1+0.5,0.75) {$s_{\c}$};}
+\foreach \r/\l in {0/{swaps 1},1/{swaps 2},2/{\dots},3/{autocallables},4/{transaction lente}} {\node[anchor=east] at (-0.1,-\r*0.55+0.22) {\l};}
+\foreach \c in {0,...,15} {\draw[fill=omThm!45] (\c*0.55,-4*0.55) rectangle ++(0.5,0.45);}
+\node[anchor=west,align=left] at (9.0,-1.0) {une tâche = un lot de transactions\\ $\times$ un lot de scénarios};
+\node[anchor=west,align=left,omThm] at (9.0,-2.0) {la transaction lente~:\\ isolée, ses scénarios\\ distribués plus finement};
+\node at (4.3,1.2) {lots de scénarios};
+\end{tikzpicture}
+
+\omcaption{La grille en tâches~: les lignes sont des lots de transactions regroupés par coût estimé, les colonnes des lots de scénarios~; chaque case est une tâche. Un plan tenant compte du coût
+plan réserve à une transaction mesurée lente sa propre ligne, avec des colonnes plus fines, afin qu'aucune tâche unique ne tienne à elle seule la fenêtre.}\label{fig:pl:the-risk-grid:tasks}
+\end{omfigure}
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{77}{92}{Planification de la grille~: lots de transactions par coût estimé, lots de scénarios d'une taille choisie,
+et transactions trop coûteuses pour une seule tâche isolées et distribuées plus finement.}\label{lst:pl:the-risk-grid:plan}
+
+Avec 1\,000 scénarios par lot, il y a 220 tâches, chacune étant un lot de transactions sur l'ensemble des scénarios~: peu nombreuses, longues et impossibles à équilibrer. Avec
+cinq scénarios, il y en a 44\,000, et leurs coûts fixes --- 44\,000 fois cinq secondes --- dépassent le pricing lui-même.
+La \Cref{fig:pl:the-risk-grid:granularity} montre toute la courbe~: sur 32 cœurs, la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} (makespan) passe de 2.35~heures pour 1\,000 scénarios par tâche
+à 1.19 pour 100, puis remonte à 2.93 pour cinq~; seuls les lots de 20 à 250 scénarios tiennent la fenêtre, 20 avec seize secondes de marge.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=12cm,height=6cm,xlabel={scénarios par tâche (échelle log)},ylabel={durée totale (heures)},xmin=4,xmax=1200,ymin=0,ymax=3.6,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2}]
+\addplot[color=omThm,very thick,mark=*] table[x=scen_batch,y=naive_h]{figdata/platforms/20-the-risk-grid/sweep_32.csv};
+\addlegendentry{naïf, 32 cœurs}
+\addplot[color=omDef,very thick,mark=square*] table[x=scen_batch,y=aware_h]{figdata/platforms/20-the-risk-grid/sweep_32.csv};
+\addlegendentry{tenant compte du coût, 32 cœurs}
+\addplot[color=omThm,thick,dashed,mark=o] table[x=scen_batch,y=naive_h]{figdata/platforms/20-the-risk-grid/sweep_64.csv};
+\addlegendentry{naïf, 64 cœurs}
+\addplot[color=omDef,thick,dashed,mark=square] table[x=scen_batch,y=aware_h]{figdata/platforms/20-the-risk-grid/sweep_64.csv};
+\addlegendentry{tenant compte du coût, 64 cœurs}
+\draw[black,thick,dotted] (axis cs:4,1.5) -- (axis cs:1200,1.5);
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{Durée totale} (makespan) de la grille nocturne sur 32 cœurs (trait plein) et 64 (tirets) en fonction du nombre de scénarios par tâche, pour un plan qui fait confiance aux estimations de coût
+(naïf) et un plan qui isole la transaction mesurée lente la nuit dernière (tenant compte du coût)~; la ligne en pointillés est la fenêtre de 90~minutes. Les tâches grossières ne peuvent pas être équilibrées~; les tâches fines se noient dans leurs
+coûts fixes. Données~: \texttt{fig\_riskgrid.py}, avec les coûts issus de \texttt{bench\_riskgrid.py}.}\label{fig:pl:the-risk-grid:granularity}
+\end{omfigure}
+
+\section{Granularité des tâches, échec et reprise}
+
+La transaction lente rend les tâches grossières encore pires. Le moteur d'un autocallable bascule sur des pas quotidiens et price en 4.88~secondes, 220 fois son
+Dans le plan naïf, son lot de transactions sur les 1\,000 scénarios est une tâche de plus de 5\,300~secondes que l'ordonnanceur, qui trie par
+estimation, la lance comme les autres~: la grille se termine 8\,468~secondes après 04~h~30, à 06~h~51~; sur 64 cœurs, à 06~h~25 (6\,922~secondes). Un plan
+tenant compte du coût utilise le coût mesuré la nuit dernière~: la transaction lente reçoit des tâches propres, de 122 scénarios chacune, et le plan à 1\,000 scénarios se termine en
+4\,123~secondes sur 32 cœurs (05~h~38)~; la meilleure granularité, 250 scénarios, donne en 3\,846 (05~h~34).
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{105}{122}{Exécution d'un plan~: échecs traités par tâche (relancés, puis perdus) ou par transaction
+(mise en quarantaine), puis les tâches ordonnancées par estimation la plus longue en premier sur le cluster simulé.}\label{lst:pl:the-risk-grid:run}
+
+Les échecs appellent le même raisonnement. Il manque la volatilité d'une swaption, qui échoue à chaque fois. Si une transaction en échec fait échouer sa tâche,
+l'ordonnanceur relance la tâche deux fois, puis abandonne~: la grille perd chaque résultat de chaque tâche qui contenait la transaction --- 38.3~millions des
+105~millions de cellules, plus d'un tiers du portefeuille --- et brûle 1\,100 secondes-cœur en relances. Si la boucle de pricing rattrape l'échec par transaction, comme le fait le moteur
+du livre~6 (une transaction en échec donne une valeur manquante et une entrée dans un rapport d'erreurs, jamais une exécution interrompue), la grille perd les
+1\,000 cellules de la transaction en échec, la met en quarantaine avec un rapport, et finit 60~secondes plus tôt.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.6cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}@{}}
+\toprule
+gestion des échecs & \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} (makespan, s) & secondes-cœur gaspillées & résultats perdus \\
+\midrule
+par tâche (deux relances, puis perdue) & 4\,095 & 1\,100 & 38\,263\,000 \\
+par transaction (mise en quarantaine avec un rapport) & 4\,035 & 0 & 1\,000 \\
+\bottomrule
+\end{tabular}
+\caption{Une transaction qui échoue toujours, dans le plan tenant compte du coût avec 100 scénarios par tâche sur 32 cœurs.}\label{tab:pl:the-risk-grid:failures}
+\end{table}
+
+\section{Sensibilités par l'adjoint en production}
+
+Le lot de nuit calcule aussi les sensibilités. Décaler les huit piliers de courbe d'un swap à la hausse et à la baisse coûte seize réévaluations~; l'adjoint de
+la bande du livre~4 (\texttt{firm.aad}, chapitre~28 de ce livre) enregistre une valorisation et la parcourt à rebours une seule fois, et donne les huit dérivées --- égales à celles obtenues par décalage
+à $10^{-9}$ près dans les tests (\cref{lst:pl:the-risk-grid:adjoint}). Sur cet ordinateur portable, les deltas par décalage d'un swap prennent 388~microsecondes
+et l'adjoint 66, soit 5.9 fois plus vite, avec une bande en Python~; une bande compilée ramène le coût de l'adjoint à quelques valorisations, quel que soit le nombre
+de piliers. Pour les 60\,000 swaps du livre, le décalage demande 1.02~million d'appels de pricing, l'adjoint 60\,000 valorisations enregistrées.
+
+\omcode{code/firm/riskgrid/firm_riskgrid.py}{126}{141}{Valeur d'un swap sur une courbe à piliers, écrite une seule fois sur la bande~; un seul parcours à rebours donne
+sa dérivée à chaque pilier.}\label{lst:pl:the-risk-grid:adjoint}
+
+\section{Risque intrajournalier et réévaluation incrémentale}
+
+\begin{definition}[Réévaluation incrémentale]\label{def:pl:the-risk-grid:incremental}
+La \emph{réévaluation incrémentale}\index{réévaluation incrémentale} ne recalcule que les résultats dont les entrées ont changé~: chaque résultat est stocké avec la
+version de la transaction et celle des données de marché à partir desquelles il a été calculé, et une relance ne revalorise que les transactions dont la clé ne figure pas dans la base.
+\end{definition}
+
+Dans la journée, les scénarios et l'instantané de base sont ceux du matin, et la plupart des transactions n'ont pas changé. Les résultats étant indexés par (transaction, version de la transaction,
+version des données de marché), une relance intrajournalière après la modification ou la saisie de 1\,500 transactions revalorise ces 1\,500 sous les 1\,000 scénarios~:
+1.5~million d'appels de pricing au lieu de 105~millions. Un nouvel instantané de marché change toutes les clés~; pour ce cas, le système temps réel du chapitre~18 reporte les sensibilités
+d'un instantané à l'autre, et la grille attend la nuit.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xbar,bar width=9pt,xmode=log,xmin=1e4,xmax=5e9,log origin=infty,
+  symbolic y coords={intrajournalier incrémental,intrajournalier complet,deltas des swaps par adjoint,deltas des swaps par décalage,grille nocturne},ytick=data,
+  enlarge y limits=0.15,xlabel={appels de pricing (échelle logarithmique)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!20},nodes near coords,nodes near coords style={font=\scriptsize,anchor=west},point meta=explicit symbolic]
+\addplot[fill=omDef!45,draw=omDef] coordinates {(105105000,grille nocturne)[105.1 millions] (1020000,deltas des swaps par décalage)[1.02 million]
+  (60000,deltas des swaps par adjoint)[60\,000 valorisations] (105000000,intrajournalier complet)[105 millions] (1500000,intrajournalier incrémental)[1.5 million]};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Appels de pricing de la grille nocturne, des deltas de piliers des swaps par décalage et par l'adjoint, et d'une relance intrajournalière faite en complet
+et de façon incrémentale après modification de 1\,500 transactions.}\label{fig:pl:the-risk-grid:calls}
+\end{omfigure}
+
+\begin{example}[06~h~51 contre 06~h~00]\label{ex:pl:the-risk-grid:batch}
+Planifiée par lots de transactions sur l'ensemble des scénarios et en se fiant à ses estimations, la grille se termine à 06~h~51 sur 32 cœurs et à 06~h~25 sur 64~:
+davantage de cœurs raccourcissent la file, mais pas la tâche longue unique. En découpant les scénarios en lots de 100, le plan naïf passe à 05~h~41~; en isolant
+la transaction lente grâce à son coût mesuré, toutes les granularités de 20 à 1\,000 scénarios tiennent dans la fenêtre, la meilleure à 05~h~34 (250 scénarios par tâche).
+Mettre en quarantaine la transaction défaillante au lieu de faire échouer ses tâches préserve plus d'un tiers des résultats du livre. Les appels de pricing économisés ailleurs
+sont encore plus importants~: l'adjoint remplace 1.02~million de réévaluations de swaps par décalage par 60\,000 valorisations enregistrées, et une relance incrémentale
+intrajournalière fait 1.5~million d'appels là où une relance complète en fait 105~millions.
+\end{example}
+
+\section{Tutoriel~: planifier une grille nocturne}\label{tut:pl:the-risk-grid:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Mesurer les coûts de pricing, planifier la grille à plusieurs granularités, la réparer pour une transaction lente et une transaction défaillante, et compter les appels
+que les adjoints et les relances incrémentales économisent. \textbf{État final~:} la \cref{fig:pl:the-risk-grid:granularity} et le \cref{tab:pl:the-risk-grid:failures}.
+\begin{tutsteps}
+\item \textbf{Coûts}~: \texttt{bench\_riskgrid.py}~: un appel de pricing par type, deltas de swaps par décalage et par adjoint.
+\item \textbf{Planifier et exécuter}~: \texttt{pl\_riskgrid.grid(scen\_batch, cost\_aware)}~; \texttt{sweep()}.
+\item \textbf{Défaillances}~: \texttt{failure\_policies()}.
+\item \textbf{Adjoints}~: \texttt{firm\_riskgrid.swap\_pv\_adjoint} face aux sensibilités par décalage de la bibliothèque.
+\item \textbf{Intrajournalier}~: \texttt{intraday()}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Donner à l'ordonnanceur les coûts mesurés de chaque transaction et voir à quelle distance de la borne inférieure se situe la grille~;
+ajouter les réévaluations des sensibilités au travail de la grille et trouver la nouvelle meilleure granularité.
+\end{tutorial}
+
+\section{Construction~: la grille de risque}\label{bld:pl:the-risk-grid:riskgrid}
+
+\begin{build}
+\bfield{Rôle} La réévaluation nocturne planifiée selon son coût, menée jusqu'à sa fenêtre, robuste aux transactions lentes et défaillantes, et rendue moins coûteuse grâce
+aux adjoints et aux relances incrémentales.
+\bfield{Interface} \texttt{GridTrade}, \texttt{plan}, \texttt{run -> GridRun}, \texttt{swap\_pv\_adjoint}, \texttt{ResultCache},
+\texttt{cells}, \texttt{lower\_bound}, \texttt{hours}.
+\bfield{Règles} Les plans utilisent les coûts mesurés lors de la relance précédente lorsqu'ils existent~; la défaillance d'une transaction ne fait jamais échouer sa tâche~; les résultats portent
+la version de leur transaction et celle des données de marché~; les adjoints sont vérifiés contre les décalages.
+\bfield{Tests d'acceptation} \texttt{code/firm/riskgrid/tests/}~: regroupement et isolation d'une transaction lourde~; les deux politiques de défaillance et la
+borne inférieure~; deltas des piliers par adjoint égaux aux sensibilités par décalage de la bibliothèque~; les clés du cache de résultats.
+\bfield{Pour aller plus loin} Résultats écrits dans la \omterm{def:pl:backtest-engine-architecture:results}{base de résultats} du chapitre~11~; plan alimenté par un modèle de coût appris sur les relances passées~; adjoints
+avec points de contrôle à travers les trajectoires de Monte Carlo (livre~4, chapitre~28).
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~4, chapitre~28 (adjoints)~; One Quant Book~5, chapitre~28, et livre~6, chapitre~29 (la bibliothèque, le moteur de risque)~; chapitre~13 de ce livre (ordonnancement).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:1}
+Calculer le nombre de tâches que fait le plan avec 100 scénarios par tâche, et le coût fixe qu'elles ajoutent.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:2}
+Expliquer pourquoi le doublement des cœurs ne fait passer la fin du plan naïf que de 06~h~51 à 06~h~25.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:the-risk-grid:3}
+Calculer le nombre d'appels de pricing qu'exigent les deltas de piliers d'un swap par décalage, et le nombre de valorisations dont a besoin l'adjoint.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:4}
+Expliquer pourquoi la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} remonte en dessous de 50 scénarios par tâche.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:5}
+Expliquer pourquoi faire échouer une tâche pour une seule transaction fait perdre 38~millions de résultats.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:the-risk-grid:6}
+Quand la \omterm{def:pl:the-risk-grid:incremental}{réévaluation incrémentale} n'économise-t-elle rien, et qu'est-ce qui couvre ce cas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-risk-grid:7}
+\emph{Programmation.} Lancer le balayage sur 64 cœurs. Quelles granularités tiennent la fenêtre avec chaque plan, et laquelle est la meilleure~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:the-risk-grid:8}
+\emph{Trouver la faille.} «~Le batch est arrivé en retard, alors nous avons acheté deux fois plus de machines.~»
+\end{exercise}
+
+\section{Problème~: 06~h~51 contre 06~h~00}
+
+\begin{problem}[{Problème du week-end --- une grille qui manque sa fenêtre}]\label{pb:pl:the-risk-grid:1}
+Le livre du chapitre, les coûts, le cluster et les plans.
+
+\medskip\noindent\textbf{Partie I --- La grille.}
+\begin{enumerate}
+\item Quel est le travail de la grille, en transactions, scénarios et appels de pricing~?
+\item Quelles transactions dominent son coût, et pourquoi~?
+\item Que coûte une tâche en plus de son pricing~?
+\item Quelle est la fenêtre, et sur combien de cœurs~?
+\item Quelle est la borne inférieure sur 32 cœurs~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Granularité.}
+\begin{enumerate}[resume]
+\item Quelle est la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} à 1\,000, 100 et 5 scénarios par tâche~?
+\item Quelles granularités tiennent la fenêtre avec le plan naïf~?
+\item Que fait la transaction lente aux tâches grossières, et pourquoi l'ordonnanceur n'aide-t-il pas~?
+\item Que change le plan sensible au coût~?
+\item Quelle est la meilleure fin sensible au coût~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Échecs et économies.}
+\begin{enumerate}[resume]
+\item Que se passe-t-il pour une transaction en échec, par tâche et par transaction~?
+\item Combien de résultats et de core-secondes chaque politique perd-elle~?
+\item Dans ce cas, à quelle vitesse les delta de swap adjoints battent-ils les delta par perturbation~?
+\item Combien d'appels de pricing l'adjoint économise-t-il sur les swaps du livre~?
+\item Combien coûte un recalcul incrémental intrajournalier~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} du batch en fonction de la \omterm{def:pl:the-risk-grid:fanout}{granularité des tâches} et de la taille du cluster, la granularité qui tient la
+fenêtre, et les appels de pricing économisés par les sensibilités adjointes et par la \omterm{def:pl:the-risk-grid:incremental}{réévaluation incrémentale} intrajournalière.
+\item Que changeriez-vous en premier dans la planification de la grille~?
+\item Que surveilleriez-vous chaque soir~?
+\item Quand achèteriez-vous davantage de machines~?
+\item En une phrase~: qu'est-ce qui décide de la fin d'un batch nocturne~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:the-risk-grid:1}
+Votre batch de risque nocturne manque sa fenêtre. Que regardez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:the-risk-grid:2}
+Comment découperiez-vous un million de transactions par mille scénarios en tâches~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:the-risk-grid:3}
+Pourquoi utiliser la différentiation adjointe pour le risque, et où n'aide-t-elle pas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:the-risk-grid:4}
+Une transaction échoue au pricing chaque nuit. Que doit faire la grille avec elle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:the-risk-grid:5}
+Concevez l'infrastructure de réévaluation nocturne et intrajournalière du portefeuille de négociation d'une banque.
+\end{interviewq}

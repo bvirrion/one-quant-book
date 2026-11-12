@@ -1,0 +1,317 @@
+\chapter{Modèles séquentiels sur les carnets d'ordres}\label{ch:ml:sequence-models-on-order-books}
+
+Un article très cité rapporte qu'un réseau convolutif-récurrent lisant les états bruts d'un carnet d'ordres à dix niveaux
+surpasse tous les algorithmes existants sur un jeu de données de référence de carnets d'ordres, et offre une précision stable hors échantillon (out-of-sample) sur une
+année de cotations de la London Stock Exchange. Sur un ordinateur portable,
+sur quelques heures d'un carnet simulé, avec des étiquettes construites honnêtement et chaque session de test tenue à l'écart de l'entraînement, le meilleur
+modèle séquentiel atteint un coefficient d'information (IC) de 0.43, et une \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} sur dix variables construites à la main (le
+déséquilibre du flux d'ordres, le déséquilibre des files, le flux récent et les mouvements) atteint 0.54. L'article n'a pas tort sur ses données~; le résultat est que
+les carnets bruts sont une entrée difficile, les modèles séquentiels en exigent beaucoup, et l'affirmation «~l'apprentissage profond trouve
+lui-même les variables~» a un coût en données qu'il faut payer en sessions. Ce chapitre construit les quatre architectures séquentielles de référence,
+les entraîne sur des fenêtres de carnet d'ordres et mesure ce qu'elles apportent.
+
+\section{Flux de carnets d'ordres en entrée}
+
+Les données du chapitre sont des sessions de dix minutes de \texttt{firm.tape} (livre~7, chapitre~2), chacune avec sa propre graine~: huit pour
+l'entraînement, trois pour l'\omterm{def:ml:trees-and-boosting:early}{arrêt précoce} (early stopping), huit pour le test, et huit autres pour doubler plus tard l'\omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensemble d'entraînement}. Toutes les
+demi-secondes, le carnet est reconstruit à partir des messages et résumé niveau par niveau~: pour chacun des dix meilleurs niveaux de chaque côté,
+la distance du prix au mid, en ticks, et le logarithme de la taille en lots, soit quarante nombres par instantané. Une
+entrée est une fenêtre des 20 derniers instantanés (dix secondes)~; son étiquette est la direction de la moyenne du mid sur les dix
+secondes suivantes, par rapport au mid courant~: baisse, stable ou hausse, avec une zone morte d'un quart de tick (la \cref{fig:ml:lobseq:window}).
+Les fenêtres ne franchissent jamais les sessions, et la mise à l'échelle des quarante colonnes n'est calibrée que sur les sessions d'entraînement.
+
+\begin{omfigure}
+\begin{tikzpicture}[x=0.40cm,y=0.40cm,font=\footnotesize]
+\foreach \t in {0,...,19} { \foreach \l in {0,...,9} {
+  \fill[omDef!15] (\t,\l) rectangle ++(0.85,0.85); } }
+\draw[omDef,thick] (-0.2,-0.2) rectangle (19.95,10.05);
+\node[anchor=east,align=right] at (-0.5,5) {10 niveaux $\times$ 4\\(distance, log de la taille,\\bid et ask)};
+\node at (10,-1.1) {20 instantanés, un par demi-seconde (dix secondes)};
+\draw[->,thick] (20.4,5) -- (23.3,5) node[midway,above] {modèle};
+\node[draw=omThm,fill=omThm!10,rounded corners=2pt,align=center,anchor=west] at (23.5,5) {$\P(\text{baisse})$, $\P(\text{stable})$,\\ $\P(\text{hausse})$};
+\draw[omProp,thick,->] (19.9,11.2) -- (26.5,11.2);
+\node[omProp,anchor=south] at (23.2,11.3) {10 s suivantes~: mid moyen $-$ mid};
+\draw[omProp,dashed] (19.9,10.2) -- (19.9,11.6);
+\node[anchor=south] at (10,10.2) {instant de décision $t$ à la fin de la fenêtre};
+\end{tikzpicture}
+
+\omcaption{Une fenêtre d'entrée et son étiquette. L'étiquette compare la moyenne du mid sur les dix secondes suivantes avec le mid à
+l'instant de décision et reste stable à un quart de tick près~; le lissage suit la littérature DeepLOB et rend l'étiquette
+plus facile à prédire que le mouvement suivant lui-même.}\label{fig:ml:lobseq:window}
+\end{omfigure}
+
+Les classes sont déséquilibrées~: 73~\% des fenêtres de test sont stables, 15~\% en baisse et 13~\% en hausse. Prédire toujours «~stable~» est
+juste dans 73~\% des cas, si bien que la précision est un mauvais score~; le chapitre la rapporte pour la comparer à la littérature et classe
+les modèles selon le coefficient d'information de $\P(\text{hausse}) - \P(\text{baisse})$ avec la variation future, session par
+session.
+
+\section{Modèles convolutifs et récurrents}
+
+\begin{definition}[Réseau de neurones convolutif]\label{def:ml:sequence-models-on-order-books:cnn}
+Un \emph{réseau de neurones convolutif}\index{réseau de neurones convolutif} applique le même petit filtre à chaque
+position de son entrée~: une couche convolutive unidimensionnelle envoie une séquence $z_1,\dots,z_T$ de vecteurs à $d$ composantes vers
+$u_t = \mathrm{act}(\sum_{j=0}^{k-1}B_jz_{t+j-\lfloor k/2\rfloor} + c)$, avec $k$ matrices de filtre $B_j$ communes à tous les $t$.
+\end{definition}
+
+\begin{definition}[Réseau de neurones récurrent, mémoire à long et court terme]\label{def:ml:sequence-models-on-order-books:rnn}
+Un \emph{réseau de neurones récurrent}\index{réseau de neurones récurrent} lit une séquence pas à pas et porte un état caché,
+$h_t = \mathrm{act}(A x_t + C h_{t-1} + c)$. Un réseau à \emph{mémoire à long et court terme}\index{mémoire à long et court terme}
+(LSTM) ajoute un état de cellule mis à jour par des portes (entrée, oubli et sortie, chacune une sigmoïde de $x_t$ et $h_{t-1}$), ce qui
+laisse les gradients se propager sur de longues séquences (Hochreiter et Schmidhuber, 1997).
+\end{definition}
+
+Le CNN du chapitre comporte deux couches convolutives de 32 filtres de largeur cinq, en fait la moyenne sur la fenêtre et classe~;
+le LSTM compte 32 unités et classe à partir de son dernier état. Les deux lisent les quarante colonnes de chaque instantané de la fenêtre.
+
+\section{Convolutions temporelles et attention}
+
+\begin{definition}[Convolution causale, réseau convolutif temporel]\label{def:ml:sequence-models-on-order-books:tcn}
+Une \emph{convolution causale}\index{convolution causale} n'utilise que les positions courante et antérieures~:
+$u_t = \sum_{j=0}^{k-1}B_jz_{t - jr}$, avec une dilatation $r$. Un
+\emph{réseau convolutif temporel}\index{réseau convolutif temporel} (TCN) empile des convolutions causales avec des dilatations $1, 2, 4,\dots$, de sorte que le champ réceptif croisse
+exponentiellement avec la profondeur, généralement avec des connexions résiduelles (Bai, Kolter et Koltun, 2018).
+\end{definition}
+
+\begin{definition}[Mécanisme d'attention, transformer]\label{def:ml:sequence-models-on-order-books:attention}
+Un \emph{mécanisme d'attention}\index{mécanisme d'attention} permet à chaque position d'une séquence de former sa sortie comme
+moyenne pondérée de toutes les positions~: avec des requêtes $\mathsf Q = ZA_{\mathsf Q}$, des clés $\mathsf K = ZA_{\mathsf K}$ et des valeurs
+$\mathsf V = ZA_{\mathsf V}$ calculées à partir de la séquence $Z$ ($T\times h$), la sortie est
+$\mathrm{softmax}(\mathsf Q\mathsf K^\top/\sqrt h)\mathsf V$. Une couche \emph{transformer}\index{transformer} combine
+plusieurs têtes d'attention, un réseau appliqué position par position, des connexions résiduelles et une \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{normalisation par couche} (layer normalisation)~; les positions sont codées
+en ajoutant aux entrées des vecteurs appris ou fixes (Vaswani et al., 2017).
+\end{definition}
+
+Le TCN compte quatre blocs causaux (dilatations de 1 à 8, filtres de largeur trois, champ réceptif de 31 instantanés, plus que la
+fenêtre) et classe à partir de la dernière position~; le modèle d'attention est une couche \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} à deux têtes de largeur 32
+et positions apprises, lu lui aussi à la dernière position.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.4cm,ybar,bar width=14pt,ylabel={coefficient d'information de test},
+  symbolic x coords={logistic,CNN,LSTM,TCN,attention},xtick=data,
+  xticklabels={{logistique sur\\variables},CNN,LSTM,TCN,attention},xticklabel style={align=center},tick label style={font=\small},
+  label style={font=\small},ymin=-0.2,ymax=0.7,grid=major,grid style={gray!25},enlarge x limits=0.14,
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef,error bars/.cd,y dir=both,y explicit]
+  table[x=model,y=ic,y error=sd]{figdata/ml/08-sequence-models-on-order-books/models.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coefficient d'information de $\P(\text{hausse}) - \P(\text{baisse})$ avec la variation future, moyenné sur huit
+sessions de test (et deux graines pour les modèles séquentiels)~; les barres montrent l'écart type entre sessions et graines. Le
+\omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} lit dix variables construites à la main à l'instant de décision~; les modèles séquentiels lisent le carnet brut à dix niveaux
+sur dix secondes. Données~: \texttt{ml\_lobseq.table}.}\label{fig:ml:lobseq:models}
+\end{omfigure}
+
+\section{Ce que la littérature reproduit}
+
+Sur les données du chapitre (la \cref{fig:ml:lobseq:models}), la \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} multinomiale sur les variables construites à la main du
+livre~8 (chapitre~14~; déséquilibre du flux d'ordres (OFI) sur trois fenêtres, déséquilibre des files, flux et mouvements passés) atteint une précision de
+0.781 et un IC de 0.543. Parmi les modèles séquentiels, le \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} fait le mieux (précision 0.775, IC 0.426), puis le TCN
+(0.766, 0.366), le LSTM (0.729, 0.292) et le CNN (0.727, 0.060)~: le CNN moyenne ses filtres sur la fenêtre et donc ne
+peut distinguer le dernier instantané du premier, et il fait à peine mieux que de toujours prédire «~stable~». La dispersion entre sessions
+et graines (0.15 à 0.20 d'IC pour les modèles séquentiels, 0.09 pour la \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique}) est aussi grande que les écarts.
+
+Les modèles ont été soumis à un \omterm{def:ml:trees-and-boosting:early}{arrêt précoce} (early stopping) après une à quatre \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques}~: huit sessions représentent 8\,808 fenêtres, et un modèle
+à plusieurs milliers de paramètres qui lit 800 nombres par fenêtre s'ajuste rapidement à leur bruit. Doubler les données aide (la \cref{fig:ml:lobseq:scaling})~:
+l'IC du TCN passe de 0.13 sur quatre sessions à 0.30 sur huit et 0.44 sur seize, tandis que la \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} reste
+entre 0.54 et 0.57 tout du long. Les modèles séquentiels apprennent à partir du carnet brut ce que les variables construites à la main donnent
+directement au modèle linéaire, et ils sont encore en train de l'apprendre avec seize sessions.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9.5cm,height=5.2cm,xlabel={sessions d'entraînement (dix minutes chacune)},ylabel={IC de test},
+  tick label style={font=\small},label style={font=\small},xmin=2,xmax=18,ymin=0,ymax=0.7,xtick={4,8,16},
+  grid=major,grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*] table[x=sessions,y=tcn]{figdata/ml/08-sequence-models-on-order-books/scaling.csv};
+\addplot[omThm,very thick,mark=square*] table[x=sessions,y=logistic]{figdata/ml/08-sequence-models-on-order-books/scaling.csv};
+\legend{TCN sur le carnet brut,régression logistique sur variables construites à la main}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{IC de test à mesure que l'\omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensemble d'entraînement} croît de quatre à seize sessions (une graine~; les mêmes huit sessions de test). Données~:
+\texttt{ml\_lobseq.scaling}.}\label{fig:ml:lobseq:scaling}
+\end{omfigure}
+
+La littérature publiée va dans le même sens dès que l'évaluation est rigoureuse. DeepLOB, de Zhang, Zohren et Roberts, a surpassé
+les algorithmes antérieurs sur l'indice de référence FI-2010 (Ntakaris et al.) et a conservé une précision hors échantillon (out-of-sample) stable sur une année de
+cotations de la London Stock Exchange, y compris sur des instruments sur lesquels il n'avait pas été entraîné. Sirignano et Cont, en s'entraînant sur
+des milliards de cotations américaines, ont mis en évidence une relation stable et universelle entre l'historique du flux d'ordres et la direction du
+mouvement suivant, et qu'un modèle agrégé sur l'ensemble des actions bat les modèles propres à chaque action~: c'est l'échelle qui a rendu l'entrée brute exploitable. Kolm,
+Turiel et Westray, sur 115 actions du Nasdaq, ont montré que des réseaux plus simples entraînés sur le flux d'ordres surpassent nettement
+la plupart des modèles entraînés directement sur les carnets d'ordres. L'indice de référence LOBCAST, qui regroupe quinze modèles profonds publiés (Prata et al., 2024),
+constate que tous perdent une part importante de leur performance sur des données sur lesquelles ils n'ont pas été calibrés. Deux leçons valent pour tout
+modèle sur carnet d'ordres~: construire les variables stationnaires que la littérature sur la microstructure connaît déjà (flux d'ordres, déséquilibre,
+livre~7, chapitre~8), et juger un modèle sur des sessions, des journées et des instruments qu'il n'a jamais vus.
+
+\begin{method}[Entraîner un modèle séquentiel sur des carnets d'ordres]\label{met:ml:lobseq:method}
+\begin{enumerate}
+\item Découper par session (journée, instrument), jamais par fenêtre~; ajuster toute normalisation sur les sessions d'entraînement.
+\item Fixer l'horizon de l'étiquette et la bande morte à partir de la transaction que le modèle sert~; indiquer la part de chaque classe et un score qui
+ne récompense pas la prédiction de la classe majoritaire (l'IC, ou un P\&L tenant compte des coûts).
+\item Partir d'un modèle linéaire sur les variables de flux d'ordres et de déséquilibre~; donner au modèle séquentiel les mêmes variables comme
+canaux supplémentaires avant de lui demander de les retrouver.
+\item Indiquer la dispersion entre sessions et graines, ainsi qu'une courbe d'apprentissage en sessions.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: DeepLOB sur un ordinateur portable}\label{tut:ml:sequence-models-on-order-books:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Convertir des sessions simulées en fenêtres de carnet d'ordres, entraîner quatre modèles séquentiels et une \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} de référence, et
+mesurer la courbe d'apprentissage en sessions. \textbf{État final~:} les \cref{fig:ml:lobseq:models,fig:ml:lobseq:scaling}.
+\begin{tutsteps}
+\item \textbf{Fenêtres et étiquettes}, à l'intérieur de chaque session.
+\omcode{code/firm/lobseq/firm_lobseq.py}{57}{73}{Fenêtres de snapshots, étiquettes de direction lissées et normaliseur ajusté sur les fenêtres d'entraînement.}\label{lst:ml:lobseq:windows}
+\item \textbf{Le TCN et le modèle d'attention.}
+\omcode{code/firm/lobseq/firm_lobseq.py}{97}{136}{Convolutions causales dilatées et transformer à une couche.}\label{lst:ml:lobseq:models}
+\item \textbf{Exécuter} \texttt{ml\_lobseq.table()}, \texttt{scaling(4)}, \texttt{scaling(8)}, \texttt{scaling(16)} et
+\texttt{fig\_lobseq.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Donner au TCN les variables construites à la main comme dix canaux supplémentaires et voir quelle part de l'écart avec la
+\omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} se referme~; remplacer l'étiquette lissée par le signe du prochain changement du mid.
+\end{tutorial}
+
+\section{Construction~: jeux de données et modèles séquentiels sur carnets d'ordres}\label{bld:ml:sequence-models-on-order-books:lobseq}
+
+\begin{build}
+\bfield{Rôle} Modèles séquentiels sur carnets d'ordres entraînés et évalués de la même façon sur des sessions simulées aujourd'hui, et sur les
+bandes enregistrées du simulateur de bourse du livre~10 lorsqu'elles seront disponibles.
+\bfield{Interface} \texttt{snapshots(tape, step, levels, start)}, \texttt{windows(S, mid, T, horizon, threshold)},
+\texttt{Scaler}, \texttt{CNN}, \texttt{LSTMNet}, \texttt{TCN}, \texttt{Attention},
+\texttt{train(model, X, y, Xv, yv, epochs, lr, batch, patience, seed)}, \texttt{evaluate(model, X, y, fwd)}.
+\bfield{Règles} Les fenêtres d'une session restent dans un même découpage~; le carnet est reconstruit à partir des messages, sans aucun message
+postérieur à l'instant du snapshot~; un seul fil CPU, algorithmes déterministes.
+\bfield{Tests d'acceptation} \texttt{code/firm/lobseq/tests/}~: les snapshots correspondent à un carnet reconstruit à la main à un instant donné et
+n'utilisent aucun message postérieur~; les fenêtres et les étiquettes sont vérifiées à la main sur une courte série~; la sortie du TCN à un pas ne dépend pas des
+entrées ultérieures (causalité)~; chaque modèle s'entraîne sur un motif implanté et fait mieux que le hasard.
+\bfield{Pour aller plus loin} Entrées de type market-by-order (âge et position dans la file de chaque ordre)~; un modèle agrégé sur plusieurs
+instruments simulés, dans l'esprit de Sirignano et Cont.
+\end{build}
+
+\begin{omsources}
+\item Z.~Zhang, S.~Zohren et S.~Roberts, «~DeepLOB: deep convolutional neural networks for limit order books~»,
+\emph{IEEE Transactions on Signal Processing} 67(11), 2019.
+\item J.~Sirignano et R.~Cont, «~Universal features of price formation in financial markets: perspectives from deep
+learning~», \emph{Quantitative Finance} 19(9), 2019.
+\item P.~N.~Kolm, J.~Turiel et N.~Westray, «~Deep order flow imbalance: extracting alpha at multiple horizons from the
+limit order book~», \emph{Mathematical Finance} 33(4), 2023.
+\item M.~Prata et al., «~LOB-based deep learning models for stock price trend prediction: a benchmark study~»,
+\emph{Artificial Intelligence Review} 57, 2024.
+\item A.~Ntakaris, M.~Magris, J.~Kanniainen, M.~Gabbouj et A.~Iosifidis, «~Benchmark dataset for mid-price forecasting of
+limit order book data with machine learning methods~», \emph{Journal of Forecasting} 37(8), 2018.
+\item S.~Hochreiter et J.~Schmidhuber, «~Long short-term memory~», \emph{Neural Computation} 9(8), 1997~; S.~Bai, J.~Z.~Kolter
+et V.~Koltun, «~An empirical evaluation of generic convolutional and recurrent networks for sequence modeling~», arXiv,
+2018~; A.~Vaswani et al., «~Attention is all you need~», \emph{NeurIPS}, 2017.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:1}
+Calculer le champ réceptif, en snapshots, d'un TCN dont les filtres ont une largeur de trois et des dilatations 1, 2, 4 et 8, puis avec une largeur de cinq.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:2}
+Les fenêtres de test sont à 72.7~\% stables, à 14.7~\% à la baisse et à 12.5~\% à la hausse. Calculer la précision qu'atteint la prédiction systématique de «~stable~», et
+celle d'un tirage au hasard selon les proportions des classes~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:sequence-models-on-order-books:3}
+Pour une tête d'attention sur $T = 20$ positions de largeur $h = 32$, calculer le nombre de multiplications qu'exige $\mathsf Q\mathsf K^\top$
+et indiquer comment ce nombre croît avec $T$.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:4}
+Pourquoi le CNN, qui moyenne sur la fenêtre, réussit-il si mal, et quelle petite modification y remédierait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:5}
+L'étiquette moyenne le mid sur les dix secondes suivantes. Pourquoi cela la rend-elle plus facile à prédire que la variation suivante du mid,
+et que signifie-t-elle pour le trading~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:sequence-models-on-order-books:6}
+\emph{Trouver la faille.} «~Nous avons découpé nos 50 jours de fenêtres de carnet d'ordres en \omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensembles d'entraînement} et de test au hasard, et notre réseau atteint 88~\%
+de précision.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:sequence-models-on-order-books:7}
+\emph{Programmation.} Entraîner le LSTM sur seize sessions (\texttt{scaling(16, name='LSTM')}). Rapporter son IC et le comparer à celui du
+TCN sur seize sessions.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:sequence-models-on-order-books:8}
+Montrer qu'une pile de \omterm{def:ml:sequence-models-on-order-books:tcn}{convolutions causales} de largeur $k$ avec des dilatations $1, 2,\dots,2^{L-1}$ possède un champ réceptif de
+$1 + (k - 1)(2^L - 1)$ positions et que sa sortie en $t$ ne dépend d'aucune entrée postérieure à $t$.
+\end{exercise}
+
+\section{Problème~: DeepLOB sur un ordinateur portable}
+
+\begin{problem}[{Problème du week-end --- le carnet brut contre les variables construites à la main}]\label{pb:ml:sequence-models-on-order-books:1}
+Les sessions du chapitre~: huit pour l'entraînement, trois pour l'arrêt, huit pour le test, huit autres pour agrandir l'\omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensemble d'entraînement}.
+
+\medskip\noindent\textbf{Partie I --- Les données.}
+\begin{enumerate}
+\item Que contient un instantané et une fenêtre~?
+\item Comment l'étiquette est-elle construite, et quelles sont les proportions des classes~?
+\item Pourquoi la précision est-elle un mauvais score ici, et que retient le chapitre à la place~?
+\item Pourquoi les fenêtres ne doivent-elles jamais chevaucher la séparation entre sessions~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les modèles.}
+\begin{enumerate}[resume]
+\item Quels sont les champs réceptifs des quatre modèles de séquences sur la fenêtre~?
+\item Que vaut chaque modèle (précision et IC)~?
+\item Que vaut la \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} sur les variables construites à la main~?
+\item Quelle est l'amplitude de l'écart entre les sessions et les graines~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les données (suite).}
+\begin{enumerate}[resume]
+\item Au bout de combien d'\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} les modèles s'arrêtent-ils, et pourquoi~?
+\item Que vaut le TCN avec quatre, huit et seize sessions d'entraînement~?
+\item La \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} profite-t-elle de davantage de sessions~? Pourquoi pas~?
+\item Que faudrait-il que la courbe fasse pour que le TCN dépasse la référence~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Qu'ont trouvé Kolm, Turiel et Westray sur les carnets bruts face au flux d'ordres~?
+\item Qu'a trouvé l'indice de référence LOBCAST sur les modèles publiés face à de nouvelles données~?
+\item Qu'est-ce qui a permis au modèle à entrées brutes de Sirignano et Cont de fonctionner~?
+\item Énoncer le \emph{résultat nommé}~: l'IC et la précision du meilleur modèle de séquences face à la \omterm{def:ml:linear-and-regularised-baselines:logistic}{régression logistique} sur le déséquilibre du flux d'ordres,
+avec l'écart entre les graines et les sessions.
+\item Que mettre en production pour une prévision à dix secondes, et que tenter ensuite~?
+\item Comment \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} l'IC en décision de trading, étant donné les étiquettes du chapitre~2~?
+\item Qu'est-ce qui change dans le simulateur du livre~10 avec plusieurs instruments~?
+\item En une phrase~: que faut-il à un modèle de séquences pour battre une bonne variable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML, chercheur}]\label{iq:ml:sequence-models-on-order-books:1}
+Qu'est-ce qu'une \omterm{def:ml:sequence-models-on-order-books:tcn}{convolution causale}, et pourquoi importe-t-elle pour un modèle de trading~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:sequence-models-on-order-books:2}
+Expliquez l'auto-attention en quelques équations. Que coûte-t-elle en fonction de la longueur de la séquence~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:sequence-models-on-order-books:3}
+Votre modèle de carnet d'ordres a une précision de 80~\% sur une étiquette à trois classes fondée sur le prix milieu. Quelles questions posez-vous avant d'être
+impressionné~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:ml:sequence-models-on-order-books:4}
+Des niveaux bruts du carnet ou des variables de flux d'ordres comme entrées~? Argumentez à partir des faits.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:sequence-models-on-order-books:5}
+Comment découpez-vous les données de carnet d'ordres en \omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensembles d'entraînement} et de test, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:sequence-models-on-order-books:6}
+Pourquoi un LSTM pourrait-il sous-performer un TCN sur de courtes fenêtres de données de carnet d'ordres, et quand attendriez-vous l'inverse~?
+\end{interviewq}

@@ -1,0 +1,443 @@
+\chapter{Instructions vectorielles et code parallèle sur les données}\label{ch:ll:vector-instructions-and-data-parallel-code}
+
+Un analyseur qui lit un octet à la fois regarde un message comme on lit une page lettre par lettre. En 2019, Geoff
+Langdale et Daniel Lemire ont publié un analyseur JSON qui examine 32 ou 64 octets par instruction, et l'ont présenté comme
+le premier analyseur JSON conforme à la norme «~capable de traiter des gigaoctets de données par seconde sur un seul cœur~», en utilisant un quart
+ou moins des instructions d'un analyseur de référence très répandu. Sur l'ordinateur portable de ce livre, la boucle qui cherche la fin
+d'un champ octet par octet parcourt environ quatre octets par nanoseconde~; la même recherche écrite avec des \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles} de 256 bits parcourt
+environ quatre-vingts octets, soit une dizaine de fois plus vite, et découpe un ordre FIX de 159 octets en ses seize champs en environ \qty{11}{\nano\second}
+contre une centaine. Les données de marché et les messages d'ordres sont du texte ou du binaire compacté, lus champ par champ à chaque tick~: ce
+chapitre montre ce que sont les \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles}, quand le compilateur les utilise de lui-même et ce qui l'en empêche, comment les écrire à la main
+avec un repli scalaire auquel les tests les confrontent, et comment disposer les données pour qu'elles s'appliquent.
+
+\section{Registres SIMD et jeux d'instructions}
+
+\begin{definition}[SIMD, instruction vectorielle]\label{def:ll:vector-instructions-and-data-parallel-code:simd}
+Le \emph{SIMD}\index{SIMD} (single instruction, multiple data) est l'exécution d'une même opération sur plusieurs éléments de données
+à la fois. Une \emph{instruction vectorielle}\index{instruction vectorielle} est une telle opération appliquée à un registre vectoriel qui contient plusieurs
+éléments côte à côte~: sur x86-64, des registres \texttt{xmm} de 16 octets (SSE2, présent sur tout processeur x86-64), des
+registres \texttt{ymm} de 32 octets (AVX2) et, sur les processeurs qui le proposent, des registres \texttt{zmm} de 64 octets (AVX-512).
+\end{definition}
+
+Un registre de 32 octets contient 32 octets, 16 entiers de deux octets, 8 entiers ou flottants de quatre octets, ou 4 flottants de huit octets, et une seule instruction
+additionne, compare ou multiplie tous ces éléments. L'instruction la plus importante pour l'analyse syntaxique est la comparaison d'octets~:
+\texttt{VPCMPEQB} compare les 32 octets de deux registres \texttt{ymm} et met chaque octet du résultat à tous ses bits à un là où ils
+sont égaux, et \texttt{VPMOVMSKB} rassemble le bit de poids fort de chacun de ces octets dans un entier de 32 bits placé dans un registre ordinaire. Un
+fragment de message comparé à un registre entièrement rempli de l'octet délimiteur devient donc un masque de 32 bits, avec un bit par position
+et «~où se trouve le premier délimiteur~» devient «~combien de zéros de poids faible le masque comporte-t-il~», soit une instruction de plus
+(\cref{fig:ll:vector-instructions-and-data-parallel-code:mask}). La boucle fait en trois instructions ce que la boucle scalaire
+fait en 32 comparaisons et 32 branchements.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,c/.style={draw=gray!60,minimum width=0.34cm,minimum height=0.42cm,inner sep=0pt}]
+\foreach \ch [count=\j from 0] in {3,5,=,D,|,5,5,=,E,S,Z,6,|,5,4,=,1,|,3,8,=,5,|,4,4,=,5,7,2,3,|,6} {
+  \pgfmathtruncatemacro{\i}{\j}
+  \pgfmathtruncatemacro{\hit}{(\i==4)||(\i==12)||(\i==17)||(\i==22)||(\i==30)}
+  \ifnum\hit=1
+    \node[c,fill=omThm!25] at (0.36*\i,0) {\ch};
+    \node[c,fill=omThm!55,text=white] at (0.36*\i,-1.3) {1};
+  \else
+    \node[c,fill=gray!8] at (0.36*\i,0) {\ch};
+    \node[c] at (0.36*\i,-1.3) {0};
+  \fi
+  \node[c,fill=omDef!12] at (0.36*\i,-0.65) {|};
+}
+\node[anchor=east,font=\footnotesize] at (-0.3,0) {32 octets d'un message};
+\node[anchor=east,font=\footnotesize] at (-0.3,-0.65) {délimiteur, diffusé};
+\node[anchor=east,font=\footnotesize] at (-0.3,-1.3) {bits de \texttt{movemask}};
+\foreach \i in {0,8,16,24,31} {\node[font=\tiny,gray] at (0.36*\i,0.38) {\i};}
+\draw[-Stealth,thick,omThm] (0.36*4,-1.55) -- ++(0,-0.45) node[below,align=center,font=\footnotesize]
+  {zéros de poids faible $= 4$~:\\ premier délimiteur};
+\node[anchor=west,align=left,font=\footnotesize] at (3.4,-2.25) {effacer le bit de poids faible et recompter~: 12, 17, 22, 30\\
+  (un \texttt{VPCMPEQB}, un \texttt{VPMOVMSKB}, un comptage par champ)};
+\end{tikzpicture}
+
+\omcaption{Recherche des délimiteurs de champs d'un message FIX par une seule comparaison de 32 octets. L'octet \texttt{|} représente le
+délimiteur SOH (octet 1). La comparaison met un octet à tous les bits à un là où le message est égal au délimiteur~; l'instruction de masque
+rassemble un bit par octet~; le comptage des zéros de poids faible donne chaque position
+à son tour.}\label{fig:ll:vector-instructions-and-data-parallel-code:mask}
+\end{omfigure}
+
+Le processeur de l'ordinateur portable dispose de SSE2 jusqu'à AVX2 et de la multiplication-addition fusionnée (FMA) (livre~4, chapitre~25), mais pas d'AVX-512, comme le montrent ses
+indicateurs de fonctionnalités dans \path{/proc/cpuinfo}. C'est la situation ordinaire pour le code d'une société de trading~: il est compilé une fois et
+s'exécute sur des machines de plusieurs générations, si bien que le jeu d'instructions le plus large ne peut pas être présumé, et un binaire qui exécute une
+instruction AVX2 sur un processeur qui ne la possède pas s'arrête avec un signal d'instruction illégale. La section~3 traite ce point.
+
+\section{Auto-vectorisation et ce qui la bloque}
+
+\begin{definition}[Auto-vectorisation]\label{def:ll:vector-instructions-and-data-parallel-code:auto}
+L'\emph{auto-vectorisation}\index{auto-vectorisation} est la transformation, par le compilateur, d'une boucle scalaire en \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles}
+qui traitent plusieurs itérations à la fois, effectuée lorsqu'il peut démontrer que le résultat reste inchangé et juge la
+transformation rentable.
+\end{definition}
+
+Le compilateur vectorise de lui-même plus souvent qu'on ne le pense, et moins souvent qu'on ne l'espère. GCC le fait avec
+\texttt{-O3}~; à partir de GCC~12, il le fait aussi à \texttt{-O2}, avec un modèle de coût qui n'accepte que des transformations très bon marché
+(les notes de version), si bien qu'une boucle que GCC~11 laisse scalaire à \texttt{-O2} peut être vectorisée par GCC~13 avec le
+même drapeau~: la version du compilateur fait partie de la performance. \texttt{-fopt-info-vec-all} demande au compilateur de signaler chaque décision.
+Le \Cref{lst:ll:vector-instructions-and-data-parallel-code:report} est son rapport sur cinq petites boucles avec le GCC~11 de l'ordinateur portable.
+
+\omcode{code/low-latency/14-vector-instructions-and-data-parallel-code/cpp/vecreport/gxx11.txt}{1}{20}{Le rapport de vectorisation
+de GCC~11 pour \texttt{ll\_vecdemo.cpp}~: la réévaluation sur des colonnes (ligne 13), sur des enregistrements (20--21), une recherche qui
+s'arrête tôt (27), et des sommes entière et en double précision (34, 40).}\label{lst:ll:vector-instructions-and-data-parallel-code:report}
+
+Chaque ligne est une leçon. À \texttt{-O2}, rien n'est vectorisé. La réévaluation sur des tableaux séparés est vectorisée à
+\texttt{-O3}, deux flottants en double précision par instruction, quatre avec \texttt{-mavx2}, mais seulement après que le compilateur a «~versionné~» la boucle~:
+le pointeur de sortie pourrait chevaucher une entrée, il le vérifie donc à l'exécution et conserve une copie scalaire de la boucle pour ce cas
+(\texttt{\_\_restrict}, qui promet l'absence de chevauchement, supprime la vérification). Le même calcul sur des enregistrements de 80 octets n'est
+pas vectorisé du tout~: les cinq champs d'options consécutives sont séparés de 80 octets, et GCC~11 ne trouve aucun type vectoriel pour de tels
+chargements à pas variable. La recherche est refusée parce qu'elle peut quitter la boucle plus tôt («~control flow in loop~»)~: GCC~11 ne vectorise pas une boucle
+avec sortie anticipée. La somme entière est vectorisée. La somme en double précision est signalée
+vectorisée elle aussi, et son assembleur montre pourquoi cela ne signifie rien~: les additions restent dans leur ordre d'origine, un élément à la
+fois, car l'addition en virgule flottante n'est pas associative et en modifier l'ordre changerait le résultat (chapitre~8, où
+\texttt{-ffast-math} l'autorisait et modifiait la réponse). Les obstacles, en bref~: le recouvrement possible des pointeurs, les données à pas variable ou dispersées,
+les sorties anticipées, les appels qui ne peuvent pas être mis en ligne, et les réductions dont l'ordre compte.
+
+\section{Intrinsèques et répartition selon les fonctions du CPU}
+
+\begin{definition}[Intrinsèque du compilateur, répartition selon les fonctions du CPU]\label{def:ll:vector-instructions-and-data-parallel-code:intrinsic}
+Un \emph{intrinsèque du compilateur}\index{intrinsèque du compilateur} est une fonction que le compilateur connaît et traduit en une instruction précise
+(\texttt{\_mm256\_cmpeq\_epi8} en \texttt{VPCMPEQB}), ce qui permet à un programme d'utiliser une instruction sans écrire
+d'assembleur, tandis que le compilateur continue d'allouer les registres et d'ordonnancer autour d'elle. La \emph{répartition selon les
+fonctions du CPU}\index{répartition selon les fonctions du CPU} choisit à l'exécution, d'après les fonctions que signale le processeur, laquelle parmi plusieurs versions compilées d'une fonction
+doit être appelée.
+\end{definition}
+
+Lorsque le compilateur refuse de vectoriser une boucle, les intrinsèques le font à la main. La recherche d'un octet dans la construction charge 32 octets,
+les compare au délimiteur diffusé, prend le masque et compte ses zéros de poids faible~; un message dont la longueur n'est pas un multiple de
+32 se termine par un chargement de plus qui s'achève exactement sur son dernier octet et chevauche le bloc précédent, les octets déjà
+vus étant écartés du masque, de sorte qu'aucun octet au-delà du message n'est jamais lu. Ce dernier point n'est pas une affaire de pédanterie~: une lecture au-delà
+de la fin d'un tampon qui se termine à une frontière de page provoque une faute, et le sanitiseur du chapitre~8 signale toute lecture de ce type.
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{64}{79}{Recherche AVX2 d'un octet, avec un dernier
+bloc qui chevauche le précédent.}\label{lst:ll:vector-instructions-and-data-parallel-code:find}
+
+\begin{sloppypar}La fonction est compilée pour AVX2 au moyen d'un attribut \texttt{target}, sans compiler pour autant tout le programme, et elle est appelée
+seulement après une vérification. La fonction \texttt{\_\_builtin\_cpu\_supports(\textquotedbl{}avx2\textquotedbl{})} de GCC renvoie une valeur non nulle lorsque le processeur en fonctionnement
+dispose de la fonctionnalité~; la construction la vérifie une seule fois, au premier appel, et en conserve la réponse. Le \omterm{def:ll:cpp-for-latency-iii-the-compiler:fmv}{multiversionnage de fonctions} du chapitre~8 fait la même chose
+automatiquement pour une fonction entière~; la version explicite rend le choix visible et testable, et les tests appellent chaque
+version directement sur les mêmes entrées.\end{sloppypar}
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{196}{210}{Répartition~: détecter les fonctions une seule fois, puis appeler la
+version la plus large.}\label{lst:ll:vector-instructions-and-data-parallel-code:dispatch}
+
+Rust exprime le même contrat dans ses types. Une fonction qui utilise des intrinsèques est déclarée \texttt{unsafe} avec l'attribut \texttt{target\_feature} qui active \texttt{avx2}, et son appel est sûr
+seulement une fois que la macro \texttt{is\_x86\_feature\_detected!} a renvoyé vrai pour \texttt{avx2}, comme le montre l'exemple même de la bibliothèque standard~: le
+bloc \texttt{unsafe} «~est sûr parce que nous testons que la fonctionnalité \texttt{avx2} est bien disponible sur notre CPU~».
+
+\omcode{code/firm/simdscan/rust/src/lib.rs}{86}{98}{La même répartition en Rust~: l'appel unsafe est protégé par la
+vérification à l'exécution.}\label{lst:ll:vector-instructions-and-data-parallel-code:rust}
+
+Les nombres demandent un second artifice. Huit chiffres ASCII chargés comme un seul entier de 64 bits peuvent être convertis en leur valeur sans boucle~:
+on soustrait le caractère \texttt{0} de chaque octet en une seule opération, puis on combine les chiffres voisins en nombres à deux chiffres dans des voies de 16 bits
+ceux-ci en nombres à quatre chiffres dans des voies de 32 bits, et ceux-là dans le résultat, soit trois multiplications en tout. Il s'agit de \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{SIMD}
+à l'intérieur d'un registre ordinaire, et cela ne demande aucune instruction particulière~; une version avec les multiplications-additions de SSE4.1 fait la même chose dans les
+registres vectoriels.
+
+\omcode{code/firm/simdscan/cpp/firm_simdscan.hpp}{134}{144}{Huit chiffres en trois étapes de multiplication-addition dans un seul
+registre de 64 bits.}\label{lst:ll:vector-instructions-and-data-parallel-code:swar}
+
+\begin{proposition}[La combinaison des huit chiffres]\label{prop:ll:vector-instructions-and-data-parallel-code:swar}
+Soient des octets $b_0,\dots,b_7$ contenant les chiffres $d_0,\dots,d_7$ (après soustraction du caractère zéro), $b_0$ étant le plus bas. Après
+l'étape $v \leftarrow (10v + (v \gg 8)) \wedge \mathtt{0x00FF00FF00FF00FF}$, la voie de 16 bits $k$ contient $10 d_{2k} + d_{2k+1}$~;
+après les deux étapes analogues avec 100 et 10\,000, les 32 bits de poids faible contiennent $\sum_{j=0}^{7} d_j\, 10^{7-j}$.
+\end{proposition}
+
+\begin{proof}
+Avant le masque, l'octet $2k$ de $10v + (v \gg 8)$ vaut $10 d_{2k} + d_{2k+1} \le 99 < 256$, puisque le décalage ramène l'octet $2k+1$
+en position $2k$~; aucune retenue ne sort de l'octet, et le masque écarte les octets impairs, qui contiennent des sommes inutiles. Le même
+raisonnement sur les voies de 16 bits (valeurs allant jusqu'à $99 \times 100 + 99 < 2^{16}$) et sur les voies de 32 bits (jusqu'à $9\,999 \times 10\,000 +
+9\,999 < 2^{32}$) donne les valeurs à quatre et à huit chiffres, le chiffre antérieur occupant toujours la position la plus élevée.
+\end{proof}
+
+Sur le portable, un champ de huit chiffres coûte environ \qty{2.0}{\nano\second} avec la boucle scalaire, \qty{1.0}{\nano\second} avec le
+procédé du registre et \qty{0.7}{\nano\second} avec SSE4.1, contre environ \qty{5}{\nano\second} pour la
+bibliothèque standard, \texttt{std::from\_chars}, qui valide en outre et traite une longueur quelconque. Un prix converti en un nombre entier de
+dix-millièmes coûte environ \qty{7}{\nano\second}, et le même prix lu comme un double par \texttt{strtod} environ
+\qty{43}{\nano\second}. L'article de Lemire sur l'analyse des nombres illustre ce point pour l'analyse des flottants~: un flottant de 64 bits comporte au plus
+17 chiffres significatifs, qui tiennent dans un seul mot de 64 bits, et une analyse faite ainsi est plusieurs fois plus rapide que celle de la bibliothèque C.
+
+\section{Où la vectorisation est rentable dans un système de trading}
+
+La \cref{fig:ll:vector-instructions-and-data-parallel-code:scan} mesure la recherche d'un délimiteur placé à la
+fin d'un message de chaque longueur. La boucle scalaire coûte environ un quart de nanoseconde par octet~; SSE2 environ un quarantième, AVX2 environ un
+quatre-vingtième, auxquels s'ajoute une fraction de nanoseconde par appel. En dessous de 16 octets, les deux versions vectorielles confient le message à la boucle scalaire
+et coûtent la même chose. Découper un message d'ordre FIX complet en ses champs (16 champs, 159 octets) prend environ
+\qty{95}{\nano\second} un octet à la fois et environ \qty{11}{\nano\second} avec la boucle à masque, soit environ neuf fois moins.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,xmode=log,ymode=log,log basis x=2,xmin=6,xmax=5500,ymin=0.4,ymax=2000,
+  xlabel={longueur du message (octets, échelle logarithmique)},ylabel={ns par recherche (échelle logarithmique)},
+  xtick={8,16,32,64,128,256,512,1024,4096},xticklabels={8,16,32,64,128,256,512,1024,4096},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=bytes,y=scalar]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\addplot[omMeth,thick,mark=square*,mark size=1.2pt] table[x=bytes,y=sse2]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\addplot[omDef,very thick,mark=triangle*,mark size=1.6pt] table[x=bytes,y=avx2]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_scan.csv};
+\legend{boucle scalaire,SSE2 (16 octets),AVX2 (32 octets)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Temps nécessaire pour trouver un délimiteur à la fin d'un message, selon la longueur du message~: médiane de lots de mille recherches
+d'un message dans le cache de premier niveau. Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~:
+\texttt{bench\_simd.py}.}\label{fig:ll:vector-instructions-and-data-parallel-code:scan}
+\end{omfigure}
+
+Où cela compte-t-il~? Partout où des octets sont examinés un à un sur le chemin critique~: découper les messages FIX sur leur délimiteur
+(chapitre~15), repérer les caractères structurels des messages JSON provenant des plateformes qui les publient dans ce format (chapitre~17), valider et
+analyser les champs numériques, les sommes de contrôle et les copies. Cela compte moins pour les protocoles binaires dont les champs sont à des décalages fixes
+(chapitre~16), où il n'y a rien à rechercher~; là, les \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles} rapportent plutôt dans le traitement en masse de tableaux~: les
+contrôles de risque de nombreux ordres, la réévaluation d'un livre de positions, les statistiques qu'une stratégie met à jour. Trois conditions décident~:
+assez d'éléments pour remplir un registre, la même opération sur chacun, et des données disposées de façon contiguë. Les deux premières sont des propriétés
+du problème~; la troisième relève d'un choix de conception.
+
+\section{Structure de tableaux}
+
+\begin{definition}[Structure de tableaux]\label{def:ll:vector-instructions-and-data-parallel-code:soa}
+Une \emph{structure de tableaux}\index{structure de tableaux} stocke une collection d'enregistrements sous la forme d'un tableau par champ, de sorte que le
+même champ d'enregistrements consécutifs soit contigu en mémoire~; la disposition habituelle, un enregistrement après l'autre, s'appelle un
+tableau de structures.
+\end{definition}
+
+Un livre d'options réévalué à partir de ses grecques montre la différence
+(\cref{fig:ll:vector-instructions-and-data-parallel-code:layout}). Chaque enregistrement d'option porte un identifiant, un symbole, sa
+quantité et quatre grecques, une échéance et quelques indicateurs~: 80 octets, dont la réévaluation $q(\Delta\,\delta S + \tfrac12
+\Gamma\,\delta S^2 + \mathcal{V}\,\delta\sigma + \Theta\,\delta t)$ n'en lit que 40. Stockés en enregistrements, quatre deltas consécutifs sont
+séparés de 80 octets et aucune instruction ne les charge ensemble~; stockés en colonnes, ils occupent 32 octets consécutifs, en un seul chargement. La moitié de
+chaque \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} récupérée pour les enregistrements est de surcroît perdue.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize]
+\node[anchor=west,font=\footnotesize\bfseries] at (-0.1,1.0) {tableau de structures (enregistrements de 80 octets)};
+\foreach \r in {0,1,2} {
+  \pgfmathsetmacro{\x}{\r*4.3}
+  \draw[fill=gray!10] (\x,0) rectangle ++(0.8,0.5) node[midway]{id};
+  \draw[fill=gray!10] (\x+0.8,0) rectangle ++(1.1,0.5) node[midway,font=\tiny]{symbole};
+  \foreach \f/\k in {q/0,$\Delta$/1,$\Gamma$/2,$\mathcal{V}$/3,$\Theta$/4} {
+    \draw[fill=omDef!25] (\x+1.9+0.4*\k,0) rectangle ++(0.4,0.5) node[midway]{\f};
+  }
+  \draw[fill=gray!10] (\x+3.9,0) rectangle ++(0.35,0.5);
+}
+\foreach \r in {0,1,2} {\draw[-Stealth,omThm,thick] (\r*4.3+2.5,-0.05) -- (\r*4.3+2.5,-0.45);}
+\node[anchor=west,omThm] at (-0.1,-0.7) {deltas espacés de 80 octets~: un chargement chacun, la moitié de chaque ligne inutilisée};
+\node[anchor=west,font=\footnotesize\bfseries] at (-0.1,-1.45) {structure de tableaux (un tableau par champ)};
+\foreach \f/\y in {$\Delta$/-2.15,$\Gamma$/-2.75} {
+  \node[anchor=east] at (-0.15,\y+0.25) {\f};
+  \foreach \k in {0,...,15} {\draw[fill=omDef!25] (0.4*\k,\y) rectangle ++(0.4,0.5);}
+}
+\draw[very thick,omThm] (0,-2.15) rectangle ++(1.6,0.5);
+\node[anchor=west,omThm] at (6.6,-1.9) {quatre deltas, 32 octets contigus~:};
+\node[anchor=west,omThm] at (6.6,-2.3) {un chargement \texttt{ymm}, une multiplication-addition fusionnée (FMA)};
+\end{tikzpicture}
+
+\omcaption{Le même carnet d'options, en enregistrements puis en colonnes. La réévaluation lit cinq champs de l'enregistrement~; en colonnes, chaque
+champ de quatre options consécutives remplit un registre de 256~bits.}\label{fig:ll:vector-instructions-and-data-parallel-code:layout}
+\end{omfigure}
+
+La \Cref{fig:ll:vector-instructions-and-data-parallel-code:reval} mesure les deux dispositions pour trois jeux d'indicateurs. Avec 1\,024
+options, qui tiennent dans les caches, les enregistrements coûtent environ \qty{0.8}{\nano\second} par option, quels que soient les indicateurs, car aucun
+compilateur ne les vectorise~; les colonnes coûtent le même prix avec \texttt{-O2} (GCC~11 ne les vectorise pas à ce niveau), la moitié avec \texttt{-O3}
+(deux doubles par instruction) et le quart avec \texttt{-mavx2 -mfma}, quatre doubles par instruction et une multiplication-addition
+fusionnée (FMA) pour chaque couple multiplication et addition. Avec un million d'options, les données ne tiennent plus dans les caches et les
+octets déplacés décident~: 88~octets par option pour les enregistrements (l'enregistrement et le résultat), 48 pour les colonnes, et le coût mesuré est
+environ trois fois plus faible pour les colonnes, quels que soient les indicateurs, la largeur des vecteurs ne jouant plus guère.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=8pt,ymin=0,ymax=6.5,
+  symbolic x coords={O2,O3,O3avx2},xtick=data,xticklabels={\texttt{-O2},\texttt{-O3},\texttt{-O3 -mavx2 -mfma}},
+  enlarge x limits=0.25,ylabel={ns par option},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=gray!35,draw=gray] table[x=key,y=rows_1k]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=cols_1k]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=gray!70,draw=gray!80!black] table[x=key,y=rows_1m]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=key,y=cols_1m]{figdata/low-latency/14-vector-instructions-and-data-parallel-code/measured_reval.csv};
+\legend{{enregistrements, 1\,024 options},{colonnes, 1\,024 options},{enregistrements, $2^{20}$ options},{colonnes, $2^{20}$ options}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Réévaluation d'un carnet d'options à partir de ses grecques, stockées en enregistrements de 80~octets ou en colonnes, compilées avec trois jeux
+d'indicateurs par GCC~11~: en cache (1\,024 options) et depuis la mémoire ($2^{20}$ options, 80~Mo d'enregistrements). Mesures sur un portable (Intel Core
+Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~: \texttt{bench\_simd.py}.}\label{fig:ll:vector-instructions-and-data-parallel-code:reval}
+\end{omfigure}
+
+Les colonnes ont un coût. Ajouter ou retirer une option touche chaque tableau~; le code qui traite une option à la fois (un ordre
+qui arrive, une exécution) lit un élément dans chacun de plusieurs tableaux, ce qui fait plus de \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} qu'un seul enregistrement~; et la
+disposition est moins naturelle à écrire. Le compromis habituel consiste à garder les enregistrements là où l'on traite des éléments isolés, et les colonnes
+là où l'on calcule sur de nombreux éléments, ou des blocs de colonnes (les deltas de huit options, puis leurs gammas) qui offrent les deux. Un carnet d'ordres
+traité un message à la fois (chapitre~19) demande des enregistrements~; un moteur de risque qui réévalue chaque position à chaque mouvement (chapitre~22)
+demande des colonnes.
+
+\section{Tutoriel~: parcourir, analyser et disposer}\label{tut:ll:vector-instructions-and-data-parallel-code:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Parcourir et analyser avec des \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles} derrière un contrôle des fonctions du CPU, vérifiées octet par octet contre une référence scalaire~; lire
+les décisions du compilateur~; mesurer les dispositions. \textbf{État final~:}
+\cref{fig:ll:vector-instructions-and-data-parallel-code:scan,fig:ll:vector-instructions-and-data-parallel-code:reval},
+\cref{lst:ll:vector-instructions-and-data-parallel-code:report}, et des tests verts en C++ et en Rust.
+\begin{tutsteps}
+\item \textbf{Vérifier le code vectoriel par rapport au code scalaire.} Le test C++ de la construction parcourt toutes les longueurs de 0 à 200 octets avec
+des délimiteurs placés à des positions aléatoires (ou aucun), vingt messages par longueur, à travers les recherches scalaire, SSE2, AVX2 et réparties
+ainsi que les recherches de positions, et exige des réponses identiques~; il analyse 200\,000 nombres à huit chiffres de quatre façons. Les
+tampons ont exactement la longueur des messages, si bien qu'une exécution sous AddressSanitizer détecte toute lecture au-delà de la fin.
+\item \textbf{Lire le rapport du compilateur}~: \texttt{python ll\_vecreport.py} compile \texttt{ll\_vecdemo.cpp} avec trois jeux
+d'indicateurs et écrit le \cref{lst:ll:vector-instructions-and-data-parallel-code:report} pour le GCC installé~; l'exécuter avec un
+GCC plus récent et comparer les lignes de \texttt{-O2}.
+\item \textbf{Mesurer} avec \texttt{python bench\_simd.py}~: recherches selon la longueur, répartition des messages FIX, analyseurs et
+réévaluation construite avec trois jeux d'indicateurs.
+\item \textbf{La même chose en Rust}~: \texttt{cargo test} dans \path{code/firm/simdscan/rust} exécute les parcours de la réplique pour chaque longueur
+et ses analyseurs sur les mêmes valeurs.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter \texttt{\_\_restrict} aux pointeurs de \texttt{reval\_columns} et vérifier que la
+ligne de versionnement du rapport disparaît~; écrire la somme des doubles avec quatre accumulateurs distincts et voir si le compilateur
+la vectorise pour de bon.
+\end{tutorial}
+
+\section{Construction~: le scanneur de la société}\label{bld:ll:vector-instructions-and-data-parallel-code:simdscan}
+
+\begin{build}
+\bfield{Rôle} Les primitives octet par octet de chaque protocole texte que la société lit~: le moteur FIX découpe les messages sur le
+délimiteur avec elles (chapitre~15), et le client WebSocket repère les caractères structurels du JSON et analyse les prix et les tailles avec
+elles (chapitre~17).
+\bfield{Interface} C++20 \texttt{firm::simdscan}~: \texttt{find\_byte(p, n, c)}, \texttt{positions(p, n, c, out, cap)},
+\texttt{positions\_any(p, n, set, m, out, cap)}, chacune en version \texttt{\_scalar}, \texttt{\_sse2} (recherche) et \texttt{\_avx2}
+~; \texttt{parse8\_scalar}, \texttt{parse8\_swar}, \texttt{parse8\_sse}, \texttt{is8digits},
+\texttt{parse\_uint(p, n, value, used)}, \texttt{parse\_fixed(p, n, scale, out)}~; \texttt{level()}. Rust
+\texttt{firm\_simdscan}~: \texttt{find\_byte}, \texttt{positions}, \texttt{parse8\_swar}, \texttt{parse\_uint},
+\texttt{parse\_fixed}, avec les références scalaires.
+\bfield{Règles} Chaque routine vectorielle renvoie ce que sa référence scalaire renvoie pour toute entrée, ne lit jamais en dehors de
+$[p, p+n)$, et n'est appelée qu'après le contrôle des fonctions du CPU à l'exécution~; le code AVX2 est compilé par des attributs de fonction, jamais en
+compilant le programme pour AVX2~; les prix sont analysés en entiers d'une échelle déclarée, jamais en doubles.
+\bfield{Tests d'acceptation} \texttt{code/firm/simdscan/}~: chaque longueur de 0 à 200 octets contre les références scalaires en
+C++ et en Rust, la limite de capacité des recherches de positions respectée, 200\,000 valeurs à huit chiffres analysées de façon identique par chaque
+méthode, entiers de 19 chiffres, prix avec et sans décimales, prix négatifs, et le rejet des prix mal formés.
+\bfield{Pour aller plus loin} Une version AVX-512 sélectionnée par le même répartiteur~; un classifieur des caractères structurels du JSON avec une
+table de consultation (une permutation au lieu d'une comparaison par caractère)~; un validateur pour huit chiffres dans la voie vectorielle.
+\end{build}
+
+\begin{omsources} \sloppy
+\item G.~Langdale et D.~Lemire, «~Parsing gigabytes of JSON per second~», \emph{The VLDB Journal} 28(6), 2019.
+\item D.~Lemire, «~Number parsing at a gigabyte per second~», \emph{Software: Practice and Experience} 51(8), 2021.
+\item Notes de version de GCC 12 (vectorisation à \texttt{-O2})~; manuel de GCC, fonctions intégrées x86
+(\texttt{\_\_builtin\_cpu\_supports}).
+\item Intel 64 and IA-32 Architectures Software Developer's Manual, instructions \texttt{PCMPEQB} et \texttt{PMOVMSKB} (telles
+que transcrites dans la référence des instructions x86 sur felixcloutier.com).
+\item La bibliothèque standard de Rust, \texttt{core::arch} et \texttt{is\_x86\_feature\_detected}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:1}
+Combien de doubles, d'entiers de 32~bits et d'octets un registre de 256~bits contient-il~? Combien de comparaisons de 256~bits faut-il pour
+examiner chaque octet d'un paquet de 1\,500 octets~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:2}
+Le masque d'un bloc de 32~octets vaut \texttt{0x00041010} (bit~0 pour le premier octet). Où se trouvent les délimiteurs dans le bloc~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:3}
+Appliquer à la main la \cref{prop:ll:vector-instructions-and-data-parallel-code:swar} aux chiffres \texttt{20260925}~: donner les
+voies de 16~bits après la première étape et les voies de 32~bits après la seconde.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:4}
+Un message de 70~octets est parcouru par blocs de 32~octets, le dernier bloc chevauchant le précédent. Indiquer les octets couverts par chaque chargement, combien
+de bits il faut décaler hors du dernier masque, et pourquoi le résultat reste juste si le délimiteur se trouve à l'octet 60.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:5}
+Expliquer chacune des trois raisons que donne le compilateur dans le \cref{lst:ll:vector-instructions-and-data-parallel-code:report}
+pour ne pas vectoriser, ou pour ne vectoriser qu'après un contrôle, et comment supprimer chacune d'elles.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:6}
+Estimer, à partir du balayage mesuré, le temps que met AVX2 pour parcourir un tampon entier de 4\,096~octets, et ce que cela
+représente en octets par nanoseconde. Dire ce qui le limite une fois que le tampon ne tient plus dans le cache de premier niveau.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:7}
+\emph{Programmation.} Ajouter \texttt{positions\_any\_sse2} à \texttt{firm.simdscan} (blocs de 16~octets, dernier bloc chevauchant), puis
+l'utiliser dans la \omterm{def:ll:vector-instructions-and-data-parallel-code:intrinsic}{répartition selon les fonctions du CPU} lorsque AVX2 est absent, et étendre le test C++ pour le comparer à la référence scalaire pour toutes les longueurs.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:vector-instructions-and-data-parallel-code:8}
+\emph{Trouver la faille.} «~Notre machine de construction dispose d'AVX-512, donc nous compilons avec \texttt{-march=native}~; elle a réussi tous les tests dans
+l'intégration continue et a bien fonctionné sur les nouveaux serveurs.~»
+\end{exercise}
+
+\section{Problème~: Trente-deux octets à la fois}
+
+\begin{problem}[{Problème du week-end --- quand un balayage vectoriel est-il rentable~?}]\label{pb:ll:vector-instructions-and-data-parallel-code:1}
+Le balayage mesuré (\texttt{measured\_scan.csv}) donne le coût de chaque recherche selon la longueur du message~; les mesures du découpage et de l'analyseur
+figurent dans \texttt{measured\_split.csv} et \texttt{measured\_parse.csv}. Une passerelle d'ordres FIX reçoit des rapports d'exécution
+d'environ 200~octets, comportant 20 champs, à raison de 200\,000 par seconde en pointe.
+
+\medskip\noindent\textbf{Partie I --- Les coûts.}
+\begin{enumerate}
+\item À partir des mesures à 4\,096~octets, calculer le coût par octet de chaque méthode.
+\item Ajuster une droite $a + bL$ aux coûts d'AVX2 pour $L \ge 32$ (\texttt{ll\_simd.fit}). Donner $a$ et $b$.
+\item En ne comptant pour la boucle scalaire que son coût par octet, déterminer à partir de quelle longueur la recherche AVX2 est moins coûteuse, puis la même chose pour SSE2.
+\item Expliquer pourquoi ne lui imputer aucun coût fixe la favorise.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La passerelle.}
+\begin{enumerate}[resume]
+\item Calculer le coût du découpage d'un rapport de 200~octets avec chaque méthode, par extrapolation à partir du découpage mesuré.
+\item Calculer le temps de cœur consommé par seconde pour le découpage en pointe, pour chaque méthode.
+\item Chaque rapport porte quatre prix et quatre quantités à analyser. En utilisant \texttt{parse\_fixed} plutôt que \texttt{strtod}, calculer
+le gain réalisé par rapport.
+\item Déterminer lequel des deux gains par rapport est le plus important~: le découpage ou l'analyse.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les limites.}
+\begin{enumerate}[resume]
+\item Expliquer pourquoi la recherche vectorielle n'apporte rien à un protocole binaire dont les champs se trouvent à des décalages fixes.
+\item Décrire ce qui se passe sur un processeur dépourvu d'AVX2.
+\item Expliquer pourquoi le dernier bloc doit chevaucher le précédent plutôt que de lire 32~octets à partir du début du reste, qui dépassent la fin du tampon.
+\item Dire ce qu'AVX-512 changerait dans le coût par octet, et ce qu'il ne changerait pas.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la longueur de message en dessous de laquelle le balayage vectoriel ne rentabilise pas sa mise en place, à partir du
+coût mesuré par octet et par appel.
+\item Vérifier si un champ FIX est plus court que ce seuil.
+\item Indiquer la mesure à ajouter avant de se fier au seuil de rentabilité sur un serveur.
+\item Expliquer pourquoi les références scalaires sont conservées dans la construction.
+\item Décrire un test permettant de vérifier que la répartition retient le chemin scalaire sur une machine sans AVX2, puis sur une machine qui en dispose.
+\item Indiquer où, ailleurs dans un système de trading, le même schéma de traitement par blocs de 32~octets s'appliquerait.
+\item Indiquer quel changement de disposition permettrait aux contrôles de risque du chapitre~22 d'utiliser les mêmes instructions.
+\item En une phrase~: dire quand les \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{instructions vectorielles} sont rentables.
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:vector-instructions-and-data-parallel-code:1}
+Qu'est-ce que le \omterm{def:ll:vector-instructions-and-data-parallel-code:simd}{SIMD}~? Donnez un exemple de boucle qui en profite et d'une boucle qui n'en profite pas.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:vector-instructions-and-data-parallel-code:2}
+Comment chercheriez-vous la première occurrence d'un octet dans un tampon le plus rapidement possible~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:vector-instructions-and-data-parallel-code:3}
+Qu'est-ce qui empêche un compilateur de vectoriser une boucle~? Comment découvririez-vous pourquoi il ne l'a pas fait~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:vector-instructions-and-data-parallel-code:4}
+Votre binaire utilise AVX2 et doit fonctionner sur des machines plus anciennes. Comment le déployez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:vector-instructions-and-data-parallel-code:5}
+Tableau de structures ou \omterm{def:ll:vector-instructions-and-data-parallel-code:soa}{structure de tableaux} pour un livre de positions réévalué à chaque mouvement de prix~? Pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:vector-instructions-and-data-parallel-code:6}
+Analysez un prix décimal ASCII en un entier à virgule fixe sans boucle sur les caractères. Que devez-vous valider~?
+\end{interviewq}

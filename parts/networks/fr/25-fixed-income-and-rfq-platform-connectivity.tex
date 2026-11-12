@@ -1,0 +1,320 @@
+\chapter{Connectivité des plateformes de titres à revenu fixe et de RFQ}\label{ch:nw:fixed-income-and-rfq-platform-connectivity}
+
+Sur une plateforme de demande de cotation (RFQ), le \omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation} du client court pendant des secondes, non des microsecondes~; pourtant les dealers répondent en
+millisecondes. Une réponse qui arrive après le temporisateur n'est pas un moins bon prix mais aucun prix du tout, et certains clients n'attendent plus
+attendre le temporisateur~: leurs règles exécutent la meilleure des toutes premières réponses, ou la première acceptable. Selon ces règles, un
+dealer, plus lent de vingt millisecondes qu'un concurrent, perd des transactions qu'il aurait remportées sur le prix, et le modèle du chapitre établit que
+diviser par deux le temps de tarification d'un auto-responder vaut près de quinze fois plus que de proposer un centime de mieux.
+
+Le livre~2 a présenté la négociation par demande de cotation, les plateformes dealer-to-client, les courtiers interdealers et la négociation all-to-all~;
+le livre~11 a construit l'auto-quoter avec son modèle de probabilité de gain et son prix de couverture (cover price)~; le livre~13 a traité la session FIX et le budget de latence.
+Ce chapitre les relie~: les interfaces des plateformes, le pipeline de l'auto-responder, de la demande à la réponse, la latence qui
+compte lorsque l'horloge est un \omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation}, et les carnets d'ordres interdealers, qui sont de fait des bourses sans en porter le nom et se trouvent dans les
+centres de données des chapitres~10 et~11. L'enchère est une simulation étiquetée, reposant sur le modèle de prix du livre~11.
+
+\section{Interfaces des plateformes}
+
+Un dealer se connecte à chaque plateforme dealer-to-client par une session FIX ou par l'interface propre à la plateforme, reçoit les demandes,
+et y répond par des prix fermes valables pendant une durée indiquée. Les protocoles des plateformes diffèrent par ce que voit le client et par le temps pendant lequel
+le prix du dealer engage celui-ci (\cref{dat:nw:fixed-income-and-rfq-platform-connectivity:platforms})~: une demande unilatérale, une demande bilatérale
+de type request for market qui masque le côté du client, une request for stream dans laquelle les dealers actualisent leurs prix toutes les 250
+millisecondes, ou un prix assorti d'un «~wire time~» pendant lequel il peut être frappé.
+
+\begin{definition}[Temporisateur de cotation]\label{def:nw:fixed-income-and-rfq-platform-connectivity:timer}
+Un \emph{temporisateur de cotation}\index{temporisateur de cotation} (quote timer) est la période, fixée par la plateforme ou par le client pour chaque demande de cotation, pendant
+laquelle les réponses des dealers sont recueillies et restent exécutables~; une réponse qui arrive après son expiration n'est pas affichée, et un prix
+affiché pendant cette période engage le dealer jusqu'à ce que le client exécute, passe ou que le temporisateur expire.
+\end{definition}
+
+\begin{dated}{2026-09}{Protocoles de demande de cotation et automatisation, d'après les plateformes}\label{dat:nw:fixed-income-and-rfq-platform-connectivity:platforms}
+\begin{itemize}
+\item Protocoles de TW SEF (avis de 2015)~: une RFQ est «~une enchère en temps réel avec plusieurs destinataires de RFQ~» dans laquelle le
+  demandeur choisit le meilleur prix~; au moins trois destinataires non affiliés pour les transactions obligatoires~; request for market~; RFQ+
+  à côté du carnet d'ordres~; request for stream, avec des prix actualisés «~toutes les 250 millisecondes~»~; sinon un prix assorti d'un «~wire
+  time~».
+\item L'AiEX de Tradeweb exécute les ordres issus du système de gestion des ordres (OMS) du client selon des règles prédéfinies~; un client peut «~exécuter au
+  meilleur prix dès qu'il a reçu cinq réponses~» ou attendre un dealer particulier (2018).
+\item MarketAxess (juin 2023)~: les protocoles d'automatisation représentaient «~près de 10~\% du volume total de négociation~» depuis le début de l'année~; son Adaptive
+  Auto-X était en phase pilote.
+\end{itemize}
+\end{dated}
+
+\section{Fonctionnement de l'auto-responder~: le pipeline de la demande à la réponse}
+
+Un auto-responder est un pipeline~: la demande arrive par le réseau et le moteur FIX~; le pricer valorise l'obligation (la fair value du livre~11 à partir des
+cours périmés, de la courbe de l'émetteur et des comparables)~; les limites et le risque sont contrôlés~; la réponse est renvoyée. Chaque étape
+a une distribution de latence, et les demandes que l'auto-responder n'est pas autorisé à traiter, pour cause de taille, de liquidité ou de risque, vont à
+une personne, qui répond en quelques secondes.
+
+\omcode{code/firm/rfqlink/firm_rfqlink.py}{47}{53}{Temps d'une réponse~: les temps lognormaux des étapes, plus celui d'une personne pour la part des demandes hors des limites de l'auto-responder.}\label{lst:nw:fixed-income-and-rfq-platform-connectivity:response}
+
+Le dealer du chapitre compte cinq étapes (réseau à l'entrée et à la sortie, \qty{0.5}{\milli\second} chacun, moteur FIX \qty{0.1}{\milli\second},
+tarification \qty{20}{\milli\second}, limites \qty{1}{\milli\second}, médianes assorties de dispersions lognormales) et envoie 2~\% des demandes à
+une personne, dont les réponses prennent six secondes en médiane. Ses quatre concurrents sont identiques, sauf une étape de tarification de
+\qty{50}{\milli\second}. Tout cela relève d'hypothèses, dans les ordres de grandeur réalistes pour un auto-responder (livre~13).
+
+\begin{definition}[Règle d'exécution automatique]\label{def:nw:fixed-income-and-rfq-platform-connectivity:rule}
+Une \emph{règle d'exécution automatique}\index{règle d'exécution automatique} (automated execution rule) est une instruction préréglée du client, exécutée par la plateforme, qui
+exécute une demande de cotation sans décision humaine~: à la meilleure réponse à l'expiration du temporisateur, à la meilleure des premières
+$k$ réponses, à la première réponse située dans une tolérance autour d'un prix de référence, ou auprès d'un dealer désigné.
+\end{definition}
+
+\section{La latence qui compte lorsque l'horloge est un temporisateur de cotation}
+
+Deux latences comptent. La première est de savoir si la réponse arrive avant le temporisateur~: avec un temporisateur de deux secondes, les étapes automatiques
+ne manquent jamais, et la probabilité de manquer est presque exactement le produit de la part envoyée à une personne par la probabilité qu'une personne mette plus de deux secondes,
+soit 1.94~\% pour le dealer du chapitre (voir la \cref{fig:nw:fixed-income-and-rfq-platform-connectivity:miss}). La seconde est de savoir si la réponse
+arrive avant les réponses que la règle du client retiendra, ce qui dépend de cette règle.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmode=log,ymode=log,xmin=100,xmax=31623,ymin=1e-5,ymax=0.1,
+  xlabel={temporisateur de cotation (ms, log)},ylabel={probabilité de le manquer (log)},tick label style={font=\footnotesize},
+  label style={font=\small},grid=major,grid style={gray!25},legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,legend columns=2},
+  unbounded coords=discard,table/col sep=comma]
+\addplot[omThm,thick,mark=*,mark size=1.3pt] table[x=timer_ms,y=ours]{figdata/networks/25-fixed-income-and-rfq-platform-connectivity/miss.csv};
+\addplot[omDef,thick,mark=square*,mark size=1.3pt] table[x=timer_ms,y=auto]{figdata/networks/25-fixed-income-and-rfq-platform-connectivity/miss.csv};
+\legend{2~\% traitées par une personne, entièrement automatique}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: probabilité que le dealer du chapitre réponde après le \omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation}, en fonction de la durée de celui-ci. Entièrement
+automatique, il ne manque jamais un temporisateur d'une seconde ou plus~; avec 2~\% des demandes traitées par une personne (six secondes en médiane), il
+manque 1.94~\% des temporisateurs de deux secondes, et le palier vient de la personne, non du réseau. Données~: \texttt{fig\_rfq.py},
+\texttt{nw\_rfq.miss\_curves()}.}\label{fig:nw:fixed-income-and-rfq-platform-connectivity:miss}
+\end{omfigure}
+
+La règle du client décide du reste. L'enchère tire le cours acheteur de chaque dealer comme le fait le livre~11~: l'estimation bruitée de la valeur de l'obligation par le dealer
+diminuée d'une marge de 15 cents pour 100 de nominal, et le client ne vend qu'à un prix supérieur ou égal à son prix de réservation~; avec toutes les réponses reçues à temps
+et la règle «~meilleure à l'expiration~», la simulation est exactement l'enchère du livre~11 (les tests le vérifient). Alors les règles divergent.
+
+\omcode{code/firm/rfqlink/firm_rfqlink.py}{68}{85}{Les trois règles du client, et les demandes perdues faute de rapidité~: notre réponse était la meilleure acceptable dans les délais, et la règle en a choisi une autre.}\label{lst:nw:fixed-income-and-rfq-platform-connectivity:rules}
+
+\begin{proposition}[Quand la vitesse ne vaut rien]\label{prop:nw:fixed-income-and-rfq-platform-connectivity:speed}
+Avec la règle «~meilleure à l'expiration~», le taux de gain d'un dealer ne dépend de son temps de réponse que par la probabilité de manquer le temporisateur~;
+avec «~meilleure des $k$ premières~» et «~première acceptable~», il baisse avec le rang du dealer dans l'ordre d'arrivée, si bien qu'une réponse plus rapide au
+même prix gagne davantage.
+\end{proposition}
+
+\begin{proof}
+À l'expiration, le client compare toutes les réponses arrivées à temps, quel que soit leur ordre. Avec les autres règles, une réponse hors des
+$k$ premières, ou derrière une réponse acceptable antérieure, n'est jamais comparée, et un pipeline plus rapide accroît sa chance d'en faire partie.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,xmin=1,xmax=1000,ymin=0,ymax=0.65,
+  xlabel={médiane de notre étape de tarification (ms, log)~; concurrents à 50 ms},ylabel={part des demandes que nous gagnons},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,legend columns=3},table/col sep=comma]
+\addplot[omDef,thick,mark=*,mark size=1.2pt] table[x=pricing_ms,y=expiry]{figdata/networks/25-fixed-income-and-rfq-platform-connectivity/wins.csv};
+\addplot[omMeth,thick,mark=square*,mark size=1.2pt] table[x=pricing_ms,y=first_k]{figdata/networks/25-fixed-income-and-rfq-platform-connectivity/wins.csv};
+\addplot[omThm,thick,mark=triangle*,mark size=1.6pt] table[x=pricing_ms,y=first_ok]{figdata/networks/25-fixed-income-and-rfq-platform-connectivity/wins.csv};
+\legend{meilleure à l'expiration,meilleure des trois premières,première acceptable}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: la part des demandes que le dealer remporte parmi cinq, en fonction de son temps de tarification, selon trois règles des clients, tous les
+dealers à la même marge. À l'échéance, la courbe reste plate tant que la queue de la distribution du temps de tarification atteint le temporisateur, à plusieurs centaines de millisecondes~; avec les deux autres règles, chaque
+milliseconde compte. Données~: \texttt{fig\_rfq.py}, \texttt{nw\_rfq.curves()}.}\label{fig:nw:fixed-income-and-rfq-platform-connectivity:wins}
+\end{omfigure}
+
+À son étape de tarification de \qty{20}{\milli\second}, le dealer remporte 19.2~\% des demandes lorsque les clients retiennent la meilleure réponse à l'échéance, 26.4~\%
+lorsqu'ils retiennent la meilleure des trois premières, et 39.0~\% lorsqu'ils retiennent la première réponse acceptable~: être plus rapide que ses quatre rivaux vaut
+deux fois sa part. L'autre face de ces mêmes règles est le manque à gagner lié à la vitesse~: sous «~première acceptable~», 5.7~\% de toutes les demandes
+sont celles où la réponse du dealer était la meilleure réponse acceptable à temps, mais où celle d'un rival plus rapide a été retenue~; sous «~meilleure des trois premières~»,
+1.6~\%.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.0cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{4.2cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+Règle des clients & Taux de gain & Division par deux du temps de tarification (10 ms) & Un centime de mieux \\
+\midrule
+Meilleure à l'échéance & 19.2~\% & $+0.0$ points & $+0.9$ points \\
+Meilleure des trois premières & 26.4~\% & $+2.3$ points & $+1.0$ points \\
+Première acceptable & 39.0~\% & $+12.6$ points & $+0.9$ points \\
+\bottomrule
+\end{tabular}
+\caption{Simulation~: la hausse du taux de gain obtenue en divisant par deux le temps de tarification, par rapport à une cotation meilleure d'un centime pour 100 de nominal (un point de
+base de prix), selon chaque règle des clients. Données~: \texttt{nw\_rfq.values()}.}\label{tab:nw:fixed-income-and-rfq-platform-connectivity:value}
+\end{table}
+
+La valeur d'une milliseconde et celle d'un point de base ne sont donc pas comparables en général, mais seulement règle par règle
+(le \cref{tab:nw:fixed-income-and-rfq-platform-connectivity:value}). Un dealer dont les clients attendent le temporisateur doit consacrer ses efforts au prix~; celui
+dont les clients exécutent la première réponse acceptable doit d'abord consacrer ses efforts à son pipeline, puisque dix millisecondes valent presque quinze centimes de
+prix. Les règles retenues par ses clients sont une information que le dealer peut estimer à partir de ses propres gains et pertes selon le temps de réponse.
+
+\section{Les carnets d'ordres interdealers}
+
+Les marchés interdealers d'obligations d'État sont des carnets d'ordres à cours limité centralisés, gérés comme des bourses et situés sur les mêmes campus que
+les marchés de contrats à terme et d'options des chapitres~10 et~11 (l'\cref{dat:nw:fixed-income-and-rfq-platform-connectivity:idb}). Les marchés américains de BrokerTec
+s'apparient chez CME, au NY5 de Secaucus, et ses marchés européens au LD4.2 de Slough, chacun doté d'un site de reprise~; BrokerTec Chicago, un
+second carnet d'ordres pour les Treasuries les plus activement négociées, est installé au centre de données de CME à Aurora, à côté des futures sur Treasuries, pour négocier le cash
+contre les futures. Sur ces carnets, tout ce qui est vu aux chapitres~1 à~9 s'applique~: \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation}, \omterm{def:nw:colocation-products-and-how-they-are-sold:mmr}{interconnexions} (cross-connects), feeds, passerelles~; les
+secondes des plateformes RFQ redeviennent des microsecondes.
+
+\begin{dated}{2026-09}{Carnets d'ordres interdealers d'obligations d'État sur CME Globex, d'après la documentation de CME}\label{dat:nw:fixed-income-and-rfq-platform-connectivity:idb}
+Marchés américains de BrokerTec~: production à NY5, reprise à Aurora~; marchés européens~: production à LD4.2, reprise à NY5~; objectifs de délai de reprise
+de quatre heures (États-Unis) et de deux heures (Europe). BrokerTec Chicago (carnet d'ordres secondaire des Treasuries américaines les plus actives)~: le centre de données CME Globex à
+Aurora, Illinois.
+\end{dated}
+
+La distance entre NY5 et Aurora est celle du basis trade cash--futures~: les futures sur Treasuries américains s'apparient à Aurora, le
+carnet cash principal à Secaucus, et les deux sont séparés par le couloir New Jersey--Chicago du chapitre~10, la route sur laquelle la fibre et les faisceaux hertziens
+se disputent la course. Un second carnet cash à Aurora réunit les deux jambes dans un même bâtiment pour les firmes qui les négocient ensemble.
+
+\begin{method}[Connecter un desk obligataire]\label{met:nw:fixed-income-and-rfq-platform-connectivity:desk}
+\begin{enumerate}
+\item Dresser la liste des plateformes et des carnets que le desk négocie~; pour chacun, le protocole, le type de session, le temporisateur ou le temps de transmission, et le centre de
+  données.
+\item Construire l'auto-répondeur sous forme de pipeline avec un budget de latence par étape~; mesurer la part envoyée à une personne et les temps de réponse
+  de cette personne.
+\item Estimer les règles d'exécution des clients à partir des gains et des pertes selon le temps de réponse~; consacrer ses efforts à la vitesse là où les règles la récompensent, et au prix
+  là où elles ne la récompensent pas.
+\item Recourir à la \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation} pour les carnets d'ordres, comme pour toute bourse~; pour le cash contre les futures, choisir entre deux sites ou un seul.
+\item Surveiller les dépassements du temporisateur, les réponses postérieures aux $k$ premières, et les gains perdus faute de vitesse, par plateforme et par client.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: deux secondes pour répondre}\label{tut:nw:fixed-income-and-rfq-platform-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Simuler le pipeline d'un auto-répondeur, le temporisateur et trois règles des clients sur l'adjudication du livre~11.
+\textbf{État final~:} la \cref{fig:nw:fixed-income-and-rfq-platform-connectivity:wins} et
+le \cref{tab:nw:fixed-income-and-rfq-platform-connectivity:value}.
+\begin{tutsteps}
+\item \textbf{Pipelines.} \texttt{firm\_rfqlink.Pipeline} et \texttt{Stage}~; \texttt{response\_ms}
+  (le \cref{lst:nw:fixed-income-and-rfq-platform-connectivity:response}) et \texttt{miss\_prob} pour le temporisateur.
+\item \textbf{Adjudication.} \texttt{auction} avec chaque règle (le \cref{lst:nw:fixed-income-and-rfq-platform-connectivity:rules}), contrôlé
+  par rapport à \texttt{firm\_rfqmm.simulate} lorsque toutes les réponses arrivent à temps.
+\item \textbf{Valeur.} \texttt{value\_of} pour un pipeline plus rapide et un meilleur prix~; \texttt{nw\_rfq.curves} sur l'ensemble des temps de tarification.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Laisser chaque client choisir sa règle au hasard, avec des parts estimées à partir des données, et laisser la marge réagir~:
+l'équilibre du livre~11 sous la règle de la première réponse acceptable.
+\end{tutorial}
+
+\section{Construction~: le modèle de connectivité RFQ}\label{bld:nw:fixed-income-and-rfq-platform-connectivity:rfqlink}
+
+\begin{build}
+\bfield{Rôle} Temporisateurs, pipelines et règles des clients pour un dealer sur les plateformes RFQ~: les lignes taux du plan du chapitre~29.
+\bfield{Interface} \texttt{firm\_rfqlink}~: \texttt{Stage}, \texttt{Pipeline}, \texttt{response\_ms}, \texttt{miss\_prob},
+\texttt{auction}, \texttt{value\_of}, \texttt{scaled}, \texttt{log\_grid}.
+\bfield{Règles} Les prix suivent le modèle \texttt{firm.rfqmm} du livre~11, inchangé~; les paramètres du pipeline et des clients sont des hypothèses énoncées~;
+les résultats sont une simulation étiquetée.
+\bfield{Tests d'acceptation} \texttt{code/firm/rfqlink/tests/}~: identité avec \texttt{firm\_rfqmm.simulate} lorsque toutes les réponses arrivent à temps,
+pipelines et temporisateurs déterministes, et l'ordre des règles.
+\bfield{Pour aller plus loin} Temps de transmission et last look sur les flux~; répartition des règles des clients estimée à partir des données~; limiteurs de débit sur les sessions.
+\end{build}
+
+\begin{omsources}
+\item TW SEF LLC, Trading and Execution Protocols (2015).
+\item The TRADE, «~Automating trade execution, intelligently~» (2018); Markets Media on MarketAxess's Adaptive Auto-X (2023).
+\item CME Group Client Systems Wiki~: BrokerTec disaster recovery process and scenarios~; BrokerTec Chicago.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:1}
+Expliquer le sort d'une réponse parvenue après le \omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:2}
+Indiquer où les carnets d'ordres américains et européens de BrokerTec s'apparient, et où se situent leurs sites de reprise.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:3}
+Expliquer pourquoi la probabilité de manquer un temporisateur de deux secondes est presque égale à la part des demandes envoyées à une personne.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:4}
+À partir de la \cref{prop:nw:fixed-income-and-rfq-platform-connectivity:speed}, pourquoi diviser par deux le temps de pricing ne rapporte-t-il rien sous «~meilleure à
+l'échéance~»~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:5}
+Un client exécute «~au meilleur prix dès qu'il dispose de cinq réponses~» et interroge cinq dealers. Laquelle des règles du chapitre correspond-elle à ce cas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:6}
+Pourquoi un trader de basis cash--futures pourrait-il préférer un deuxième carnet d'ordres Treasury chez Aurora~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:7}
+\emph{Programmation.} Avec \texttt{nw\_rfq.curves}, à quel temps de pricing le taux de gain du dealer sous «~première acceptable~» tombe-t-il
+sous son taux sous «~meilleure à l'échéance~»~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:fixed-income-and-rfq-platform-connectivity:8}
+\emph{Trouver la faille.} «~Nos clients disposent de temporisateurs de deux secondes, donc notre pricer de 20~millisecondes est cent fois plus rapide qu'il ne doit l'être.~»
+\end{exercise}
+
+\section{Problème~: Deux secondes pour répondre}
+
+\begin{problem}[{Problème du week-end --- temporisateurs, règles et pipeline d'un dealer}]\label{pb:nw:fixed-income-and-rfq-platform-connectivity:1}
+Un dealer répond aux demandes de cotation (RFQ) sur des obligations d'entreprise face à quatre concurrents. Son pipeline et celui de ses concurrents sont ceux du chapitre~; le
+\omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation} est de deux secondes.
+
+\medskip\noindent\textbf{Partie I --- Le temporisateur.}
+\begin{enumerate}
+\item Donner la probabilité que le dealer manque le temporisateur, et expliquer d'où elle provient.
+\item Donner la probabilité de manquer le temporisateur si le pipeline était entièrement automatique.
+\item Déterminer à partir de quelle durée de temporisateur le pipeline entièrement automatique ne manque plus aucune réponse.
+\item Comparer le coût d'une réponse manquée pour le dealer à celui d'une réponse perdante.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les règles.}
+\begin{enumerate}[resume]
+\item Déterminer la part des demandes que le dealer remporte sous chaque règle.
+\item Déterminer la part perdue à cause de la vitesse sous chaque règle.
+\item Expliquer pourquoi elle est nulle à l'échéance.
+\item Expliquer pourquoi le dealer remporte davantage sous «~première acceptable~» qu'à l'échéance.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La vitesse contre le prix.}
+\begin{enumerate}[resume]
+\item Déterminer ce que rapporte la division par deux du temps de pricing sous chaque règle.
+\item Déterminer le gain procuré par une cotation meilleure d'un centime.
+\item Calculer combien de centimes de prix valent dix millisecondes sous «~première acceptable~».
+\item Dire comment le dealer peut savoir quelles règles utilisent ses clients.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la probabilité de manquer le \omterm{def:nw:fixed-income-and-rfq-platform-connectivity:timer}{temporisateur de cotation} pour la distribution de latence du pipeline, et la part
+  d'activité perdue au profit d'un dealer plus rapide sous une règle d'exécution «~première acceptable~».
+\item Dire quelles données sont publiées et lesquelles sont supposées.
+\item Dire où le dealer doit consacrer son prochain mois d'ingénierie.
+\item Analyser ce qui se passe si chaque concurrent divise lui aussi son temps de pricing par deux.
+\item Dire comment gérer la part envoyée à une personne.
+\item Dire ce qui change dans les carnets d'ordres inter-dealers.
+\item Dire où cela s'insère dans le plan du chapitre~29.
+\item Résumer en une phrase le moment où une milliseconde compte sur une plateforme dont le temporisateur est de deux secondes.
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:1}
+Quelles sont les étapes d'un auto-responder RFQ, et laquelle vous semble la plus lente~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:2}
+Pourquoi un client exécuterait-il la première réponse acceptable plutôt que d'attendre la meilleure~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:3}
+Comment estimeriez-vous si votre temps de réponse vous fait perdre des affaires sur une plateforme~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:4}
+La latence p99 de votre auto-responder a doublé après une mise en production. Que vérifiez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:5}
+Un dealer doit-il coter plus serré ou répondre plus vite~? Comment trancheriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:fixed-income-and-rfq-platform-connectivity:6}
+Concevez la connectivité et l'auto-responder d'un dealer qui répond sur trois plateformes obligataires et négocie sur un carnet inter-dealers.
+\end{interviewq}

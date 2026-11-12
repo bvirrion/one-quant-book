@@ -1,0 +1,355 @@
+\chapter{Résilience}\label{ch:ll:resilience}
+
+Le 1\up{er} octobre 2020, un module de mémoire est tombé en panne dans l'un des deux appareils d'un système à disque partagé installé au sein de la Bourse de
+Tokyo, dans son système de négociation. Les opérations devaient «~basculer automatiquement~» vers le second appareil, mais la \omterm{def:ll:resilience:failover}{bascule} automatique
+ne fonctionnait pas pour ce type de panne, sauf si un paramètre avait été modifié, et il ne l'avait pas été. Les ingénieurs ont basculé
+à la main à 9~h~26, moins d'une demi-heure après l'heure d'ouverture prévue du marché, et chaque fonction est redevenue normale. La
+négociation est néanmoins restée suspendue toute la journée. Les ordres reçus avant que la bourse ne coupe son réseau avaient été appariés, et
+leurs exécutions s'étaient accumulées dans le système sans être transmises aux participants~; seul un nombre limité de
+participants aurait pu renvoyer leurs ordres, et il n'existait aucune règle convenue et testée pour le redémarrage. Le matériel a été rétabli en
+quelques minutes~; l'état, lui, ne l'a pas été. Ce chapitre traite du second problème~: comment un système de négociation conserve une histoire unique et convenue de ce
+qu'il a reçu et envoyé, afin que, lorsqu'une machine tombe en panne, une autre puisse prendre le relais en quelques millisecondes sans perdre un ordre
+ni en envoyer un deux fois.
+
+\section{Modes de défaillance d'un système de négociation}
+
+Les composants tombent en panne de quelques façons, et chacune appelle une réponse différente. Un processus plante, ou sa machine plante~: il s'arrête, et la
+question est de savoir qui prend le relais et à partir de quel état. Un processus se bloque ou ralentit~: il n'est pas arrêté, il peut donc revenir et
+agir après qu'un autre a pris le relais, ce qui est pire qu'un plantage. Une liaison réseau tombe~: chaque côté peut croire que
+l'autre est mort alors que les deux sont vivants. Une session avec une plateforme se coupe~: les ordres déjà transmis poursuivent leur course, peuvent être exécutés ou
+annulés par celle-ci (chapitre~21), et la société ne sait pas lequel tant qu'elle ne s'est pas reconnectée. Enfin, le mécanisme de \omterm{def:ll:resilience:failover}{bascule} lui-même tombe en panne, comme à
+Tokyo, parce qu'il ne s'exécute que lorsque quelque chose d'autre a déjà mal tourné, et c'est donc le code le moins sollicité du
+système. Pour un système de négociation, le risque opérationnel du livre~6 (chapitre~28) se résume pour l'essentiel à cette liste.
+
+L'objectif de conception en découle~: chaque entrée sur laquelle le système agit, et chaque ordre qu'il envoie, doit être enregistrée avant de produire un effet, dans
+un ordre unique que tous acceptent, de sorte que n'importe quelle machine puisse reconstruire l'état en rejouant l'enregistrement, et que tout ordre puisse
+être reconnu s'il est renvoyé.
+
+\section{Architectures à séquenceur}
+
+\begin{definition}[Architecture à séquenceur]\label{def:ll:resilience:sequencer}
+Une \emph{architecture à séquenceur}\index{architecture à séquenceur} est une conception dans laquelle chaque entrée d'un système (événements de marché,
+comptes rendus d'ordres, commandes) passe par un composant unique, le séquenceur, qui lui attribue le numéro suivant d'une séquence globale
+et l'ajoute à un journal durable avant que tout autre composant n'agisse sur elle~; chaque composant traite ensuite le
+journal dans l'ordre des numéros.
+\end{definition}
+
+Le séquenceur transforme de nombreuses sources non ordonnées en une histoire ordonnée unique. C'est le \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées} du chapitre~23, élargi du
+processus au système~: les données de marché venant du \omterm{def:ll:the-feed-handler:handler}{feed handler}, les comptes rendus venant de la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}, les changements de paramètres venant du
+plan de contrôle deviennent tous des entrées numérotées d'un même journal. Le rejeu du moteur de stratégie, présenté au chapitre~23, devient le mode
+de fonctionnement normal~: un composant est une fonction du journal, et deux composants qui lisent le même journal calculent la
+même chose. Le coût est un saut supplémentaire sur le chemin de chaque entrée (une microseconde dans la simulation de la construction, davantage lorsque le
+journal est répliqué avant d'être acquitté), ainsi qu'un composant dont la défaillance doit être gérée elle-même~; la bourse de détail dont Fowler a décrit
+l'architecture (chapitre~20) gardait sa logique métier sur un seul fil d'exécution alimenté par un journal de ce type, à partir duquel son état pouvait être reconstruit.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (md) at (0,1.0) {données de marché\\ (feed handler)};
+\node[box] (rp) at (0,-1.0) {comptes rendus\\ (passerelle)};
+\node[box,fill=omThm!18] (sq) at (3.0,0) {séquenceur\\ numérote les entrées};
+\node[box,fill=gray!10,minimum width=2.2cm] (jr) at (6.0,0) {journal\\ époque $|$ séq $|$ entrée};
+\node[box] (pr) at (9.2,1.0) {réplique primaire\\ \textbf{envoie}};
+\node[box] (bk) at (9.2,-1.0) {réplique de secours\\ calcule, sans envoyer};
+\node[box,fill=gray!10] (vn) at (12.3,1.0) {plateforme};
+\draw[->] (md) -- (sq);
+\draw[->] (rp) -- (sq);
+\draw[->,thick] (sq) -- (jr);
+\draw[->] (jr) -- (pr);
+\draw[->] (jr) -- (bk);
+\draw[->,thick] (pr) -- node[above]{ordres} (vn);
+\draw[->,dashed] (pr) -- node[right]{heartbeats} (bk);
+\draw[->,dashed,omThm] (bk.east) -- ++(0.5,0) |- node[pos=0.25,right,align=left]{bascule~: nouvelle\\ époque, reconnexion,\\ réconciliation, renvoi} (vn.south);
+\end{tikzpicture}
+
+\omcaption{Une \omterm{def:ll:resilience:sequencer}{architecture à séquenceur} avec un secours à chaud. Chaque entrée est numérotée et journalisée avant que quiconque n'agisse sur elle~; les deux répliques appliquent le journal et calculent le même état et les mêmes ordres, mais seule la
+réplique primaire envoie. Lorsque les \omterm{def:ll:protocols-i-fix:session}{heartbeats}
+cessent, le secours élève l'époque du journal, rétablit la session de saisie des ordres, réconcilie et renvoie ce que
+aucun compte rendu n'acquitte.}\label{fig:ll:resilience:arch}
+\end{omfigure}
+
+\section{Machines à états répliquées et bascule}
+
+\begin{definition}[Machine à états répliquée, réplication primaire--secours]\label{def:ll:resilience:rsm}
+Une \emph{machine à états répliquée}\index{machine à états répliquée} est un programme déterministe exécuté en plusieurs copies (répliques)
+qui appliquent la même suite d'entrées et passent donc par les mêmes états et produisent les mêmes sorties.
+La \emph{réplication primaire--secours}\index{réplication primaire--secours} fait fonctionner une réplique comme primaire, dont les sorties sont envoyées,
+et les autres comme secours, dont les sorties sont calculées puis écartées, prêtes à remplacer le primaire.
+\end{definition}
+
+\begin{definition}[Bascule, split brain]\label{def:ll:resilience:failover}
+Une \emph{bascule}\index{bascule} (failover) est le remplacement d'un primaire défaillant par un secours, qui reprend son
+rôle et ses connexions. Le \emph{split brain}\index{split brain} est l'état dans lequel deux répliques agissent simultanément comme primaire, typiquement
+parce qu'un secours a pris le relais d'un primaire qui était lent ou coupé du réseau plutôt que mort~; chacune envoie alors
+des sorties dont l'autre ne sait rien.
+\end{definition}
+
+L'approche par machine à états est ancienne et générale (le tutoriel de Schneider, en 1990), et sa partie difficile, c'est-à-dire se mettre d'accord sur
+l'entrée suivante du journal lorsque des machines tombent en panne, est ce que résolvent des algorithmes de consensus tels que Raft (Ongaro et Ousterhout, 2014). Un système de négociation
+a généralement besoin de moins~: un séquenceur qui écrit le journal, répliqué de façon synchrone sur une seconde machine, et une règle pour
+décider qui est primaire. Les répliques de la construction sont l'état de stratégie du livre en miniature~: la réplique de \texttt{firm.sequencer}
+négocie cent actions à chaque mouvement de prix avec un ordre exécuter-ou-annuler, dans une limite de position, et conserve
+ses ordres au moyen d'un identifiant dérivé de l'entrée du journal qui les a créés. Les répliques en Python, en C++ et en Rust rejouent
+le journal de l'exemple de référence (une \omterm{def:ll:resilience:failover}{bascule}, avec une seconde époque, des renvois et un doublon) et atteignent les mêmes états, empreinte de hachage comprise.
+
+Le \omterm{def:ll:resilience:failover}{split brain} est empêché par le \emph{fencing}. Le journal porte une époque, un nombre qui ne fait que croître~; chaque primaire écrit sous
+l'époque dans laquelle il est devenu primaire, et un secours qui prend le relais en premier relève l'époque du journal. Dès lors, le journal
+refuse toute écriture sous une époque antérieure (\cref{lst:ll:resilience:fence})~: un primaire qui n'était que lent, et qui se réveille en se croyant encore
+aux commandes, peut calculer ce qu'il veut mais ne peut plus rien enregistrer, et rien de ce qui n'a pas été enregistré
+n'est envoyé. La passerelle applique la même règle aux sorties, puisque la plateforme ignore les époques.
+
+\omcode{code/firm/sequencer/cpp/firm_sequencer.hpp}{32}{42}{La barrière du journal~: après une nouvelle époque, une écriture issue d'une époque antérieure
+ne peut plus rien ajouter.}\label{lst:ll:resilience:fence}
+
+La défaillance est détectée au moyen des \omterm{def:ll:protocols-i-fix:session}{heartbeats}~: le primaire en envoie une par milliseconde, et le secours déclare mort le primaire après trois
+signaux manqués. La détection représente donc la plus grande part du temps de reprise de la construction~: de 2.8 à \qty{3.1}{\milli\second} depuis la panne jusqu'à un secours devenu primaire, reconnecté et réconcilié,
+dont la reconnexion et le rejeu des comptes rendus manqués prennent
+quelques dizaines de microsecondes. Un délai d'expiration plus court accélère la reprise et déclare mort davantage de primaires lents, ce qui est précisément le cas où le fencing
+compte. Le secours de la construction est à chaud~: il applique chaque entrée du journal dès qu'elle est écrite, si bien qu'il n'y a rien à rattraper. Un
+secours à froid doit d'abord rejouer le journal~; la réplique C++ l'applique à environ \qty{37}{\nano\second} par entrée, de sorte qu'un journal
+d'une journée de 37~millions d'entrées (chapitre~23) prend environ une seconde et demie, acceptable pour un redémarrage, mais pas pour une \omterm{def:ll:resilience:failover}{bascule}.
+
+\section{Coupures de l'échange et reprise}
+
+\begin{definition}[Traitement idempotent]\label{def:ll:resilience:idempotent}
+Une opération est traitée \emph{de façon idempotente}\index{traitement idempotent} lorsque l'effectuer deux fois a le même effet que
+l'effectuer une seule fois. Pour les ordres, cela signifie que chaque ordre porte un identifiant fixé à sa création, de sorte que la plateforme, ou
+la passerelle propre à la société, reconnaît une seconde copie et la rejette.
+\end{definition}
+
+Le moment dangereux d'une \omterm{def:ll:resilience:failover}{bascule} tient aux ordres de l'intervalle~: ceux que l'ancien primaire a envoyés et dont les comptes rendus n'ont jamais été journalisés.
+Le nouveau primaire sait qu'ils existent, puisqu'il les a calculés à partir du journal, mais ignore s'ils sont partis~: l'ancien primaire peut être mort
+avant de les envoyer, alors que l'ordre était sur le fil, ou après que la plateforme l'a exécuté et avant que le compte rendu ne revienne. Il
+dispose de trois manières de procéder (\cref{lst:ll:resilience:resend}). Il peut les renvoyer aussitôt sous de nouveaux identifiants, réflexe
+des passerelles qui ne réutilisent jamais un identifiant. Il peut d'abord se reconnecter, demander à la plateforme les comptes rendus qu'il a manqués (le rejeu séquencé
+du chapitre~21), réconcilier, et ne renvoyer que ce qui reste sans trace. Ou bien il peut renvoyer aussitôt sous les identifiants d'origine des ordres
+d'origine, dérivés du journal, et laisser la plateforme rejeter toute copie d'un ordre qu'elle possède déjà.
+
+\omcode{code/firm/sequencer/firm_sequencer_sim.py}{116}{137}{La reprise~: barrière du journal, puis renvoi de ce qu'aucun compte rendu
+n'accuse, sous les identifiants d'origine ou sous de nouveaux (un renvoi est journalisé, afin que les répliques
+restent en accord).}\label{lst:ll:resilience:resend}
+
+Le \Cref{tab:ll:resilience:cuts} rend compte d'un primaire tué à chaque étape de chacun des 46 ordres du scénario, face au
+moteur d'appariement du livre~10. Avec de nouveaux identifiants et sans réconciliation, une panne pendant qu'un ordre est sur le fil ou chez la plateforme, mais pas
+encore signalé, l'envoie deux fois~: 54 des 184 points de coupure se terminent par un doublon, un pour chacun des 27 ordres exécutés, dans chacune
+des deux étapes, et le pire fait dépasser la position à 1\,100 actions, contre 1\,000. Réconcilier d'abord
+les supprime tous dans ce modèle, car chaque ordre est signalé en moins de \qty{40}{\micro\second} et la plateforme rejoue ses
+comptes rendus. Les identifiants idempotents les suppriment quel que soit l'ordre des opérations, ce qui compte lorsque la plateforme tarde
+à signaler ou que la session ne peut pas être rejouée~: les participants de la bourse de Tokyo en 2020 se trouvaient précisément dans cette situation. Dans
+tous les cas, l'état du nouveau primaire est égal à un rejeu frais du journal et à la position que détient la plateforme.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.0cm}>{\centering\arraybackslash}p{1.9cm}>{\centering\arraybackslash}p{1.9cm}>{\centering\arraybackslash}p{1.9cm}>{\centering\arraybackslash}p{1.9cm}>{\centering\arraybackslash}p{2.3cm}@{}}
+\toprule
+procédure & \multicolumn{4}{c}{doublons, selon l'étape de l'ordre au moment de la panne} & position maximale \\
+ & journalisé & en vol & chez la plateforme & signalé & \\
+\midrule
+identifiants frais & 0 & 27 & 27 & 0 & 1\,100 \\
+identifiants frais, réconciliés d'abord & 0 & 0 & 0 & 0 & 1\,000 \\
+clés d'idempotence & 0 & 0 & 0 & 0 & 1\,000 \\
+\bottomrule
+\end{tabular}
+\caption{Le primaire tué à chacune des quatre étapes de chacun des 46 ordres du scénario (184 \omterm{def:ll:resilience:failover}{bascules} par procédure) face au
+moteur d'appariement~; la reprise a pris de 2.8 à \qty{3.1}{\milli\second} dans chaque cas, et l'état était toujours égal à un rejeu du
+journal. Données~: \texttt{fig\_failover.py} (déterministe).}\label{tab:ll:resilience:cuts}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (12.6,0) node[right]{temps};
+\foreach \x/\l in {0/{entrée journalisée},2.6/{ordre envoyé},6.2/{sur la plateforme},9.8/{compte rendu journalisé}} {
+  \draw (\x,-0.12) -- (\x,0.12);
+  \node[below,align=center] at (\x,-0.15) {\l};
+}
+\fill[omDef!15] (0,0.2) rectangle (2.6,1.0);
+\node[align=center,font=\tiny] at (1.3,0.6) {non envoyé~:\\ un renvoi\\ est sans risque};
+\fill[omThm!25] (2.6,0.2) rectangle (9.8,1.0);
+\node[align=center] at (6.2,0.6) {une panne ici~: un renvoi sous un nouvel identifiant\\ duplique l'ordre s'il a été exécuté};
+\fill[omMeth!15] (9.8,0.2) rectangle (12.4,1.0);
+\node[align=center] at (11.1,0.6) {connu~:\\ rien à renvoyer};
+\draw[<->] (2.6,1.25) -- node[above]{\qty{20}{\micro\second} sur le fil, \qty{20}{\micro\second} au retour} (9.8,1.25);
+\end{tikzpicture}
+
+\omcaption{La vie d'un ordre et la fenêtre dans laquelle une \omterm{def:ll:resilience:failover}{bascule} peut le dupliquer~: du moment où il part au moment où
+son compte rendu est journalisé, deux traversées du réseau. Avec de nouveaux identifiants et sans réconciliation, une panne
+n'importe où dans la fenêtre rouge envoie l'ordre deux fois s'il avait été exécuté.}\label{fig:ll:resilience:window}
+\end{omfigure}
+
+Le même raisonnement s'applique à une simple déconnexion, sans aucune \omterm{def:ll:resilience:failover}{bascule}~: la passerelle perd sa session, se reconnecte en demandant
+les comptes rendus qu'elle n'a pas vus, les applique (l'annulation à la déconnexion de la plateforme a pu entre-temps annuler des ordres au repos),
+réconcilie avec le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy}, et ce n'est qu'alors qu'elle laisse la stratégie négocier. Le simulateur du livre~10 fournit chaque élément~: rejeu séquencé
+à la connexion, annulation à la déconnexion, et rejet d'un identifiant d'ordre client en double.
+
+\section{Tester la bascule}
+
+Le code de \omterm{def:ll:resilience:failover}{bascule} s'exécute lorsque quelque chose d'autre a déjà échoué, si bien que c'est le code le moins testé d'un système, à moins qu'on ne le teste
+délibérément, et l'incident de Tokyo est l'exemple type d'un dispositif qui a fonctionné pour les pannes contre lesquelles il avait été testé, et non
+pour celle qui s'est produite. Le test de la construction est le tableau~: le primaire est tué à chaque étape de chaque ordre d'un scénario,
+et chaque exécution est vérifiée contre des propriétés qui doivent tenir quel que soit le point de panne (l'état du nouveau primaire est égal à un rejeu
+du journal~; sa position est celle de la plateforme~; aucun ordre n'est exécuté deux fois lorsque des clés d'idempotence sont utilisées). Les propriétés
+comptent davantage que le scénario~; des points de coupure exhaustifs transforment un événement rare en test courant. En production, la même idée est
+pratiquée en provoquant délibérément des \omterm{def:ll:resilience:failover}{bascules}, selon un calendrier, afin que la procédure soit exercée lorsque rien d'autre ne va mal.
+
+\section{Tutoriel~: tuer le primaire partout}\label{tut:ll:resilience:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Lancer le séquenceur, deux répliques et une passerelle face au moteur d'appariement, tuer le primaire à chaque étape
+de chaque ordre, et comparer trois procédures de reprise. \textbf{État final~:} \cref{tab:ll:resilience:cuts}, et des rejeux verts du
+journal de \omterm{def:ll:resilience:failover}{bascule} dans trois langages.
+\begin{tutsteps}
+\item \textbf{Le scénario.} \texttt{firm\_sequencer\_sim.run(None)} exécute 60 cotations, à une milliseconde d'intervalle, sans panne~: 46
+ordres, une position de $-700$, l'état égal à un rejeu.
+\item \textbf{Points de coupure.} \texttt{cut\_points()} liste le milieu de chacune des quatre étapes de chaque ordre~;
+\texttt{python fig\_failover.py} exécute les trois procédures à chacun de ces points.
+\item \textbf{Répliques dans trois langages.} Les répliques C++ et Rust rejouent \texttt{data/journal.txt}, une \omterm{def:ll:resilience:failover}{bascule} avec de nouveaux
+identifiants, et atteignent les états de \texttt{data/expected.txt}~; un écrivain de l'ancienne époque est refusé.
+\item \textbf{Rattrapage.} \texttt{python bench\_sequencer.py} mesure le temps qu'une réplique met à appliquer deux millions d'entrées.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Retarder les comptes rendus de la plateforme d'une milliseconde et observer les doublons réapparaître même avec la réconciliation~;
+raccourcir le délai d'expiration des \omterm{def:ll:protocols-i-fix:session}{heartbeats} et compter les \omterm{def:ll:resilience:failover}{bascules} qu'un primaire lent provoquerait.
+\end{tutorial}
+
+\section{Construction~: le séquenceur}\label{bld:ll:resilience:sequencer}
+
+\begin{build}
+\bfield{Rôle} Le backbone qui rend redémarrable et réplicable le chemin de négociation du livre (chapitres~18 à 22)~: un
+journal unique d'entrées numérotées, des répliques qui calculent à partir de lui, et une \omterm{def:ll:resilience:failover}{bascule} qui ne perd ni ne duplique aucun ordre.
+\bfield{Interface} Référence Python \texttt{firm\_sequencer}~: \texttt{Journal} avec \texttt{append} et \texttt{fence}~;
+\texttt{Replica} avec \texttt{apply} et \texttt{unacknowledged}~; \texttt{cl\_for}~; \texttt{to\_line}, \texttt{from\_line}~;
+\texttt{firm\_sequencer\_sim.run} et \texttt{cut\_points} face au moteur du livre~10. C++20 \texttt{firm::seq}~:
+\texttt{Journal}, \texttt{Replica}, \texttt{parse}. Rust \texttt{firm\_sequencer}~: \texttt{Journal}, \texttt{Replica},
+\texttt{parse}.
+\bfield{Règles} Rien n'agit sur une entrée avant qu'elle ne soit journalisée~; les répliques sont des fonctions déterministes du journal~; les époques
+ne font que croître et interdisent aux écrivains plus anciens~; les identifiants d'ordre dérivent du journal~; les renvois sont journalisés.
+\bfield{Tests d'acceptation} \texttt{code/firm/sequencer/}~: le journal de \omterm{def:ll:resilience:failover}{bascule} rejoué jusqu'aux mêmes états dans trois langages~;
+la barrière refuse une époque ancienne~; les trous sont refusés~; à chaque point de coupure du scénario et pour chaque procédure, l'état est égal à un rejeu
+et à la position de la plateforme~; les doublons n'apparaissent qu'avec de nouveaux identifiants et sans réconciliation.
+\bfield{Pour aller plus loin} Un journal répliqué avec accusé de réception synchrone par le secours~; plusieurs passerelles derrière les répliques~;
+Raft pour élire le primaire~; la passerelle du chapitre~21 et la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} du chapitre~22 en tant que répliques.
+\end{build}
+
+\begin{omsources}
+\item Tokyo Stock Exchange, \emph{The Cause of the Recent Failure in arrowhead and Measures Implemented}, 5 October 2020, et
+\emph{The Failure of Equity Trading System on October 1, 2020}, rapport, 19 octobre 2020.
+\item F.~B.~Schneider, ``Implementing fault-tolerant services using the state machine approach: a tutorial'', \emph{ACM
+Computing Surveys} 22(4), 1990.
+\item D.~Ongaro et J.~Ousterhout, ``In search of an understandable consensus algorithm'', \emph{USENIX Annual Technical
+Conference}, 2014.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:1}
+L'époque du journal est 3. L'ancien primaire, devenu primaire à l'époque 2, tente d'ajouter une entrée. Que se passe-t-il, et que devient
+les ordres qu'il a calculés à partir de cette entrée~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:2}
+Des battements toutes les millisecondes, trois battements manqués déclarent le primaire mort, vérifiés à chaque battement. Quels sont les temps
+les plus courts et les plus longs entre une panne et sa détection~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:resilience:3}
+Un ordre créé par l'entrée 46 du journal est la première sortie de cette entrée. Quel est son identifiant client dans la construction, et
+pourquoi chaque réplique doit-elle le calculer de la même façon~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:4}
+Une stratégie envoie 500 ordres par seconde~; chacun passe \qty{40}{\micro\second} entre son départ et l'journalisation de son compte rendu,
+et 90~\% d'entre eux s'exécutent. Une panne survient à un instant aléatoire. Quelle est la probabilité qu'un renvoi avec de nouveaux identifiants,
+sans réconciliation, duplique un ordre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:5}
+Une sauvegarde froide applique le journal à raison de \qty{37}{\nano\second} par entrée. Combien de temps lui faut-il pour rattraper une journée de
+37 millions d'entrées, puis la dernière heure de celle-ci~? Pourquoi garder malgré tout la sauvegarde à chaud~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:resilience:6}
+La plateforme rejette une copie d'un ordre sous un identifiant qu'elle a déjà vu. La sauvegarde renvoie sous les identifiants d'origine un ordre
+que la plateforme a exécuté. Que reçoit la sauvegarde, et que doit faire sa réplique de cette réponse~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:resilience:7}
+\emph{Programmation.} Retarder les comptes rendus de la plateforme d'une milliseconde dans \texttt{firm\_sequencer\_sim} et relancer les trois procédures.
+Laquelle duplique maintenant des ordres, à quelles étapes, et pourquoi les clés d'idempotence n'en produisent-elles toujours aucun~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:resilience:8}
+\emph{Trouver la faille.} «~Notre \omterm{def:ll:resilience:failover}{bascule} est simple~: la sauvegarde surveille le battement du primaire et, quand il s'arrête, elle
+relance la stratégie à partir de sa configuration et envoie de nouvelles cotations.~»
+\end{exercise}
+
+\section{Problème~: La bascule qui a doublé les ordres}
+
+\begin{problem}[{Problème du week-end --- compter les doublons en chaque point de défaillance}]\label{pb:ll:resilience:1}
+Utiliser le \cref{tab:ll:resilience:cuts} (\texttt{failover.csv}, \texttt{failover\_summary.csv})~: 46 ordres en 60 millisecondes, quatre
+étapes chacun, trois procédures de reprise.
+
+\medskip\noindent\textbf{Partie I --- La fenêtre.}
+\begin{enumerate}
+\item Nommer les quatre étapes de la vie d'un ordre utilisées comme points de coupure, et dire pour lesquelles le nouveau primaire ne peut pas savoir
+si l'ordre est parti.
+\item Combien de temps un ordre passe-t-il dans les deux étapes dangereuses de la simulation~?
+\item Pourquoi seuls 27 des 46 ordres produisent-ils un doublon dans chaque étape dangereuse~?
+\item Pourquoi une panne survenant alors qu'un ordre est journalisé mais pas encore envoyé ne le duplique-t-elle jamais~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Dans le temps.}
+\begin{enumerate}[resume]
+\item Quel est le taux d'ordres du scénario~?
+\item Si l'instant de la panne est uniforme sur le scénario, quelle est la probabilité qu'une \omterm{def:ll:resilience:failover}{bascule} avec de nouveaux identifiants duplique
+un ordre~?
+\item Quelle serait-elle pour une stratégie envoyant 5\,000 ordres par seconde avec les mêmes latences~?
+\item Pourquoi la plus grande position atteint-elle 1\,100 avec de nouveaux identifiants~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les remèdes.}
+\begin{enumerate}[resume]
+\item Pourquoi réconcilier d'abord supprime-t-il tous les doublons dans ce modèle~?
+\item Donner deux situations réelles dans lesquelles réconcilier d'abord ne suffirait pas.
+\item Pourquoi les clés d'idempotence fonctionnent-elles quel que soit l'ordre des opérations~?
+\item Que doit-il être vrai pour que les clés d'idempotence soient possibles~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les doublons après une \omterm{def:ll:resilience:failover}{bascule} sans clés d'idempotence sur les points de panne, avec elles,
+et le temps de reprise.
+\item Qu'est-ce qui domine le temps de reprise, et quel est le prix de le raccourcir~?
+\item Qu'apporte le verrouillage par époque que les clés d'idempotence n'apportent pas~?
+\item Qu'est-ce qui a mal tourné à Tokyo en 2020, dans les termes du chapitre~?
+\item Pourquoi les renvois eux-mêmes doivent-ils être journalisés~?
+\item Quelles propriétés le test vérifie-t-il en chaque point de coupure, et pourquoi des propriétés plutôt que des sorties attendues~?
+\item Qu'ajouteriez-vous pour tester une sauvegarde froide~?
+\item En une phrase~: qu'est-ce qui rend une \omterm{def:ll:resilience:failover}{bascule} sûre~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:resilience:1}
+Qu'est-ce qu'un séquenceur, et pourquoi un système de trading en placerait-il un devant tout le reste~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:resilience:2}
+Votre primaire cesse d'envoyer ses battements. Comment la sauvegarde prend-elle le relais sans envoyer d'ordres en double~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:resilience:3}
+Qu'est-ce que le \omterm{def:ll:resilience:failover}{split brain}, et comment l'empêchez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:ll:resilience:4}
+Votre session vers la bourse tombe pendant cinq secondes. Que faites-vous, dans l'ordre, quand elle revient~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:resilience:5}
+Comment testeriez-vous que la \omterm{def:ll:resilience:failover}{bascule} fonctionne, sachant qu'elle est rarement nécessaire~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:resilience:6}
+Concevez un système de trading qui survit à la perte de n'importe quelle machine, avec au plus quelques millisecondes d'interruption et aucun
+ordre perdu ni dupliqué. Quels en sont les composants, le protocole entre eux, et les tests~?
+\end{interviewq}

@@ -1,0 +1,381 @@
+\chapter{Messagerie et architecture pilotée par les événements}\label{ch:pl:messaging-and-event-driven-architecture}
+
+Un consommateur du topic des exécutions plante après avoir appliqué un lot de messages aux positions et avant d'enregistrer jusqu'où il a lu. Au
+redémarrage, il relit le lot et l'applique de nouveau, si bien que la position de la société sur une action est doublée jusqu'à ce que quelqu'un la compare au
+drop copy. Rien n'était cassé~: le système de messagerie a livré chaque message au moins une fois, ce qu'il avait exactement promis. Ce chapitre
+porte sur ce que promettent les systèmes de messagerie, sur ce qu'ils ne peuvent pas promettre, et sur la manière dont un consommateur transforme une \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au moins une fois} en effets exactement une fois --- avec un
+\omterm{def:pl:messaging-and-event-driven-architecture:log}{journal partitionné} construit en mémoire, un \omterm{def:pl:position-and-pnl-services:service}{service de positions} soumis à mille plantages dans trois modes, et la \omterm{def:pl:messaging-and-event-driven-architecture:outbox}{boîte d'envoi transactionnelle} (outbox) qui permet à un service de modifier
+sa base de données et de l'annoncer sans perdre ni l'un ni l'autre.
+
+\section{Pourquoi les systèmes communiquent par messages}
+
+La carte de la plateforme du chapitre~\ref{ch:pl:the-platform-map} est un ensemble de services~: \omterm{def:pl:trade-capture-and-booking:capture}{saisie des transactions} (trade capture), positions, risque, P\&L, surveillance. Ils peuvent
+s'appeler directement, chacun sachant qui a besoin de quoi~; ou bien chacun peut publier ce qui s'est passé, et quiconque en a besoin s'y abonne. La seconde
+option les découple de trois façons --- dans la connaissance (l'éditeur ne connaît pas ses consommateurs), dans le temps (un consommateur peut être arrêté et rattraper son retard), et
+dans le débit (un consommateur lent ne ralentit pas l'éditeur) --- et fait du flux d'événements lui-même un enregistrement qu'on peut rejouer.
+
+\begin{definition}[Publication--abonnement]\label{def:pl:messaging-and-event-driven-architecture:pubsub}
+Le \emph{publication--abonnement}\index{publication--abonnement} (publish--subscribe) est un schéma de messagerie dans lequel des producteurs publient des messages dans des topics nommés sans
+adresser de consommateur, et chaque consommateur reçoit les messages des topics auxquels il est abonné.
+\end{definition}
+
+Le coût est que le graphe des appels devient invisible, et que les pannes passent de l'appel (qui échoue bruyamment) à la livraison (qui peut perdre ou
+répéter des messages en silence). La plus grande partie de ce chapitre traite de la seconde.
+
+\section{Courtiers et transports sans courtier}
+
+\begin{definition}[Courtier de messages, messagerie sans courtier]\label{def:pl:messaging-and-event-driven-architecture:broker}
+Un \emph{courtier de messages}\index{courtier de messages} (message broker) est un serveur qui reçoit des messages de producteurs, les stocke et les livre à des consommateurs,
+de sorte que producteurs et consommateurs ne connaissent que le courtier. Dans la \emph{messagerie sans courtier}\index{messagerie sans courtier} (brokerless messaging), les producteurs envoient directement
+aux consommateurs --- en unicast, en multicast ou par mémoire partagée --- au moyen d'une bibliothèque présente dans chaque processus, sans serveur sur le chemin.
+\end{definition}
+
+Les deux répondent à des besoins différents. Un courtier ajoute un saut et un serveur à exploiter, et en contrepartie offre le stockage, le rejeu et des consommateurs qui vont et viennent.
+Les transports sans courtier offrent la latence la plus faible et aucun composant central~: les chemins des données de marché et des ordres du livre~13 sont sans courtier, avec
+du multicast (livre~13, chapitre~16) et des tampons circulaires (ring buffers) en mémoire partagée, et des bibliothèques comme Aeron --- «~efficient reliable UDP
+unicast, UDP multicast, and IPC message transport~» --- assurent la fiabilité par-dessus. Entre services qui tiennent davantage à
+ne pas perdre un événement qu'à la microseconde --- \omterm{def:pl:trade-capture-and-booking:capture}{saisie des transactions}, positions, risque, la chaîne post-marché --- la société utilise un journal.
+
+\section{Le journal comme colonne vertébrale}
+
+\begin{definition}[Journal partitionné, position du consommateur]\label{def:pl:messaging-and-event-driven-architecture:log}
+Un \emph{journal partitionné}\index{journal partitionné} (partitioned log) stocke chaque topic sous forme de plusieurs partitions, chacune étant une suite de messages en ajout seul, repérés par
+leur position dans celle-ci~; la partition d'un message est choisie à partir de sa clé, de sorte que des messages de même clé conservent leur ordre. Une
+\emph{position du consommateur}\index{position du consommateur} (offset) est la position jusqu'à laquelle un consommateur a lu une partition, enregistrée par le consommateur (validée) afin de
+pouvoir reprendre à cet endroit.
+\end{definition}
+
+\begin{definition}[Groupe de consommateurs]\label{def:pl:messaging-and-event-driven-architecture:group}
+Un \emph{groupe de consommateurs}\index{groupe de consommateurs} (consumer group) est un ensemble de processus consommateurs qui se partagent les partitions d'un topic, chaque partition étant lue par exactement
+un seul membre à la fois, avec une seule position validée par partition pour l'ensemble du groupe~; lorsque des membres rejoignent ou quittent le groupe, les partitions sont réaffectées
+(un rééquilibrage).
+\end{definition}
+
+Telle est la conception que Kreps, Narkhede et Rao ont décrite pour Kafka en 2011~: un message n'a pas d'identifiant propre, «~each message is
+addressed by its logical offset in the log~». Le \texttt{firm.eventlog} du chapitre la construit en mémoire~: des topics, des partitions selon un
+hachage stable de la clé, des segments en ajout seul sur disque, une rétention qui supprime des segments entiers, et des positions validées par groupe. En regroupant les
+exécutions par compte, toutes les exécutions d'un compte se retrouvent dans une même partition, dans l'ordre~; huit partitions partagées par trois consommateurs sont réparties en trois, trois et
+deux.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  cell/.style={draw=omDef,fill=omDef!8,minimum width=6mm,minimum height=6mm,inner sep=0pt,font=\scriptsize},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[draw=omDef,rounded corners=2pt,align=center,text width=17mm,minimum height=24mm,font=\footnotesize] (prod) at (-0.9,0) {producteurs\\(saisie des\\trans\-actions)};
+\foreach \p/\n in {0/7,1/5,2/8,3/6} {
+  \node[font=\scriptsize,anchor=east] at (2.4,1.35-0.9*\p) {partition \p};
+  \foreach \i in {1,...,\n} \node[cell] at (2.3+0.62*\i,1.35-0.9*\p) {\the\numexpr\i-1\relax};
+}
+\draw[arr] (prod.east) -- (0.8,0);
+\draw[omThm,very thick] (2.3+0.62*4.5,1.7) -- (2.3+0.62*4.5,1.0) node[above,pos=0,font=\scriptsize]{validée 4};
+\draw[omThm,very thick] (2.3+0.62*3.5,-1.0) -- (2.3+0.62*3.5,-1.7) node[below,pos=1,font=\scriptsize]{validée 3};
+\node[draw=omThm,rounded corners=2pt,align=center,text width=24mm] (c1) at (9.8,0.9) {consommateur 1\\partitions 0, 1};
+\node[draw=omThm,rounded corners=2pt,align=center,text width=24mm] (c2) at (9.8,-0.9) {consommateur 2\\partitions 2, 3};
+\node[font=\scriptsize,omThm] at (9.8,-1.9) {un groupe de consommateurs};
+\draw[arr] (6.95,1.35) -- (c1.west); \draw[arr] (5.7,0.45) -- (c1.west);
+\draw[arr] (7.6,-0.45) -- (c2.west); \draw[arr] (6.35,-1.35) -- (c2.west);
+\end{tikzpicture}
+
+\omcaption{Un topic de quatre partitions, chacune étant une suite de messages en ajout seul repérés par leur position, et un \omterm{def:pl:messaging-and-event-driven-architecture:group}{groupe de consommateurs} de deux membres qui
+se les partagent. Le groupe valide une position par partition (en rouge)~: celle à partir de laquelle un membre reprend après un redémarrage ou
+un rééquilibrage.}\label{fig:pl:messaging-and-event-driven-architecture:log}
+\end{omfigure}
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{53}{64}{Ajout dans un journal partitionné~: la clé choisit la partition, et la paire (identifiant, séquence) du producteur
+déjà stockée est ignorée, de sorte qu'un renvoi ne crée pas de doublon.}\label{lst:pl:messaging-and-event-driven-architecture:append}
+
+\section{Garanties de livraison et mythe de l'exactement une fois}
+
+Un consommateur fait deux choses avec un lot~: il traite les messages, et il valide la position. Un plantage peut survenir entre les deux, et
+l'ordre de ces deux opérations détermine ce que le plantage coûte.
+
+\begin{definition}[Livraison au plus une fois et au moins une fois]\label{def:pl:messaging-and-event-driven-architecture:delivery}
+Avec une \emph{livraison au plus une fois}\index{livraison au plus une fois} (at-most-once delivery), un message peut être perdu mais n'est jamais traité deux fois~: le consommateur valide
+la position avant de traiter. Avec une \emph{livraison au moins une fois}\index{livraison au moins une fois} (at-least-once delivery), un message n'est jamais perdu mais peut être traité plus
+d'une fois~: le consommateur valide après traitement, et un plantage entre les deux répète les messages non validés.
+\end{definition}
+
+\begin{definition}[Traitement exactement une fois]\label{def:pl:messaging-and-event-driven-architecture:exactly}
+Le \emph{traitement exactement une fois}\index{traitement exactement une fois} (exactly-once processing) est la garantie que l'effet de chaque message sur l'état du consommateur se produit
+une seule fois, quels que soient les plantages~: obtenue non pas du transport, qui ne peut livrer qu'au moins une fois, mais en rendant l'effet idempotent
+(livre~13, chapitre~24) ou en stockant l'état et la position dans une même transaction atomique.
+\end{definition}
+
+L'article de 2011 était explicite~: «~Kafka only guarantees at-least-once delivery~», et une application qui se soucie des
+doublons doit «~must add its own deduplication logic~». Des versions ultérieures ont ajouté un producteur idempotent et des transactions,
+qui assurent l'exactement une fois entre topics Kafka~; pour toute autre destination, la documentation indique que l'exactement une fois «~generally
+requires cooperation with such systems~». Le \omterm{def:pl:position-and-pnl-services:service}{service de positions} est une telle destination.
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{105}{126}{Un lot dans les trois modes~: validation avant traitement, validation après, ou application du lot et de la
+position suivante dans une même transaction de base de données.}\label{lst:pl:messaging-and-event-driven-architecture:modes}
+
+La journée du chapitre compte 10\,000 exécutions synthétiques pour dix comptes et vingt actions, réparties par compte dans quatre partitions et consommées par lots
+de 100. Chaque jour, dix plantages surviennent en des points tirés uniformément parmi les étapes du consommateur --- chaque message traité, et l'instant entre
+le traitement d'un lot et sa validation --- et cent jours sont simulés dans chaque mode. Pour chaque exécution, nous comptons le nombre de fois où elle a atteint le
+\omterm{def:pl:position-and-pnl-services:service}{service de positions}.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ybar,bar width=14pt,ylabel={exécutions par 1\,000 plantages},symbolic x coords={at-most-once,at-least-once,atomic},
+  xtick=data,xticklabels={validation d'abord\\(au plus une fois),validation après\\(au moins une fois),état et position\\atomique},
+  xticklabel style={align=center},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,ymin=0,ymax=62000,
+  nodes near coords,every node near coord/.append style={font=\scriptsize,/pgf/number format/1000 sep={\,}},scaled y ticks=false,
+  yticklabel style={/pgf/number format/1000 sep={\,}},
+  legend style={font=\small,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,/tikz/every even column/.append style={column sep=4mm}}]
+\addplot[fill=omThm!60,draw=omThm] table[x=mode,y=lost_per_1000]{figdata/platforms/24-messaging-and-event-driven-architecture/modes.csv};
+\addplot[fill=omDef!40,draw=omDef] table[x=mode,y=dup_per_1000]{figdata/platforms/24-messaging-and-event-driven-architecture/modes.csv};
+\legend{perdues,dupliquées}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Exécutions perdues et dupliquées pour 1\,000 plantages du consommateur, sur cent jours de dix plantages dans chaque mode. La validation d'abord perd environ
+la moitié d'un lot par plantage (50\,323 pour 1\,000)~; la validation après en duplique autant (48\,652)~; état et \omterm{def:pl:messaging-and-event-driven-architecture:log}{position du consommateur} dans une même transaction, aucune. Données~:
+\texttt{fig\_eventlog.py}.}\label{fig:pl:messaging-and-event-driven-architecture:modes}
+\end{omfigure}
+
+Les deux premiers modes sont des images miroir (\cref{fig:pl:messaging-and-event-driven-architecture:modes}). Un plantage au sein d'un lot de 100 tombe
+en moyenne à mi-parcours, donc la validation d'abord perd environ 50 exécutions et la validation après en répète environ 50~; un plantage juste après le traitement et avant la
+validation --- celle du hook --- répète les cent. Dans le troisième mode, les positions et la \omterm{def:pl:messaging-and-event-driven-architecture:log}{position du consommateur} suivante sont écrites dans une seule transaction SQLite~: un plantage
+survenant avant la validation annule les deux écritures, le consommateur reprend à la position qui correspond à l'état, et aucune exécution n'est perdue ni comptée
+deux fois sur 1\,000 plantages. Le même effet vient du traitement idempotent~: on stocke l'identifiant de chaque exécution avec l'état et on ignore les identifiants
+déjà appliqués.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={jour, trié selon son erreur},ylabel={plus grande erreur de position (actions)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=1,xmax=100,ymin=-200,ymax=7000,yticklabel style={/pgf/number format/1000 sep={\,}}]
+\addplot[omThm,thick] table[x=rank,y=at_most_once]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\addplot[omDef,thick] table[x=rank,y=at_least_once]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\addplot[black,thick] table[x=rank,y=atomic]{figdata/platforms/24-messaging-and-event-driven-architecture/worst.csv};
+\node[omDef,font=\scriptsize,anchor=east] at (axis cs:88,6300) {validation après~: jusqu'à 6\,500};
+\node[omThm,font=\scriptsize,anchor=north west] at (axis cs:55,3200) {validation d'abord~: jusqu'à 5\,100};
+\node[font=\scriptsize,anchor=south west] at (axis cs:3,150) {atomique~: 0 chaque jour};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La plus grande erreur de position en fin de journée, tous comptes et actions confondus, pour chacun des cent jours, classés. Dix plantages par jour laissent une
+pire erreur médiane de 3\,500 actions lorsqu'on valide d'abord et de 3\,800 lorsqu'on valide après, et jusqu'à 5\,100 et 6\,500~; le mode atomique termine
+chaque jour exact. Données~: \texttt{fig\_eventlog.py}.}\label{fig:pl:messaging-and-event-driven-architecture:worst}
+\end{omfigure}
+
+\section{Patrons~: outbox, event sourcing, messages en échec}
+
+Le problème du consommateur a son pendant côté producteur. Le service de \omterm{def:pl:trade-capture-and-booking:capture}{saisie des transactions} (trade capture) doit enregistrer une transaction dans sa base de données et publier
+l'événement qui l'annonce. Deux écritures séparées ne peuvent pas être atomiques~: écrire puis publier, et un plantage entre les deux laisse une transaction dont personne n'est informé~;
+publier puis écrire, et les consommateurs agissent sur une transaction qui n'existe pas.
+
+\begin{definition}[Boîte d'envoi transactionnelle]\label{def:pl:messaging-and-event-driven-architecture:outbox}
+Une \emph{boîte d'envoi transactionnelle}\index{boîte d'envoi transactionnelle} (transactional outbox) est une table de la base de données propre au service, où celui-ci écrit chaque événement au sein
+de la même transaction que le changement qu'il annonce~; un relais distinct lit la table, publie les événements dans l'ordre et les marque comme envoyés, de sorte que
+qu'un événement soit publié si et seulement si son changement a été validé --- au moins une fois, avec une clé qui permet au journal ou au consommateur d'écarter les
+répétitions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=9mm,text width=24mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (svc) {service de saisie\\des transactions};
+\node[box,right=12mm of svc,yshift=6mm] (t) {table \texttt{trades}};
+\node[box,right=12mm of svc,yshift=-6mm] (o) {table \texttt{outbox}};
+\node[draw=omThm,dashed,rounded corners=3pt,fit=(t)(o),inner sep=4pt,label={[font=\scriptsize,omThm]above:une transaction}] (tx) {};
+\node[box,right=18mm of tx] (r) {relais};
+\node[box,right=18mm of r] (l) {journal, topic\\\texttt{trades}};
+\draw[arr] (svc.east) -- (tx.west);
+\draw[arr] (o.east) -- node[below,pos=0.55,font=\scriptsize]{non envoyé} (r.west |- o.east);
+\draw[arr] (r) -- node[above,font=\scriptsize]{1. publier} (l);
+\draw[arr,omThm] (r.south) to[bend left=35] node[below,font=\scriptsize]{2. marquer comme envoyé} (o.south east);
+\end{tikzpicture}
+
+\omcaption{La \omterm{def:pl:messaging-and-event-driven-architecture:outbox}{boîte d'envoi transactionnelle}~: la transaction et l'événement qui l'annonce sont validés dans une même transaction de base de données~; un relais publie
+les événements non envoyés vers le journal, puis les marque comme envoyés. Un plantage entre 1 et 2 répète un événement sans jamais en perdre un, et la clé d'idempotence permet au
+journal d'écarter la répétition.}\label{fig:pl:messaging-and-event-driven-architecture:outbox}
+\end{omfigure}
+
+\omcode{code/firm/eventlog/firm_eventlog.py}{171}{192}{La boîte d'envoi transactionnelle~: la transaction et son événement dans une même transaction de base de données, et le relais qui publie
+chaque événement, avec son numéro dans la boîte d'envoi comme clé d'idempotence, avant de le marquer comme envoyé.}\label{lst:pl:messaging-and-event-driven-architecture:outbox}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.2cm}>{\centering\arraybackslash}p{2.8cm}>{\centering\arraybackslash}p{2.8cm}>{\centering\arraybackslash}p{2.8cm}@{}}
+\toprule
+conception & événements perdus & événements fantômes & événements dupliqués\\
+\midrule
+écrire la transaction, puis publier & 22 & 0 & 0\\
+publier, puis écrire la transaction & 0 & 22 & 0\\
+boîte d'envoi, relais sans clé d'idempotence & 0 & 0 & 22\\
+boîte d'envoi, relais avec clé d'idempotence & 0 & 0 & 0\\
+\bottomrule
+\end{tabular}
+\caption{2\,000 transactions publiées avec une probabilité de 1~\% de plantage au point dangereux de chaque conception~: entre les deux écritures, ou entre
+la publication et le marquage comme envoyée d'une ligne de la boîte d'envoi. Un événement fantôme annonce une transaction que la base de données ne contient pas.}
+\label{tab:pl:messaging-and-event-driven-architecture:outbox}
+\end{table}
+
+Le \Cref{tab:pl:messaging-and-event-driven-architecture:outbox} montre les trois modes de défaillance et la correction. La boîte d'envoi déplace le problème de
+deux systèmes à un seul, et ce qui reste --- un relais qui a publié puis est tombé avant de marquer --- est une répétition, que le producteur idempotent ou
+le consommateur l'élimine.
+
+\begin{definition}[Event sourcing]\label{def:pl:messaging-and-event-driven-architecture:sourcing}
+L'\emph{event sourcing}\index{event sourcing} stocke l'état d'un système comme la suite des événements qui l'ont changé, ajoutés et jamais édités, et
+dérive chaque état courant et chaque état passé en les rejouant.
+\end{definition}
+
+Le magasin de transactions du \cref{ch:pl:trade-capture-and-booking} est en \omterm{def:pl:messaging-and-event-driven-architecture:sourcing}{event sourcing}, et le journal en est le lieu naturel~: un nouveau système aval
+s'abonne au sujet et le rejoue depuis son début pour construire son propre état. Le prix à payer est la rétention --- le journal doit conserver chaque événement, ou
+un instantané accompagné de la position qu'il couvre --- et une discipline sur les modifications du format des événements.
+
+\begin{definition}[File des messages en échec]\label{def:pl:messaging-and-event-driven-architecture:dlq}
+Une \emph{file des messages en échec}\index{file des messages en échec} (dead-letter queue) est un sujet vers lequel un consommateur envoie un message qu'il n'a pas réussi à traiter un nombre donné de
+fois, avec la partition et la position d'où il provient, afin qu'un seul message mal formé n'arrête pas la partition qui le suit.
+\end{definition}
+
+Dans un \omterm{def:pl:messaging-and-event-driven-architecture:log}{journal partitionné}, un message qui échoue toujours est pire que dans une file~: le consommateur ne peut pas le sauter sans valider au-delà, de sorte que chaque
+message qui le suit dans la partition attend. Le sujet des messages en échec permet au consommateur de poursuivre et laisse une trace à réparer et à rejouer ---
+ce qui, pour les exécutions, doit être fait avant que quiconque ne se fie aux positions.
+
+\begin{dated}{2026-09}{Les sémantiques de livraison de Kafka}\label{dat:pl:messaging-and-event-driven-architecture:kafka}
+La documentation de Kafka distingue la \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au plus une fois} (des messages peuvent être perdus, mais ne sont jamais redélivrés), la \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au moins une fois} (ils ne sont jamais perdus, mais peuvent être
+redélivrés) et la livraison exactement une fois~; un consommateur qui enregistre sa position avant le traitement obtient la première, après le traitement la deuxième. Depuis la version
+0.11.0.0, son producteur propose une option de livraison idempotente, de sorte qu'un renvoi ne crée pas de doublons dans le journal, ainsi que des transactions
+qui écrivent dans plusieurs partitions de façon atomique~; la livraison exactement une fois vers d'autres systèmes exige en général leur coopération.
+\end{dated}
+
+\section{Tutoriel~: une millième panne}\label{tut:pl:messaging-and-event-driven-architecture:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Consommer une journée d'exécutions soumise à des pannes selon trois modes et publier les transactions de trois façons. \textbf{État final~:}
+la \cref{fig:pl:messaging-and-event-driven-architecture:modes} et le \cref{tab:pl:messaging-and-event-driven-architecture:outbox}.
+\begin{tutsteps}
+\item \textbf{Journal}~: \texttt{firm\_eventlog.Log}, un sujet de quatre partitions~; \texttt{pl\_eventlog.publish(fills())}.
+\item \textbf{Une journée}~: \texttt{day(fs, mode, crash\_steps)} pour chaque mode, avec les mêmes étapes de panne~; compter les applications par exécution.
+\item \textbf{Cent jours}~: \texttt{schedules(mode)}, exécutions perdues et dupliquées pour 1\,000 pannes et pire erreur de position.
+\item \textbf{Boîte d'envoi}~: \texttt{publishing(design)} pour les quatre conceptions.
+\item \textbf{Lettres mortes}~: placer une exécution mal formée dans une partition et la consommer avec \texttt{process\_with\_dlq}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer le magasin atomique par un traitement idempotent (une table des \omterm{def:pl:position-and-pnl-services:execid}{identifiants d'exécution} appliqués) et vérifier qu'il donne le
+même résultat~; rééquilibrer le groupe au milieu de la journée.
+\end{tutorial}
+
+\section{Construction~: le journal d'événements}\label{bld:pl:messaging-and-event-driven-architecture:eventlog}
+
+\begin{build}
+\bfield{Rôle} Transporter les événements de la société entre les services, dans l'ordre par clé, de façon durable, avec des consommateurs capables de transformer une \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison
+au moins une fois} en effets exactement une fois.
+\bfield{Interface} \texttt{Log} (\texttt{create}, \texttt{append}, \texttt{read}, \texttt{end}, \texttt{retain}, \texttt{commit},
+\texttt{committed}), \texttt{assign}, \texttt{run\_batch}, \texttt{AtomicStore}, \texttt{Outbox}, \texttt{process\_with\_dlq}.
+\bfield{Règles} Partitionner par clé~; ne jamais modifier un message~; chaque consommateur déclare son mode~; état et position atomiques, ou traitement idempotent,
+pour tout consommateur dont l'état compte~; chaque événement publié par une boîte d'envoi~; un message qui continue d'échouer part vers les lettres mortes avec son
+origine.
+\bfield{Tests d'acceptation} \texttt{code/firm/eventlog/tests/}~: une clé dans une partition et dans l'ordre, segments et rétention~; un renvoi
+ignoré~; l'affectation au groupe~; les trois modes sous une panne~; le renvoi du relais de la boîte d'envoi dédupliqué~; un message empoisonné vers les lettres mortes.
+\bfield{Pour aller plus loin} Rééquilibrage du \omterm{def:pl:messaging-and-event-driven-architecture:group}{groupe de consommateurs} avec un numéro de génération qui écarte un membre périmé~; compaction par clé~; un serveur réseau.
+\end{build}
+
+\begin{omsources}
+\item J.~Kreps, N.~Narkhede et J.~Rao, \emph{Kafka: a Distributed Messaging System for Log Processing}, NetDB 2011.
+\item Documentation d'Apache Kafka, \emph{Design}~: sémantiques de livraison des messages.
+\item One Quant Book~13, chapitres~12, 16 et~24 (tampons circulaires et consommateurs lents, multicast, traitement idempotent et séquenceurs).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:1}
+Pourquoi les exécutions sont-elles réparties par compte plutôt qu'envoyées en tourniquet entre les partitions~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:2}
+Un consommateur valide après traitement et plante après avoir appliqué 30 messages d'un lot de 100. Que se passe-t-il au redémarrage~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:messaging-and-event-driven-architecture:3}
+Huit partitions et trois consommateurs dans un groupe~: comment sont-elles affectées, et que se passe-t-il si un quatrième rejoint le groupe~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:4}
+Pourquoi valider d'abord perd-il une cinquantaine d'exécutions par panne, et valider après en duplique-t-il à peu près autant~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:5}
+Le \omterm{def:pl:position-and-pnl-services:service}{service de positions} garde son état en mémoire et écrit un instantané chaque minute. Où doit-il conserver sa position de consommateur~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:6}
+Pourquoi le relais de la boîte d'envoi produit-il encore des répétitions, et qui les supprime~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:7}
+\emph{Programmation.} Rendre idempotent le \omterm{def:pl:position-and-pnl-services:service}{service de positions} à \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au moins une fois} en stockant les \omterm{def:pl:position-and-pnl-services:execid}{identifiants d'exécution} appliqués, puis exécuter \texttt{schedules} dessus.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:messaging-and-event-driven-architecture:8}
+\emph{Trouver la faille.} «~Nous avons activé le \omterm{def:pl:messaging-and-event-driven-architecture:exactly}{traitement exactement une fois} dans le système de messagerie, donc les positions ne peuvent
+plus être comptées deux fois.~»
+\end{exercise}
+
+\section{Problème~: double pendant onze minutes}
+
+\begin{problem}[{Problème du week-end --- double pendant onze minutes}]\label{pb:pl:messaging-and-event-driven-architecture:1}
+Le journal du chapitre, les exécutions, les calendriers de pannes et le service de \omterm{def:pl:trade-capture-and-booking:capture}{saisie des transactions}.
+
+\medskip\noindent\textbf{Partie I --- Le journal.}
+\begin{enumerate}
+\item Que découple la \omterm{def:pl:messaging-and-event-driven-architecture:pubsub}{publication--abonnement}, et que coûte-t-elle~?
+\item Quand choisir un courtier, et quand un transport sans courtier~?
+\item Comment un message est-il adressé dans un \omterm{def:pl:messaging-and-event-driven-architecture:log}{journal partitionné}, et comment sa partition est-elle choisie~?
+\item Que partage un \omterm{def:pl:messaging-and-event-driven-architecture:group}{groupe de consommateurs}, et qu'est-ce qu'un rééquilibrage~?
+\item Que fait disparaître la rétention, et que doit faire un nouvel abonné s'il a perdu des événements dont il a besoin~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Pannes.}
+\begin{enumerate}[resume]
+\item Quelles sont les deux étapes de la consommation d'un lot, et où une panne peut-elle survenir~?
+\item Combien de pannes ont eu lieu dans chaque mode, et pourquoi en moins dans l'un d'eux~?
+\item Combien d'exécutions ont été perdues ou dupliquées pour 1\,000 pannes dans chaque mode~?
+\item Quelle est la pire erreur de position en fin de journée dans chaque mode, et la médiane~?
+\item Comment le mode atomique évite-t-il à la fois les pertes et les doublons~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Production.}
+\begin{enumerate}[resume]
+\item Pourquoi la transaction et son événement ne peuvent-ils pas être écrits de façon atomique sans \omterm{def:pl:messaging-and-event-driven-architecture:outbox}{boîte d'envoi transactionnelle}~?
+\item Que produit chaque conception naïve en cas de pannes~?
+\item Que laisse la boîte d'envoi, et comment est-elle supprimée~?
+\item Qu'est-ce que l'\omterm{def:pl:messaging-and-event-driven-architecture:sourcing}{event sourcing}, et qu'exige-t-il du journal~?
+\item Que protège une \omterm{def:pl:messaging-and-event-driven-architecture:dlq}{file des messages en échec}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le nombre d'exécutions dupliquées et perdues pour 1\,000 pannes avec la \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au plus une fois}, au moins une fois et
+un traitement idempotent dont la \omterm{def:pl:messaging-and-event-driven-architecture:log}{position du consommateur} est atomique, ainsi que l'erreur maximale de position que produit chacun d'eux.
+\item Quel mode le \omterm{def:pl:position-and-pnl-services:service}{service de positions} doit-il utiliser, et lequel un tableau de bord de supervision~?
+\item Que couvre le \omterm{def:pl:messaging-and-event-driven-architecture:exactly}{traitement exactement une fois} dans un produit de messagerie~?
+\item Comment détecter l'erreur du crochet en quelques minutes~?
+\item En une phrase~: d'où vient le \omterm{def:pl:messaging-and-event-driven-architecture:exactly}{traitement exactement une fois}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:messaging-and-event-driven-architecture:1}
+Expliquez la \omterm{def:pl:messaging-and-event-driven-architecture:delivery}{livraison au plus une fois}, au moins une fois et exactement une fois.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:messaging-and-event-driven-architecture:2}
+Votre consommateur applique des exécutions à une base de données. Comment vous assurez-vous qu'une panne ne compte jamais deux fois une exécution~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:messaging-and-event-driven-architecture:3}
+Comment publiez-vous un événement chaque fois qu'une ligne est insérée dans votre base de données, sans jamais en perdre ni en inventer un~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:messaging-and-event-driven-architecture:4}
+Comment gardez-vous dans l'ordre les messages d'un même compte lorsqu'un sujet a de nombreuses partitions et de nombreux consommateurs~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:messaging-and-event-driven-architecture:5}
+Concevez le backbone d'événements qui transporte les transactions, les exécutions et les positions entre les services d'une société de trading.
+\end{interviewq}

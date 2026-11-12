@@ -1,0 +1,304 @@
+\chapter{Données et feature stores}\label{ch:ml:data-and-feature-stores}
+
+Une prévision du carnet d'ordres à horizon d'une seconde affiche un coefficient d'information de rang (rank IC) de 0.44 dans son backtest et de 0.36 en production. Rien n'est
+faux dans le modèle. En recherche, ses variables ont été calculées sur des barres d'une seconde et rattachées à chaque décision à la fin de
+sa seconde~; en production, elles sont calculées à partir de chaque message jusqu'à la décision. Les variables de recherche avaient vu jusqu'à une
+seconde du futur, et le modèle avait appris à l'utiliser. Ce chapitre vise à rendre cela impossible~: déclarer chaque
+variable une seule fois et la calculer de la même manière pour l'entraînement et pour le trading, la stocker avec son temps de connaissance, connaître
+la fraîcheur de chaque valeur, et tester en continu que les deux calculs concordent. Ses mesures utilisent le marché synthétique à carnet d'ordres du livre et
+quatre écarts injectés~; le test de parité les détecte tous, et un seul d'entre eux coûte quelque chose au modèle, ce qui est
+une raison de les détecter tous plutôt que de deviner lesquels comptent.
+
+\section{La même variable deux fois~: hors ligne et en ligne}
+
+\begin{definition}[Feature store, magasin hors ligne, magasin en ligne, définition de variable]\label{def:ml:data-and-feature-stores:store}
+Un \emph{feature store}\index{feature store} est le système qui calcule, stocke et sert les entrées des modèles d'une entreprise à partir d'un seul
+jeu de déclarations. Son \emph{magasin hors ligne}\index{magasin hors ligne} (offline store) conserve les valeurs des variables sur l'historique, indexées par entité et
+instant, pour l'entraînement et les backtests~; son \emph{magasin en ligne}\index{magasin en ligne} (online store) conserve les dernières valeurs, mises à jour à mesure que les données
+arrivent, pour les modèles en production. Une \emph{définition de variable}\index{définition de variable} (feature definition) déclare une variable sous forme de donnée (ses
+entrées, son agrégation, sa fenêtre, son horloge et sa version) afin que les deux magasins la calculent à partir de la même déclaration
+(Sculley et coauteurs, 2015, sur les raisons de cet enjeu~; Hermann et Del Balso, 2017, pour un des premiers dispositifs de production).
+\end{definition}
+
+Le chapitre déclare douze variables du carnet d'ordres (\cref{tab:ml:fs:skew})~: la fourchette, les déséquilibres de file et de profondeur
+et le mid pondéré (les dernières valeurs après chaque message, issues du moteur en flux \texttt{firm.lobfeat} du livre~7), le déséquilibre du flux
+d'ordres sur cinq et trente secondes, les volumes échangés et signés sur trente secondes, les nombres de transactions et de messages sur dix secondes, et
+la variation du mid sur cinq et trente secondes. Chacune est un \texttt{FeatureDef}~: un nom, l'entrée par événement, une agrégation (dernière
+valeur, somme, nombre, variation) et une fenêtre. Le \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne} calcule les douze pour un historique entier, sur une liste d'instants de décision
+en une seule fois, à partir de sommes cumulées et de jointures as-of (\cref{lst:ml:fs:offline})~; le moteur en ligne consomme les messages un à un
+et tient à jour des fenêtres glissantes (\cref{lst:ml:fs:online}). Sur huit séances de trente minutes de \texttt{firm.tape}, 313\,681 messages
+et 7\,714 décisions (une à chaque transaction), les deux concordent exactement à chaque décision~: tel est le contrat du magasin.
+
+\section{Exactitude à date dans le magasin}
+
+Chaque valeur du \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne} porte l'instant où elle est devenue connue, et une requête pour une décision à l'instant $t$ ne voit que les valeurs
+connues à $t$~: la jointure as-of du livre~7 (chapitre~3), appliquée aux variables. Pour les variables pilotées par événements, le temps de connaissance est
+celui du dernier message lu par la variable~; pour les variables issues de données plus lentes (fondamentaux, données alternatives, chapitre~15)
+c'est l'instant de livraison, et le magasin est bitemporel. Les deux erreurs que cela écarte sont celles qui sont injectées ici~: une chaîne de recherche
+qui lit un message au-delà de la décision (un décalage d'un cran dans une jointure), et une autre qui calcule les variables sur une horloge plus grossière
+horloge et rattache à chaque décision la valeur en fin de sa barre.
+
+\section{Fraîcheur et matérialisation}
+
+\begin{definition}[Matérialisation, fraîcheur des variables]\label{def:ml:data-and-feature-stores:fresh}
+La \emph{matérialisation}\index{matérialisation} est le traitement qui calcule les valeurs des variables à partir de leurs définitions et les écrit
+dans un magasin, par lots pour le \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne} ou en continu pour le \omterm{def:ml:data-and-feature-stores:store}{magasin en ligne}.
+La \emph{fraîcheur des variables}\index{fraîcheur des variables} (feature freshness) est l'âge d'une valeur servie~: le temps écoulé depuis la plus récente de ses entrées, grandeur qu'un système de production
+surveille et borne.
+\end{definition}
+
+La fraîcheur est ce qui distingue la production de la recherche, même lorsque le code est partagé~: un flux d'entrée qui arrive en retard rend
+périmée toute valeur en ligne qui en dépend. Le quatrième écart injecté retarde les publications de transactions de 200~millisecondes par rapport au
+carnet, comme le ferait un flux de transactions distinct~; les trois variables de nombre de transactions et de volume diffèrent alors de la recherche dans 92 à 94~\% des
+décisions, de 7 à 17~\% de leur écart-type, alors que les variables de carnet ne sont pas touchées.
+
+\section{Détection des écarts}
+
+\begin{definition}[Écart entraînement--service]\label{def:ml:data-and-feature-stores:skew}
+Un \emph{écart entraînement--service}\index{ecart@écart entraînement--service} (training--serving skew) est toute différence entre les valeurs des variables sur lesquelles un modèle a été entraîné
+et celles qu'il reçoit en production au même instant~: code différent, horloges différentes, entrées différentes,
+arithmétique différente ou synchronisation des données différente.
+\end{definition}
+
+Le test de parité (\cref{lst:ml:fs:parity}) recalcule hors ligne les valeurs de la production pour un échantillon de décisions récentes et les compare
+variable par variable. Le \Cref{tab:ml:fs:skew} montre l'empreinte de chaque écart injecté, et le \cref{tab:ml:fs:parity} ce que voient le test
+et le modèle. Un contrôle de cinq décisions tirées au hasard par séance, exécuté cinq fois sur chacune des huit séances, détecte
+tous les écarts, à chaque fois~: chacun modifie la plupart des décisions. La tolérance est un choix de conception~: à $10^{-9}$, le test signale aussi
+le stockage float32 de la production (une variation d'au plus $10^{-7}$, sans effet sur le modèle), et à $10^{-6}$ il cesse de le signaler tout en
+continuant à signaler les trois autres dans 96 à 100~\% des décisions.
+
+\begin{table}[htbp]
+\centering\small
+\setlength{\tabcolsep}{4pt}%
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.2cm}>{\centering\arraybackslash}p{2.5cm}>{\centering\arraybackslash}p{2.5cm}>{\centering\arraybackslash}p{2.5cm}>{\centering\arraybackslash}p{2.5cm}@{}}
+\toprule
+& \multicolumn{4}{c}{Écart quadratique moyen en proportion de l'écart-type de la variable}\\
+\cmidrule(l){2-5}
+variable & un événement d'avance & barres d'une seconde & float32 & transactions en retard\\
+\midrule
+fourchette & 0.38 & 0.92 & 0 & 0\\
+déséquilibre de file & 0.24 & 0.73 & 0.00 & 0\\
+déséquilibre de profondeur & 0.11 & 0.41 & 0.00 & 0\\
+mid pondéré moins mid & 0.30 & 0.79 & 0.00 & 0\\
+OFI 5 s & 0.03 & 0.24 & 0 & 0\\
+OFI 30 s & 0.01 & 0.07 & 0 & 0\\
+volume 30 s & 0.01 & 0.07 & 0 & 0.07\\
+volume signé 30 s & 0.02 & 0.10 & 0 & 0.11\\
+transactions 10 s & 0.02 & 0.18 & 0 & 0.17\\
+variation du mid 5 s & 0.09 & 0.39 & 0 & 0\\
+variation du mid 30 s & 0.03 & 0.13 & 0 & 0\\
+messages 10 s & 0.00 & 0.04 & 0 & 0\\
+\bottomrule
+\end{tabular}
+\caption{Ampleur de chaque écart injecté, variable par variable, sur 7\,714 décisions (0.00~: une différence inférieure à
+un demi-centième~; 0~: aucune). Données~: \texttt{ml\_featstore.feature\_skew}.}\label{tab:ml:fs:skew}
+\end{table}
+
+\begin{table}[htbp]
+\centering\small
+\setlength{\tabcolsep}{4pt}%
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.8cm}>{\centering\arraybackslash}p{1.9cm}>{\centering\arraybackslash}p{2.4cm}>{\centering\arraybackslash}p{1.6cm}>{\centering\arraybackslash}p{1.7cm}>{\centering\arraybackslash}p{2.2cm}@{}}
+\toprule
+& décisions & détectées & \multicolumn{2}{c}{rank IC} & P\&L en production\\
+\cmidrule(lr){4-5}
+écart & discordantes & (contrôle sur 5 échantillons) & backtest & production & (ticks)\\
+\midrule
+aucun & 0 & 0 & 0.411 & 0.411 & 0.089\\
+recherche, un événement d'avance & 100~\% & 100~\% & 0.395 & 0.418 & 0.091\\
+recherche sur barres d'une seconde & 96~\% & 100~\% & 0.438 & 0.360 & 0.078\\
+stockage float32 en production & 92~\% & 100~\% & 0.411 & 0.411 & 0.089\\
+production, publications de transactions avec 200 ms de retard & 100~\% & 100~\% & 0.411 & 0.411 & 0.089\\
+\bottomrule
+\end{tabular}
+\caption{Test de parité (tolérance $10^{-9}$) et prévision ridge de la variation du mid sur la seconde suivante, entraînée sur quatre
+séances avec chaque chaîne de recherche et testée sur quatre autres~: son backtest sur les variables de recherche et son résultat en production sur
+variables de production, rank IC et P\&L moyen par décision de trading du signe de la prévision. Données~:
+\texttt{ml\_featstore.parity\_table}, \texttt{model\_effects}.}\label{tab:ml:fs:parity}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.8cm,ybar,bar width=10pt,ymin=0.3,ymax=0.46,ylabel={rank IC, prévision à une seconde},area legend,
+  xtick={0,1,2,3,4},xticklabels={{aucun},{un événement\\ en avance},{barres\\ d'une seconde},{stockage\\ float32},{transactions\\ en retard}},
+  xticklabel style={align=center},tick label style={font=\small},label style={font=\small},xmin=-0.5,xmax=4.5,grid=major,
+  grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[fill=omThm,draw=none,bar shift=-5.5pt] table[x=i,y=backtest]{figdata/ml/24-data-and-feature-stores/ic.csv};
+\addplot[fill=omDef,draw=none,bar shift=5.5pt] table[x=i,y=live]{figdata/ml/24-data-and-feature-stores/ic.csv};
+\legend{backtest (variables de recherche),en direct (variables de production)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Ce que chaque écart fait au modèle~: le rank IC que son backtest de recherche annonce et celui qu'il obtient en direct. Données~:
+\texttt{ml\_featstore.model\_effects}.}\label{fig:ml:fs:ic}
+\end{omfigure}
+
+Le résultat qui donne son nom au chapitre figure à la troisième ligne du tableau. La recherche sur barres d'une seconde gonfle l'IC du backtest de 0.411 à
+0.438 et, parce que le modèle a appris à s'appuyer sur des variables ayant vu le futur, fournit 0.360 en direct, en deçà de ce que gagne la
+chaîne propre~; le P\&L par décision passe de 0.089 tick à 0.078. L'anticipation d'un seul événement produit ici l'effet inverse~: le
+message qui suit une transaction est généralement une mise à jour de cotation au fond du carnet, qui ajoute du bruit plutôt que de l'information, et le backtest
+sous-estime le résultat en direct (0.395 contre 0.418). Sur la prévision à cinq secondes, les mêmes écarts déplacent l'IC de moins de 0.01~: 
+qu'un écart coûte quelque chose dépend de la corrélation de son erreur avec la cible, ce qui n'est pas connaissable à l'avance. Le
+rôle du magasin est de faire concorder les magasins, non de juger quels désaccords sont inoffensifs.
+
+\begin{method}[Calcul des variables en production]\label{met:ml:fs:method}
+\begin{enumerate}
+\item Déclarer chaque variable une seule fois, sous forme de données, avec son horloge et sa fenêtre, et la versionner.
+\item Calculer hors ligne et en ligne à partir des mêmes déclarations~; dans le \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne}, horodater chaque valeur de son temps de connaissance
+et de son point de jointure dans le temps.
+\item Lancer chaque jour un test de parité sur un échantillon de décisions récentes, avec des tolérances fixées par variable, et alerter à la moindre divergence.
+\item Surveiller la fraîcheur de chaque variable en ligne par rapport à une borne, et replier ou arrêter lorsque les entrées deviennent périmées.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: les mêmes variables deux fois}\label{tut:ml:data-and-feature-stores:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Déclarer douze variables, les calculer hors ligne et en ligne sur huit séances, introduire quatre écarts, et mesurer ce que
+voient le test de parité et le modèle. \textbf{État final~:} \cref{tab:ml:fs:skew,tab:ml:fs:parity}, \cref{fig:ml:fs:ic}.
+\begin{tutsteps}
+\item \textbf{Le \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne}~: toutes les décisions à la fois.}
+\omcode{code/firm/featstore/firm_featstore.py}{61}{79}{Valeurs vectorisées des variables au point dans le temps.}\label{lst:ml:fs:offline}
+\item \textbf{Le moteur en ligne~: fenêtres glissantes.}
+\omcode{code/firm/featstore/firm_featstore.py}{108}{124}{Valeurs en ligne à tout instant.}\label{lst:ml:fs:online}
+\item \textbf{Le test de parité.}
+\omcode{code/firm/featstore/firm_featstore.py}{143}{151}{Comparaison des magasins sur un échantillon de décisions.}\label{lst:ml:fs:parity}
+\item \textbf{Exécuter} \texttt{ml\_featstore.parity\_table()}, \texttt{parity\_table(tol=1e-6)}, \texttt{model\_effects()},
+\texttt{model\_effects(5.0)}, \texttt{feature\_skew()} et \texttt{fig\_featstore.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Introduire un écart qui n'affecte qu'une décision sur mille et déterminer la taille d'échantillon qu'un contrôle quotidien doit avoir
+pour le détecter en une semaine.
+\end{tutorial}
+
+\section{Construction~: le feature store}\label{bld:ml:data-and-feature-stores:featstore}
+
+\begin{build}
+\bfield{Rôle} Entrées du modèle calculées une seule fois selon leur définition, au point dans le temps hors ligne, fraîches en ligne, et vérifiées en continu
+l'une par rapport à l'autre.
+\bfield{Interface} \texttt{FeatureDef(name, input, agg, window, version)}, \texttt{events\_from\_tape(tape, levels)} (dans
+\texttt{firm.lobfeat}), \texttt{offline(events, defs, times, lag\_events)}, \texttt{OnlineEngine(defs)} avec \texttt{on} et
+\texttt{values}, \texttt{stream(events, defs, times)}, \texttt{parity(off, on, tol, sample, seed)},
+\texttt{freshness(engine, now)}.
+\bfield{Règles} Aucune variable n'existe en dehors d'une définition~; le \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne} ne renvoie jamais une valeur connue après l'instant de la requête~;
+le test de parité tourne chaque jour~; les entrées périmées sont des alarmes.
+\bfield{Tests d'acceptation} \texttt{code/firm/featstore/tests/}~: hors ligne et en ligne égaux exactement sur une séance~; chaque agrégation sur fenêtre
+coïncide avec un recalcul par force brute~; une anticipation d'un seul événement est signalée~; la fraîcheur croît lorsque les entrées cessent.
+\bfield{Pour aller plus loin} Un \omterm{def:ml:data-and-feature-stores:store}{magasin hors ligne} bitemporel sur \texttt{firm.pit} pour les variables lentes~; des tolérances par variable apprises de
+l'arithmétique~; des moteurs en ligne en C++ ou en Rust, vérifiés contre la référence Python, comme le livre~7 l'a fait pour \texttt{firm.lobfeat}.
+\end{build}
+
+\begin{omsources}
+\item D.~Sculley et coauteurs, ``Hidden technical debt in machine learning systems'', \emph{Advances in Neural Information
+Processing Systems} 28, 2015.
+\item J.~Hermann et M.~Del Balso, ``Meet Michelangelo: Uber's machine learning platform'', blog d'ingénierie d'Uber, 2017.
+\item N.~Polyzotis, S.~Roy, S.~E.~Whang et M.~Zinkevich, ``Data lifecycle challenges in production machine learning: a
+survey'', \emph{SIGMOD Record} 47(2), 2018.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:1}
+Une variable de volume sur trente secondes est calculée à une décision à 10:00:07.300. Quelles transactions le \omterm{def:ml:data-and-feature-stores:store}{magasin en ligne} inclut-il, et lesquelles
+un pipeline de recherche sur barres d'une seconde, joint à la fin de la seconde de la décision, inclut-il~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:2}
+Un écart modifie une décision sur mille. Combien de décisions tirées au hasard un contrôle doit-il comparer pour le détecter avec
+une probabilité de 95~\%~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:data-and-feature-stores:3}
+Pourquoi le stockage en float32 modifie-t-il les variables de déséquilibre mais pas les variables de volume et de nombre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:4}
+Pourquoi les barres d'une seconde ont-elles nui à la prévision à une seconde et non à celle à cinq secondes~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:5}
+Pourquoi l'anticipation d'un seul événement a-t-elle dégradé le backtest au lieu de l'améliorer~? Le ferait-elle toujours~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:data-and-feature-stores:6}
+\emph{Trouver la faille.} «~Nous avons vérifié que les variables de production et de recherche ont la même moyenne et le même écart-type chaque jour,
+donc il n'y a pas d'\omterm{def:ml:data-and-feature-stores:skew}{écart entraînement--service}.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:data-and-feature-stores:7}
+\emph{Programmation.} Réentraîner le modèle à une seconde sur les valeurs que le moteur de production calcule lorsqu'il rejoue les séances d'entraînement
+au lieu des variables de recherche sur barres d'une seconde, puis l'évaluer en direct. Que récupère-t-il, et que coûte-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:data-and-feature-stores:8}
+Concevoir la tolérance du test de parité pour une somme sur une fenêtre d'entrées float64 dont les calculs en ligne et hors ligne
+additionnent les termes dans des ordres différents.
+\end{exercise}
+
+\section{Problème~: Deux fois les mêmes variables}
+
+\begin{problem}[{Problème du week-end --- une définition, deux calculs}]\label{pb:ml:data-and-feature-stores:1}
+Les douze variables du chapitre, huit séances et quatre écarts.
+
+\medskip\noindent\textbf{Partie I --- Le magasin.}
+\begin{enumerate}
+\item Que contient une \omterm{def:ml:data-and-feature-stores:store}{définition de variable}, et pourquoi la traiter comme des données~?
+\item En quoi les calculs hors ligne et en ligne diffèrent-ils, et comment savoir qu'ils concordent~?
+\item Quel est le temps de connaissance d'une variable de carnet d'ordres, et d'un fondamental trimestriel~?
+\item Qu'est-ce que la fraîcheur, et qu'est-ce qui l'a fait échouer ici~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les écarts.}
+\begin{enumerate}[resume]
+\item Décrire les quatre écarts et les variables que chacun touche.
+\item Lesquels sont des bogues de recherche et lesquels des bogues de production~?
+\item Quelle part des décisions chacun modifie-t-il~?
+\item Comment la tolérance du test de parité modifie-t-elle ce qu'il signale~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le modèle.}
+\begin{enumerate}[resume]
+\item Quels sont les IC du backtest et en direct sous chaque écart~?
+\item Pourquoi l'écart lié aux barres d'une seconde gonfle-t-il le backtest et dégrade-t-il le résultat en direct~?
+\item Que change-t-il à un horizon de cinq secondes~?
+\item À quoi ressemblerait l'écart d'IC sur le tableau de bord d'un desk~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'IC et le P\&L perdus à cause de la fenêtre mal alignée, et le taux de détection du test de parité pour chaque
+écart injecté.
+\item Quel écart est le plus dangereux, et pourquoi~?
+\item Comment déploie-t-on une modification de la définition d'une variable~?
+\item Que fait-on le jour où le test de parité se déclenche~?
+\item Comment intègre-t-on les variables d'un fournisseur dans le magasin~?
+\item Que doit le magasin au validateur du modèle (chapitre~21)~?
+\item Quel est le coût d'un \omterm{def:ml:data-and-feature-stores:store}{feature store} pour une petite équipe, et quand vaut-il la peine~?
+\item En une phrase~: que garantit un \omterm{def:ml:data-and-feature-stores:store}{feature store}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML}]\label{iq:ml:data-and-feature-stores:1}
+Qu'est-ce que l'\omterm{def:ml:data-and-feature-stores:skew}{écart entraînement--service}~? Donnez trois causes.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:data-and-feature-stores:2}
+Concevez un \omterm{def:ml:data-and-feature-stores:store}{feature store} pour des variables de carnet d'ordres utilisées par un modèle qui passe des ordres à chaque message.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:data-and-feature-stores:3}
+L'IC en direct de votre modèle ne vaut que la moitié de celui du backtest. Comment déterminer si les variables sont en cause~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:data-and-feature-stores:4}
+Qu'est-ce qu'une jointure point-in-time, et comment un \omterm{def:ml:data-and-feature-stores:store}{feature store} la met-il en œuvre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:data-and-feature-stores:5}
+Comment surveillez-vous la \omterm{def:ml:data-and-feature-stores:fresh}{fraîcheur des variables}, et que faites-vous lorsqu'une variable devient obsolète~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:data-and-feature-stores:6}
+Comment feriez-vous coïncider bit à bit une implémentation en ligne et une implémentation hors ligne d'une somme sur fenêtre~?
+\end{interviewq}

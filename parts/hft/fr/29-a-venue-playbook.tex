@@ -1,0 +1,413 @@
+\chapter{Un carnet de plateformes}\label{ch:hf:a-venue-playbook}
+
+Le même code de cotation se comporte différemment sur une bourse d'actions à priorité prix-temps, sur un carnet de contrats à terme à allocation au prorata, sur une plateforme dotée d'un \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} (speed bump) et sur une bourse de crypto-actifs
+dotée d'un budget d'ordres. Un desk qui découvre ces différences en production les apprend à ses dépens~: des ordres rejetés par un budget
+qu'il n'a pas lu, une file rejointe avec une mauvaise taille, des cotations qui arrivent cinq secondes après le prix qu'il avait observé. Un desk tient donc une fiche par plateforme et
+relit cette fiche avant le premier ordre. Dans la simulation de ce chapitre, un teneur de marché, écrit une fois pour toutes et lancé avec les paramètres de sa plateforme d'origine, voit 94~\% de ses
+ordres rejetés sur une plateforme de crypto-actifs, n'exécute qu'un quart du volume qu'il aurait pu négocier sur un carnet au prorata, et transforme la moitié de son volume en preneur de liquidité sur une plateforme qui
+retarde les nouveaux ordres. Trois plateformes demandent la modification d'un paramètre, quatre n'exigent rien, et deux, dont une parmi les trois précédentes, demandent un code différent.
+
+\section{Ce que contient un profil de plateforme}
+
+\begin{definition}[Profil de plateforme]\label{def:hf:a-venue-playbook:profile}
+Un \emph{profil de plateforme}\index{profil de plateforme} (venue profile) est un enregistrement structuré et versionné de ce qu'une stratégie de trading doit savoir sur une plateforme avant de lui envoyer
+un ordre (sa règle d'appariement, son tick et son lot, ses frais et leur unité, son flux de données de marché, ses types d'ordres, ses délais, son budget de messages, sa session et ses particularités connues),
+ainsi que les paramètres propres à la stratégie pour cette plateforme, validés par des règles qui lient les deux.
+\end{definition}
+
+Un profil comporte deux moitiés (la \cref{fig:hf:a-venue-playbook:flow}). La première décrit la plateforme et change quand la plateforme change~: un nouveau barème de frais
+un nouveau type d'ordre, une nouvelle limite. La seconde décrit la manière dont le desk y cote et change quand le desk apprend~: la taille affichée, la distance dont
+le prix doit bouger avant de recoter, le nombre de recotations autorisé, si ses ordres sont marqués post-only. Les règles lient les deux moitiés. Une
+taille de cotation doit être un multiple du lot. Un marquage post-only exige une plateforme qui propose des ordres post-only. Un délai qui épargne les ordres post-only
+doit s'accompagner d'ordres post-only. Les recotations doivent tenir dans le budget de messages. Chaque règle tient sur une ligne de \texttt{firm.venueprofile.validate}
+(le \cref{lst:hf:a-venue-playbook:validate}), et chacune a été apprise par quelqu'un en production.
+
+Les champs, un par un, sont ceux que les chapitres précédents ont utilisés~:
+\begin{itemize}
+\item \textbf{Appariement.} Priorité prix-temps (chapitres 1 à 10) ou allocation au prorata avec une part pour l'ordre de tête (du \cref{ch:hf:futures-market-making}),
+ou un intervalle par lots avec un prix de compensation unique (du \cref{ch:hf:latency-arbitrage-and-its-defence}), ou aucun moteur d'appariement
+(du \cref{ch:hf:on-chain-trading}).
+\item \textbf{Tick, lot et échelle de prix.} Un tick d'un cent sur une action de 100~\$ vaut un point de base~; un quart de point sur un contrat à terme représente un
+montant différent par contrat, et le lot transforme une taille de cotation en risque.
+\item \textbf{Frais et leur unité.} Par action sur les actions américaines, par contrat sur les contrats à terme et les options, en points de base de notionnel sur les plateformes de crypto-actifs~;
+le signe des frais du fournisseur de liquidité distingue une plateforme maker-taker d'une plateforme inversée (du \cref{ch:hf:rebates-inverted-venues-and-tiers}).
+\item \textbf{Flux.} Market-by-order ou market-by-price, et la possibilité pour un teneur de marché de retrouver ses propres ordres dans ce flux~: sans elle, il les poursuivra
+(du \cref{ch:hf:the-business-of-market-making}).
+\item \textbf{Types d'ordres.} Post-only, \omterm{def:hf:automated-options-market-making:mass}{cotations de masse} (mass quote), remplacement avec ou sans perte de priorité, ordres indexés.
+\item \textbf{Délais.} Un \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} (speed bump), symétrique ou asymétrique (la \cref{def:hf:latency-arbitrage-and-its-defence:bump})~; un délai pendant la séance sur
+la passation d'ordres~; un intervalle par lots.
+\item \textbf{Budgets.} Ordres par seconde, par jour, par compte et par instrument, selon que les annulations comptent, et ce qui se passe en cas de dépassement~: un rejet, une
+déconnexion, des frais.
+\item \textbf{Session et particularités.} Horaires, adjudications, fenêtres de maintenance, et le paragraphe qui commence par «~note that~».
+\end{itemize}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>=stealth,box/.style={draw,rounded corners,fill=omThm!8,minimum width=2.5cm,minimum height=0.75cm,align=center}]
+\node[box] (v) at (0,1.3) {moitié plateforme\\appariement, tick, lot, frais,\\flux, ordres, délais, budget};
+\node[box] (q) at (0,-0.3) {moitié cotation\\taille, seuil de recotation,\\cadence, post-only};
+\node[box,fill=omDef!12] (val) at (4.2,0.5) {valider\\(règles reliant\\les deux moitiés)};
+\node[box] (cfg) at (8.2,1.3) {simulateur\\configuration};
+\node[box] (par) at (8.2,-0.3) {teneur de marché\\paramètres};
+\node[box,fill=omDef!20] (sim) at (8.2,-1.9) {un teneur de marché,\\origine contre propre};
+\node[box,fill=gray!10] (rep) at (4.2,-1.9) {rapport~: volume, edge,\\sélection adverse, messages};
+\node[box,fill=gray!10] (reg) at (0,-1.9) {ligne du registre\\et barème de frais};
+\draw[->] (v) -- (val); \draw[->] (q) -- (val);
+\draw[->] (val) -- (cfg); \draw[->] (val) -- (par);
+\draw[->] (cfg.east) -- ++(0.5,0) |- (sim.east); \draw[->] (par) -- (sim);
+\draw[->] (sim) -- (rep); \draw[->] (val.south west) -- (reg.north east);
+\end{tikzpicture}
+
+\omcaption{Un \omterm{def:hf:a-venue-playbook:profile}{profil de plateforme} et ce qu'il produit. La moitié plateforme et la moitié cotation sont validées ensemble~; un profil valide fournit la
+configuration du simulateur de bourse (livre~10), les paramètres du teneur de marché, et les lignes du registre des plateformes et du moteur de barèmes de frais
+du livre~1. Le chapitre fait tourner un teneur de marché sur chaque profil simulé, avec les paramètres de la plateforme d'origine et avec ceux du profil propre. Source~:
+\texttt{firm.venueprofile}.}\label{fig:hf:a-venue-playbook:flow}
+\end{omfigure}
+
+Le registre du chapitre contient onze profils, un par type de plateforme~; huit disposent d'un moteur d'appariement que le simulateur de bourse peut exécuter. Leurs frais et
+limites sont donnés à titre illustratif de chaque type, fixés d'après les chiffres de l'encadré daté lorsqu'il en existe un~; le profil propre à un desk contient le barème réel de la plateforme, avec
+la date de sa lecture. La moitié plateforme des onze profils~:
+
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}p{2.4cm}@{}}
+\toprule
+profil & appariement & tick~; lot & frais, maker/taker & délai ou budget & cotation propre\\
+\midrule
+actions lit & prix-temps & 1 c~; 100 & $-0.20$/$+0.30$ c/action & -- & origine\\
+actions inversées & prix-temps & 1 c~; 100 & $+0.10$/$-0.05$ c/action & -- & origine\\
+actions ralenties & prix-temps & 1 c~; 100 & $-0.20$/$+0.30$ c/action & 350 \textmu s, tous & origine\\
+lots & adjudication par lots & 1 c~; 100 & 0/0 & intervalle de 100 ms & origine\\
+contrats à terme au prorata & tête, au prorata & 0.25~; 1 & 0/0 par contrat & -- & taille 500\\
+contrats à terme FIFO & prix-temps & 0.25~; 1 & 0/0 par contrat & ratio de messages & origine\\
+crypto-actifs & prix-temps & 1~; 1 & $-0.5$/$+2.5$ pb & 0.125/s, rafale 5 & cadence de 16~s\\
+événement & prix-temps & 1 c~; 1 & 0/0 & 5~s, nouveaux ordres & seuil de 3 ticks\\
+options & tête, au prorata & 1 c~; 1 & $-25$/$+50$ c/contrat & outils de risque & non simulé\\
+ECN de change & prix-temps & 1 pip~; 1M & 0/0.05 pb & -- & non simulé\\
+on-chain & pool & -- & frais de pool de 30 pb & temps de bloc & non simulé\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Le budget crypto est une part par instrument du budget d'un compte~: 200\,000 ordres par jour, chiffre de l'encadré daté, partagé par environ dix-huit instruments,
+laisse un ordre toutes les huit secondes pour chacun, avec une rafale de cinq. Le délai de cinq secondes sur les nouveaux ordres de la plateforme événementielle se situe entre une et douze
+secondes que relève l'encadré daté pour les marchés en cours de jeu d'une bourse de paris.
+
+\section{Plateformes d'actions et d'options}
+
+Sur une bourse d'actions américaine, la première question du profil porte sur le signe des frais. Une plateforme maker-taker verse au fournisseur de liquidité une remise et facture au preneur de liquidité jusqu'au
+plafond des frais d'accès~; une plateforme inversée facture le fournisseur de liquidité et paie le preneur, si bien que ses files sont plus courtes et que ses exécutions sont plus souvent celles des acteurs informés
+(du \cref{ch:hf:rebates-inverted-venues-and-tiers}). Dans la simulation du chapitre, les deux plateformes ont le même carnet avec les signes des frais permutés~: le teneur de marché négocie
+14\,567 unités sur chacune, les mêmes exécutions, et sa ligne de frais passe d'une remise de 29~\$ à une charge de 15~\$ en vingt minutes. Rien dans les
+paramètres du teneur de marché n'a à changer pour cela~; sa comptabilité doit l'être, et il en va de même de la décision de coter ou non sur cette plateforme.
+
+La deuxième question est celle du flux. Un flux ordre par ordre (un flux market-by-order comme l'ITCH de Nasdaq, où un ordre remplacé reçoit une nouvelle référence)
+permet au teneur de marché de retrouver ses propres ordres et de coter à partir de ceux des autres~; un flux market-by-price affiche des totaux par niveau, et le teneur de marché doit retrancher sa propre
+taille, ce qui n'est exact qu'une fois ses accusés de réception parvenus. Le teneur de marché du chapitre identifie ses ordres par les références figurant dans leurs
+accusés de réception, et le simulateur livre les accusés avant le flux public (15 contre 20 microsecondes), comme le fait d'ordinaire l'entrée
+d'ordres privée. Avec un accusé arrivant en second, une première version de ce teneur de marché prit son propre ordre pour celui d'un autre et le poursuivit.
+
+La troisième question est celle du délai. La plateforme d'actions ralenties retarde chaque message de 350 microsecondes, délai qu'une bourse américaine applique depuis 2016.
+Dans la simulation, il ne change rien~: l'ordre de l'arbitragiste et l'annulation du teneur de marché sont retardés de la même façon, l'arbitragiste gagne toujours chaque course, et 42~\%
+du volume du teneur de marché est encore pris lors d'un saut de cours. Le \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} de ce dispositif protège les ordres indexés de la plateforme, qui se recalent avant l'arrivée retardée
+de l'arbitragiste (du \cref{ch:hf:latency-arbitrage-and-its-defence})~; il ne protège pas une cotation affichée dont le propriétaire réagit à travers le même délai.
+Un délai asymétrique, qui épargne les annulations, le ferait~; une proposition américaine de ce type a été désapprouvée en 2020.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=9pt,ymin=0,ymax=72,xmin=-0.6,xmax=7.6,
+  xtick={0,1,2,3,4,5,6,7},xticklabels={cotée,inversée,ralentie,lot,{prorata},FIFO fut.,crypto,événement},
+  xticklabel style={font=\scriptsize,rotate=25,anchor=north east},ylabel={\small volume capté (\%)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},table/col sep=comma,
+  legend style={font=\scriptsize,at={(0.03,0.97)},anchor=north west},legend columns=2]
+\addplot[fill=omThm!60,draw=omThm] table[x=i,y=picked_home]{figdata/hft/29-a-venue-playbook/playbook.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=i,y=picked_own]{figdata/hft/29-a-venue-playbook/playbook.csv};
+\legend{paramètres d'origine,paramètres propres}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La part du volume du teneur de marché prise par l'arbitragiste rapide lors d'un saut du cours efficient, sur chaque plateforme simulée, avec
+les paramètres de la plateforme d'origine et avec ses propres paramètres~; trois graines de 20 minutes, un saut toutes les 20 secondes en moyenne. L'arbitragiste est informé d'un saut 20
+microsecondes avant le teneur de marché et envoie son ordre par une liaison de 5 microsecondes, contre 20 pour le teneur de marché. Données~: \texttt{hf\_venues.playbook}.}\label{fig:hf:a-venue-playbook:picked}
+\end{omfigure}
+
+Les plateformes d'options ajoutent deux champs qu'une plateforme d'actions n'a pas~: les \omterm{def:hf:automated-options-market-making:mass}{cotations de masse}, un message unique qui remplace le cours acheteur et le cours vendeur de nombreuses séries, et
+la protection contre le risque de cotation côté bourse, qui interrompt les exécutions d'un teneur de marché lorsque celles qui portent sur une même classe dans une courte fenêtre dépassent les limites qu'il a fixées
+(\cref{ch:hf:automated-options-market-making}). Le profil enregistre les deux, avec les paramètres de la protection tels que le desk les a fixés~;
+ils constituent la dernière ligne de défense sur une plateforme où un seul balayage touche des centaines de séries.
+
+\section{Futures et plateformes de change}
+
+Un carnet de contrats à terme au prorata répartit chaque ordre entrant entre les ordres au repos, en proportion de leurs tailles, après avoir réservé une part à l'ordre qui
+a fixé le prix. La taille est le paramètre~: le teneur de marché avec les 100 unités de la plateforme d'origine a négocié 10\,884 unités dans les simulations, et avec les 500 du profil il en a négocié
+40\,633, soit 3.7 fois davantage avec moins de messages. Une taille plus grande se fait aussi davantage prendre à chaque saut, 58~\% de son volume contre 47~\%, de sorte que
+l'edge par unité bouge à peine, $-0.14$ tick contre $-0.17$~; le choix d'afficher la taille dépend de l'edge, et du nombre d'autres teneurs de marché
+qui surcotent à leur tour (\cref{ch:hf:futures-market-making}). Un carnet de contrats à terme FIFO est un carnet prix-temps à unités de contrat~: dans les simulations, il
+se comporte exactement comme la plateforme d'actions cotée, hormis la ligne des frais. Ce que son profil ajoute, c'est l'indice de référence d'efficacité en messages de la bourse, le nombre de messages rapporté au volume négocié
+par groupe de produits, qu'un seuil de recotation consomme (\cref{ch:hf:the-quoting-engine}).
+
+\begin{dated}{2026-09}{Une plateforme par type, selon la lecture de leurs règlements}\label{dat:hf:a-venue-playbook:venues}
+\small
+\begin{tabular}{@{}p{2.3cm}p{9.9cm}@{}}
+Actions américaines & Le flux ITCH de Nasdaq est ordre par ordre~; un ordre remplacé reçoit une nouvelle référence. Le plafond des frais d'accès est de 0.003~\$ par action jusqu'au premier
+jour ouvré de novembre 2027, date à laquelle le plafond de 0.001~\$ adopté en 2024 s'applique.\\
+\omterm{def:hf:latency-arbitrage-and-its-defence:bump}{Ralentisseur} & L'agrément d'IEX comme bourse, le 17 juin 2016, est allé de pair avec un délai de 350 microsecondes sur ses messages entrants et sortants. La SEC
+a désapprouvé en février 2020 un délai asymétrique de quatre millisecondes sur Cboe EDGA.\\
+Futures & Les algorithmes au prorata de CME donnent à l'ordre qui améliore le premier le marché sa part, puis allouent au prorata, en arrondissant
+à l'inférieur, le reste étant alloué en FIFO (un guide de fournisseur, août 2025). Le programme d'efficacité des messages de CME compare les messages au volume
+avec des indices de référence par groupe de produits.\\
+Options & Les outils de risque de Cboe interrompent les exécutions d'un teneur de marché dès que sa limite de notionnel, de volume, de nombre ou de pourcentage de la cotation est atteinte
+sur une période de 100 millisecondes à un jour.\\
+Change & Certaines plateformes principales ont introduit des \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseurs} pour protéger les dealers (BIS, 2022)~; le last look doit être divulgué selon le FX Global Code.\\
+Crypto & Le point d'accès d'une grande plateforme au comptant a renvoyé des limites d'ordres de 100 par 10 secondes et de 200\,000 par jour le 24 septembre 2026.\\
+Paris & Une bourse de paris retarde d'une à douze secondes la pose de paris en cours de jeu, afin que les clients puissent annuler les paris non appariés.
+\end{tabular}
+\end{dated}
+
+Les plateformes de change se scindent en deux profils~: un carnet d'ordres à cours limité central (un ECN) avec un protocole à prix ferme, et le last look, divulgué ou non, des
+canaux de cotation en continu (\cref{ch:hf:fx-market-making}). Le profil d'un ECN indique la taille minimale (un million de la devise de base
+est un lot courant, de sorte que les 100 unités de la plateforme d'origine ne constituent même pas un ordre valide~: \texttt{validate} le signale), les frais en points de base ou par million, le
+plancher de latence de la plateforme ou son \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} s'il en a un, et la session, qui dure cinq jours sur sept, en continu, avec une coupure hebdomadaire.
+
+\section{Plateformes de crypto-actifs, on-chain et d'événements}
+
+Une plateforme de crypto-actifs limite le nombre d'ordres. Avec le budget du profil, un ordre toutes les huit secondes et une rafale de cinq, le teneur de marché avec les paramètres de la plateforme d'origine
+a envoyé 2\,735 ordres en vingt minutes, dont 2\,581 ont été rejetés~: chaque ordre rejeté a été renvoyé à la mise à jour suivante du carnet, et chaque
+rejet n'a rien consommé mais a laissé la cotation absente. Cadencé à une recotation toutes les seize secondes, la règle que la validation du profil impose (deux
+ordres par recotation dans le budget), il a envoyé 118 ordres, aucun rejeté, et négocié 8\,333 unités contre 7\,267
+(\cref{fig:hf:a-venue-playbook:budget}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xlabel={\small écart minimal entre recotations (s)},ylabel={\small ordres en 20 minutes},ymode=log,log basis y=10,
+  ymin=10,ymax=5000,xmin=-1,xmax=33,xtick={0,2,4,8,16,32},tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  table/col sep=comma,legend style={font=\scriptsize,at={(0.97,0.97)},anchor=north east}]
+\addplot[omThm,thick,mark=*,mark size=1.4pt] table[x=gap,y=orders]{figdata/hft/29-a-venue-playbook/budget.csv};
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.3pt] table[x=gap,y=accepted]{figdata/hft/29-a-venue-playbook/budget.csv};
+\legend{ordres envoyés,ordres acceptés}
+\end{axis}
+\begin{axis}[width=11cm,height=5.4cm,axis y line*=right,axis x line=none,ymin=0,ymax=12,xmin=-1,xmax=33,
+  ylabel={\small volume (milliers d'unités)},tick label style={font=\footnotesize},table/col sep=comma]
+\addplot[black,thick,dotted,mark=triangle*,mark size=1.6pt] table[x=gap,y=volume]{figdata/hft/29-a-venue-playbook/budget.csv};
+\node[font=\scriptsize,anchor=south] at (axis cs:8,10.1) {volume (à droite)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le budget d'ordres de la plateforme de crypto-actifs (un ordre toutes les huit secondes, une rafale de cinq) face au cadencement du teneur de marché~: ordres envoyés et acceptés
+(à gauche, échelle logarithmique) et volume négocié (à droite), trois graines de 20 minutes. Jusqu'à un écart de huit secondes, la plateforme accepte de 151 à 154 ordres quoi que
+l'on envoie, soit le budget entier~; le volume culmine à huit secondes. Données~: \texttt{hf\_venues.budget\_curve}.}\label{fig:hf:a-venue-playbook:budget}
+\end{omfigure}
+
+Le budget est saturé dans toutes les simulations jusqu'à un écart de huit secondes~: la plateforme accepte de 151 à 154 ordres en vingt minutes, soit 0.125 par seconde plus la rafale,
+quoi que le teneur de marché envoie. Ce que le cadencement décide, c'est lesquels. Un teneur de marché qui tire à chaque mise à jour du carnet dépense le budget par rafales et n'a plus
+d'ordres lorsque le marché bouge~; un teneur de marché cadencé le dépense régulièrement. Le volume culmine à un écart de huit secondes, 10\,100 unités, avec 28 ordres rejetés par
+rafales~; la règle des seize secondes sacrifie un sixième de ce volume pour n'avoir aucun rejet. Les annulations sont gratuites dans ce budget, comme elles le sont sur la
+plateforme de l'encadré daté~; l'annulation lors d'un saut n'attend jamais, ce qui explique que la validation du profil l'exige.
+
+Une plateforme on-chain n'a pas de moteur d'appariement ni de champ de profil pour un tel moteur~: ses champs sont le temps de bloc, les frais du pool, le gas et l'enchère des constructeurs
+qui ordonne les transactions d'un bloc (\cref{ch:hf:on-chain-trading}). Le simulateur ne la fait pas tourner~; le profil la consigne afin que la
+liste des plateformes du desk soit complète et qu'une stratégie supposant un carnet d'ordres y soit refusée.
+
+Une plateforme d'événements qui retarde les nouveaux ordres en cours de jeu, et non les annulations, protège les ordres au repos~: l'ordre de l'arbitragiste attend cinq secondes, l'annulation du teneur de marché
+n'attend pas, et seulement 5.6~\% du volume du teneur de marché a été pris, contre 42~\% sur la plateforme cotée. Mais le délai s'applique aussi aux nouveaux ordres du teneur de marché
+et 52~\% de son volume y a été pris, non fait~: un ordre fixé pour le carnet qu'il voyait arrive cinq secondes plus tard dans un carnet qui a bougé,
+le croise et s'exécute en preneur au vieux prix. L'edge a été le pire des huit plateformes après le lot, $-0.52$ tick par unité. Le paramètre du profil,
+un seuil de recotation de trois ticks a réduit les messages de 70~\% (de 799 à 238) pour 6~\% de volume en moins, car une recotation qui arrive cinq secondes
+trop tard est surtout perdue, et a ramené la part prise à 34~\%~; l'edge ne s'est pas amélioré ($-0.57$). Y remédier demande du code qui fixe le prix pour l'endroit où le carnet sera
+à l'arrivée de l'ordre, ou qui n'envoie aucun nouvel ordre tant que le prix bouge.
+
+\section{Intégrer une nouvelle plateforme}
+
+La plateforme par lots est l'autre cas qu'aucun paramètre ne résout. Elle protège entièrement le teneur de marché, aucun volume n'étant pris, car l'annulation lors d'un saut tombe dans le
+même intervalle que l'ordre de l'arbitragiste et est traitée avant la clôture du lot. Mais un teneur de marché qui s'affiche au meilleur cours dans une adjudication à prix uniforme
+n'est exécuté que lorsque le lot se croise à son prix, ce qui arrive quand le flux d'ordres de ce lot joue contre lui~: 2\,567 unités à $-1.12$ tick par
+unité, soit toutes les exécutions de l'adjudication. La plateforme a besoin d'un teneur de marché qui fixe son prix par rapport à sa juste valeur (\cref{ch:hf:fair-value}),
+non au meilleur cours.
+
+Ce résultat fixe l'ordre d'intégration. Un desk rédige la moitié plateforme du profil à partir du règlement de marché, du barème des frais, des spécifications du
+flux de données de marché et de la saisie d'ordres, ainsi que des notices techniques~; il la valide avec la moitié cotation de la plateforme d'origine, qui énumère ce que les paramètres d'origine font échouer~; il fait tourner la stratégie sur
+le simulateur configuré à partir du profil, avec les paramètres d'origine et les paramètres proposés, et lit l'écart~; puis il se connecte à
+l'environnement de test de la plateforme, exécute les tests de conformité qu'elle exige, et démarre avec de petites tailles sous les contrôles de risque de la
+\cref{ch:hf:risk-controls}, selon un déploiement progressif (livre~7, chapitre~21).
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+plateforme & volume & propre & part prise & edge (ticks) & messages & propre\\
+\midrule
+actions cotées & 14\,567 & = & 42~\% & $+0.03$ & 591 & =\\
+actions inversées & 14\,567 & = & 42~\% & $+0.03$ & 591 & =\\
+actions à \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} & 14\,567 & = & 42~\% & $+0.03$ & 591 & =\\
+lot & 2\,567 & = & 0~\% & $-1.12$ & 330 & =\\
+contrats à terme au prorata & 10\,884 & 40\,633 & 47~\% / 58~\% & $-0.17$ / $-0.14$ & 474 & 419\\
+contrats à terme FIFO & 14\,567 & = & 42~\% & $+0.03$ & 591 & =\\
+crypto & 7\,267 & 8\,333 & 56~\% / 48~\% & $-0.07$ / $-0.17$ & 2\,857 & 191\\
+événement & 8\,367 & 7\,900 & 6~\% / 4~\% & $-0.52$ / $-0.57$ & 799 & 238\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La table est le résultat nommé du chapitre~: le volume du teneur de marché, la part prise, son edge (ticks par unité contre le prix efficient cinq secondes
+plus tard) et ses messages sur chaque plateforme, avec les paramètres de la plateforme d'origine et, lorsqu'ils diffèrent, ceux de la plateforme elle-même (un signe égal~: rien à
+changer). Sur ce marché, s'afficher au meilleur cours est à peu près à l'équilibre sur les plateformes continues, comme le chapitre~1 l'a montré~; les plateformes diffèrent par ce qui retire l'edge
+et les paramètres d'un profil ne récupèrent que ce que des paramètres peuvent récupérer.
+
+Le profil est maintenu après l'intégration. Les plateformes modifient leurs barèmes de frais chaque mois, ajoutent des types d'ordres, déplacent leurs centres de données et changent leurs limites~; chaque
+changement fait l'objet d'une nouvelle version de la moitié plateforme, validée par rapport à la moitié cotation, et rejouée sur le simulateur avant sa mise en service. La date du profil
+est la date à laquelle quelqu'un a lu pour la dernière fois le règlement de marché.
+
+\section{Tutoriel~: un code, huit plateformes}\label{tut:hf:a-venue-playbook:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Encoder onze \omterm{def:hf:a-venue-playbook:profile}{profils de plateforme}, valider chacun avec les paramètres de cotation de la plateforme d'origine, et faire tourner un teneur de marché sur les huit plateformes simulées
+avec les paramètres de la plateforme d'origine et ceux de la plateforme elle-même. \textbf{État final~:} le tableau des résultats et les trois figures.
+\begin{tutsteps}
+\item \textbf{Les profils}~: \texttt{firm.venueprofile.standard()}, un \texttt{Registry} qui valide chaque profil à l'entrée et fait un aller-retour par
+JSON.
+\item \textbf{Les règles}~: \texttt{validate}~; \texttt{hf\_venues.home\_errors} énumère ce que les paramètres d'origine font échouer (le budget crypto, le lot FX).
+\omcode{code/firm/venueprofile/firm_venueprofile.py}{133}{153}{Les règles qui relient la moitié cotation à la moitié plateforme~: lot, post-only, délais asymétriques et budget d'ordres.}\label{lst:hf:a-venue-playbook:validate}
+\item \textbf{Le teneur de marché}, écrit une seule fois~: il s'affiche au meilleur cours des autres, recote au-delà d'un seuil et pas plus vite que son rythme, et annule
+son côté périmé sur un signal de saut.
+\omcode{code/firm/venueprofile/firm_venueprofile.py}{303}{341}{Le signal de saut vide le côté périmé pendant une période de refroidissement~; la recotation garde un ordre par côté à la cible, sauf si la cible a bougé du seuil.}\label{lst:hf:a-venue-playbook:quoter}
+\item \textbf{Les simulations}~: \texttt{hf\_venues.playbook} (trois graines de 20 minutes, paramètres d'origine et propres) et \texttt{hf\_venues.budget\_curve}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Donner à la plateforme par lots un teneur de marché qui fixe son prix par rapport à sa juste valeur~; ajouter un teneur de marché tenant compte des délais pour la plateforme événement qui
+n'envoie aucun nouvel ordre tant que le prix bouge~; ajouter la plateforme d'options avec un limiteur de \omterm{def:hf:automated-options-market-making:mass}{cotation de masse}.
+\end{tutorial}
+
+\section{Construction~: profils de plateforme}\label{bld:hf:a-venue-playbook:venueprofile}
+
+\begin{build}
+\bfield{Rôle} Tenir une fiche validée et versionnée par plateforme, et la transformer en configuration du simulateur, en paramètres du teneur de marché et en
+lignes du registre et du barème des frais.
+\bfield{Interface} \texttt{Quoting}, \texttt{Profile} (\texttt{to\_dict}, \texttt{from\_dict}), \texttt{validate(p)}, \texttt{Registry} (\texttt{get},
+\texttt{by\_type}, \texttt{simulated}, \texttt{dump}, \texttt{load}), \texttt{standard()}, \texttt{HOME}, \texttt{exchange\_config(p)},
+\texttt{venue\_record(p)} (\texttt{firm.venues} du livre~1), \texttt{fee\_schedule(p)} (\texttt{firm.feesched} du livre~1), \texttt{jumps},
+\texttt{Quoter}, \texttt{Sniper}, \texttt{run(p, quoting, seconds, seed)}.
+\bfield{Règles} Prix exprimés en 1/10\,000 de la devise, comme dans le simulateur~; unités comme sur le marché~; un profil qui échoue à la validation ne peut
+entrer dans un registre~; le budget ne s'applique qu'à la session du teneur de marché (l'arrière-plan représente de nombreux participants, chacun avec son propre budget).
+\bfield{Tests d'acceptation} \texttt{code/firm/venueprofile/tests/}~: chaque profil standard est validé et les paramètres d'origine font échouer le budget crypto
+et le lot FX~; un profil mal formé signale toutes ses fautes~; aller-retour JSON~; la configuration du simulateur pour l'allocation au prorata, les lots, les événements et la crypto~; de courtes
+simulations dans lesquelles la plateforme à \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} ne modifie aucune course, la plateforme inversée ne modifie que le signe des frais, le délai de la plateforme événement protège les ordres au repos, le
+teneur de marché cadencé ne subit aucun rejet, et une taille de prorata plus grande échange plus du double du volume.
+\bfield{Pour aller plus loin} Une comparaison de profils qui liste les règles qu'une notice de plateforme fait échouer~; la plateforme d'options avec \omterm{def:hf:automated-options-market-making:mass}{cotation de masse}~; des profils versionnés avec
+dates d'effet.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, TotalView-ITCH 5.0 specification.
+\item US Securities and Exchange Commission, Release No.\ 34-78101 (IEX, 2016) et l'ordonnance rejetant le
+délai de protection des fournisseurs de liquidité de Cboe EDGA (février 2020).
+\item CME Group, Globex Messaging Efficiency Program, dépôt de règle auprès de la CFTC, 8 novembre 2019.
+\item Betfair Developer Program, ``Why do you have a delay on placing bets on a market that is in-play''.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:1}
+Le budget crypto est de 0.125 ordre par seconde avec une rafale de cinq. Calculer le nombre d'ordres que la plateforme peut accepter en vingt minutes, et
+comparer ce nombre aux simulations.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:2}
+Une recotation envoie au plus un nouvel ordre de chaque côté. Calculer l'écart minimal entre deux recotations que le budget impose, et
+dire ce que fixe la cotation de la plateforme d'origine.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:a-venue-playbook:3}
+Sur le carnet au prorata, un ordre entrant de 1\,000 contrats rencontre un niveau de 5\,000 contrats au repos, dont l'ordre qui a fixé le prix en détient
+200 et le teneur de marché 500. Avec une part de 40~\% pour le premier ordre et le reste au prorata, calculer la quantité reçue par le teneur de marché.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:4}
+Expliquer pourquoi un délai symétrique de 350 microsecondes ne modifie aucune exécution du teneur de marché dans les simulations, et ce qui le changerait.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:5}
+Sur la plateforme événement, seulement 6~\% du volume du teneur de marché sont pris, et pourtant son edge vaut $-0.52$ tick. Expliquer ce résultat.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:a-venue-playbook:6}
+Sur la plateforme par lots, le teneur de marché n'est jamais pris. Expliquer pourquoi il perd plus d'un tick par unité, et dire ce qu'il faudrait changer.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:a-venue-playbook:7}
+\emph{Programmation.} À l'aide de \texttt{hf\_venues.budget\_curve}, déterminer quel rythme maximise le volume, combien d'ordres sont rejetés, et
+pourquoi il fait mieux que la règle des seize secondes.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:a-venue-playbook:8}
+\emph{Trouver la faille.} «~Le profil de la nouvelle plateforme a passé la validation et le simulateur affiche notre edge habituel, nous pouvons donc passer en production à pleine taille lundi.~»
+\end{exercise}
+
+\section{Problème~: Un seul code, huit plateformes}
+
+\begin{problem}[{Problème du week-end --- un seul code, huit plateformes}]\label{pb:hf:a-venue-playbook:1}
+Un desk de market making qui cote sur une bourse d'actions américaine doit étendre son moteur de cotation à sept autres types de plateformes.
+
+\medskip\noindent\textbf{Partie I --- Les plateformes.}
+\begin{enumerate}
+\item Définir un \omterm{def:hf:a-venue-playbook:profile}{profil de plateforme} et ses deux moitiés.
+\item Lister les champs de la moitié plateforme et, pour chacun, citer un chapitre de ce livre où il a joué un rôle.
+\item Que disent les plateformes de l'encadré daté au sujet de l'appariement, des délais et des budgets~?
+\item Pourquoi un pool on-chain et un flux FX à last look figurent-ils dans le registre, alors que le simulateur ne les fait pas tourner~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les règles.}
+\begin{enumerate}[resume]
+\item Énoncer les règles de validation qui relient la moitié cotation à la moitié plateforme.
+\item Quelles règles les paramètres de la plateforme d'origine enfreignent-ils, et sur quelles plateformes~?
+\item Pourquoi l'annulation de saut doit-elle être gratuite dans le cadre du budget~?
+\item Comment le moteur de cotation retrouve-t-il ses propres ordres, et que se passe-t-il si le flux montre un ordre avant que son accusé de réception n'arrive~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Mesures.}
+\begin{enumerate}[resume]
+\item Décrire le marché des simulations~: le flux, les sauts, l'arbitragiste, le signal du moteur de cotation.
+\item Donner le volume, la part prélevée, l'edge et le nombre de messages sur chaque plateforme avec les paramètres d'origine.
+\item Quelles plateformes changent avec les paramètres propres à la plateforme, et de combien~?
+\item Décrire la courbe de budget et expliquer pourquoi les ordres acceptés sont plats jusqu'à huit secondes.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la capture du moteur de cotation et le nombre de messages sur chaque type de plateforme, avec et sans les paramètres propres à la plateforme.
+\item Quelles plateformes ont besoin d'un paramètre, lesquelles n'ont besoin de rien, et lesquelles demandent un code différent~?
+\item Pourquoi la plateforme équipée d'un \omterm{def:hf:latency-arbitrage-and-its-defence:bump}{ralentisseur} ne protège-t-elle pas le moteur de cotation, et quel type de délai le ferait~?
+\item Que faudrait-il faire sur la plateforme événementielle~?
+\item Que faudrait-il faire sur la plateforme par lots~?
+\item Comment intégrer une neuvième plateforme, étape par étape~?
+\item Comment tenir un profil à jour, et qui valide un changement~?
+\item En une phrase~: à quoi sert un \omterm{def:hf:a-venue-playbook:profile}{profil de plateforme}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:hf:a-venue-playbook:1}
+Quels champs mettriez-vous dans un \omterm{def:hf:a-venue-playbook:profile}{profil de plateforme}, et lesquels trois vérifieriez-vous avant le premier ordre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:hf:a-venue-playbook:2}
+Vous faites passer une stratégie de cotation d'une plateforme d'actions à priorité prix-temps vers un carnet de contrats à terme à allocation au prorata. Que modifiez-vous en premier, et quel est le risque de
+ce changement~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:hf:a-venue-playbook:3}
+Vos ordres sur une plateforme crypto sont rejetés par rafales, et vos cotations manquent lorsque le marché bouge. Diagnostiquez et corrigez.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:hf:a-venue-playbook:4}
+Une plateforme introduit un délai sur les ordres entrants qui épargne les annulations. Comment cela modifie-t-il l'économie d'un teneur de marché, et de qui~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:hf:a-venue-playbook:5}
+Avec un budget d'ordres de $b$ par seconde et une rafale de $B$, et des recotations de deux ordres chacune, quel rythme utilise le budget sans rejet, et pourquoi
+un rythme plus rapide pourrait-il rapporter davantage~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:hf:a-venue-playbook:6}
+Dans une adjudication à prix uniforme par lots, un teneur de marché se place au meilleur cours acheteur et au meilleur cours vendeur. Montrez que ses exécutions subissent une sélection adverse, et décrivez une règle de cotation
+qui n'y est pas soumise.
+\end{interviewq}

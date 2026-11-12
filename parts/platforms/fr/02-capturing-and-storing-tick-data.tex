@@ -1,0 +1,434 @@
+\chapter{Capture et stockage des données tick}\label{ch:pl:capturing-and-storing-tick-data}
+
+Le flux consolidé des options américaines doit transporter des centaines de milliards de messages un jour chargé (l'encadré daté de
+la \cref{sec:pl:capturing-and-storing-tick-data:economics} donne le chiffre). Une société qui conserve chacun de ces messages pendant
+cinq ans exploite en parallèle une activité de stockage, et la première décision qu'elle prend n'est pas quelle base de données acheter mais
+ce qu'il faut exactement conserver~: les paquets tels qu'ils sont arrivés, avec leurs doublons, leurs trous et leurs heures d'arrivée,
+ou les événements qu'ils désignaient, nettoyés, arbitrés et disposés pour la lecture. Ce chapitre capture dix minutes chargées de la
+bourse simulée du livre~10 sur ses deux lignes de flux, les transforme en enregistrements d'événements de la société, mesure le coût de chaque disposition en octets, et met à l'échelle le
+résultat, avec des volumes de messages et des prix cités, à la question du titre de son problème du week-end~: un pétaoctet par an~?
+
+\section{Qu'est-ce que les données tick et où sont-elles capturées}
+
+\begin{definition}[Données tick]\label{def:pl:capturing-and-storing-tick-data:tick}
+Les \emph{données tick}\index{données tick} sont l'enregistrement de chaque événement qu'une plateforme publie sur ses instruments --- ajouts
+d'ordres, modifications, annulations et exécutions, transactions, cotations, messages d'état et de mesures de négociation --- avec les horodatages que
+la plateforme leur a apposés et l'heure à laquelle la société les a reçus.
+\end{definition}
+
+Les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} sont l'enregistrement le plus fin d'un marché que puisse conserver une société, et tout ce qui est plus grossier en
+découle~: les barres (livre~7, chapitre~2), les variables de carnet d'ordres (chapitre~8 de ce livre), les rejeux de son chapitre~18. Ce qui l'est moins, c'est que «~les~»
+\omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} d'une journée dépendent de l'endroit où elles ont été capturées. La \Cref{fig:pl:capturing-and-storing-tick-data:points} montre les trois
+points de capture usuels sur le parcours du traitement des données de marché du livre~13.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,
+  box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center},
+  cpt/.style={draw,rounded corners=2pt,fill=omThm!12,minimum height=0.6cm,inner sep=3pt,align=center}]
+\node[box] (a) at (0,0.6) {ligne A};
+\node[box] (b) at (0,-0.6) {ligne B};
+\node[box] (fh) at (3.2,0) {feed handler\\arbitrage, trous};
+\node[box] (bk) at (7.0,0) {constructeur de\\carnet, stratégie};
+\node[box] (st) at (10.9,0) {vue agrégée\\(écrans, risque)};
+\draw[->] (a) -- (fh);
+\draw[->] (b) -- (fh);
+\draw[->] (fh) -- node[above,font=\tiny]{événements} (bk);
+\draw[->] (bk) -- node[above,font=\tiny]{mises à jour} (st);
+\node[cpt] (c1) at (1.4,-1.9) {1. au fil~:\\paquets, les deux lignes};
+\node[cpt] (c2) at (4.9,-1.9) {2. après arbitrage~:\\un événement par message};
+\node[cpt] (c3) at (9.0,-1.9) {3. après conflation~:\\ce sur quoi on a agi};
+\draw[->,dashed,omThm] (1.4,0) -- (c1);
+\draw[->,dashed,omThm] (4.9,0) -- (c2);
+\draw[->,dashed,omThm] (9.0,0) -- (c3);
+\end{tikzpicture}
+
+\omcaption{Trois points de capture sur le parcours des données de marché. Au fil (une prise réseau ou un boîtier de capture, livre~14,
+chapitre~5), les paquets des deux lignes sont conservés tels qu'ils sont arrivés~; après l'arbitrage du feed handler, chaque message n'apparaît qu'une fois,
+dans l'ordre de la séquence~; après la conflation, seules restent les mises à jour qu'un consommateur a effectivement vues.}\label{fig:pl:capturing-and-storing-tick-data:points}
+\end{omfigure}
+
+Chaque point répond à des questions différentes. Seule la capture au fil peut dire quelle ligne a perdu quel paquet et à quel moment chaque paquet
+est arrivé, ce dont a besoin une enquête sur la latence ou sur le réseau. Seule la capture après arbitrage restitue le marché tel que le carnet de la société
+l'a vu, message par message. Seule la capture après conflation correspond à ce sur quoi un consommateur lent (livre~13, chapitre~12)
+a effectivement agi. La recherche veut la deuxième~; les opérations et la conformité ont parfois besoin de la première ou de la troisième.
+
+\begin{definition}[Capture brute]\label{def:pl:capturing-and-storing-tick-data:raw}
+Une \emph{capture brute}\index{capture brute} est la suite des octets reçus en un point de capture, conservée sans interprétation,
+chaque unité (un paquet, une trame) étant accompagnée de l'heure à laquelle la société l'a reçue.
+\end{definition}
+
+La capture du chapitre se fait au premier point, dans le format de fichier enregistré du simulateur du livre~10~: pour chaque paquet
+reçu sur une ligne, son heure de réception (8~octets), sa longueur (4~octets) et le paquet MoldUDP64 lui-même. Dix minutes de la phase d'ouverture chargée du simulateur,
+deux instruments, avec ses perturbations simulées --- pertes indépendantes sur chaque ligne, rafales de pertes, paquets dupliqués, gigue (jitter) et
+une panne de cinq secondes sur la ligne B --- donnent 15.8~Mo sur la ligne A et 15.6~Mo sur la ligne B.
+
+\section{Capture brute contre stockage normalisé}
+
+Pour reconstituer à partir de la capture le marché que le livre a vu, les deux lignes sont fusionnées par numéro de séquence~: la première copie de chaque message
+l'emporte, les copies suivantes sont des doublons, et un trou reste ouvert jusqu'à ce que l'autre ligne ait eu le temps de le combler. Ce que ni
+l'une ni l'autre ligne ne comble constitue un trou dans l'enregistrement~; un feed handler en temps réel demanderait le service de retransmission de la plateforme ou reconstruirait à partir d'un instantané (snapshot)
+(livre~13, chapitre~18), tandis qu'une capture destinée à la recherche le consigne et passe à la suite.
+La \Cref{lst:pl:capturing-and-storing-tick-data:arb} est l'arbitrage de \texttt{firm.tickcap}.
+
+\omcode{code/firm/tickcap/firm_tickcap.py}{53}{87}{Arbitrage de lignes pour le stockage~: la première copie l'emporte, les doublons sont comptés, et un
+trou que ni l'une ni l'autre ligne ne comble dans le délai imparti est consigné puis ignoré.}\label{lst:pl:capturing-and-storing-tick-data:arb}
+
+Sur la session de dix minutes, les deux lignes transportent 503\,024 paquets. L'arbitrage délivre 258\,535 messages, écarte 255\,899
+doublons (presque chaque paquet arrive deux fois, une fois par ligne) et consigne quatre trous, soit huit messages au total, perdus sur les deux lignes au
+même instant. Chaque message délivré est ensuite normalisé en enregistrement d'événement de la société~: l'heure de réception suivie de l'événement de 48~octets du
+feed handler du livre~13 (nature, côté, instrument, numéro de séquence, heure d'échange, références d'ordres, prix, quantité), soit 56~octets au
+total. Le stockage et le chemin de négociation partagent donc une seule disposition, et un test vérifie que les événements de la capture sont, message par
+message, ceux du feed handler.
+
+\begin{proposition}[La brute suffit, la normalisée non]\label{prop:pl:capturing-and-storing-tick-data:sufficient}
+Les enregistrements normalisés d'une session sont une fonction de sa \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} (et du code du normaliseur). La \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}
+n'est pas une fonction des enregistrements normalisés.
+\end{proposition}
+
+\begin{proof}
+La première partie relève de la construction~: l'arbitrage et la normalisation sont des fonctions déterministes des paquets captés et
+de leurs heures de réception. Pour la seconde, deux captures qui ne diffèrent que par ce que la normalisation écarte --- la ligne qui a livré un message
+en premier, les doublons, le découpage en paquets, l'heure de réception d'une copie ultérieure, les octets d'un type de message que le normaliseur ne connaît pas
+--- donnent les mêmes enregistrements.
+\end{proof}
+
+La proposition est l'argument entier en faveur de la conservation des \omterm{def:pl:capturing-and-storing-tick-data:raw}{captures brutes}. Un normaliseur comporte des bogues, et un champ
+dont personne n'avait besoin au moment de son écriture (un indicateur, un nouveau type de message après une mise à niveau de la plateforme) devient nécessaire un an plus tard~; avec la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}, les deux cas se corrigent
+en relançant le normaliseur corrigé~; sans elle, elles sont perdues. Le prix se mesure en octets, que le reste de ce chapitre
+compte.
+
+\begin{example}[Un champ que personne n'a conservé]\label{ex:pl:capturing-and-storing-tick-data:field}
+Les messages d'exécution avec prix du simulateur (type C) portent un indicateur imprimable qui précise si l'exécution compte dans le
+volume de la journée, et ses ajouts d'ordres portent le symbole de l'instrument et un numéro de suivi. L'enregistrement normalisé ne prévoit de champ pour
+aucun de ces éléments. Un chercheur qui veut plus tard un volume excluant les exécutions non imprimables ne peut le recalculer
+qu'à partir de la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}~; à partir du stockage normalisé, l'information est perdue pour chaque journée déjà écrite.
+\end{example}
+
+\section{Dispositions des enregistrements et codages}
+
+La \Cref{fig:pl:capturing-and-storing-tick-data:layouts} compte les octets par message. La \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} coûte 61.0~octets par message sur une
+ligne~: le simulateur envoie un message par paquet, si bien que chaque message porte un en-tête d'enregistrement de fichier de 12~octets, un en-tête MoldUDP64
+de 20~octets, une longueur de 2~octets, en plus de ses propres 23 à 44~octets. Les flux réels regroupent plusieurs messages dans un paquet et paient moins de surcharge~;
+la part de celle-ci est une propriété du flux, et c'est une raison de mesurer sur le flux effectivement capturé. L'enregistrement normalisé fait
+56~octets, de taille fixe~: il est à peine plus petit, mais chaque enregistrement se trouve à un décalage connu, ce qu'exploite le chapitre~4.
+
+\begin{definition}[Taux de compression]\label{def:pl:capturing-and-storing-tick-data:ratio}
+Le \emph{taux de compression}\index{taux de compression} (compression ratio) d'une disposition est la taille des données non compressées divisée par la taille des
+données compressées, $\mathrm{CR} = b_{\mathrm{raw}} / b_{\mathrm{comp}}$~; les octets par message après compression sont
+$b_{\mathrm{raw}} / \mathrm{CR}$.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,xbar,bar width=9pt,xmin=0,xmax=72,
+  ytick={0,1,2,3,4,5},yticklabels={capture brute,brute~; zlib 6,normalisée,normalisée~; zlib 6,Parquet~; zstd 3,colonnes delta~; zlib 6},
+  xlabel={octets par message},tick label style={font=\small},label style={font=\small},y dir=reverse,
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=1},
+  grid=major,grid style={gray!20},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=bytes_per_msg,y=k]{figdata/platforms/02-capturing-and-storing-tick-data/layouts.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Octets par message de la session de dix minutes, par disposition~: la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} d'une ligne, les enregistrements normalisés de 56~octets,
+et chacune compressée par un compresseur générique (zlib, niveau 6), dans un fichier en colonnes avec zstd (chapitre~3), et en colonnes avec les
+colonnes de temps, de numéro de séquence et de prix en encodage delta avant zlib. Données~: \texttt{pl\_tickcap.study}.}\label{fig:pl:capturing-and-storing-tick-data:layouts}
+\end{omfigure}
+
+Un compresseur générique appliqué à la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} atteint un taux de 3.32~; sur les enregistrements normalisés, 3.67. Les dispositions en colonnes font mieux,
+et le meilleur résultat de ce chapitre est l'astuce en colonnes la plus simple~: écrire chaque champ dans sa propre colonne, et écrire les colonnes dont
+valeurs croissent lentement (heure de réception, numéro de séquence, heure d'échange) ou varient par petits pas (prix) sous forme de différences avec la
+valeur précédente, avant un compresseur générique. Les deltas du numéro de séquence valent tous 1, ceux de l'heure de réception sont de petits
+entiers, et le taux monte à 4.70, soit 11.9~octets par message. Le chapitre~3 explique pourquoi les colonnes se compressent mieux que les lignes~; ce
+chapitre se contente de compter.
+
+\omcode{code/firm/tickcap/firm_tickcap.py}{121}{131}{Encodage delta par colonne~: chaque champ écrit comme une colonne, ceux qui varient
+lentement sous forme de différences avec la ligne précédente.}\label{lst:pl:capturing-and-storing-tick-data:delta}
+
+\begin{remark}[Répartition des messages]\label{rem:pl:capturing-and-storing-tick-data:mix}
+Sur les 258\,535 messages de la session, 49.3~\% sont des ajouts d'ordres et 47.3~\% des suppressions~; les exécutions représentent 3.4~\%. C'est la forme d'un
+marché coté, et c'est pourquoi une base ne contenant que les transactions est cent fois plus petite qu'une base à profondeur complète et ne répond à aucune des
+questions des chapitres~8 et~18 du livre~7.
+\end{remark}
+
+\section{Partitionnement et compression}
+
+\begin{definition}[Partitionnement, clé de partition]\label{def:pl:capturing-and-storing-tick-data:partition}
+Le \emph{partitionnement}\index{partitionnement} (partitioning) découpe un jeu de données en parties stockées séparément selon la valeur d'un ou de plusieurs champs, sa
+\emph{clé de partition}\index{clé de partition} (partition key), soit la date de négociation ou l'instrument, de sorte qu'une requête qui nomme des valeurs de clé ne lise que
+les parties qui les contiennent.
+\end{definition}
+
+\begin{proposition}[Élagage]\label{prop:pl:capturing-and-storing-tick-data:pruning}
+Une requête dont le filtre fixe la \omterm{def:pl:capturing-and-storing-tick-data:partition}{clé de partition} à un ensemble $S$ de valeurs lit $\sum_{v\in S} B_v$ octets, où $B_v$ est la taille de
+la partition de valeur $v$, au lieu de l'ensemble du jeu de données~; avec une surcharge par fichier $o$, elle paie aussi $|S|\,o$.
+\end{proposition}
+
+\begin{proof}
+Les partitions hors de $S$ ne peuvent contenir aucune ligne correspondante, si bien qu'il n'est pas nécessaire de les ouvrir~; chaque partition ouverte coûte sa taille et sa
+surcharge.
+\end{proof}
+
+La session du chapitre est stockée sous \texttt{date=2026-09-28/locate=N/}. Ses deux instruments sont très inégaux~: l'instrument~1
+occupe 811\,160 octets sur les 14\,477\,960, soit 5.6~\% de la journée, si bien qu'une requête le concernant lit 5.6~\% de ce que coûterait le
+fichier non partitionné. Le terme de surcharge est la limite. Partitionner une journée d'options américaines par série d'options, et une requête pour un sous-jacent donné ouvre
+des milliers de petits fichiers, chacun coûtant une recherche de répertoire et une ouverture~; partitionner par sous-jacent donne des fichiers volumineux, et la
+requête en ouvre peu. La règle empirique qui en découle --- choisir la \omterm{def:pl:capturing-and-storing-tick-data:partition}{clé de partition} parmi les filtres que les requêtes utilisent réellement, et garder
+des partitions assez grandes pour que leur surcharge soit négligeable --- fait l'objet de la base de ticks du chapitre~4.
+
+La compression implique son propre compromis, entre taux et vitesse (voir la \cref{fig:pl:capturing-and-storing-tick-data:speed}). Sur cet ordinateur portable
+zlib au niveau 9 gagne environ 2~\% de taux par rapport au niveau 6, pour un douzième de sa vitesse, et zstd au niveau 9 dans un fichier en colonnes est
+à la fois plus rapide et plus efficace que zlib au niveau 6 sur les mêmes enregistrements. La capture écrit une seule fois et en temps réel, elle a donc besoin de vitesse~; la base historique écrit une fois
+la nuit et est lue des milliers de fois, elle privilégie donc le taux.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6.8cm,xmode=log,xlabel={débit de compression (Mo/s, échelle logarithmique)},ylabel={taux de compression},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},xmin=1.5,xmax=1000,ymin=2.7,ymax=5.0,
+  nodes near coords,point meta=explicit symbolic,visualization depends on={value \thisrow{anchor}\as\myanchor},
+  nodes near coords style={font=\scriptsize,anchor=\myanchor},table/col sep=comma]
+\addplot[only marks,mark=*,omDef] table[x=mb_per_s,y=ratio,meta=method,row sep=\\]{method,ratio,mb_per_s,anchor\\ brut zlib 1,2.949,122.5,south west\\ brut zlib 6,3.318,34.5,north west\\ brut zlib 9,3.399,3.0,south west\\ norm. zlib 6,3.674,51.3,south east\\ Parquet zstd 1,3.454,220.3,south west\\ Parquet zstd 9,3.826,94.2,south east\\ delta zlib 6,4.703,31.2,south west\\};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:capturing-and-storing-tick-data:ratio}{Taux de compression} en fonction du débit pour la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} de la session («~brute~») et les enregistrements normalisés, par méthode et
+niveau, meilleure de cinq exécutions sur un seul cœur. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, machine par ailleurs inactive. Données~:
+\texttt{bench\_compress.py}.}\label{fig:pl:capturing-and-storing-tick-data:speed}
+\end{omfigure}
+
+\begin{method}[Choix d'une disposition pour une capture]\label{met:pl:capturing-and-storing-tick-data:choose}
+Conserver la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} des lignes sur lesquelles la firme négocie, compressée rapidement, aussi longtemps que les enquêtes en ont besoin. Normaliser en
+enregistrements de largeur fixe dans l'ordre d'arrivée pour la base intrajournalière. En fin de journée, réécrire en colonnes, partitionnées par
+date et par la clé sur laquelle filtrent les requêtes, compressées pour le \omterm{def:pl:capturing-and-storing-tick-data:ratio}{taux de compression}. Mesurer les octets par message et la vitesse du compresseur sur les
+flux propres à la firme, et non sur ceux d'un banc d'essai.
+\end{method}
+
+\section{Rétention, niveaux de stockage et économie des pétaoctets}\label{sec:pl:capturing-and-storing-tick-data:economics}
+
+\begin{definition}[Niveau de stockage, politique de rétention]\label{def:pl:capturing-and-storing-tick-data:tier}
+Un \emph{niveau de stockage}\index{niveau de stockage} (storage tier) est une catégorie de stockage dotée de son propre prix, de son temps d'accès et de ses frais d'accès (stockage à chaud
+lecture en millisecondes, stockage à accès peu fréquent, stockage d'archive restauré en quelques heures). Une \emph{politique de rétention}\index{politique de rétention} (retention policy)
+précise pendant combien de temps chaque jeu de données est conservé, dans quel niveau à chaque âge, et quand il est supprimé.
+\end{definition}
+
+\begin{dated}{2026-09}{Nombre de messages d'un flux complet et prix du stockage}\label{dat:pl:capturing-and-storing-tick-data:numbers}
+L'opérateur du flux consolidé d'options américaines prévoit, dans un avis aux abonnés du 15 septembre 2025 (consulté en
+septembre 2026), une capacité de 311 milliards de messages par jour à partir de juillet 2026, avec des pointes de 13.6 millions de messages par 100 millisecondes, pour l'un des
+deux flux redondants. Les tarifs publics d'un grand fournisseur de cloud pour le stockage d'objets dans sa région US East (consultés en
+septembre 2026) sont de 0.023~USD par Go-mois pour le stockage standard, 0.0125~USD pour l'accès peu fréquent et 0.00099~USD pour son niveau d'archivage le plus profond.
+\end{dated}
+
+\begin{dated}{2026-09}{Durée de conservation des enregistrements d'ordres}\label{dat:pl:capturing-and-storing-tick-data:retention}
+Dans l'Union européenne (consulté en septembre 2026), les entreprises d'investissement qui pratiquent le trading algorithmique conservent les enregistrements de leurs
+ordres pendant cinq ans à compter de la transmission de chaque ordre (Commission Delegated Regulation (EU) 2017/589, article 28). Les données de marché
+ne sont pas un enregistrement d'ordre, mais les données dont une firme a besoin pour expliquer un ordre sont conservées au moins aussi longtemps.
+\end{dated}
+
+Le modèle de stockage de \texttt{firm.tickcap} le développe~: les octets par jour sont égaux au nombre de messages, multiplié par les octets par message, multiplié par le nombre
+de copies~; une année compte 252 jours de séance~; le coût en régime permanent pour conserver cinq ans est celui du dernier mois (21 jours de séance) sur le stockage à chaud
+du reste de la première année sur le stockage à accès peu fréquent, et des quatre années plus anciennes sur l'archive.
+Le \Cref{tab:pl:capturing-and-storing-tick-data:economics} applique ce modèle à la capacité prévue du flux d'options, avec les
+octets par message de la session simulée.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+disposition & To par jour & Po par an & Po en 5 ans & USD par an, par niveaux \\
+\midrule
+\omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}, deux lignes & 37.95 & 9.56 & 47.8 & 1\,989\,000 \\
+\omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}, une ligne & 18.97 & 4.78 & 23.9 & 995\,000 \\
+normalisée & 17.42 & 4.39 & 21.9 & 913\,000 \\
+colonnes delta, zlib 6 & 3.70 & 0.93 & 4.67 & 194\,000 \\
+\bottomrule
+\end{tabular}
+\caption{Capture complète du flux d'options à sa capacité quotidienne prévue (encadré daté), avec les octets par
+message de la session simulée~: stockage par jour, par an et après cinq ans, et coût annuel de la conservation de cinq ans sur trois niveaux aux tarifs
+datés. Données~: \texttt{pl\_tickcap.economics}.}\label{tab:pl:capturing-and-storing-tick-data:economics}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={années conservées},ylabel={pétaoctets stockés},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!20},xmin=0,xmax=5,ymin=0,ymax=50,xtick={0,1,2,3,4,5},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.28)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[thick,omThm] table[x=years,y=s0]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omThm,dashed] table[x=years,y=s1]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omDef] table[x=years,y=s2]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\addplot[thick,omMeth] table[x=years,y=s3]{figdata/platforms/02-capturing-and-storing-tick-data/stored.csv};
+\legend{brut~; deux lignes,brut~; une ligne,normalisé,colonnes delta + zlib}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Pétaoctets accumulés par la capture complète du flux d'options à sa capacité prévue, par disposition~: cinq ans de \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} des deux lignes
+atteignent 48~Po, cinq ans de colonnes compressées 4.7~Po. Données~: \texttt{pl\_tickcap.economics} (nombre de messages et tarifs de l'encadré daté).
+et tarifs de l'encadré daté).}\label{fig:pl:capturing-and-storing-tick-data:stored}
+\end{omfigure}
+
+Deux précautions gardent le tableau honnête. Le nombre de messages est une capacité que l'opérateur du flux prévoit, un plafond et non une
+journée moyenne, si bien que le tableau constitue une borne supérieure. Et les octets par message sont ceux du simulateur~: les vrais messages d'options ont d'autres
+tailles et une autre redondance, et un taux réel peut être supérieur ou inférieur. La méthode se transpose~; les chiffres doivent être mesurés à nouveau sur le
+flux lui-même. Ce qui se transpose, c'est la forme~: le pétaoctet le moins cher est celui qui n'est pas écrit deux fois (les deux lignes), pas écrit dans
+sa disposition la plus lourde, et pas conservé sur le niveau à chaud après le mois pendant lequel quelqu'un le lit.
+
+\section{Tutoriel~: dix minutes sur deux lignes}\label{tut:pl:capturing-and-storing-tick-data:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Capturer une session simulée chargée sur les deux lignes, arbitrer et normaliser, mesurer chaque disposition, et étendre le
+résultat à un flux complet. \textbf{État final~:} \cref{fig:pl:capturing-and-storing-tick-data:layouts,fig:pl:capturing-and-storing-tick-data:stored}
+et le \cref{tab:pl:capturing-and-storing-tick-data:economics}.
+\begin{tutsteps}
+\item \textbf{Générer.} \texttt{pl\_tickcap.day()} lance \texttt{make\_recorded\_day} du livre~10 pendant dix minutes et deux
+instruments dans \texttt{data/platforms/generated/} (environ 43~Mo, ignoré par git, régénéré par le script).
+\item \textbf{Arbitrer et normaliser} (\cref{lst:pl:capturing-and-storing-tick-data:arb})~: 258\,535 messages, 255\,899
+doublons, quatre trous de huit messages.
+\item \textbf{Mesurer} avec \texttt{study()}~: octets par message et \omterm{def:pl:capturing-and-storing-tick-data:ratio}{taux de compression} de chaque disposition.
+\item \textbf{Partitionner} avec \texttt{firm\_tickcap.partition} et comparer les octets lus par une requête sur un seul instrument.
+\item \textbf{Passer à l'échelle} avec \texttt{economics()} et les données sources citées.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Trier les enregistrements par instrument avant l'encodage delta, prévoir, puis mesurer, la variation
+du taux~; exécuter \texttt{bench\_compress.py} avec zstd à davantage de niveaux et trouver le niveau auquel la capture suivrait le
+débit de pointe du flux.
+\end{tutorial}
+
+\section{Construction~: la capture des ticks}\label{bld:pl:capturing-and-storing-tick-data:tickcap}
+
+\begin{build}
+\bfield{Rôle} Le premier étage de la colonne vertébrale de données de la firme~: \omterm{def:pl:capturing-and-storing-tick-data:raw}{captures brutes} de chaque ligne, enregistrements normalisés et arbitrés, une
+disposition partitionnée, et les chiffres qui dimensionnent le stockage. La base de ticks du chapitre~4 lit ses enregistrements~; les contrôles de qualité du chapitre~7
+lisent ses trous et ses compteurs.
+\bfield{Interface} \texttt{RECORD} (56~octets~: heure de réception et événement de flux du livre~13)~; \texttt{read\_capture(data)}~;
+\texttt{arbitrate(lines, timeout\_ns) -> (messages, gaps, counters)}~; \texttt{normalise(messages)}~;
+\texttt{partition(rec, root, date)}, \texttt{read\_partition}~; \texttt{delta\_encode},
+\texttt{compressed\_size(data, method, level)}~; \texttt{StorageModel(msgs\_per\_day, bytes\_per\_msg, ratio, days\_per\_year, copies)} avec \texttt{bytes\_per\_day},
+\texttt{bytes\_per\_year}, \texttt{stored\_after}, \texttt{cost\_per\_year}.
+\bfield{Règles} La \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} n'est jamais modifiée~; l'arbitrage est déterministe (première copie par heure de réception, puis par ligne)~; chaque
+trou est consigné avec son intervalle de numéros de séquence~; l'enregistrement normalisé est l'événement du livre~13 plus l'heure de réception, octet pour octet.
+\bfield{Tests d'acceptation} \texttt{code/firm/tickcap/tests/}~: la disposition de l'enregistrement~; un aller-retour de capture~; l'arbitrage avec une perte sur
+une ligne, des doublons et un trou sur les deux~; les mêmes événements que le feed handler du livre~13 sur une session enregistrée jusqu'au premier trou~;
+des partitions écrites puis relues~; chaque méthode de compression plus petite que l'entrée et l'encodage delta inversible~; le
+modèle de stockage calculé à la main.
+\bfield{Pour aller plus loin} La retransmission et la reprise par instantané (snapshot) pendant la capture (réutiliser \texttt{firm.feedhandler})~; une capture qui écrit
+des blocs compressés avec un index~; le modèle avec un nombre de messages qui croît chaque année.
+\end{build}
+
+\begin{omsources}
+\item Options Price Reporting Authority, \emph{Revised OPRA Capacity Projections}, avis aux abonnés aux données multicast,
+15 septembre 2025.
+\item Y.~Collet et M.~Kucherawy (éd.), \emph{Zstandard Compression and the application/zstd Media Type}, RFC~8878, 2021~;
+P.~Deutsch et J.-L.~Gailly, \emph{ZLIB Compressed Data Format Specification}, RFC~1950, 1996.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS~6), article~28.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:1}
+La capture de la ligne A fait 15\,773\,858 octets pour 258\,535 messages, un message par paquet. Combien d'octets par message cela représente-t-il, et
+quelle part en est l'encadrement (l'en-tête d'enregistrement de fichier de 12 octets, l'en-tête de paquet de 20 octets et la longueur de 2 octets)~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:2}
+Les enregistrements normalisés se compressent avec zlib au niveau 6 à 15.24 octets par message. Quel est le \omterm{def:pl:capturing-and-storing-tick-data:ratio}{taux de compression}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:capturing-and-storing-tick-data:3}
+La partition de l'instrument~1 contient 811\,160 octets des 14\,477\,960 octets de la journée. Combien d'enregistrements cela représente-t-il, et quelle part de la journée
+une requête sur l'instrument~1 lit-elle avec et sans \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitionnement} par instrument~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:4}
+Conserver les \omterm{def:pl:capturing-and-storing-tick-data:raw}{captures brutes} des deux lignes double leur coût. Formuler une question à laquelle seules les deux \omterm{def:pl:capturing-and-storing-tick-data:raw}{captures brutes} peuvent répondre, et une question
+à laquelle les enregistrements arbitrés répondent aussi bien.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:5}
+À raison de 311 milliards de messages par jour et de 11.9 octets par message, combien de téraoctets par jour et de pétaoctets par an (252 jours)
+occupe la disposition en colonnes compressée~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:capturing-and-storing-tick-data:6}
+Avec les prix datés, combien coûte par an la conservation de cinq années de la disposition compressée si tout reste en
+stockage standard, comparé à la politique par niveaux du \cref{tab:pl:capturing-and-storing-tick-data:economics}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:capturing-and-storing-tick-data:7}
+\emph{Programmation.} Trier les enregistrements de la séance par instrument puis par numéro de séquence avant l'encodage delta. Prédire la variation
+du \omterm{def:pl:capturing-and-storing-tick-data:ratio}{taux de compression}, puis la mesurer avec \texttt{compressed\_size}, et expliquer le résultat.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:capturing-and-storing-tick-data:8}
+\emph{Trouver la faille.} «~Notre capture compresse chaque paquet avec zlib au niveau 9 avant de l'écrire, car cela donne le meilleur
+taux sur notre référence.~»
+\end{exercise}
+
+\section{Problème~: un pétaoctet par an~?}
+
+\begin{problem}[{Problème du week-end --- dimensionnement de la capture d'un flux complet}]\label{pb:pl:capturing-and-storing-tick-data:1}
+La séance de dix minutes du chapitre, ses dispositions, la capacité prévue du flux d'options et les prix de stockage des
+encadrés datés.
+
+\medskip\noindent\textbf{Partie I --- La capture.}
+\begin{enumerate}
+\item Combien de paquets transportent les deux lignes, et combien de messages l'arbitrage délivre-t-il~?
+\item Combien de doublons sont écartés, et pourquoi ce nombre est-il proche de la moitié des paquets~?
+\item Combien de messages ont été perdus sur les deux lignes, et qu'aurait fait un feed handler en temps réel à leur sujet~?
+\item Pourquoi les enregistrements normalisés ne peuvent-ils pas être reconvertis en \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}~?
+\item Nommer un champ des messages du simulateur que l'enregistrement normalisé omet.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Dispositions.}
+\begin{enumerate}[resume]
+\item Donner les octets par message pour la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute}, pour les enregistrements normalisés et pour les colonnes soumises à l'encodage delta avec zlib.
+\item Quels sont les \omterm{def:pl:capturing-and-storing-tick-data:ratio}{taux de compression} de la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} avec zlib et des colonnes soumises à l'encodage delta~?
+\item Pourquoi l'encodage delta profite-t-il le plus au numéro de séquence~?
+\item Quelle disposition faudrait-il conserver, et pendant combien de temps~?
+\item Pourquoi faut-il remesurer les octets par message sur le flux réel~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Échelle.}
+\begin{enumerate}[resume]
+\item À la capacité prévue, combien de téraoctets par jour représente la \omterm{def:pl:capturing-and-storing-tick-data:raw}{capture brute} des deux lignes~?
+\item Combien de pétaoctets s'accumulent-ils en cinq ans~?
+\item Mêmes questions pour les colonnes soumises à l'encodage delta.
+\item Quel est le coût annuel de la conservation de cinq années de chacune dans les trois niveaux~?
+\item Pourquoi le chiffre de capacité est-il une borne supérieure pour une journée typique~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les pétaoctets par an et le coût annuel de la capture complète dans la disposition la plus lourde et dans la plus
+légère.
+\item La réponse à la question du titre dépend-elle davantage de la disposition ou de la hiérarchisation par niveaux~?
+\item Que fait gagner le \omterm{def:pl:capturing-and-storing-tick-data:partition}{partitionnement} par instrument à une requête sur un instrument pendant la séance, et que coûte-t-il
+lorsqu'il existe des millions de séries~?
+\item À quel endroit du pipeline faut-il exécuter le compresseur rapide, et à quel endroit le lent~?
+\item En une phrase~: que doit conserver une firme de ses \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick}, et sous quelle forme~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:capturing-and-storing-tick-data:1}
+Quelle est la différence entre les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} brutes et normalisées, et pourquoi une firme conserverait-elle les deux~?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:capturing-and-storing-tick-data:2}
+Deux lignes de flux redondantes sont capturées. Comment les transformez-vous en un seul flux de messages, et que faites-vous d'un trou~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:capturing-and-storing-tick-data:3}
+Comment estimeriez-vous le stockage nécessaire pour conserver cinq années d'un flux à profondeur complète, et que mesureriez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:capturing-and-storing-tick-data:4}
+Comment choisissez-vous une \omterm{def:pl:capturing-and-storing-tick-data:partition}{clé de partition} pour les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick}, et que se passe-t-il si vous en choisissez une trop fine~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:capturing-and-storing-tick-data:5}
+Pourquoi les données de marché se compressent-elles bien, et quels champs se compressent le mieux~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:capturing-and-storing-tick-data:6}
+Concevez le stockage des \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} d'une firme qui négocie des options américaines~: ce qui est capturé où, dans quelle disposition, conservé combien de temps, dans
+quel niveau, et pour quel ordre de grandeur de coût~?
+\end{interviewq}

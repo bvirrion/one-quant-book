@@ -1,0 +1,332 @@
+\chapter{Programmation sans verrou}\label{ch:ll:lock-free-programming}
+
+En juillet 1997, une sonde posée à la surface de Mars se mit à redémarrer d'elle-même, perdant des données à chaque fois. Une tâche de faible priorité qui
+collectait des données météorologiques détenait un verrou dont avait besoin une tâche de haute priorité gérant le bus d'information~; une tâche de priorité moyenne
+s'intercalait, la tâche de haute priorité manqua son échéance, et un watchdog redémarra la machine. Le correctif, téléversé depuis
+la Terre, activa l'héritage de priorité pour ce verrou (Jones, 1997). Un thread de trading qui partage un verrou avec un outil de journalisation,
+un module de reporting des risques ou un rechargeur de configuration pose le même problème, sauf que l'échéance se compte en microsecondes, et que le
+thread inférieur n'a pas besoin d'être interrompu par rien de plus sinistre que l'ordonnanceur du système d'exploitation. Ce chapitre traite de
+du partage de données entre threads \omterm{def:ll:lock-free-programming:progress}{sans verrou}~: ce que le matériel garantit sur la mémoire, ce que C++ et Rust permettent à un programme
+dire sur l'ordonnancement, la boucle \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} et son piège classique, la récupération de la mémoire que d'autres threads peuvent
+encore lire, et ce que «~\omterm{def:ll:lock-free-programming:progress}{sans verrou}~» promet réellement.
+
+\section{Atomiques et modèle mémoire}
+
+\begin{definition}[Opération atomique]\label{def:ll:lock-free-programming:atomic}
+Une \emph{opération atomique}\index{opération atomique} sur un emplacement mémoire est indivisible vis-à-vis des autres threads~: aucun
+thread ne l'observe à moitié faite. C++ fournit \texttt{std::atomic<T>} et Rust \texttt{AtomicU64} et ses semblables, avec
+lectures, écritures, échanges, fetch-and-add et \omterm{def:ll:lock-free-programming:cas}{compare-and-swap}~; sur x86, chacun correspond à une seule instruction pour des tailles allant jusqu'à huit
+octets.
+\end{definition}
+
+Une \omterm{def:ll:rust-for-low-latency:race}{course aux données} (data race, chapitre~9) est un \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{comportement indéfini} en C++~; les atomiques sont le moyen de partager un emplacement sans en produire une. La
+question qu'elles laissent ouverte est celle de l'ordre. Un processeur exécute dans le désordre (chapitre~2), garde les écritures dans un tampon avant
+qu'elles atteignent le cache, et un compilateur réordonne les accès mémoire qu'il peut prouver indépendants dans un même thread~; un autre thread peut
+donc voir les écritures d'un thread dans un ordre différent de celui du programme.
+
+\begin{definition}[Ordonnancement mémoire, ordonnancement acquire--release, cohérence séquentielle]\label{def:ll:lock-free-programming:ordering}
+L'\emph{ordonnancement mémoire}\index{ordonnancement mémoire} (memory ordering) d'une \omterm{def:ll:lock-free-programming:atomic}{opération atomique} précise les autres accès mémoire qu'elle ordonne.
+Dans l'\emph{ordonnancement acquire--release}\index{ordonnancement acquire--release}, une lecture en acquire qui lit la valeur écrite par une
+écriture en release voit toutes les écritures faites par le thread qui écrit avant cette écriture~: la paire publie les données. \emph{Cohérence
+séquentielle}\index{cohérence séquentielle}, la valeur par défaut des atomiques C++, ajoute un ordre total unique sur toutes ces opérations
+que tous les threads acceptent, comme si elles étaient entrelacées sur un seul processeur. Une opération relâchée est atomique mais ordonne
+rien d'autre.
+\end{definition}
+
+Le schéma de publication (écrire les données, puis stocker un drapeau en release~; charger le drapeau en acquire, puis lire les données) est
+le backbone de tout tampon circulaire du chapitre~12. La \omterm{def:ll:lock-free-programming:ordering}{cohérence séquentielle} est nécessaire moins souvent et coûte plus cher~; le cas classique
+où l'\omterm{def:ll:lock-free-programming:ordering}{ordonnancement acquire--release} ne suffit pas est le schéma du tampon d'écritures de la \cref{fig:ll:lock-free-programming:litmus}~: chaque
+thread écrit son propre drapeau et lit celui de l'autre. Sur x86, une écriture peut encore se trouver dans le tampon d'écritures du processeur quand la
+lecture suivante d'un autre emplacement s'achève, si bien que les deux threads peuvent lire zéro. Seule une écriture à \omterm{def:ll:lock-free-programming:ordering}{cohérence séquentielle} (compilée
+en une instruction qui vide le tampon) l'interdit.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5cm,ybar,bar width=16pt,ymin=0,enlarge y limits={upper,value=0.2},
+  symbolic x coords={relaxed,release-acquire,seq_cst},xtick=data,xticklabels={relaxed,{release--acquire},seq\_cst},
+  enlarge x limits=0.3,ylabel={$r_1 = r_2 = 0$ par million},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=ordering,y=both_zero]{figdata/low-latency/11-lock-free-programming/measured_litmus.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le test litmus du tampon d'écritures~: le thread A exécute \texttt{x = 1; r1 = y}, le thread B exécute \texttt{y = 1; r2 = x},
+un million de fois chacun. Sous une \omterm{def:ll:lock-free-programming:ordering}{cohérence séquentielle}, au moins une lecture voit 1~; avec des ordonnancements plus faibles, les écritures encore dans le tampon de chaque
+cœur permettent aux deux de lire 0, rarement mais réellement. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans
+cœurs isolés. Données~: \texttt{bench\_lockfree.py}.}\label{fig:ll:lock-free-programming:litmus}
+\end{omfigure}
+
+\section{Boucles compare-and-swap et problème ABA}
+
+\begin{definition}[Compare-and-swap]\label{def:ll:lock-free-programming:cas}
+Le \emph{compare-and-swap}\index{compare-and-swap} (CAS) remplace atomiquement la valeur d'un emplacement par une nouvelle valeur si et
+seulement si elle est toujours égale à une valeur attendue, et indique si elle l'a fait. Une boucle CAS lit la valeur courante, calcule une nouvelle
+valeur, puis relance le CAS jusqu'à ce qu'aucun autre thread n'ait modifié l'emplacement entre-temps.
+\end{definition}
+
+Toute structure \omterm{def:ll:lock-free-programming:progress}{sans verrou} est construite à partir de boucles CAS. Une pile dépile en lisant le nœud de tête et son successeur, puis fait
+basculer la tête du nœud vers son successeur par un CAS~; le CAS échoue, et la boucle recommence, si un autre thread a déplacé la tête
+entre-temps. L'échec qu'elle ne peut pas voir est le changement qui a été annulé.
+
+\begin{definition}[Problème ABA]\label{def:ll:lock-free-programming:aba}
+Le \emph{problème ABA}\index{problème ABA} est l'échec d'un \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} à voir qu'un emplacement est passé de
+$A$ à $B$, puis de nouveau à $A$, entre la lecture et le CAS~: la comparaison réussit alors que l'état à partir duquel elle a été calculée
+(ici, le successeur de $A$) est périmé.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  nd/.style={draw=omDef,fill=omDef!10,circle,minimum size=0.6cm,inner sep=0pt},
+  fr/.style={draw=gray,fill=gray!15,circle,minimum size=0.6cm,inner sep=0pt}]
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (0.9,1.9) {1. thread 1 lit\\ tête et suivant};
+\node[nd] (a1) at (0,1.4) {A}; \node[nd] (b1) at (0.9,1.4) {B}; \node[nd] (c1) at (1.8,1.4) {C};
+\draw[-Stealth] (a1) -- (b1); \draw[-Stealth] (b1) -- (c1);
+\node[anchor=north,align=center] at (0.9,0.9) {tête = A,\\ suivant = B};
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (5.3,1.9) {2. thread 2~: dépile A,\\ dépile B, empile A};
+\node[nd] (a2) at (4.5,1.4) {A}; \node[nd] (c2) at (5.4,1.4) {C}; \node[fr] (b2) at (6.6,1.4) {B};
+\draw[-Stealth] (a2) -- (c2);
+\node[anchor=north,align=center] at (5.5,0.9) {tête = A à nouveau~;\\ B de retour dans la réserve};
+\node[anchor=south,font=\footnotesize\bfseries,align=center] at (10.0,1.9) {3. thread 1~:\\ CAS(tête, A $\to$ B)};
+\node[fr,draw=omThm,fill=omThm!15] (b3) at (9.5,1.4) {B}; \node[nd] (c3) at (10.6,1.4) {C};
+\draw[-Stealth,omThm] (b3) -- (c3);
+\node[anchor=north,align=center,omThm] at (10.05,0.9) {réussit~: la tête est\\ un nœud de la réserve libre};
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:ll:lock-free-programming:aba}{problème ABA} sur une pile \omterm{def:ll:lock-free-programming:progress}{sans verrou}. La tête vaut A les deux fois où le thread 1 regarde, si bien que son \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} réussit
+et installe B, que le thread 2 a déjà retiré. Un marqueur incrémenté à chaque mise à jour rend inégale la seconde comparaison avec A.
+Données~: \texttt{ll\_aba.aba}, un rejeu déterministe.}\label{fig:ll:lock-free-programming:aba}
+\end{omfigure}
+
+Les remèdes classiques changent ce que l'on compare. Un marqueur (un compteur de version) stocké à côté du pointeur et incrémenté à chaque
+mise à jour fait comparer les trois états $A$, $B$, $A$ comme $(A,1)$, $(B,2)$, $(A,3)$. Sur x86-64, un pointeur et un compteur tiennent dans un
+\omterm{def:ll:lock-free-programming:cas}{compare-and-swap} de 16 octets~; la pile du tutoriel évite cette instruction large en rangeant les nœuds dans un tableau de taille fixe et en empaquetant un
+index de 32 bits avec un marqueur de 32 bits dans un seul mot de 64 bits. Ses nœuds ne sont jamais libérés, ce qui supprime l'autre moitié du
+problème.
+
+\section{Récupération sûre de la mémoire}
+
+\begin{definition}[Pointeur de danger, récupération par époques]\label{def:ll:lock-free-programming:reclaim}
+Dans une structure \omterm{def:ll:lock-free-programming:progress}{sans verrou} dont les nœuds sont libérés, un nœud retiré par un thread peut encore être lu par un autre qui a chargé son
+adresse avant ce retrait. Un \emph{pointeur de danger}\index{pointeur de danger} (hazard pointer) est un pointeur publié par chaque thread vers un nœud que le
+thread s'apprête à lire~; un nœud n'est libéré que lorsqu'aucun pointeur de danger ne le désigne (Michael, 2004). Dans
+\emph{récupération par époques}\index{récupération par époques} (epoch-based reclamation), les threads annoncent leur entrée dans une époque globale et leur sortie de celle-ci~; un nœud
+retiré à l'époque $e$ est libéré dès que chaque thread a quitté $e$ (Fraser, 2004).
+\end{definition}
+
+Les deux reportent la libération jusqu'à ce qu'aucun lecteur ne puisse tenir le nœud, et toutes deux pèsent sur le chemin de lecture~: les \omterm{def:ll:lock-free-programming:reclaim}{pointeurs de danger} coûtent une écriture et une
+barrière mémoire par nœud lu, les époques une écriture à l'entrée et à la sortie de chaque opération. Sur un chemin critique (hot path), la récupération la plus simple consiste à n'en faire aucune~:
+des pools à taille fixe dont les emplacements sont recyclés mais jamais rendus au système (chapitre~6), des tampons circulaires bornés dont les cellules sont réutilisées
+selon leur position (chapitre~12), et les indices étiquetés du tutoriel. La récupération compte pour les structures non bornées partagées entre
+de nombreux threads, et un chemin critique ne devrait pas en avoir.
+
+\section{Garanties de progression}
+
+\begin{definition}[Sans verrou, sans attente]\label{def:ll:lock-free-programming:progress}
+Un algorithme est \emph{sans verrou}\index{sans verrou} (lock-free) si, quel que soit l'ordonnancement des threads, un thread achève son
+opération en un nombre fini de ses propres pas~: un thread qui s'arrête ne peut pas bloquer les autres. Il est \emph{sans attente}\index{sans attente} (wait-free)
+si chaque thread achève son opération en un nombre borné de ses propres pas, quoi que fassent les autres (Herlihy, 1991).
+\end{definition}
+
+\begin{definition}[Inversion de priorité]\label{def:ll:lock-free-programming:inversion}
+L'\emph{inversion de priorité}\index{inversion de priorité} (priority inversion) survient lorsqu'un thread de haute priorité attend une ressource détenue par un
+thread de basse priorité qui ne peut pas s'exécuter, parce que des threads de priorité intermédiaire monopolisent son processeur~; le thread de haute priorité est
+de fait rétrogradé sous les threads de priorité intermédiaire.
+\end{definition}
+
+Ces garanties portent sur les blocages, non sur la vitesse. Les threads d'un algorithme \omterm{def:ll:lock-free-programming:progress}{sans verrou} peuvent encore entrer en collision et réessayer, et en cas de
+contention, une boucle CAS peut être plus lente qu'un verrou (\cref{fig:ll:lock-free-programming:counters})~; ce qu'elle supprime est la
+possibilité qu'un thread préempté détenant un verrou fige tout le monde et, avec elle, l'\omterm{def:ll:lock-free-programming:inversion}{inversion de priorité}. Beaucoup de structures utiles
+se situent entre ces catégories~: la file multi-producteurs bornée de la construction utilise une seule opération CAS par appel, \omterm{def:ll:lock-free-programming:progress}{sans
+verrou}, mais son auteur signale qu'elle n'est pas \omterm{def:ll:lock-free-programming:progress}{sans verrou} au sens officiel, car un producteur arrêté entre la réservation d'une
+cellule et son remplissage bloque les consommateurs de cette cellule. Les structures \omterm{def:ll:lock-free-programming:progress}{sans attente} sont plus rares et souvent plus lentes en moyenne~; un
+tampon circulaire à un seul producteur et un seul consommateur (chapitre~12) est \omterm{def:ll:lock-free-programming:progress}{sans attente} sans surcoût, et c'est la structure la plus utilisée sur les chemins critiques du trading.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,ymode=log,xmin=0.8,xmax=4.2,ymin=2,ymax=400,xtick={1,2,3,4},
+  ytick={2,5,10,20,50,100,200},yticklabels={2,5,10,20,50,100,200},
+  xlabel={threads effectuant un incrément},ylabel={ns par incrément, par thread (log)},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*] table[x=threads,y=mutex]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omProp,thick,mark=square*] table[x=threads,y=CAS_loop]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omDef,thick,mark=triangle*] table[x=threads,y=fetch_add]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\addplot[omMeth,very thick,mark=diamond*] table[x=threads,y=per_thread]{figdata/low-latency/11-lock-free-programming/measured_counters.csv};
+\legend{mutex,boucle CAS,fetch\_add,compteurs par thread}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Un à quatre threads comptant chacun un million d'événements dans un compteur partagé protégé par un mutex, mis à jour par une
+boucle CAS ou par \texttt{fetch\_add}, ou dans des compteurs par thread alignés, additionnés à la fin. Seul le dispositif qui ne partage rien
+passe à l'échelle. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés, threads non épinglés. Données~:
+\texttt{bench\_lockfree.py}.}\label{fig:ll:lock-free-programming:counters}
+\end{omfigure}
+
+Les compteurs rendent concrète la seconde leçon du chapitre. Avec un seul thread, chaque dispositif coûte quelques nanosecondes. Avec deux threads ou
+plus, tout dispositif qui écrit une même ligne partagée paie à chaque mise à jour le va-et-vient de la ligne entre les cœurs (chapitre~3), une boucle CAS aussi pour ses reprises,
+un mutex aussi pour la ligne propre du verrou~; les compteurs par thread, chacun sur sa propre \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}, coûtent
+ce qu'ils coûtent seuls. La synchronisation la plus rapide est celle dont on n'a pas besoin~: donner à chaque thread ses propres données et
+les combiner à la fin, ou ne transmettre les données que dans un seul sens.
+
+\section{Tutoriel~: une pile, une file et un test litmus}\label{tut:ll:lock-free-programming:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire une pile \omterm{def:ll:lock-free-programming:progress}{sans verrou} insensible au \omterm{def:ll:lock-free-programming:aba}{problème ABA}, mesurer le coût du partage d'un compteur, observer le
+réordonnancement mémoire, construire une file bornée multi-producteurs multi-consommateurs. \textbf{État final~:}
+les \cref{fig:ll:lock-free-programming:litmus,fig:ll:lock-free-programming:counters} et une file soumise à des tests de résistance dans deux langages.
+\begin{tutsteps}
+\item \textbf{Une pile étiquetée.} La tête regroupe une étiquette avec un indice de nœud~; push et pop sont des boucles CAS qui incrémentent l'étiquette.
+\omcode{code/low-latency/11-lock-free-programming/cpp/ll_lockfree.hpp}{13}{43}{Une pile de Treiber sur un pool à taille fixe, à tête étiquetée.}\label{lst:ll:lock-free-programming:stack}
+\item \textbf{Rejouer ABA.} \texttt{ll\_aba.aba(tagged=False)} rejoue l'entrelacement de la \cref{fig:ll:lock-free-programming:aba}
+et renvoie une pile dont la tête est un nœud libéré~; avec \texttt{tagged=True}, l'opération CAS échoue.
+\item \textbf{La file.} Un producteur réserve une position par une opération CAS, écrit sa cellule et la publie par une
+écriture release du numéro de séquence de la cellule~; le consommateur de cette position effectue une lecture acquire.
+\omcode{code/firm/mpmcq/cpp/firm_mpmcq.hpp}{30}{48}{Le côté producteur de la file MPMC bornée.}\label{lst:ll:lock-free-programming:push}
+\item \textbf{Tests de résistance et sanitisation.} Les tests font tourner deux producteurs et deux consommateurs sur 300\,000 éléments et vérifient
+que chaque élément arrive exactement une fois, en C++ et en Rust~; le test C++ s'exécute aussi sous le sanitiseur de threads.
+\item \textbf{Mesurer} avec \texttt{python bench\_lockfree.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Retirer l'étiquette de la tête de la pile et lancer le test d'alternance à deux threads jusqu'à ce qu'il échoue~; passer
+l'écriture release de la file à relaxed et lancer le test de résistance sous le sanitiseur de threads.
+\end{tutorial}
+
+\section{Construction~: la file bornée MPMC}\label{bld:ll:lock-free-programming:mpmcq}
+
+\begin{build}
+\bfield{Rôle} La file destinée aux rares endroits où plusieurs threads produisent dans un même flux ou en consomment~: ordres
+de requêtes de plusieurs stratégies vers une même passerelle, travail pour un pool de calculateurs de risque. Les chemins à un seul producteur utilisent
+plutôt les tampons circulaires du chapitre~12.
+\bfield{Interface} C++20~: \texttt{firm::mpmcq::Queue<T>(capacity)} avec \texttt{try\_push(v)} et \texttt{try\_pop()} renvoyant
+\texttt{std::optional<T>}~; Rust \texttt{firm\_mpmcq::Queue<T: Copy>} avec \texttt{try\_push} et \texttt{try\_pop}.
+\bfield{Règles} Capacité égale à une puissance de deux~; une opération CAS par appel~; aucune allocation après la construction~; l'état plein et vide
+est signalé, jamais attendu à l'intérieur de la file~; positions du producteur et du consommateur sur des \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} distinctes.
+\bfield{Tests d'acceptation} \texttt{code/firm/mpmcq/}~: premier entré, premier sorti au fil d'un cycle plein puis vide~; deux producteurs et deux
+consommateurs livrent 300\,000 éléments exactement une fois, en C++20 et en Rust, en quelques secondes.
+\bfield{Pour aller plus loin} Opérations par lots qui réservent plusieurs positions par une seule opération CAS~; un enveloppeur bloquant pour les threads qui
+peuvent se mettre en sommeil.
+\end{build}
+
+\begin{omsources}
+\item M.~Jones, ``What really happened on Mars Rover Pathfinder'', 1997.
+\item H.-J.~Boehm et S.~Adve, ``Foundations of the C++ concurrency memory model'', PLDI 2008.
+\item M.~Herlihy, ``Wait-free synchronization'', \emph{ACM TOPLAS} 13(1), 1991.
+\item M.~Michael, ``Hazard pointers: safe memory reclamation for lock-free objects'', \emph{IEEE TPDS} 15(6), 2004;
+K.~Fraser, \emph{Practical lock-freedom}, Cambridge, rapport technique 579, 2004.
+\item D.~Vyukov, ``Bounded MPMC queue'', 1024cores.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:1}
+À partir de la \cref{fig:ll:lock-free-programming:counters}, calculer le coût d'un \texttt{fetch\_add} partagé par incrément avec un seul thread
+et avec quatre. Combien d'incréments par seconde quatre threads réalisent-ils ensemble, en compteur partagé et en compteurs par thread~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:2}
+Un rédacteur stocke un prix, puis lève un drapeau avec release~; un lecteur charge le drapeau avec acquire et, s'il est levé, lit le prix.
+Le lecteur peut-il voir le drapeau levé et un prix ancien~? Et si l'écriture du drapeau est relaxed~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:lock-free-programming:3}
+Une étiquette de 32 bits est incrémentée à chaque mise à jour de la tête de la pile, à raison de 100 millions de mises à jour par seconde. Au bout de combien de temps elle revient à zéro,
+et pourquoi ce rebouclage est-il (presque) sans danger~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:4}
+Dans le test du tampon de stockage, quels résultats $(r_1, r_2)$ sont possibles sous \omterm{def:ll:lock-free-programming:ordering}{cohérence séquentielle}, et quel résultat supplémentaire x86
+autorise-t-il avec release--acquire~? Pourquoi la figure le montre-t-elle si rarement~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:5}
+Pourquoi la file MPMC bornée n'est-elle pas \omterm{def:ll:lock-free-programming:progress}{sans verrou} au sens strict~? Décrire le blocage.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:lock-free-programming:6}
+Un thread de journalisation détient un mutex pendant \qty{2}{\micro\second} par message, 100\,000 fois par seconde, et le thread de trading prend le
+même mutex une fois par ordre. Quelle fraction des ordres trouve le mutex occupé, et combien de temps peut-on attendre si le
+thread de journalisation est préempté pendant un quantum d'ordonnanceur de \qty{4}{\milli\second}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:lock-free-programming:7}
+\emph{Programmation.} Exécuter la pile sans étiquette de \texttt{ll\_lockfree.hpp} (mode \texttt{aba} du banc d'essai) avec deux threads
+qui dépilent et repilent un million de fois chacun, vingt fois de suite. Un nœud est-il jamais perdu ou dupliqué~? Que dit le résultat
+sur la validation du code \omterm{def:ll:lock-free-programming:progress}{sans verrou} par l'exécution~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:lock-free-programming:8}
+\emph{Trouver la faille.} «~Notre instantané du carnet d'ordres est publié avec un drapeau relaxed~; nous l'avons testé pendant une semaine sur x86 sans
+jamais voir d'instantané déchiré, donc il est correct.~»
+\end{exercise}
+
+\section{Problème~: le détenteur de verrou désordonnancé}
+
+\begin{problem}[{Problème du week-end --- un verrou partagé avec le journal}]\label{pb:ll:lock-free-programming:1}
+Un thread de stratégie envoie environ 20\,000 ordres par seconde et, pour chacun, prend un mutex afin d'ajouter l'ordre à un tampon de journal que
+vide un thread de journalisation. Le thread de journalisation détient le même mutex pendant \qty{3}{\micro\second} à chaque vidage, 50\,000 fois par seconde.
+De temps à autre, le système d'exploitation préempte le thread de journalisation pendant qu'il détient le mutex, pour un quantum d'environ
+\qty{3}{\milli\second}~; supposons que cela se produise sur 0.01~\% de ses vidages.
+
+\medskip\noindent\textbf{Partie I --- Contention.}
+\begin{enumerate}
+\item Quelle fraction du temps le thread de journalisation détient-il le mutex~?
+\item Quelle fraction des ordres trouve le mutex occupé, et combien de temps attendent-ils en moyenne~?
+\item Quel est le temps de blocage moyen attendu par seconde pour la stratégie, en ignorant la préemption~?
+\item Que dit la \cref{fig:ll:lock-free-programming:counters} du coût propre du mutex lorsque deux threads le prennent souvent~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Préemption.}
+\begin{enumerate}[resume]
+\item Combien de préemptions du détenteur du verrou se produisent par seconde~?
+\item Quelle fraction du temps le mutex est-il détenu par un thread de journalisation préempté~?
+\item Combien d'ordres par seconde rencontrent un tel détenteur préempté, et combien de temps chacun attend-il au plus~?
+\item Additionner les parties I et II~: le temps de blocage attendu par seconde.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La refonte.}
+\begin{enumerate}[resume]
+\item Remplacer le mutex par un anneau à producteur unique et consommateur unique~: que fait désormais la stratégie par ordre~?
+\item Que se passe-t-il lorsque l'anneau est plein~?
+\item Quelle garantie de progression l'anneau offre-t-il à la stratégie~?
+\item Pourquoi l'héritage de priorité ne résout-il pas le problème pour un thread de trading~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le temps de blocage moyen par seconde de la stratégie avec le mutex, puis avec l'anneau.
+\item Que firent les ingénieurs de Mars Pathfinder, et pourquoi cela suffit-il là-bas~?
+\item Où ailleurs dans un processus de trading un verrou peut-il se cacher~?
+\item Qu'exige le \omterm{def:ll:lock-free-programming:aba}{problème ABA} d'une structure \omterm{def:ll:lock-free-programming:progress}{sans verrou} qui libère la mémoire~?
+\item Comment les tests de la construction vérifient-ils la file, et que ne peuvent-ils pas prouver~?
+\item Quand un mutex est-il le bon choix dans un système de trading~?
+\item Quel \omterm{def:ll:lock-free-programming:ordering}{ordonnancement mémoire} la publication de l'anneau exige-t-elle~?
+\item En une phrase~: qu'apporte l'approche \omterm{def:ll:lock-free-programming:progress}{sans verrou} à un chemin critique~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:1}
+Quelle est la différence entre \texttt{memory\_order\_relaxed}, les opérations acquire--release et les \omterm{def:ll:lock-free-programming:atomic}{opérations atomiques} à \omterm{def:ll:lock-free-programming:ordering}{cohérence séquentielle}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:2}
+Expliquez le \omterm{def:ll:lock-free-programming:aba}{problème ABA} et deux manières de l'empêcher.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:3}
+Un algorithme \omterm{def:ll:lock-free-programming:progress}{sans verrou} est-il toujours plus rapide qu'un algorithme avec verrous~? Donnez un contre-exemple.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:4}
+Qu'est-ce que l'\omterm{def:ll:lock-free-programming:inversion}{inversion de priorité}, et pourquoi importe-t-elle dans un système de trading~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:5}
+Comment testez-vous du code \omterm{def:ll:lock-free-programming:progress}{sans verrou}~? Que ne peut pas vous apprendre un test de résistance~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:lock-free-programming:6}
+Concevez un compteur que de nombreux threads incrémentent et qu'un thread lit une fois par seconde, avec le coût le plus faible
+pour les threads qui incrémentent.
+\end{interviewq}

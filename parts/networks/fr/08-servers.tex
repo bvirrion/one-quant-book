@@ -1,0 +1,357 @@
+\chapter{Serveurs}\label{ch:nw:servers}
+
+Les serveurs que les sociétés de trading achètent pour le chemin critique (hot path) sont choisis pour la vitesse d'un seul cœur, et non pour le nombre de cœurs. Un processeur de serveur grand public
+à 128 cœurs en fait tourner l'un quelconque à 4.1~GHz au maximum~; un processeur de serveur à 16 cœurs en fait tourner un à 5~GHz au maximum~;
+et des constructeurs spécialisés vendent des machines dont le processeur a été réglé pour faire tourner ses 24 cœurs à 4.8~GHz, refroidies par liquide,
+alimentées par une alimentation de \qty{2\,000}{\watt} et garanties par le constructeur de la machine plutôt que par le fabricant de la puce. Un chemin de trading qui passe l'essentiel de son temps
+à calculer gagne en rapidité presque proportionnellement à l'horloge~; celui qui passe son temps à attendre la mémoire ou la \omterm{def:nw:networking-for-trading:frame}{carte réseau} ne bouge guère.
+Lequel des deux est le chemin d'une société détermine le serveur qu'elle doit acheter.
+
+Le livre~13 (chapitres~2 à~4 et~13) a étudié le processeur, la hiérarchie de mémoire, la machine à deux sockets et le système d'exploitation
+du point de vue du programme. Ce chapitre considère le serveur comme un objet que l'on achète et que l'on installe en baie~: comment choisir son processeur, ce qu'il faut régler
+dans son micrologiciel, ce que le \omterm{def:nw:servers:oc}{surcadençage} apporte et ce qu'il coûte, comment il est administré, et combien d'exemplaires tiennent dans une armoire.
+
+\section{Choisir le processeur}
+
+\begin{definition}[Enveloppe thermique (TDP)]\label{def:nw:servers:tdp}
+L'\emph{enveloppe thermique}\index{enveloppe thermique} (thermal design power, TDP) d'un processeur est la puissance soutenue, en watts, que son constructeur
+le conçoit pour dissiper en charge à ses fréquences nominales, et que le refroidissement et l'alimentation du serveur doivent pouvoir absorber.
+\end{definition}
+
+Trois chiffres de la fiche d'un processeur comptent pour un chemin critique, et un quatrième pour l'armoire. La fréquence de \emph{boost} est la
+fréquence qu'un cœur occupé peut atteindre lorsque le reste de la puce est au repos~: AMD définit le boost maximal de ses processeurs EPYC comme «~la
+fréquence maximale atteignable par n'importe quel cœur seul~». La fréquence \emph{de base} est celle que chaque cœur est assuré de tenir en pleine charge. La taille du cache
+détermine la part du carnet d'ordres et de l'état de la stratégie qui reste proche du cœur. Et l'\omterm{def:nw:servers:tdp}{enveloppe thermique} fixe le nombre de serveurs
+que la puissance d'une armoire permet d'alimenter.
+
+\begin{proposition}[Ce qu'apporte une horloge plus rapide]\label{prop:nw:servers:clock}
+Soit un chemin qui prend $t_{\mathrm{ref}}$ sur un cœur cadencé à $f_{\mathrm{ref}}$, dont une part $\phi$ est liée au cœur (elle croît
+avec l'horloge), et le reste est lié à la mémoire, au bus ou à la carte. Sur un cœur à $f$, il prend
+\[
+  t(f) = t_{\mathrm{ref}}\Bigl(\phi\,\frac{f_{\mathrm{ref}}}{f} + 1 - \phi\Bigr),
+\]
+un gain de vitesse qui tend vers $1/(1-\phi)$ quelle que soit la rapidité de l'horloge.
+\end{proposition}
+
+\begin{proof}
+La partie liée au cœur est un nombre de cycles, chacun d'une durée de $1/f$~; le reste est un temps fixé par les latences
+propres à la mémoire et aux périphériques. Lorsque $f \to \infty$, il ne reste que $(1-\phi)\,t_{\mathrm{ref}}$.
+\end{proof}
+
+\begin{example}[Le chemin du livre~13 sur trois processeurs]\label{ex:nw:servers:book13}
+Les étapes internes au processus du livre~13 (décodage, anneau, carnet, stratégie, risque, passerelle) avaient des médianes dont la somme vaut
+\qty{1\,528}{\nano\second} sur un cœur de portable dont le turbo maximal est de 4.8~GHz. Supposons que 60~\% de ce temps soit lié au cœur. Sur un cœur à
+5.0~GHz, le chemin prend \qty{1\,491}{\nano\second}~; à 4.1~GHz, \qty{1\,685}{\nano\second}~; sur un cœur maintenu à la fréquence de base de 2.7~GHz,
+\qty{2\,241}{\nano\second}. L'horloge la plus rapide présentée dans le \cref{tab:nw:servers:candidates} fait gagner 2.4~\% par rapport à la référence~; la plus lente coûte 47~\%.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xmin=2.4,xmax=6.1,ymin=1100,ymax=3000,xlabel={fréquence du cœur (GHz)},
+  ylabel={médiane dans le processus (ns)},y tick label style={/pgf/number format/1000 sep={\,}},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick] table[x=ghz,y=phi100]{figdata/networks/08-servers/model.csv};
+\addplot[omMeth,very thick] table[x=ghz,y=phi60]{figdata/networks/08-servers/model.csv};
+\addplot[omDef,very thick] table[x=ghz,y=phi30]{figdata/networks/08-servers/model.csv};
+\addplot[only marks,mark=*,mark size=2pt,black] table[x=ghz,y=ns]{figdata/networks/08-servers/candidates.csv};
+\legend{tout lié au cœur,60~\% lié au cœur,30~\% lié au cœur,candidats (60~\%)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Modèle~: le chemin du livre~13 dans le processus (\qty{1\,528}{\nano\second} à 4.8~GHz) reporté à d'autres fréquences, pour trois parts du temps lié au cœur
+(\cref{prop:nw:servers:clock})~; les points sont les candidats du \cref{tab:nw:servers:candidates} à leur horloge de cœur chaud et à 60~\%.
+Plus le chemin attend la mémoire, plus la courbe est plate. Données~: \texttt{fig\_servers.py}.}\label{fig:nw:servers:model}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Processeurs de serveur, selon leurs constructeurs}\label{dat:nw:servers:parts}
+EPYC 9175F d'AMD~: 16 cœurs, une fréquence de base de 4.2~GHz, un boost maximal pouvant atteindre 5~GHz, 512~Mo de cache de niveau~3, une \omterm{def:nw:servers:tdp}{enveloppe thermique} (TDP) par défaut de
+\qty{320}{\watt}, affiché à 3\,703~USD pour des lots de mille unités (lancé en octobre 2024). EPYC 9755 d'AMD~: 128 cœurs à 2.7~GHz en base
+et jusqu'à 4.1~GHz en boost, 512~Mo de cache de niveau~3, \qty{500}{\watt}, 10\,931~USD. Xeon Gold 6544Y d'Intel~: 16 cœurs à 3.6~GHz en base et
+4.1~GHz de turbo maximal, 45~Mo de cache, \qty{270}{\watt} (lancé au quatrième trimestre 2023).
+\end{dated}
+
+\section{Réglages du micrologiciel}
+
+Le micrologiciel (BIOS) décide de nombreuses choses que le système d'exploitation ne peut plus modifier ensuite~: la manière dont le processeur économise l'énergie, si chaque
+cœur exécute un ou deux fils d'exécution, la façon dont la mémoire est entrelacée entre les sockets, et les événements qui interrompent le processeur à l'insu du
+système d'exploitation.
+
+\begin{definition}[Interruption de gestion système (SMI)]\label{def:nw:servers:smi}
+Une \emph{interruption de gestion système}\index{interruption de gestion système} (system management interrupt, SMI) est une interruption traitée par le micrologiciel de la plateforme, et non par le
+système d'exploitation, pour des fonctions telles que la régulation de la température et des ventilateurs ou l'émulation de périphériques anciens~; elle ne peut en général pas être masquée,
+et pendant son exécution le système d'exploitation et tous les programmes de ce processeur sont arrêtés.
+\end{definition}
+
+Une SMI est la seule interruption que l'isolation de cœurs (livre~13, chapitre~13) ne peut pas écarter~: la documentation temps réel de Red Hat met en garde
+contre un gestionnaire mal écrit qui «~peut consommer plusieurs millisecondes~», que le système d'exploitation ne peut pas préempter. Les sociétés demandent donc à leurs
+constructeurs de serveurs quelles sources de SMI peuvent être désactivées sans risque, comptent celles qui restent grâce aux compteurs du processeur, et traitent une
+pause inexpliquée de la machine entière comme une SMI tant que le contraire n'est pas démontré.
+
+\begin{method}[Réglages du micrologiciel pour un serveur de chemin critique]\label{met:nw:servers:bios}
+\begin{enumerate}
+\item Profil d'énergie pour la performance maximale~; états de veille profonds (C-states) désactivés sur les cœurs chauds, afin qu'un cœur en attente ne soit jamais lent à se réveiller.
+\item Un comportement de turbo fixe~: soit le boost maximal d'un seul cœur, les autres cœurs restant au repos, soit une fréquence fixe pour l'ensemble des cœurs, mais
+  pas une horloge qui varie avec la charge, que les constructeurs décrivent comme une source de gigue (jitter).
+\item Multithreading simultané (SMT) désactivé, ou ses fils frères laissés inactifs sur les cœurs chauds.
+\item Mémoire à sa vitesse nominale maximale~; entrelacement entre les sockets désactivé, afin que la mémoire de chaque socket reste locale.
+\item Signalement des erreurs corrigées et sources d'\omterm{def:nw:servers:smi}{interruptions de gestion système} (SMI) réduites à ce que le constructeur déclare sans risque.
+\item L'ensemble de la liste consigné comme données et audité, avec les réglages du système d'exploitation, avant que le serveur ne trade (la construction).
+\end{enumerate}
+\end{method}
+
+\section{Machines surcadencées et refroidies par liquide}
+
+\begin{definition}[Surcadençage (overclocking)]\label{def:nw:servers:oc}
+Le \emph{surcadençage}\index{surcadençage} (overclocking) consiste à faire fonctionner un processeur, ou sa mémoire, au-delà de la fréquence nominale fixée par son constructeur, en général avec une tension
+d'alimentation plus élevée et un refroidissement plus puissant, et en dehors de la garantie du constructeur.
+\end{definition}
+
+Une horloge plus rapide à tension plus élevée dissipe davantage de puissance, à peu près proportionnellement à la fréquence multipliée par le carré de la tension~; c'est pourquoi les
+constructeurs spécialisés associent le \omterm{def:nw:servers:oc}{surcadençage} au refroidissement par liquide et à des alimentations surdimensionnées, et pourquoi ils vendent les tests de stabilité comme partie intégrante du
+produit. Ce qu'ils vendent est un processeur qui fait tourner ses cœurs à une fréquence proche de, ou supérieure à, le boost d'un seul cœur annoncé par le constructeur, tous
+les cœurs, toute la journée, sans les changements d'horloge qu'impose un turbo dépendant de la charge.
+
+\begin{dated}{2026-09}{Serveurs surcadencés, présentés par leurs constructeurs}\label{dat:nw:servers:oc}
+Blackcore Technologies décrit sa gamme ICON comme «~une plateforme serveur surcadencée et refroidie par liquide pour processeurs Intel~», et son serveur G3 SPR-M
+comme un Intel Xeon w7-2495X réglé, «~affichant 4.8~GHz sur tous les cœurs~», avec 45~Mo de cache et une mémoire DDR5 surcadencée, sur
+une alimentation redondante personnalisée de 2\,000 watts. Business Systems International décrit son ORION HF~310 comme un serveur à un seul socket surcadencé
+dont la conception désactive les cœurs inutiles et verrouille les autres jusqu'à 5.2~GHz, en affirmant que «~le mode turbo crée de la gigue (jitter), un problème que
+les traders veulent éviter à tout prix~».
+\end{dated}
+
+\begin{definition}[Test de déverminage (burn-in)]\label{def:nw:servers:burnin}
+Un \emph{test de déverminage}\index{test de déverminage} (burn-in test) exécute un serveur neuf ou reconfiguré à pleine charge, souvent pendant plusieurs jours, avec des charges de stress qui
+sollicitent le processeur, la mémoire et les périphériques, et vérifient l'absence d'erreurs, de throttling et d'instabilité avant que le serveur
+ne soit confié au trading.
+\end{definition}
+
+\section{Mémoire, fiabilité et gestion}
+
+\begin{definition}[Mémoire à code correcteur d'erreurs (ECC)]\label{def:nw:servers:ecc}
+La \emph{mémoire à code correcteur d'erreurs}\index{mémoire à code correcteur d'erreurs} (error-correcting code memory, ECC) stocke des bits de contrôle supplémentaires avec chaque mot, de sorte que le
+contrôleur de mémoire puisse corriger un bit retourné et détecter un double retournement~; la mémoire des serveurs est presque toujours ECC, et la mémoire surcadencée rend ses
+signalements plus importants, et non moins.
+\end{definition}
+
+\begin{definition}[Contrôleur de gestion de la carte mère (BMC)]\label{def:nw:servers:bmc}
+Un \emph{contrôleur de gestion de la carte mère}\index{contrôleur de gestion de la carte mère} (baseboard management controller, BMC) est un petit ordinateur indépendant, intégré à la carte mère du serveur,
+doté de son propre port réseau, qui permet à un opérateur de mettre le serveur sous et hors tension, de lire ses capteurs et ses journaux, de mettre à jour son micrologiciel
+et d'utiliser sa console à distance, quel que soit l'état du processeur principal et du système d'exploitation.
+\end{definition}
+
+Une cage est souvent éloignée des ingénieurs de la société. Le BMC est le moyen qu'ils ont d'atteindre un serveur figé, sur le
+\omterm{def:nw:switches-and-layer-1-devices:oob}{réseau d'administration hors bande} du chapitre~2, et ses capteurs (températures, vitesses des ventilateurs, puissance) sont le premier signe qu'une machine surcadencée
+dérive hors de son enveloppe testée. C'est aussi un ordinateur doté de son propre micrologiciel, connecté à un réseau~: il reçoit des correctifs et doit être isolé comme tout ordinateur.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=omDef!15,minimum width=2.6cm,minimum height=1.6cm] (s0) at (0,0) {socket 0\\ cœurs chauds};
+\node[b,fill=omDef!8,minimum width=2.6cm,minimum height=1.6cm] (s1) at (5.0,0) {socket 1\\ autres tâches};
+\foreach \k in {0,1,2,3} {\node[b,fill=gray!10,minimum width=0.5cm,font=\scriptsize] at (-1.0+0.65*\k,1.6) {M};}
+\foreach \k in {0,1,2,3} {\node[b,fill=gray!10,minimum width=0.5cm,font=\scriptsize] at (4.0+0.65*\k,1.6) {M};}
+\draw[<->,gray] (0,1.3) -- (s0.north);
+\draw[<->,gray] (5.0,1.3) -- (s1.north);
+\node[font=\scriptsize] at (-1.9,1.6) {mémoire};
+\node[b,fill=omMeth!20] (nic) at (0,-2.0) {carte réseau\\ (feed, ordres)};
+\node[b,fill=gray!8] (disk) at (5.0,-2.0) {stockage, autres cartes};
+\node[b,fill=omThm!12] (bmc) at (9.0,-0.9) {BMC};
+\node[b,fill=gray!8] (mgmt) at (9.0,-2.4) {réseau\\ d'administration};
+\draw[<->,thick] (s0) -- node[above,font=\scriptsize]{interconnexion} (s1);
+\draw[<->,thick] (s0) -- node[right,font=\scriptsize]{PCIe} (nic);
+\draw[<->,thick] (s1) -- (disk);
+\draw[<->,gray] (bmc) -- (mgmt);
+\draw[gray,dashed] (bmc.west) -- ++(-0.9,0) |- (s1.east);
+\end{tikzpicture}
+
+\omcaption{Un serveur de trading à deux sockets. La \omterm{def:nw:networking-for-trading:frame}{carte réseau} se trouve sur le bus du socket~0, et les threads chauds tournent sur les cœurs du socket~0 avec
+la mémoire du socket~0 (livre~13, chapitre~4)~; le socket~1 prend tout le reste. Le \omterm{def:nw:servers:bmc}{contrôleur de gestion de la carte mère} surveille et
+contrôle la machine depuis son propre port sur le réseau d'administration.}\label{fig:nw:servers:anatomy}
+\end{omfigure}
+
+\section{Baies, alimentation et chaleur}
+
+\begin{definition}[Unité de baie (U)]\label{def:nw:servers:ru}
+Une \emph{unité de baie}\index{unité de baie} (rack unit, U) est la hauteur standard d'un équipement dans une baie de 19~pouces, soit 1.75~pouces (44.45~mm)~; une armoire
+en contient couramment environ 42 d'entre elles, et les serveurs font 1U, 2U ou davantage.
+\end{definition}
+
+Une baie de colocation est vendue avec une enveloppe de puissance en kilowatts (chapitre~9), et c'est en général la puissance, et non l'espace, qui limite en premier. Un serveur compté à
+l'\omterm{def:nw:servers:tdp}{enveloppe thermique} (TDP) de ses processeurs, plus \qty{250}{\watt} pour tout le reste, consomme \qty{570}{\watt} avec un seul EPYC 9175F~: dix-sept tiennent dans
+\qty{10}{\kilo\watt}. Le serveur à deux sockets de 128 cœurs consomme \qty{1\,250}{\watt}~: huit tiennent, avec 2\,048 cœurs au total. Le serveur surcadencé,
+dimensionné sur son alimentation de \qty{2\,000}{\watt}, faute de consommation publiée par son constructeur, en tient cinq.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.4cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}@{}}
+\toprule
+Candidat & Horloge chaude & Chemin à chaud & Chemin à base & Serveurs par & Cœurs par \\
+ & (GHz) & horloge (ns) & horloge (ns) & \qty{10}{\kilo\watt} & \qty{10}{\kilo\watt} \\
+\midrule
+AMD EPYC 9175F, un socket & 5.0 & 1\,491 & 1\,659 & 17 & 272 \\
+Intel Xeon Gold 6544Y, un socket & 4.1 & 1\,685 & 1\,834 & 19 & 304 \\
+AMD EPYC 9755, deux sockets & 4.1 & 1\,685 & 2\,241 & 8 & 2\,048 \\
+w7-2495X surcadencé (tous les cœurs) & 4.8 & 1\,528 & 1\,528 & 5 & 120 \\
+\bottomrule
+\end{tabular}
+\caption{Candidats pour un serveur de chemin critique, avec le chemin en cours de traitement du livre~13, lié à 60~\% aux cœurs (\cref{prop:nw:servers:clock})~; l'horloge chaude
+est le boost d'un seul cœur, ou la valeur tous cœurs annoncée par le constructeur pour le serveur surcadencé. Le nombre de serveurs par armoire compte chaque serveur à
+l'\omterm{def:nw:servers:tdp}{enveloppe thermique} (TDP) de ses processeurs plus \qty{250}{\watt} (le serveur surcadencé à son alimentation de \qty{2\,000}{\watt}) et 42 \omterm{def:nw:servers:ru}{unités de baie}. Données~: \texttt{nw\_servers.table()},
+\cref{dat:nw:servers:parts,dat:nw:servers:oc}.}\label{tab:nw:servers:candidates}
+\end{table}
+
+Le \Cref{tab:nw:servers:candidates} résume l'argument du chapitre en une ligne par candidat. Le processeur à 16 cœurs au boost le plus élevé est le plus rapide
+pour un chemin qui s'exécute sur un ou deux cœurs, tant que les autres cœurs restent assez calmes pour lui laisser ce boost. La machine surcadencée renonce
+un peu de ce pic au profit d'une horloge qui ne bouge pas, sur chaque cœur, ce qui compte lorsque le chemin critique utilise plusieurs cœurs à la fois. Le
+processeur à 128 cœurs est le bon serveur pour la recherche, la simulation et les autres travaux de la société (livre~15), et le mauvais pour le
+chemin critique.
+
+\section{Tutoriel~: choisir et auditer un serveur}\label{tut:nw:servers:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Prédire la latence du chemin critique sur les serveurs candidats à partir des mesures du livre~13, les faire tenir dans une armoire, et auditer les
+réglages du micrologiciel d'un serveur dans le même rapport que celui de son système d'exploitation. \textbf{État final~:} \cref{tab:nw:servers:candidates},
+\cref{fig:nw:servers:model} et un rapport d'audit combiné.
+\begin{tutsteps}
+\item \textbf{La référence.} \texttt{nw\_servers.ref\_ns()} lit les médianes par étape du livre~13 via \texttt{firm.wirepath} (1\,528~ns).
+\item \textbf{Le modèle.} \texttt{firm.serverspec.path\_ns} applique la \cref{prop:nw:servers:clock}~; \texttt{curve()} la trace, et
+  \texttt{python fig\_servers.py} écrit les données du graphique.
+\item \textbf{Les candidats.} \texttt{CANDIDATES} contient les lignes du registre~; \texttt{table(phi, cabinet\_kw)} prédit le chemin de chacun et le fait
+  tenir dans une armoire.
+\item \textbf{Audit.} \texttt{firmware\_audit(settings)} vérifie le micrologiciel d'un serveur par rapport à \texttt{FIRMWARE} et renvoie
+  les constats de \texttt{firm.tuneaudit}, de sorte que \texttt{firm\_tuneaudit.report} les affiche avec ceux de l'hôte.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Mesurer $\phi$ pour le chemin du livre~13 en l'exécutant sur les cœurs de performance et d'efficacité de l'ordinateur portable (leurs
+fréquences maximales sont de 4.8 et 3.8~GHz) et en ajustant la \cref{prop:nw:servers:clock}~; recalculer le tableau pour une armoire de 20~kW.
+\end{tutorial}
+
+\omcode{code/firm/serverspec/firm_serverspec.py}{55}{75}{Le modèle de latence, l'ajustement d'une armoire et le classement de \texttt{firm.serverspec}.}\label{lst:nw:servers:model}
+
+\section{Construction~: la spécification des serveurs}\label{bld:nw:servers:serverspec}
+
+\begin{build}
+\bfield{Rôle} Le choix du serveur sous forme de données~: des candidats avec leurs sources, un modèle de latence rattaché au chemin mesuré de la société, un ajustement par armoire et une liste de contrôle du micrologiciel
+auditée avec le réglage de l'hôte, pour la nomenclature (bill of materials) du chapitre~29.
+\bfield{Interface} \texttt{firm\_serverspec}~: \texttt{Candidate}, \texttt{CANDIDATES}, \texttt{path\_ns(t\_ref, phi, f, f\_ref)},
+\texttt{speedup}, \texttt{per\_cabinet(c, kw, u)}, \texttt{rank}, \texttt{FIRMWARE}, \texttt{firmware\_audit(settings)} renvoyant des
+\texttt{firm\_tuneaudit.Finding}s.
+\bfield{Règles} Chaque candidat désigne sa ligne du registre~; la puissance budgétée d'un serveur est l'\omterm{def:nw:servers:tdp}{enveloppe thermique} (TDP) de ses processeurs, augmentée d'une marge déclarée,
+ou un chiffre du fabricant~; un réglage que le serveur ne signale pas est «~inconnu~», jamais «~ok~».
+\bfield{Tests d'acceptation} \texttt{code/firm/serverspec/tests/}~: les limites du modèle (tout lié aux cœurs, tout lié à la mémoire), l'ajustement d'une armoire par la puissance
+et par l'espace, le classement et les constats du micrologiciel remontés par \texttt{firm.tuneaudit}.
+\bfield{Pour aller plus loin} Ajuster $\phi$ à partir de mesures à deux fréquences~; ajouter la bande passante mémoire au modèle pour un chemin dont la partie liée à la mémoire en dépend.
+\end{build}
+
+\begin{omsources}
+\item AMD, pages produit EPYC 9175F et EPYC 9755~; Intel, spécifications du Xeon Gold 6544Y et du Core Ultra 7 155H.
+\item Blackcore Technologies, page produit G3 SPR-M~; Business Systems International, page produit ORION HF~310.
+\item Red Hat, \emph{Red Hat Enterprise Linux for Real Time}, guide de référence («~System Management Interrupts~») et guide de réglage («~Setting
+BIOS parameters for system tuning~»).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:1}
+Un chemin prend \qty{2}{\micro\second} à 3.0~GHz et est lié à 80~\% aux cœurs. Combien de temps prend-il à 5.0~GHz, et quelle est sa limite
+lorsque la fréquence croît sans borne~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:2}
+Combien de serveurs dont la puissance budgétée est de \qty{570}{\watt} tiennent dans une armoire de \qty{15}{\kilo\watt} de 42 unités, si chacun occupe une unité~? Et à
+\qty{1\,250}{\watt} et deux unités~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:servers:3}
+La fréquence de boost d'un serveur est de 5.0~GHz et sa fréquence de base de 4.2~GHz. Laquelle un budget de latence doit-il utiliser pour le chemin critique, et quand~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:4}
+Pourquoi l'isolation de cœurs ne peut-elle pas protéger un cœur chaud des \omterm{def:nw:servers:smi}{interruptions de gestion système} (SMI), et que peut faire la société à la place~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:5}
+Sur la \cref{fig:nw:servers:model}, de combien la hausse de la fréquence de 4.0 à 5.0~GHz réduit-elle la durée pour chaque part de temps lié aux cœurs~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:servers:6}
+Pourquoi une société pourrait-elle préférer une machine surcadencée sur tous les cœurs à un boost mono-cœur plus élevé, même si sa fréquence de pointe est plus basse~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:servers:7}
+\emph{Programmation.} Avec \texttt{firm.serverspec}, trouver la part liée aux cœurs en dessous de laquelle le processeur de 16 cœurs à 5.0~GHz économise moins de 1~\% par rapport à la
+référence de l'ordinateur portable, et refaire le \cref{tab:nw:servers:candidates} pour une armoire de \qty{20}{\kilo\watt}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:servers:8}
+\emph{Trouver la faille.} «~Nous avons déplacé la stratégie d'un serveur à 4.1~GHz vers un serveur à 5~GHz, et la latence ne s'est pas améliorée, donc l'indice de référence était faux.~»
+\end{exercise}
+
+\section{Problème~: cinq gigahertz ou cinquante cœurs}
+
+\begin{problem}[{Problème du week-end --- une fréquence, une armoire et un budget}]\label{pb:nw:servers:1}
+Le chemin critique d'une société prend \qty{1\,528}{\nano\second} à 4.8~GHz (étapes internes au processus du livre~13). Elle choisit entre des serveurs monoprocesseurs
+équipés de l'EPYC 9175F (boost 5.0~GHz, base 4.2), des serveurs biprocesseurs avec l'EPYC 9755 (boost 4.1, base 2.7), et le serveur
+surcadencé de l'\cref{dat:nw:servers:oc} (4.8~GHz sur tous les cœurs), pour une armoire de \qty{10}{\kilo\watt}, avec les budgets de puissance du chapitre.
+
+\medskip\noindent\textbf{Partie I --- La fréquence.}
+\begin{enumerate}
+\item À 60~\% lié aux cœurs, quelle est la durée du chemin à la fréquence chaude de chaque serveur~?
+\item Et à la fréquence de base de chacun~?
+\item Quelle est l'accélération du boost du 9175F par rapport à la fréquence de base du 9755~?
+\item Quelle est la plus grande accélération que puisse donner une fréquence à 60~\%~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- L'armoire.}
+\begin{enumerate}[resume]
+\item Combien de serveurs de chaque type tiennent dans \qty{10}{\kilo\watt}~?
+\item Combien de cœurs chaque serveur apporte-t-il à l'armoire~?
+\item Lequel est contraignant, la puissance ou l'espace, pour chacun~?
+\item La société a besoin de 40 cœurs chauds et de 1\,000 autres cœurs. Combien d'armoires de \qty{10}{\kilo\watt} faut-il pour un mélange de serveurs 9175F et 9755~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le micrologiciel.}
+\begin{enumerate}[resume]
+\item Quels réglages de la méthode faudrait-il vérifier en premier sur un nouveau serveur surcadencé, et pourquoi~?
+\item Contre quoi protège le \omterm{def:nw:servers:burnin}{test de déverminage} (burn-in)~?
+\item Le \omterm{def:nw:servers:bmc}{contrôleur de gestion de la carte mère} (BMC) signale une hausse des températures sur un serveur. Que doit-on faire~?
+\item Pourquoi le multithreading simultané (SMT) est-il désactivé sur les cœurs chauds~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le chemin critique sur les trois serveurs à leurs fréquences chaudes, et le nombre de serveurs par armoire.
+\item Au-dessous de quelle part liée aux cœurs le choix du processeur cesse-t-il d'influer de plus de 5~\%~?
+\item Où placerait-on les serveurs à 128 cœurs~?
+\item Que faudrait-il mesurer avant de croire le $\phi$ du modèle~?
+\item Pourquoi la stabilité de la fréquence du serveur surcadencé importe-t-elle plus que sa pointe~?
+\item Que change la question de la garantie dans l'achat~?
+\item Comment présenter le choix au directeur technique de la société en deux phrases~?
+\item En une phrase~: qu'est-ce qui décide si une fréquence plus élevée vaut son prix~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:servers:1}
+Pourquoi les sociétés de trading préfèrent-elles des processeurs à moins de cœurs, mais plus rapides, pour le chemin critique~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:servers:2}
+Quels réglages du BIOS modifieriez-vous sur un nouveau serveur de trading, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:servers:3}
+Qu'est-ce qu'une \omterm{def:nw:servers:smi}{interruption de gestion système}, et pourquoi importe-t-elle pour la latence~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:nw:servers:4}
+Achèteriez-vous des serveurs surcadencés~? Que demanderiez-vous au fournisseur~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:servers:5}
+Comment prédiriez-vous de combien un processeur plus rapide améliorera votre chemin avant de l'acheter~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:servers:6}
+Votre baie de colocation dispose de \qty{10}{\kilo\watt}. Comment décidez-vous de ce qu'on y met~?
+\end{interviewq}

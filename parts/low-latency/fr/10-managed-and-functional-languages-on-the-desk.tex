@@ -1,0 +1,310 @@
+\chapter{Langages managés et fonctionnels sur les desks}\label{ch:ll:managed-and-functional-languages-on-the-desk}
+
+En 2011, une bourse de détail a décrit publiquement comment sa logique d'appariement traitait six millions d'ordres par seconde sur un seul
+fil d'exécution, écrite en Java (Fowler, 2011). Ses ingénieurs n'avaient pas échappé au \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}~; ils avaient conçu le système en fonction de lui~:
+tout était pré-alloué, des tampons circulaires (ring buffers) de plusieurs millions d'emplacements créés au démarrage, aucun verrou dans la logique métier. Quelques
+années plus tôt, une société de trading pour compte propre avait expliqué pourquoi elle écrivait ses systèmes de trading critiques en OCaml, un langage fonctionnel
+doté de son propre \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} (Minsky et Weeks, 2008). Les langages managés sont présents sur les desks de trading, parfois sur
+le chemin critique (hot path). Ce chapitre explique ce que font leurs environnements d'exécution et que ne font pas le C++ ni le Rust, comment un programme
+sensible à la latence, écrit dans ces langages, est structuré, et ce que les sociétés qui les utilisent ont dit publiquement à ce sujet.
+
+\section{Ramasse-miettes et ses pauses}
+
+\begin{definition}[Ramasse-miettes, pause stop-the-world]\label{def:ll:managed-and-functional-languages-on-the-desk:gc}
+Un \emph{ramasse-miettes}\index{ramasse-miettes} (garbage collector) récupère la mémoire que le programme ne peut plus atteindre, en parcourant
+les références à partir des racines du programme (piles, variables globales). La plupart divisent le tas en générations~: les objets nouveaux vont dans une petite jeune génération,
+collectée souvent et à faible coût~; les survivants sont promus dans une vieille génération, collectée rarement et à un coût qui croît
+avec sa taille. Une \emph{pause stop-the-world}\index{pause stop-the-world} est un intervalle pendant lequel le ramasse-miettes
+a arrêté tous les threads de l'application.
+\end{definition}
+
+Le compromis est explicite~: le programme ne libère jamais la mémoire et ne la libère jamais deux fois~; en contrepartie, son exécution
+suit un rythme fixé par ses allocations. Les \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} modernes raccourcissent les pauses en effectuant l'essentiel de leur travail
+en même temps que le programme~; un \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} Java très répandu visait d'abord des pauses inférieures à dix millisecondes, puis
+plus tard, moins d'une milliseconde passée aux points où tous les threads s'arrêtent (encadré daté ci-dessous). Chacune de ces valeurs est énorme face
+à un budget d'une microseconde, et le travail concurrent lui-même prend aux cœurs et à la bande passante mémoire du programme.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\draw[fill=omDef!10,draw=omDef,rounded corners=2pt] (0,0) rectangle (3.2,1.2);
+\node[anchor=north] at (1.6,1.15) {jeune génération};
+\node at (1.6,0.45) {nouveaux objets};
+\draw[fill=omThm!10,draw=omThm,rounded corners=2pt] (5.0,0) rectangle (11.2,1.2);
+\node[anchor=north] at (8.1,1.15) {vieille génération};
+\node[align=center] at (8.1,0.42) {objets à longue durée de vie~:\\ le carnet d'ordres, les caches, l'état};
+\draw[-Stealth,thick] (3.3,0.6) -- node[above]{survivants} node[below]{promus} (4.9,0.6);
+\draw[-Stealth,thick] (-1.4,0.6) node[left]{allocation} -- (-0.1,0.6);
+\draw[omDef,thick,decorate,decoration={brace,amplitude=4pt,mirror}] (0,-0.15) -- (3.2,-0.15) node[midway,below=5pt,align=center]{collectée souvent~:\\coût $\propto$ survivants};
+\draw[omThm,thick,decorate,decoration={brace,amplitude=4pt,mirror}] (5.0,-0.15) -- (11.2,-0.15) node[midway,below=5pt,align=center]{collectée rarement~:\\coût croît avec le tas vivant};
+\end{tikzpicture}
+
+\omcaption{Un tas générationnel. L'allocation remplit la jeune génération, dont les collectes coûtent en proportion de ce qui
+survit~; les survivants passent dans la vieille génération, dont les collectes complètes parcourent tout ce qui est vivant, et arrêtent ou ralentissent le
+programme d'autant plus longtemps que le tas grandit.}\label{fig:ll:managed-and-functional-languages-on-the-desk:heap}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Objectifs de pause d'un ramasse-miettes Java moderne}\label{dat:ll:managed-and-functional-languages-on-the-desk:jvm}
+Le ZGC d'OpenJDK a été proposé (JEP 333) dans l'objectif que les durées de pause du \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} ne dépassent pas 10~millisecondes,
+ses phases stop-the-world limitées au parcours des racines. Une proposition ultérieure (JEP 376) a déplacé le parcours des piles de threads
+vers une phase concurrente, dans l'attente que moins d'une milliseconde soit consacrée aux safepoints du collecteur
+sur des machines usuelles.
+\end{dated}
+
+\section{Le style managé à faible latence~: pré-allocation, mémoire hors tas, chauffe}
+
+\begin{definition}[Mémoire hors tas (off-heap)]\label{def:ll:managed-and-functional-languages-on-the-desk:offheap}
+La \emph{mémoire hors tas}\index{mémoire hors tas} (off-heap) désigne la mémoire qu'un programme managé utilise hors de son tas collecté (tampons d'octets
+directs, fichiers mappés en mémoire, tableaux natifs), organisée par le programme et invisible au \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}~: il ne la parcourt jamais,
+ne la déplace ni ne la libère jamais.
+\end{definition}
+
+Le style décrit par la bourse évoquée plus haut découle de l'économie du \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}. N'allouer rien par message après
+le démarrage~: pré-allouer chaque objet dont le chemin critique a besoin et le réutiliser (les pools du chapitre~6)~; garder les données volumineuses et durables
+(carnets d'ordres, tampons circulaires, journaux) hors du tas ou dans des tableaux plats de types primitifs, afin que les collectes complètes aient peu à parcourir~;
+dimensionner la jeune génération pour que le peu de déchets qui subsiste la remplisse rarement~; et faire tourner un \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} discret. Ce qui reste
+est un programme dont le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} n'a rien à faire pendant la journée de trading. La limite du style tient à sa fragilité~:
+un seul appel de bibliothèque qui alloue, un seul entier encapsulé (boxed), et le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} revient sur le chemin critique, sans que rien dans le langage ne le signale~;
+l'allocation doit donc être mesurée, comme au chapitre~6.
+
+\begin{proposition}[Le budget de ramasse-miettes]\label{prop:ll:managed-and-functional-languages-on-the-desk:budget}
+Un programme qui alloue $b$ octets par message, à $r$ messages par seconde, avec une jeune génération de $Y$ octets, collecte sa
+jeune génération toutes les $Y/(rb)$ secondes. Il collecte au plus $k$ fois au cours d'une session de durée $T$ si et seulement si
+$b \le kY/(rT)$.
+\end{proposition}
+
+\begin{proof}
+L'allocation remplit la jeune génération à raison de $rb$ octets par seconde et chaque collecte la vide, donc les collectes ont lieu toutes les
+$Y/(rb)$ secondes et sont au nombre de $rbT/Y$ dans la session~; $rbT/Y \le k$ est la condition énoncée.
+\end{proof}
+
+Avec une jeune génération de 2~GiB, 200\,000 messages par seconde et une session de six heures et demie, le budget pour une
+collecte par session est inférieur à un demi-octet par message~: en pratique, zéro.
+
+\section{Compilation à la volée et désoptimisation}
+
+\begin{definition}[Compilation à la volée (JIT), période de chauffe (warm-up)]\label{def:ll:managed-and-functional-languages-on-the-desk:jit}
+Dans la \emph{compilation à la volée}\index{compilation à la volée} (just-in-time compilation), un environnement d'exécution commence par interpréter ou compiler légèrement un programme,
+mesure quel code est chaud et comment il se comporte, puis compile le code chaud en code machine optimisé à partir de ce profil.
+La \emph{période de chauffe}\index{période de chauffe} (warm-up period) est le temps, ou le nombre d'exécutions,
+qui précède le moment où le chemin critique s'exécute en code optimisé.
+\end{definition}
+
+\begin{definition}[Désoptimisation]\label{def:ll:managed-and-functional-languages-on-the-desk:deopt}
+La \emph{désoptimisation}\index{désoptimisation} est le repli de l'environnement d'exécution du code optimisé vers un niveau plus lent lorsqu'une
+hypothèse faite par l'optimiseur à partir du profil est mise en défaut (un site d'appel qui n'avait vu qu'un type en voit un autre, un embranchement
+jamais pris est emprunté)~; le code peut être recompilé plus tard.
+\end{definition}
+
+Un compilateur à la volée est une \omterm{def:ll:cpp-for-latency-iii-the-compiler:pgo}{optimisation guidée par profil} (chapitre~8) réalisée pendant l'exécution, avec le même risque~: le
+profil est ce que le programme a vu jusque-là. Un processus de trading qui démarre le matin est le plus lent sur ses premiers
+messages, précisément au moment où l'ouverture est la plus chargée, et un chemin rare emprunté pour la première fois à un moment
+volatil (un type de message inhabituel, une suspension de cotation) peut déclencher une \omterm{def:ll:managed-and-functional-languages-on-the-desk:deopt}{désoptimisation} à ce moment précis. Les remèdes usuels sont la chauffe, en rejouant du trafic synthétique ou
+enregistré dans le code réel avant la séance (avec des ordres envoyés à un simulateur, jamais au marché), et la stabilité
+des types et des embranchements du chemin critique. La compilation anticipée supprime la \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe}, au prix du profil.
+
+\section{Les sociétés à langage fonctionnel}
+
+La société de trading pour compte propre évoquée en introduction a décrit son choix dans un article de revue~: OCaml comme langage de développement principal,
+plus de vingt programmeurs OCaml et des centaines de milliers de lignes de code, utilisé pour les systèmes de trading critiques, la recherche,
+les logiciels système et l'administration, et apprécié parce qu'il permettait à la société de «~produire rapidement du code lisible, correct et efficace~»
+(Minsky et Weeks, 2008). L'argument ne portait pas sur la vitesse par message mais sur la correction par ingénieur~: un système de types expressif
+qui encode des invariants (l'état d'un ordre comme type somme dont le compilateur vérifie que tous les cas sont traités), des données immuables par
+défaut, et un code assez court pour être relu par les personnes qui s'en servent pour trader. Un essai ultérieur de la même société soutenait que le
+prochain langage qu'un programmeur apprend devrait être fonctionnel (Minsky, 2011). Le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} d'OCaml est lui aussi générationnel, avec une petite
+tas mineur collecté souvent et un tas majeur collecté de façon incrémentale~; l'OCaml sensible à la latence, comme le
+Java sensible à la latence, est écrit pour allouer peu sur le chemin critique.
+
+\section{Choisir un langage pour un desk}
+
+Le choix est moins binaire que ne le laissent entendre les débats. Plusieurs langages coexistent généralement dans une même société~: C++ ou Rust là où
+se négocie la nanoseconde, un langage géré ou fonctionnel pour le gros de la logique dont
+le \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} se situe entre la microseconde et la milliseconde, et Python pour la recherche et les opérations (le livre~15, chapitre~8). Les
+questions qui tranchent sont mesurables~: le \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} au centile qui compte~; la discipline d'allocation que l'équipe
+peut tenir et tester~; le coût des bogues que chaque langage empêche ou autorise~; et la taille et l'expérience de
+l'équipe. En Python, langage de recherche de ce livre, les leçons de ce chapitre s'appliquent directement, comme le montre le tutoriel.
+
+\section{Tutoriel~: le ramasse-miettes dans une boucle de messages Python}\label{tut:ll:managed-and-functional-languages-on-the-desk:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Observer le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} de CPython interrompre une boucle de messages, puis le supprimer par pré-allocation. \textbf{État final~:}
+\cref{fig:ll:managed-and-functional-languages-on-the-desk:gc}.
+\begin{tutsteps}
+\item \textbf{Deux carnets.} Le premier conserve chaque ordre vivant dans un dictionnaire Python, en ajoutant deux ordres pour chacun retiré, au fil du remplissage du carnet durant la matinée~; 
+le second écrit les ordres dans un tableau d'enregistrements NumPy pré-alloué.
+\omcode{code/low-latency/10-managed-and-functional-languages-on-the-desk/python/ll_gc.py}{19}{38}{Un carnet de dictionnaires et un carnet pré-alloué.}\label{lst:ll:managed-and-functional-languages-on-the-desk:books}
+\item \textbf{Chronométrer le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}.} \texttt{GcWatch} enregistre une fonction de rappel que CPython appelle avant et après chaque
+collecte, et consigne chaque pause, par génération, dans \texttt{firm.lathist}.
+\omcode{code/firm/gcwatch/firm_gcwatch.py}{27}{50}{Chronométrage de chaque collecte au moyen des rappels du module gc.}\label{lst:ll:managed-and-functional-languages-on-the-desk:watch}
+\item \textbf{Mesurer la boucle} sur 200\,000 messages avec \texttt{python bench\_gc.py}~; la boucle ne stocke que des horodatages,
+de sorte que seul le travail propre au carnet s'exécute entre deux d'entre eux.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Conserver le carnet de dictionnaires, mais appeler \texttt{gc.freeze()} après la \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe} puis de nouveau
+tous les 100\,000 messages, et observer ce qui advient des collectes complètes~; borner le carnet de dictionnaires à 1\,000 ordres vivants et
+expliquer pourquoi le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} ne se déclenche alors jamais.
+\end{tutorial}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.6cm,ybar,bar width=8pt,ymode=log,log origin y=infty,ymin=100,ymax=100000000,
+  symbolic x coords={dict book,pooled book},xtick=data,xticklabels={carnet à dictionnaire,carnet à pool},enlarge x limits=0.45,
+  ylabel={ns par message (échelle logarithmique)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=design,y=p50]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=design,y=p99]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=design,y=p999]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\addplot[fill=gray!40,draw=gray] table[x=design,y=max]{figdata/low-latency/10-managed-and-functional-languages-on-the-desk/measured_gc.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Une boucle de messages Python sur 200\,000 ordres~: un carnet de dictionnaires, qui a déclenché 259 collectes jeunes, 23 intermédiaires
+et 2 complètes, et un carnet pré-alloué en NumPy, qui n'en a déclenché aucune. Le maximum du carnet de dictionnaires correspond à sa
+collecte complète. CPython~3.10. Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~:
+\texttt{bench\_gc.py}.}\label{fig:ll:managed-and-functional-languages-on-the-desk:gc}
+\end{omfigure}
+
+Le résultat comporte deux volets, et tous deux comptent. Le carnet pré-alloué a supprimé le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}~: aucune collecte sur 200\,000
+messages, et une queue plus de vingt fois plus courte à son maximum. Il n'est pas plus rapide à la médiane~: écrire trois champs
+d'un tableau NumPy depuis Python coûte plus que créer un petit dictionnaire. Et le pire message du carnet de dictionnaires a duré
+aussi longtemps que sa dernière collecte complète, une vingtaine de millisecondes, qui a parcouru chaque ordre encore vivant. CPython ajoute
+une subtilité qui lui est propre~: son \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} compte les allocations moins les désallocations, de sorte qu'une boucle dont l'ensemble vivant reste borné
+ne déclenche jamais de collecte~; un carnet qui grossit, lui, en déclenche.
+
+\section{Construction~: surveillance du ramasse-miettes et pool de messages}\label{bld:ll:managed-and-functional-languages-on-the-desk:gcwatch}
+
+\begin{build}
+\bfield{Rôle} Les services Python de la société (serveurs de recherche, reporting, pilotes du simulateur du livre~10)
+mesurent leur \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} et le tiennent à l'écart de leurs boucles de messages.
+\bfield{Interface} Python \texttt{firm\_gcwatch}~: \texttt{GcWatch()} utilisé comme gestionnaire de contexte avec \texttt{pauses[gen]}
+(\texttt{LatHist}, en nanosecondes), \texttt{collections[gen]}, \texttt{total\_ns}~; \texttt{RecordPool(n, dtype)} avec
+\texttt{next()} et \texttt{buf}~; \texttt{MESSAGE} (horodatage, prix, quantité, côté)~;
+\texttt{steady\_state(step, n, warm)}.
+\bfield{Règles} La fonction de rappel est retirée à la fin du contexte, même en cas d'erreur~; \texttt{steady\_state} gèle le tas après
+la \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe} et le dégèle ensuite~; le pool ne grandit jamais.
+\bfield{Tests d'acceptation} \texttt{code/firm/gcwatch/tests/}~: une boucle à pool de 50\,000 messages ne provoque aucune collecte~; un
+renouvellement borné n'en provoque pas non plus~; un carnet croissant provoque des collectes jeunes, chacune chronométrée.
+\bfield{Pour aller plus loin} Mesurer le débit d'allocation (octets par message) avec \texttt{tracemalloc} dans une version de test~; déclencher une alerte si une
+collecte complète survient pendant les heures de marché.
+\end{build}
+
+\begin{omsources}
+\item M.~Fowler, ``The LMAX architecture'', 12 juillet 2011.
+\item Y.~Minsky et S.~Weeks, ``Caml trading: experiences with functional programming on Wall Street'', \emph{Journal of
+Functional Programming} 18(4), 2008~; Y.~Minsky, ``OCaml for the masses'', \emph{ACM Queue}, 2011.
+\item OpenJDK, JEP 333 (ZGC) et JEP 376 (concurrent thread-stack processing).
+\item Documentation Python, module \texttt{gc}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:1}
+Un moteur Java alloue 64 octets par message à raison de 100\,000 messages par seconde, avec une jeune génération de 1~GiB. À quelle fréquence
+collecte-t-il la jeune génération, et combien de fois le fait-il sur une session de 6.5 heures~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:2}
+La pause d'un collecteur dure \qty{1}{\milli\second}. Combien de messages arrivant à 200\,000 par seconde font la queue derrière elle, et combien de temps
+attend le dernier d'entre eux~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:3}
+D'après la \cref{fig:ll:managed-and-functional-languages-on-the-desk:gc}, de combien le carnet à pool réduit-il le maximum et
+le p99.9, et comment sa médiane se compare-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:4}
+Pourquoi une boucle Python qui conserve les 1\,000 derniers ordres dans un deque borné ne déclenche jamais le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}, alors qu'un carnet qui grossit
+le déclenche~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:5}
+Une stratégie Java est la plus rapide après dix minutes de négociation et la plus lente à l'ouverture. Expliquer ce phénomène et proposer deux remèdes.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:6}
+La bourse d'ouverture conservait des tampons circulaires de 20~millions d'emplacements côté entrée. À 6~millions d'ordres par seconde, combien de
+secondes de flux d'entrée un tel tampon contient-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:7}
+\emph{Programmation.} Appeler \texttt{gc.freeze()} dans le carnet à dictionnaire après la \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe} (warm-up), puis tous les 100\,000 messages. Compter les
+collectes complètes et noter le message le plus lent. Que sacrifie le gel~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:managed-and-functional-languages-on-the-desk:8}
+\emph{Trouver la faille.} «~La passerelle Java utilise le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} concurrent, avec des pauses inférieures à une milliseconde, donc le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}
+n'affecte pas notre latence.~»
+\end{exercise}
+
+\section{Problème~: Le budget du ramasse-miettes}
+
+\begin{problem}[{Problème du week-end --- un moteur JVM un jour de forte activité}]\label{pb:ll:managed-and-functional-languages-on-the-desk:1}
+Une société de trading fait tourner un moteur de routage d'ordres sur la JVM, avec une jeune génération de 2~GiB. Un jour ordinaire, il traite 200\,000 messages par
+seconde pendant une session de 6.5~heures et alloue en moyenne 48~octets par message. Une revue de code montre que l'essentiel vient de
+des entiers encapsulés (boxed integers) et d'un appel de journalisation qui met en forme une chaîne.
+
+\medskip\noindent\textbf{Partie I --- Le budget.}
+\begin{enumerate}
+\item Combien d'octets le moteur alloue-t-il par seconde, et par session~?
+\item À quelle fréquence collecte-t-il la jeune génération, et combien de fois par session~?
+\item Quelle est l'allocation par message qui permet au plus une collecte de la jeune génération par session~?
+\item Que signifie ce budget en pratique~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les pauses.}
+\begin{enumerate}[resume]
+\item Si chaque collecte de la jeune génération met le moteur en pause pendant \qty{0.5}{\milli\second}, combien de temps par session le moteur reste-t-il en pause~?
+\item Combien de messages s'accumulent derrière une telle pause, et combien de temps attend celui qui se trouve en queue de file~?
+\item Un jour où le trafic est trois fois plus important, comment les réponses changent-elles~?
+\item Pourquoi le jour chargé est-il celui qui compte~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les correctifs.}
+\begin{enumerate}[resume]
+\item Par quoi remplacer les entiers encapsulés sur le chemin critique (hot path)~?
+\item Par quoi remplacer la journalisation formatée (chapitre~23)~?
+\item Où placer le carnet d'ordres et les tampons circulaires, et pourquoi~?
+\item Comment vérifier, dans la suite de tests, que l'allocation par message est nulle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'allocation par message qui limite le moteur à une collecte de la jeune génération par session,
+et le temps de pause par session pour les 48~octets actuels.
+\item Que reste-t-il du coût du \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} une fois l'allocation nulle~?
+\item Pourquoi le moteur doit-il encore passer par sa \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe} avant l'ouverture~?
+\item Que montre l'expérience Python du tutoriel qui vaut aussi pour la JVM~?
+\item Pourquoi la société utilisant un langage fonctionnel accordait-elle de la valeur à ce langage, selon son propre article~?
+\item Dans quels cas faudrait-il choisir C++ ou Rust plutôt qu'un langage managé pour ce moteur~?
+\item Que doit mesurer la société avant de trancher~?
+\item En une phrase~: quel coût un \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} fait-il peser sur un chemin critique~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:1}
+Comment fonctionne un \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} générationnel, et pourquoi est-il générationnel~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:2}
+Comment écririez-vous un service à faible latence en Java pour que le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes} n'interfère pas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:3}
+Qu'est-ce que la \omterm{def:ll:managed-and-functional-languages-on-the-desk:jit}{période de chauffe} (warm-up) dans un environnement d'exécution compilé à la volée (JIT), et comment la gérez-vous avant l'ouverture~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:4}
+Qu'est-ce que la \omterm{def:ll:managed-and-functional-languages-on-the-desk:deopt}{désoptimisation}, et pourquoi peut-elle survenir au pire moment~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:5}
+Pourquoi une société de trading choisirait-elle un langage fonctionnel pour ses systèmes de trading~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:managed-and-functional-languages-on-the-desk:6}
+Le p99.9 d'un service Python est correct, mais son maximum atteint 20 millisecondes une fois toutes les quelques minutes. Comment savez-vous si
+c'est le \omterm{def:ll:managed-and-functional-languages-on-the-desk:gc}{ramasse-miettes}, et que faites-vous à ce sujet~?
+\end{interviewq}

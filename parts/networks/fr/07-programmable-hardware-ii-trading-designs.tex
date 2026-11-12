@@ -1,0 +1,367 @@
+\chapter{Matériel programmable II~: conceptions de trading}\label{ch:nw:programmable-hardware-ii-trading-designs}
+
+La conception de ce chapitre réagit deux cycles d'horloge après que le dernier octet d'un prix l'a atteinte~: \qty{12.8}{\nano\second} à 156.25~MHz,
+pour le premier ordre comme pour le dix-millième, que le marché soit calme ou en pleine rafale. Elle n'a pas de cache à manquer ni de thread à réveiller,
+et l'ordre qu'elle envoie part d'un \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{gabarit d'ordre} dans lequel trois champs sont complétés. Elle ne peut pas non plus faire grand-chose~: elle compare un prix à un
+seuil, pour un seul instrument, et tout ce qu'elle sait du monde a été écrit dans ses registres par le logiciel un instant plus tôt.
+Cette combinaison (très rapide, très étroite, pilotée par le logiciel) est ce que les firmes entendent par un \omterm{def:nw:programmable-hardware-ii-trading-designs:hybrid}{système de trading hybride}.
+
+Ce chapitre construit un \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{déclencheur matériel} sur le flux du simulateur de bourse, avec ses contrôles de risque et son \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{gabarit d'ordre}, en SystemVerilog
+sur la boîte à outils du chapitre~6, et le vérifie de quatre façons~: dans Verilator, dans Icarus, face à un modèle de cycles en C++20 et face à un modèle Python,
+ordre par ordre et cycle par cycle. Il place ensuite le déclencheur dans le chemin wire-to-wire de la firme et se demande ce qu'il apporte.
+
+\section{Décodage du flux en matériel}
+
+Un gestionnaire logiciel (livre~13, chapitre~18) reçoit un datagramme entier, puis parcourt ses messages. Un décodeur matériel parcourt les
+messages au fur et à mesure que les octets arrivent, huit par cycle, en ne conservant que l'état dont il a besoin entre les cycles~: sa position dans l'en-tête du paquet, la
+longueur du message courant, sa progression à l'intérieur de celui-ci, et les champs qu'il a déjà capturés. Dans le flux du simulateur, comme dans le
+format de flux de la bourse qu'il suit, un message d'ajout d'ordre fait 36 octets, son prix occupant les quatre derniers~; le décodeur connaît donc tout
+d'un ordre dès le cycle où son dernier octet arrive, alors que le reste du paquet (autres messages, séquence de contrôle de la trame) peut encore
+rester à venir.
+
+\omcode{code/firm/hwtrade/hdl/hwt_trigger.sv}{47}{75}{Logique combinatoire du décodeur~: une machine à états sérielle par octet, déroulée sur les
+huit voies du beat. Elle capture le type, l'instrument, le sens, la taille et le prix, et, au dernier octet du message, décide s'il faut
+déclencher.}\label{lst:nw:programmable-hardware-ii-trading-designs:parse}
+
+\begin{definition}[Déclencheur matériel, décision cut-through]\label{def:nw:programmable-hardware-ii-trading-designs:trigger}
+Un \emph{déclencheur matériel}\index{déclencheur matériel} est une logique placée sur une \omterm{def:nw:networking-for-trading:frame}{carte réseau} qui surveille un flux de données de marché pour une condition fixée
+à l'avance par le logiciel (un cours franchissant un seuil, une transaction sur un instrument donné) et, lorsqu'elle se produit, lance un ordre sans
+l'intervention de l'hôte. Une \emph{décision cut-through}\index{décision cut-through} est une décision prise dès que les octets dont elle dépend
+sont arrivés, avant que la trame qui les porte ne soit achevée ou vérifiée.
+\end{definition}
+
+La machine à états déroulée du \cref{lst:nw:programmable-hardware-ii-trading-designs:parse} est la conception correcte la plus simple, et elle est
+lente en matériel~: huit étapes d'octet enchaînées en un seul cycle forment un long chemin critique. Des décodeurs plus rapides exploitent le format~: les messages commencent à
+des décalages connus par rapport à leurs préfixes de longueur, si bien qu'une logique dédiée peut repérer un début de message dans chaque voie d'un coup, et les messages à format fixe
+peuvent être reconnus par comparaison de mots entiers. C'est le travail de la \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{fermeture temporelle} du chapitre~6, et c'est pourquoi les décodeurs de production sont
+propres au format d'une seule plateforme.
+
+\section{Construction du carnet d'ordres en matériel}
+
+Un déclencheur sur des messages isolés n'a pas besoin de carnet. Une stratégie qui négocie sur le meilleur cours acheteur ou le meilleur cours vendeur en a besoin, et un carnet en matériel est une
+structure de données différente de celles du livre~13, chapitre~19. Les ordres identifiés par leur référence exigent une table de hachage en \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAM} ou en mémoire externe
+mémoire~; les niveaux de prix exigent un tableau indexé par le décalage du prix par rapport à une référence, le meilleur niveau étant trouvé par un codeur de priorité sur les
+niveaux occupés~; chaque mise à jour doit s'achever dans le délai entre deux messages, sinon la conception doit les mettre en file d'attente. Les firmes qui construisent des carnets
+en matériel ne conservent que quelques niveaux près du meilleur prix, pour les rares instruments qui en ont besoin, et laissent le reste au logiciel.
+
+\section{Contrôles de risque en cycles}
+
+Le matériel d'une firme envoie des ordres pour le compte d'un broker-dealer, qui doit garder les contrôles préalables à la négociation «~sous le contrôle direct et exclusif
+~» du courtier (livre~11, chapitre~27), des contrôles qui rejettent les ordres dépassant des «~paramètres de prix ou de taille appropriés,
+au cas par cas ou sur une courte période de temps~». En matériel, ces contrôles se réduisent à des comparaisons et des compteurs, et ils coûtent une
+étape du pipeline.
+
+\begin{definition}[Carte des registres]\label{def:nw:programmable-hardware-ii-trading-designs:regmap}
+Une \emph{carte des registres}\index{carte des registres} est l'ensemble des adresses auxquelles une conception matérielle expose sa configuration et son état au
+logiciel (seuils, limites, bits d'activation et de kill, compteurs), lus et écrits sur le bus de l'hôte, et le document qui les
+définit.
+\end{definition}
+
+\omcode{code/firm/hwtrade/hdl/hwt_trigger.sv}{108}{135}{L'étape de risque et le gabarit d'ordre~: une limite de taille, un bit de kill et un seau à
+jetons, puis l'identifiant, la taille et le prix de l'ordre insérés.}\label{lst:nw:programmable-hardware-ii-trading-designs:risk}
+
+\begin{proposition}[Rafale d'un seau à jetons]\label{prop:nw:programmable-hardware-ii-trading-designs:bucket}
+Un seau à jetons de capacité $B$, rempli d'un jeton tous les $R$ cycles, laisse sortir au plus $B + \lfloor t/R\rfloor$ ordres sur tout intervalle
+de $t$ cycles. Si le logiciel a besoin de $t$ cycles pour repérer un emballement et activer le bit de kill, le matériel peut envoyer au plus ce nombre d'ordres
+avant de s'arrêter, et aucun après.
+\end{proposition}
+
+\begin{proof}
+Le seau contient au plus $B$ jetons au début de l'intervalle et en gagne au plus un tous les $R$ cycles~; chaque ordre en consomme un. Le
+bit de kill masque l'étape de sortie dans le cycle où il est activé.
+\end{proof}
+
+La proposition est le document d'exigences d'une couche de risque matérielle. À 156.25~MHz, avec le seau de 4 jetons du chapitre, rempli
+tous les 64 cycles, un moniteur logiciel qui réagit en \qty{20}{\micro\second} laisse sortir au plus 52 ordres~; celui qui réagit en
+\qty{100}{\micro\second} en laisse sortir 248. Les limites qui comptent en matériel sont celles qui s'imposent avant que le logiciel puisse agir.
+
+\section{Génération d'ordres à partir de gabarits}
+
+\begin{definition}[Gabarit d'ordre]\label{def:nw:programmable-hardware-ii-trading-designs:template}
+Un \emph{gabarit d'ordre}\index{gabarit d'ordre} (order template) est un message d'ordre préparé à l'avance, complet à l'exception des champs qui dépendent de
+du déclencheur (identifiant client de l'ordre, taille, prix), que le matériel insère au fur et à mesure de l'envoi.
+\end{definition}
+
+\begin{definition}[Moteur de déchargement TCP]\label{def:nw:programmable-hardware-ii-trading-designs:toe}
+Un \emph{moteur de déchargement TCP}\index{moteur de déchargement TCP} (TCP offload engine) implante le protocole TCP (numéros de séquence, accusés de réception, retransmission)
+dans le matériel d'une \omterm{def:nw:networking-for-trading:frame}{carte réseau}, de sorte que la carte puisse émettre et recevoir sur une connexion TCP sans passer par l'hôte.
+\end{definition}
+
+La saisie d'ordres passe par TCP (chapitre~1), si bien qu'une carte qui envoie seule des ordres doit gérer l'état de la connexion~: son prochain
+numéro de séquence, ses accusés de réception, ses retransmissions. Un \omterm{def:nw:programmable-hardware-ii-trading-designs:toe}{moteur de déchargement TCP} s'en charge~; le \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{gabarit d'ordre} transporte alors les en-têtes TCP et
+IP, avec numéro de séquence et sommes de contrôle complétés au moment de l'envoi. Le logiciel qui gère la session (ouverture de session, heartbeat, la
+couche de session de la plateforme) partage la connexion avec le matériel par le même moteur.
+
+\begin{dated}{2026-09}{Un chiffre publié de tick-to-trade matériel}\label{dat:nw:programmable-hardware-ii-trading-designs:stac}
+Dans un benchmark STAC-T0 publié en juin 2024, un système FPGA construit sur une carte AMD Alveo UL3524 dotée d'un cœur TCP et UDP (une solution d'Exegy et AMD
+) a été mesuré à un minimum de \qty{13.9}{\nano\second} pour des trames de 507 octets et \qty{14.1}{\nano\second} pour des trames de 68 octets, depuis
+«~le dernier bit de données entrantes nécessaire à une décision de trading jusqu'au premier bit de l'ordre sortant simulé~». La définition
+exclut le temps d'arrivée des bits entrants, qu'aucune conception, celle du chapitre comprise, ne peut éviter.
+\end{dated}
+
+\section{Conceptions hybrides~: ce qui reste dans le logiciel et pourquoi}
+
+\begin{definition}[Système de trading hybride]\label{def:nw:programmable-hardware-ii-trading-designs:hybrid}
+Un \emph{système de trading hybride}\index{système de trading hybride} répartit une stratégie entre le logiciel, qui calcule son modèle, ses positions
+et ses paramètres à son propre rythme, et le matériel, qui applique à flux tendu des décisions précalculées aux données de marché au \omterm{def:nw:networking-for-trading:ser}{débit de ligne}~; le logiciel écrit dans les
+registres du matériel, et en lit les compteurs et les copies de ce qu'il a envoyé.
+\end{definition}
+
+La répartition découle de ce que chaque côté fait bien. Le matériel est rapide et figé~: chaque fonctionnalité coûte de la logique, chaque modification une construction de
+quelques heures et une vérification de plusieurs jours, et il ne peut pas retenir beaucoup d'état. Le logiciel est lent et souple~: il peut modéliser, apprendre, compenser les positions
+entre plateformes et changer en quelques minutes. Le logiciel décide donc de \emph{ce} qui vaudrait la peine d'être fait («~acheter jusqu'à 700 à 100.02 ou mieux si
+quelqu'un propose~»), et le matériel décide de \emph{quand} (le cycle où le cours vendeur arrive). Tout ce qui demande un historique, de nombreux instruments ou
+un jugement reste dans le logiciel~; la seule comparaison qui doit d'abord avoir lieu passe sur la carte.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (feed) at (0,0) {flux (UDP)};
+\node[b,fill=omDef!18] (dec) at (2.5,0) {décodage\\ (étape 1)};
+\node[b,fill=omThm!15] (risk) at (5.4,0) {risque~: taille,\\ seau, kill\\ (étape 2)};
+\node[b,fill=omMeth!20] (tpl) at (8.3,0) {gabarit\\ d'ordre\\ (étape 3)};
+\node[b,fill=gray!10] (out) at (11.0,0) {ordres\\ (TCP offload)};
+\node[b,fill=omDef!8,minimum width=5.6cm] (sw) at (4.0,-2.4) {logiciel sur l'hôte~: modèle, positions, limites};
+\node[b,fill=gray!8] (regs) at (4.0,-1.25) {carte des registres~: seuils, limites, kill, compteurs};
+\draw[->,thick] (feed) -- (dec);
+\draw[->,thick] (dec) -- node[above,font=\scriptsize]{signal} (risk);
+\draw[->,thick] (risk) -- (tpl);
+\draw[->,thick] (tpl) -- (out);
+\draw[->,omThm] (sw) -- (regs);
+\draw[->,omThm] (regs.north -| risk.south) -- (risk.south);
+\draw[->,omThm] (regs.north -| dec.south) -- (dec.south);
+\draw[->,gray,dashed] (tpl.south) |- node[pos=0.25,right,font=\scriptsize]{copies des ordres} (sw.east);
+\end{tikzpicture}
+
+\omcaption{La conception hybride du chapitre. Trois étapes du pipeline sur la carte décodent le flux, vérifient chaque ordre candidat et l'insèrent
+dans un gabarit~; le logiciel sur l'hôte écrit les seuils, les limites et le bit de kill par la \omterm{def:nw:programmable-hardware-ii-trading-designs:regmap}{carte des registres} et reçoit les copies de tout
+ce que la carte envoie.}\label{fig:nw:programmable-hardware-ii-trading-designs:hybrid}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,c/.style={draw,minimum height=0.55cm,minimum width=1.05cm,align=center,inner sep=1pt}]
+\foreach \i in {0,...,9} {\node at (1.1*\i,1.25) {\i};}
+\node[anchor=east] at (-0.7,1.25) {cycle};
+\foreach \i in {0,...,7} {\node[c,fill=omDef!15] at (1.1*\i,0.55) {mot \i};}
+\node[anchor=east] at (-0.7,0.55) {entrée};
+\node[c,fill=omDef!35] at (1.1*7,-0.15) {prix};
+\node[anchor=east] at (-0.7,-0.15) {décodage};
+\node[c,fill=omThm!25] at (1.1*8,-0.85) {risque};
+\node[anchor=east] at (-0.7,-0.85) {risque};
+\node[c,fill=omMeth!30] at (1.1*9,-1.55) {ordre};
+\node[anchor=east] at (-0.7,-1.55) {gabarit};
+\end{tikzpicture}
+
+\omcaption{Un paquet contenant un message d'ajout d'ordre (58~octets~: 20 d'en-tête, 2 de longueur, 36 de message) traverse la conception, à raison d'un mot de
+8~octets par cycle. Le dernier octet du cours arrive dans le mot~7~; le déclencheur est enregistré à la fin de ce cycle, la décision de risque un cycle
+plus tard, et l'ordre au cycle suivant~: deux cycles après le cours, dix après le premier octet du paquet.}\label{fig:nw:programmable-hardware-ii-trading-designs:cycles}
+\end{omfigure}
+
+\section{Tutoriel~: un déclencheur sur le flux du simulateur, de quatre façons}\label{tut:nw:programmable-hardware-ii-trading-designs:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Faire tourner le déclencheur sur deux secondes du flux du simulateur de bourse, dans Verilator, dans Icarus, dans un modèle à cycles en C++20 et dans
+un modèle Python, vérifier que les quatre envoient les mêmes ordres aux mêmes cycles, et placer la conception sur le chemin wire-to-wire.
+\textbf{État final~:} \cref{tab:nw:programmable-hardware-ii-trading-designs:runs}, \cref{fig:nw:programmable-hardware-ii-trading-designs:race}
+et les tests au vert de \texttt{firm.hwtrade}.
+\begin{tutsteps}
+\item \textbf{Le flux.} \texttt{make\_hwtrade\_fixture.py} fait tourner le simulateur du livre~10 pendant deux secondes depuis l'ouverture (992 paquets)
+  et les enregistre~; \texttt{beats\_of} les découpe en mots avec deux cycles d'inactivité entre les paquets (la journée est compressée~: le seau compte
+  des cycles, et non des secondes).
+\item \textbf{Quatre modèles.} \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{CycleModel} et \texttt{cpp/firm\_hwtrade.hpp}
+  (\cref{lst:nw:programmable-hardware-ii-trading-designs:model}) exécutent les mêmes réglages~; les tests comparent leurs sorties ligne à ligne.
+\item \textbf{La référence.} \texttt{triggers()} analyse les mêmes paquets message par message en Python~: chaque message qualifié doit être
+  soit un ordre, soit un rejet.
+\item \textbf{Le chemin.} \texttt{nw\_hwtrade.paths()} construit la variante matérielle de \texttt{firm.wirepath} (la cage du chapitre~2, les
+  émetteurs-récepteurs de la carte, trois cycles) à côté du chemin logiciel du chapitre~5, et \texttt{win\_probability} confronte chacun à un concurrent~;
+  \texttt{python fig\_hwtrade.py} écrit les données du graphique.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Régler le seau à un jeton rechargé toutes les 10\,000 cycles et compter les ordres~; déplacer le bit de kill au
+cycle précédant le dixième ordre et vérifier que exactement neuf partent.
+\end{tutorial}
+
+\omcode{code/firm/hwtrade/cpp/firm_hwtrade.hpp}{20}{44}{Front d'horloge du modèle à cycles en C++20~: étape 3, puis étape 2, puis étape 1, chacune
+lisant les registres qu'a écrits le front précédent, comme le fait le matériel.}\label{lst:nw:programmable-hardware-ii-trading-designs:model}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrrr}
+\toprule
+Seuil (prix $\times 10^4$) & Taille maximale & Kill positionné au cycle & Ordres & Rejets \\
+\midrule
+1\,000\,200 & 10\,000 & jamais & 108 & 5 \\
+1\,000\,300 & 10\,000 & jamais & 133 & 27 \\
+1\,000\,300 & 600 & jamais & 131 & 29 \\
+1\,000\,300 & 10\,000 & 3\,000 & 41 & 119 \\
+\bottomrule
+\end{tabular}
+\caption{Le déclencheur sur deux secondes du flux du simulateur (instrument~1~; ajouts d'ordres sell side au seuil ou en dessous), avec un seau
+de 4 jetons rechargés toutes les 64 cycles. Verilator, Icarus, le modèle à cycles en C++20 et le modèle Python donnent les mêmes ordres aux mêmes
+cycles~; ordres et rejets totalisent les messages qualifiés que trouve la référence Python. Données~:
+le jeu d'essai de \texttt{firm.hwtrade}.}\label{tab:nw:programmable-hardware-ii-trading-designs:runs}
+\end{table}
+
+Le tableau montre chaque contrôle à l'œuvre. Un seuil plus bas déclenche moins souvent~; le seau rejette la plupart des déclenchements supplémentaires du
+seuil plus haut, car ils arrivent par rafales~; la limite de taille en rejette deux de plus~; et le bit de kill, positionné au cycle 3\,000, arrête tous les ordres suivants. Sur
+le chemin wire-to-wire du chapitre~5 (\cref{fig:nw:programmable-hardware-ii-trading-designs:race}), le chemin matériel se compose de la fibre de la cage,
+des émetteurs-récepteurs de la carte (\qty{120}{\nano\second} dans chaque sens, une valeur de modèle) et de trois cycles~: \qty{0.82}{\micro\second} à chaque quantile.
+Le chemin logiciel a une médiane de \qty{4.4}{\micro\second} et un 99\up{e}~centile de \qty{35}{\micro\second}. Face à un concurrent dont la latence a une
+médiane de \qty{1}{\micro\second} (une loi log-normale d'écart-type 0.3, un modèle), le chemin matériel gagne 75~\% des courses, et le chemin logiciel
+une sur dix mille.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xmin=0,xmax=1,ymode=log,ymin=0.5,ymax=200,xlabel={quantile},ylabel={temps bout en bout (\unit{\micro\second}, log)},
+  ytick={1,10,100},yticklabels={1,10,100},legend columns=2,legend style={font=\footnotesize,at={(1.15,-0.32)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=q,y=software_us]{figdata/networks/07-programmable-hardware-ii-trading-designs/paths.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=q,y=hardware_us]{figdata/networks/07-programmable-hardware-ii-trading-designs/paths.csv};
+\legend{chemin logiciel (chapitre~5),chemin matériel}
+\nextgroupplot[xmode=log,xmin=250,xmax=12000,ymin=0,ymax=1.05,xlabel={latence du concurrent, médiane (ns, log)},ylabel={probabilité de gagner},
+  xtick={300,1000,3000,10000},xticklabels={300,1\,000,3\,000,10\,000}]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=median_ns,y=software]{figdata/networks/07-programmable-hardware-ii-trading-designs/race.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=median_ns,y=hardware]{figdata/networks/07-programmable-hardware-ii-trading-designs/race.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Simulation~: latence wire-to-wire du chemin logiciel du chapitre~5 (étapes mesurées du livre~13, la carte et la cage) et du
+chemin matériel (la cage, les transceivers de la carte à \qty{120}{\nano\second} dans chaque sens, une valeur de modèle, et trois cycles à 156.25~MHz). À gauche~:
+quantiles~; le chemin matériel est une constante. À droite~: la probabilité de battre un concurrent dont la latence est lognormale, de
+médiane donnée et une dispersion de 0.3 (un modèle). Données~: \texttt{fig\_hwtrade.py}.}\label{fig:nw:programmable-hardware-ii-trading-designs:race}
+\end{omfigure}
+
+\section{Construction~: le déclencheur matériel}\label{bld:nw:programmable-hardware-ii-trading-designs:hwtrade}
+
+\begin{build}
+\bfield{Rôle} Un \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{déclencheur matériel} complet et testé~: décodage du flux de données, contrôles de risque et \omterm{def:nw:programmable-hardware-ii-trading-designs:template}{gabarit d'ordre} (order template), avec les trois modèles qui le rendent
+fiable, et une variante matérielle du chemin wire-to-wire de la firme pour le plan du chapitre~29.
+\bfield{Interface} \texttt{hdl/hwt\_trigger.sv} (paramètres \texttt{LOC}, \texttt{BURST}, \texttt{REFILL}~; registres \texttt{thresh},
+\texttt{max\_qty}, \texttt{kill}~; sorties~: identifiant, taille et prix de l'ordre, et compteur de rejets)~; \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{bancs de test} (testbench) \texttt{tb/hwt\_tb.cpp} et
+\texttt{tb/hwt\_tb.sv}~; C++20 \texttt{firm::hwtrade::Model}~; Python \texttt{firm\_hwtrade}~: \texttt{beats\_of}, \texttt{write\_stim},
+\texttt{CycleModel}, \texttt{triggers}, \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{run\_verilator}, \texttt{run\_icarus},
+\texttt{parse\_output}, \texttt{wirepath\_stage}.
+\bfield{Règles} Au plus un ordre par message qualifiant~; rien ne sort tant que le bit kill est positionné~; les tailles au-delà de la limite sont rejetées et
+non tronquées~; le seau à jetons ne prête jamais~; les modèles concordent avec le registre HDL, registre par registre.
+\bfield{Tests d'acceptation} \texttt{code/firm/hwtrade/}~: le modèle Python reproduit les quatre réglages du jeu de référence, et chaque message qualifiant
+est un ordre ou un rejet~; Verilator et Icarus impriment les mêmes ordres que le modèle Python~; le modèle C++20 reproduit le jeu de référence~;
+la limite de taille à sa frontière~; rien après le bit kill~; le rationnement du seau~; deux cycles entre le prix et l'ordre.
+\bfield{Pour aller plus loin} Maintenir le meilleur cours vendeur de l'instrument à partir des messages add, execute et delete, et déclencher dessus~; regrouper les trois contrôles en
+un seul cycle et mesurer le chemin critique dont il aurait besoin.
+\end{build}
+
+\begin{omsources}
+\item STAC, «~STAC-T0~», résultats obtenus avec une solution FPGA d'Exegy et AMD (2024).
+\item 17 CFR 240.15c3-5 (la Market Access Rule).
+\item Nasdaq, \emph{TotalView-ITCH 5.0}, spécification (structure Add Order)~; le \path{code/firm/exchsim/PROTOCOL.md} du simulateur de bourse.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:1}
+Un paquet transporte un ordre add de 36~octets derrière l'en-tête de 20~octets et le champ de longueur de 2~octets. À quel battement se trouve le dernier octet du prix, et combien de
+nanosecondes après le premier battement du paquet le circuit émet-il l'ordre à 156.25~MHz~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:2}
+Avec un seau de 4 jetons rechargés toutes les 64 cycles à 156.25~MHz, quel est le débit maximal soutenu d'ordres~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:3}
+Combien d'ordres le circuit du chapitre peut-il envoyer avant qu'un moniteur logiciel, qui réagit en \qty{50}{\micro\second}, ne positionne le bit kill~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:4}
+Dans le \cref{tab:nw:programmable-hardware-ii-trading-designs:runs}, pourquoi relever le seuil de 1\,000\,200 à 1\,000\,300 ajoute-t-il 25 ordres mais
+22 rejets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:5}
+Pourquoi le circuit rejette-t-il les ordres dont la taille dépasse la limite, au lieu de les envoyer à cette limite~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:6}
+Citer trois décisions que la stratégie du chapitre laisse au logiciel, et pourquoi chacune serait difficile à réaliser dans le matériel.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:7}
+\emph{Programmation.} Avec \texttt{firm.hwtrade.CycleModel}, fixer le seau à 1 jeton rechargé toutes les 10\,000 cycles et compter les ordres au seuil
+1\,000\,300. Puis positionner le bit kill un cycle avant le dixième ordre de la simulation sans restriction, et recompter.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-ii-trading-designs:8}
+\emph{Trouver la faille.} «~Notre matériel déclenche en 13 nanosecondes, donc notre latence wire-to-wire est de 13 nanosecondes.~»
+\end{exercise}
+
+\section{Problème~: Le déclencheur qui ne doit pas se déclencher deux fois}
+
+\begin{problem}[{Problème du week-end --- un chemin hybride, une course et un emballement}]\label{pb:nw:programmable-hardware-ii-trading-designs:1}
+Une firme transfère la décision d'une stratégie sensible à la latence sur le \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{déclencheur matériel} du chapitre. Utiliser les chiffres du chapitre~: la
+médiane wire-to-wire du chemin logiciel \qty{4.39}{\micro\second} et le 99\up{e}~centile \qty{35.3}{\micro\second}~; le chemin matériel \qty{0.82}{\micro\second}
+(\qty{263}{\nano\second} de cage à l'entrée, \qty{120}{\nano\second} de carte à l'entrée, trois cycles à 156.25~MHz, \qty{120}{\nano\second} de carte en sortie,
+\qty{295}{\nano\second} de cage en sortie)~; un concurrent dont la latence est lognormale~; un seau de 4 jetons rechargé toutes les 64 cycles.
+
+\medskip\noindent\textbf{Partie I --- Le chemin.}
+\begin{enumerate}
+\item Additionner les étapes du chemin matériel.
+\item Quelle part en représente la décision elle-même~?
+\item Quel est le 99\up{e}~centile du chemin matériel, et pourquoi~?
+\item De combien le chemin matériel devance-t-il le chemin logiciel à la médiane, et au 99\up{e}~centile~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La course.}
+\begin{enumerate}[resume]
+\item Face à un concurrent de médiane \qty{1}{\micro\second}, quelles sont les probabilités de gagner des deux chemins (celles de la
+  simulation du chapitre)~?
+\item Et face à un concurrent de médiane \qty{5}{\micro\second}~?
+\item Quelle partie du chemin matériel faudrait-il raccourcir ensuite, et que reste-t-il une fois la décision retirée~?
+\item Que laisse de côté le modèle de course~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'emballement.}
+\begin{enumerate}[resume]
+\item Un moniteur logiciel met \qty{20}{\micro\second} à repérer un emballement et à positionner le bit kill. Combien d'ordres peuvent sortir entre-temps~?
+\item Et avec un moniteur sur la carte elle-même, qui réagit en 16 cycles~?
+\item Pourquoi le bit kill agit-il sur l'étape 3 plutôt que seulement sur l'étape 2~?
+\item Quelles limites faudrait-il ajouter à la carte, et lesquelles doivent rester dans la couche du courtier~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les latences des deux chemins, leur probabilité de gagner face à un concurrent de médiane
+  \qty{1}{\micro\second}, et les ordres que le seau laisse sortir avant un kill à \qty{20}{\micro\second}.
+\item Le chemin de \qty{0.82}{\micro\second} vaut-il la peine d'être construit pour une stratégie qui affronte des concurrents à \qty{5}{\micro\second}~?
+\item À quoi la firme renonce-t-elle en transférant la décision dans le matériel~?
+\item À quelle fréquence le seuil peut-il changer, et qui le modifie~?
+\item Pourquoi le logiciel doit-il recevoir une copie de chaque ordre que la carte envoie~?
+\item Comment tester le circuit sur une journée enregistrée avant sa mise en production~?
+\item Que provoquerait une panne du chemin d'écriture de la \omterm{def:nw:programmable-hardware-ii-trading-designs:regmap}{carte des registres}, et comment le circuit la détecterait-il~?
+\item En une phrase~: que décide le matériel, et que décide le logiciel~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-ii-trading-designs:1}
+Comment un FPGA analyse-t-il un flux de données de marché pendant que le paquet arrive encore~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-ii-trading-designs:2}
+Quels contrôles de risque mettriez-vous dans le matériel, et comment prouvez-vous qu'ils ne peuvent pas être contournés~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:nw:programmable-hardware-ii-trading-designs:3}
+Qu'est-ce qui reste dans le logiciel d'un \omterm{def:nw:programmable-hardware-ii-trading-designs:hybrid}{système de trading hybride}, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-ii-trading-designs:4}
+Comment envoyez-vous un ordre par TCP depuis un FPGA~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-ii-trading-designs:5}
+Comment vérifieriez-vous que le \omterm{def:nw:programmable-hardware-ii-trading-designs:trigger}{déclencheur matériel} et son modèle logiciel concordent, et que feriez-vous lorsqu'ils divergent~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:nw:programmable-hardware-ii-trading-designs:6}
+Un fournisseur annonce 14~nanosecondes de tick-to-trade. Quelles questions posez-vous~?
+\end{interviewq}

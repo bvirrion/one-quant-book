@@ -1,0 +1,353 @@
+\chapter{Extensions natives}\label{ch:pl:native-extensions}
+
+Un chercheur a réécrit en C++ l'étape interne d'un signal et l'a appelée depuis Python une fois par tick, un million de fois. Elle était plus lente
+que la fonction Python qu'elle remplaçait~: 118~ns par appel contre 60~ns. Appelée une seule fois sur l'ensemble du tableau d'un million de valeurs, la
+même boucle C++ a coûté 1.4~ns par élément, soit plus de deux fois plus vite que la routine de bibliothèque qu'elle devait battre. Tout
+ce qui concerne une \omterm{def:pl:native-extensions:extension}{extension native} se joue à la frontière entre l'interpréteur et le code compilé~: à quelle fréquence on la franchit, ce qu'il faut
+convertir au passage, et qui possède la mémoire de chaque côté. Ce chapitre lie un noyau écrit en C++20 et en Rust à Python
+de deux façons, avec pybind11 et par une interface C chargée avec \texttt{ctypes}, fait passer les tableaux numpy sans les copier,
+et mesure la frontière (\texttt{firm.natext}).
+
+\section{Pourquoi et quand quitter Python}
+
+\begin{definition}[Extension native, liaison de langage]\label{def:pl:native-extensions:extension}
+Une \emph{extension native}\index{extension native} (native extension) est du code compilé (C, C++, Rust) chargé dans le processus Python et appelé comme une
+fonction Python. Une \emph{liaison de langage}\index{liaison de langage} (language binding) est la couche qui la rend appelable~: elle convertit les arguments et
+les résultats entre les représentations des deux langages, signale les erreurs à travers la frontière et précise qui possède chaque morceau de mémoire.
+\end{definition}
+
+Le chapitre~8 a donné l'ordre de préférence~: d'abord la \omterm{def:pl:python-at-scale:array}{programmation par tableaux}, qui repose déjà sur du code compilé écrit par d'autres~; ensuite une
+\omterm{def:pl:native-extensions:extension}{extension native} pour ce que les tableaux ne savent pas exprimer --- une boucle dont l'état change à chaque élément (un carnet d'ordres, une position dans la file, une machine à
+états), une fusion de deux suites triées, une récursion avec des branchements. Les deux noyaux du chapitre sont un exemple de chaque sorte~: une moyenne mobile exponentielle
+(que numpy sait exprimer comme un filtre, de sorte que la version native rivalise avec une bibliothèque) et une recherche as-of de dates triées
+en une seule passe de fusion (que numpy effectue avec une recherche dichotomique par élément, $O(n \log m)$ au lieu de $O(n + m)$).
+
+\omcode{code/firm/natext/cpp/firm_natext.hpp}{9}{38}{Les deux noyaux en C++20, indépendants de Python~: la moyenne, une étape de celle-ci, et la
+recherche as-of par une passe de fusion.}\label{lst:pl:native-extensions:kernels}
+
+\section{La frontière~: appels, types et verrou de l'interpréteur}
+
+\begin{definition}[Interface de fonctions étrangères, interface binaire d'application]\label{def:pl:native-extensions:ffi}
+Une \emph{interface de fonctions étrangères}\index{interface de fonctions étrangères} (foreign function interface) permet à du code écrit dans un langage d'appeler des fonctions compilées à partir d'un autre.
+Elle repose sur une \emph{interface binaire d'application}\index{interface binaire d'application} (application binary interface)~: la convention au niveau machine (la façon dont les arguments
+passent dans les registres et sur la pile, la disposition des structures, les noms des symboles), à laquelle l'appelant et l'appelé, compilés
+séparément, se conforment tous deux~; la convention C est celle que tous les langages savent parler.
+\end{definition}
+
+\begin{definition}[Coût de franchissement de la frontière]\label{def:pl:native-extensions:crossing}
+Le \emph{coût de franchissement de la frontière}\index{coût de franchissement de la frontière} (boundary-crossing cost) d'un appel natif est le travail fixe effectué à chaque appel, indépendamment de
+la taille de ses données~: trouver la fonction, vérifier et convertir chaque argument à partir d'un objet Python, relâcher puis reprendre le verrou de l'interpréteur,
+reconvertir le résultat et gérer les erreurs.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box,fill=omDef!12] (py) at (0,0) {Appelant Python~:\\objets, tableaux numpy};
+\node[box,fill=omMeth!15] (pb) at (4.6,0.9) {liaison pybind11~: vérifie\\le type et la disposition, relâche\\le verrou};
+\node[box,fill=omThm!12] (ct) at (4.6,-0.9) {ctypes~: passe des pointeurs\\tels que déclarés, ne vérifie rien\\(l'enveloppe doit le faire)};
+\node[box,fill=gray!10] (cpp) at (9.0,0.9) {Noyau C++20};
+\node[box,fill=gray!10] (rs) at (9.0,-0.9) {Noyau Rust\\(ABI C, cdylib)};
+\draw[->] (py) -- (pb); \draw[->] (py) -- (ct); \draw[->] (pb) -- (cpp); \draw[->] (ct) -- (rs);
+\draw[dashed,omThm,rounded corners=3pt] (-1.6,-2.4) rectangle (10.4,-1.8);
+\node[omThm] at (4.4,-2.1) {un seul tampon numpy~: lu et écrit sur place par les deux noyaux, jamais copié};
+\end{tikzpicture}
+
+\omcaption{Deux voies à travers la frontière. pybind11 génère une liaison qui vérifie le type et la disposition mémoire de chaque argument et peut
+relâcher le verrou de l'interpréteur pendant que le C++ s'exécute~; ctypes charge n'importe quelle bibliothèque dotée d'une interface C et passe ce qu'on lui indique, si bien que l'enveloppe Python
+doit faire la vérification. Les deux remettent au noyau un pointeur vers le même tampon numpy.}\label{fig:pl:native-extensions:boundary}
+\end{omfigure}
+
+La \Cref{fig:pl:native-extensions:calls} mesure la frontière. Une fonction à une étape appelée un million de fois depuis une boucle Python coûte 60~ns par appel
+lorsqu'il s'agit d'une fonction Python, 118~ns avec pybind11 et 337~ns avec \texttt{ctypes}~: chaque appel natif convertit
+trois flottants Python en doubles C et un en sens inverse, et \texttt{ctypes} le fait dynamiquement, d'après les types d'arguments déclarés à l'exécution.
+L'arithmétique, une multiplication et une addition, prend moins d'une nanoseconde. Une fonction native appelée par élément est plus lente que le Python
+qu'elle remplace, parce que la boucle qui l'entoure reste en Python.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=4.4cm,xbar,bar width=9pt,xmin=0,xmax=480,xlabel={nanosecondes par appel, boucle comprise},y dir=reverse,
+  ytick={0,1,2},yticklabels={fonction Python,C++ via pybind11,Rust via ctypes},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},point meta=explicit,
+  nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=0},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=ns_per_call,y expr=\coordindex,meta=ns_per_call]{figdata/platforms/09-native-extensions/measured_calls.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le coût d'un appel à une fonction à une étape, une fois par élément depuis une boucle Python, un million de fois~: comme fonction Python, comme C++
+avec pybind11, et comme Rust avec \texttt{ctypes}. Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution, machine
+par ailleurs inactive. Données~: \texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:calls}
+\end{omfigure}
+
+\begin{proposition}[Déplacer la boucle, pas le corps]\label{prop:pl:native-extensions:loop}
+Si un appel natif coûte $c_0$ par franchissement et $c_1$ par élément, et que le Python qu'il remplace coûte $p$ par élément, alors appeler la fonction
+une fois par élément coûte $n(c_0 + c_1)$ et n'est plus rapide que Python que si $c_0 + c_1 < p$~; un appel unique sur l'ensemble du tableau coûte
+$c_0 + n c_1$, ce qui est plus rapide que Python pour tout $n > c_0/(p - c_1)$ et tend vers $n c_1$.
+\end{proposition}
+
+\begin{proof}
+Additionner les coûts des appels dans chaque arrangement et comparer avec $np$.
+\end{proof}
+
+Avec $c_0 \approx 118$~ns et $p \approx 60$~ns, le premier arrangement ne gagne jamais~; le second gagne au-delà de quelques éléments. Le
+verrou de l'interpréteur est l'autre moitié de la frontière~: pendant que le noyau s'exécute, il ne touche à aucun objet Python, si bien que la liaison relâche le verrou
+(voir le \cref{lst:pl:native-extensions:pybind}) et d'autres fils Python peuvent s'exécuter entre-temps (le tri du chapitre~8 faisait de même).
+
+\section{Lier du C++ avec un lieur en-tête seul}
+
+pybind11 est une bibliothèque C++ à en-tête seul~: la liaison est un fichier C++ qui l'inclut, décrit les arguments de chaque fonction, et est compilé
+avec les en-têtes Python en une bibliothèque partagée que Python importe comme un module. \texttt{firm.natext} la compile au premier usage avec le
+compilateur de la collection (\texttt{g++ -std=c++20 -O2 -shared -fPIC} avec les chemins d'inclusion donnés par \texttt{python3-config} et
+pybind11).
+
+\omcode{code/firm/natext/cpp/firm_natext_py.cpp}{11}{24}{La liaison pybind11 de la moyenne~: un tableau numpy pris comme tampon float64 contigu en ordre
+C, un tableau de résultat alloué une seule fois, et le verrou de l'interpréteur relâché pendant que le C++ s'exécute.}\label{lst:pl:native-extensions:pybind}
+
+\begin{definition}[Protocole de tampon]\label{def:pl:native-extensions:buffer}
+Le \emph{protocole de tampon}\index{protocole de tampon} (buffer protocol) est l'interface de Python par laquelle un objet expose sa mémoire sous-jacente --- un pointeur,
+le type des éléments, la forme et les pas --- à d'autres objets et au code compilé, afin qu'ils puissent la lire et l'écrire sans
+la copier.
+\end{definition}
+
+Un tableau numpy expose sa mémoire de cette façon, et le \texttt{array\_t} de pybind11 la lit. La déclaration détermine ce qui se passe lorsque
+le tableau n'est pas celui qu'attend le noyau. Avec \texttt{forcecast}, pybind11 convertit en silence~: un tableau float32 ou une vue à pas est copié
+dans un nouveau tampon contigu float64, et une fonction censée écrire dans le tableau de l'appelant écrit à la place dans la copie. La
+liaison de ce chapitre déclare \texttt{c\_style} sans \texttt{forcecast} et marque ses arguments \texttt{noconvert}, si bien que les deux sont refusés
+par une erreur~: une copie doit être une décision, non une surprise.
+
+\section{Lier Rust par l'ABI C}
+
+Rust dispose aussi d'un générateur de liaisons pour Python~; cette série n'utilise aucune crate externe, si bien que le chapitre emprunte la voie qui n'en exige aucune~: une
+bibliothèque de fonctions \texttt{extern \textquotedbl{}C\textquotedbl{}} compilées en bibliothèque dynamique compatible C, chargée avec le module \texttt{ctypes} de Python.
+
+\omcode{code/firm/natext/rust/src/lib.rs}{29}{40}{Une fonction Rust à interface C~: pointeurs bruts et une longueur en entrée, une tranche construite à partir
+d'eux sous des conditions énoncées, et le noyau sûr appelé sur les tranches.}\label{lst:pl:native-extensions:rust}
+
+\begin{dated}{2026-09}{Liaisons Python de Rust}\label{dat:pl:native-extensions:pyo3}
+PyO3, décrit dans son guide d'utilisation comme «~liaisons Rust pour Python, comprenant des outils pour créer des modules d'extension Python natifs~»
+(consulté en septembre 2026), génère l'équivalent des vérifications et conversions d'arguments de pybind11 pour Rust. C'est une crate externe,
+que la série ne construit pas~; l'interface C de ce chapitre est ce que produit une telle liaison par-dessous. Un \texttt{cdylib} est, dans
+les termes de la Rust Reference, une bibliothèque système dynamique utilisée lorsqu'on compile une bibliothèque destinée à être chargée depuis un autre langage.
+\end{dated}
+
+\texttt{ctypes} est l'extrême opposé de pybind11~: il appelle toute fonction C avec les arguments qu'on lui indique et ne vérifie
+rien de la mémoire située derrière un pointeur. L'enveloppe (\cref{lst:pl:native-extensions:ctypes}) déclare une fois pour toutes les types d'arguments de chaque fonction,
+vérifie que chaque tableau est contigu en ordre C et du bon type, puis transmet les pointeurs~; sans ce contrôle, une vue à pas serait lue
+comme si elle était contiguë, en silence.
+
+\omcode{code/firm/natext/firm_natext.py}{105}{131}{Chargement de la bibliothèque Rust avec \texttt{ctypes}~: types d'arguments déclarés, et une
+enveloppe qui vérifie ce que \texttt{ctypes} ne vérifie pas avant de transmettre des pointeurs vers les tampons numpy.}\label{lst:pl:native-extensions:ctypes}
+
+\section{Sans copie à travers la frontière}
+
+\begin{definition}[Transfert sans copie]\label{def:pl:native-extensions:zerocopy}
+Un \emph{transfert sans copie} de données à travers une frontière\index{transfert sans copie} remet au destinataire une référence vers la mémoire de l'émetteur
+(un pointeur et une disposition) plutôt qu'une copie, de sorte que son coût ne dépend pas de la taille des données~; il exige que les deux côtés s'accordent
+sur la disposition, sur qui peut écrire et libérer la mémoire, et pendant combien de temps.
+\end{definition}
+
+Les deux liaisons sont sans copie pour leurs entrées~; \texttt{ewma\_into} l'est aussi pour sa sortie, en écrivant dans un tableau que
+l'appelant a alloué (un test vérifie que l'adresse du tableau est inchangée). Ce sont les règles de propriété qui le rendent sûr~: le noyau lit
+et n'écrit que pendant l'appel, ne conserve aucun pointeur après coup, et ne libère jamais ce que Python a alloué~; Python maintient les tableaux en vie pour
+la durée de l'appel. Les \omterm{def:pl:a-tick-store-on-open-formats:mmap}{fichiers projetés en mémoire} du chapitre~4 étendent la même idée au disque et à d'autres processus, et la
+disposition d'Arrow du chapitre~3 à d'autres bibliothèques et langages.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xmode=log,ymode=log,xlabel={longueur du tableau (échelle log)},ylabel={ns par élément (échelle log)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x=n,y=ewma_numpy]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=square*,omMeth] table[x=n,y=ewma_cpp]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=n,y=ewma_rust]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=diamond*,gray] table[x=n,y=ewma_python]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\legend{numpy (filtre),C++ (pybind11),Rust (ctypes),Python pur}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Temps par élément de la moyenne sur tout le tableau, en fonction de la longueur de celui-ci. Pour les tableaux courts, chaque voie est dominée par son
+coût fixe par appel ($c_0/n$)~; pour les tableaux longs, les boucles natives se stabilisent vers 1.3 à 1.9~ns par élément et le filtre de numpy vers 3 à 3.6, tandis que
+Python pur reste à des centaines. Mesures faites sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution, machine par ailleurs au repos. Données~:
+\texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:sweep}
+\end{omfigure}
+
+Les \Cref{fig:pl:native-extensions:sweep,fig:pl:native-extensions:asof} sont les variantes sur tout le tableau. Pour la moyenne, les deux voies natives
+battent le filtre de numpy à toutes les longueurs mesurées~: la routine de filtrage a un coût fixe de plusieurs microsecondes, supérieur à celui de pybind11~; à
+un million d'éléments, C++ prend 1.4~ns par élément contre 3.3 pour numpy. Pour la recherche as-of, c'est l'algorithme qui compte davantage que le
+langage~: la recherche dichotomique de numpy, élément par élément, coûte davantage à mesure que les tableaux grossissent, 21~ns à un million, tandis que le parcours de fusion reste à
+environ 6, soit trois fois moins. La voie \texttt{ctypes} paie un coût fixe plus élevé (les conversions de pointeurs de l'enveloppe) et
+ne dépasse numpy qu'à partir d'environ mille éléments pour la recherche.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,xmode=log,ymode=log,xlabel={longueur du tableau (échelle log)},ylabel={ns par élément (échelle log)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x=n,y=asof_numpy]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=square*,omMeth] table[x=n,y=asof_cpp]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=n,y=asof_rust]{figdata/platforms/09-native-extensions/measured_sweep.csv};
+\legend{numpy (recherche dichotomique par élément),C++ (fusion),Rust (fusion)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Temps par élément de la recherche as-of de $n$ instants triés dans $n$ autres. La recherche dichotomique de numpy coûte davantage par élément à mesure que les
+tableaux grossissent~; le parcours de fusion natif coûte un petit nombre constant de nanosecondes une fois le coût fixe amorti. Mesures faites sur un ordinateur portable (Intel Core
+Ultra 7 155H) sous WSL2, un seul fil d'exécution, machine par ailleurs au repos. Données~: \texttt{bench\_natext.py}.}\label{fig:pl:native-extensions:asof}
+\end{omfigure}
+
+\begin{method}[Écrire un noyau natif pour la plateforme de recherche]\label{met:pl:native-extensions:method}
+(1) Écrire le noyau en C++ ou en Rust sans rien connaître de Python~: pointeurs, longueurs, types simples. (2) Le tester isolément, dans son propre langage.
+(3) Lier le noyau une fois par tableau, jamais une fois par élément~: des tableaux en entrée, des tableaux en sortie, la boucle à l'intérieur. (4) Refuser les dispositions et les types que le noyau
+ne lit pas sur place, plutôt que de les copier en silence. (5) Relâcher le verrou de l'interpréteur autour du calcul pur. (6) Tester la liaison
+contre la référence Python sur les mêmes données, y compris les entrées vides et les cas limites.
+\end{method}
+
+\section{Tutoriel~: un noyau, quatre implémentations}\label{tut:pl:native-extensions:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire les noyaux C++ et Rust, les lier, montrer que quatre implémentations concordent, et mesurer la frontière.
+\textbf{État final~:} les \cref{fig:pl:native-extensions:calls,fig:pl:native-extensions:sweep,fig:pl:native-extensions:asof}.
+\begin{tutsteps}
+\item \textbf{Noyaux}~: lire le \cref{lst:pl:native-extensions:kernels}~; compiler et exécuter \texttt{firm\_natext\_test.cpp}~; exécuter
+\texttt{cargo test} dans \texttt{code/firm/natext/rust}.
+\item \textbf{Liaison}~: \texttt{firm\_natext.cpp\_module()} compile et importe le module pybind11~;
+\texttt{rust\_library()} construit le \texttt{cdylib} et déclare ses fonctions à \texttt{ctypes}.
+\item \textbf{Concordance}~: les tests d'acceptation comparent les quatre moyennes et les quatre recherches, sur des entrées aléatoires et limites.
+\item \textbf{Refus}~: passer une vue à pas et un tableau float32 à chaque liaison, et lire les erreurs.
+\item \textbf{Mesure}~: \texttt{bench\_natext.py} (coût par appel et balayage des tailles).
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter \texttt{forcecast} à la liaison et observer \texttt{ewma\_into} écrire dans une copie~; appeler le noyau Rust
+depuis deux fils d'exécution Python, via \texttt{ctypes} (qui relâche le verrou autour des appels étrangers), et mesurer le gain de vitesse.
+\end{tutorial}
+
+\section{Construction~: noyaux natifs pour la plateforme de recherche}\label{bld:pl:native-extensions:natext}
+
+\begin{build}
+\bfield{Rôle} Le motif et la mécanique de compilation que suit chaque noyau natif de la plateforme~: les lecteurs de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} du
+chapitre~4, les boucles internes du moteur de backtest (chapitre~11) et l'évaluation du compilateur de paiements (chapitre~19) peuvent
+tous franchir la frontière de cette façon.
+\bfield{Interface} \texttt{ewma\_python}, \texttt{ewma\_numpy}, \texttt{ewma\_cpp}, \texttt{ewma\_cpp\_into}, \texttt{ewma\_rust}~;
+\texttt{asof\_python}, \texttt{asof\_numpy}, \texttt{asof\_cpp}, \texttt{asof\_rust}~; \texttt{step\_python}, \texttt{step\_cpp},
+\texttt{step\_rust}~; \texttt{cpp\_module()}, \texttt{rust\_library()}. En-tête C++20 \texttt{firm::natext} (\texttt{ewma},
+\texttt{ewma\_step}, \texttt{asof\_index})~; crate Rust \texttt{natext\_rs} avec \texttt{natext\_ewma}, \texttt{natext\_asof},
+\texttt{natext\_ewma\_step}.
+\bfield{Règles} Les noyaux ne connaissent rien de Python~; un appel par tableau~; les entrées sont lues sur place ou refusées~; le verrou
+est relâché autour du calcul~; aucun pointeur n'est conservé après un appel~; les compilations font partie des tests, et une chaîne d'outils absente les fait échouer.
+\bfield{Tests d'acceptation} \texttt{code/firm/natext/tests/}, \texttt{cpp/firm\_natext\_test.cpp}, \texttt{rust/}~: quatre moyennes et quatre
+recherches égales, bornes comprises~; trois pas égaux~; sortie écrite sur place~; tableaux à pas et mal typés refusés par les deux liaisons.
+\bfield{Pour aller plus loin} Un noyau sur les enregistrements plats de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} (un tampon structuré, chapitre~4)~; un filtre du
+second ordre dans les quatre langages~; les liaisons comparées sous deux fils d'exécution.
+\end{build}
+
+\begin{omsources}
+\item Documentation de pybind11, \emph{NumPy} (protocole de tampon, \texttt{array\_t}, \texttt{c\_style}, \texttt{forcecast},
+\texttt{noconvert}).
+\item T.~Oliphant et C.~Banks, \emph{PEP 3118 -- Revising the buffer protocol} (Final).
+\item The Rust Reference, \emph{Linkage} (\texttt{cdylib})~; PyO3 user guide.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:1}
+À 118~ns par appel via pybind11 et 60~ns par pas en Python, combien de temps prend une journée de deux cents millions de pas dans chaque cas,
+appelée pour chaque élément~? Et calculée par un seul appel à 1.4~ns par élément~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:2}
+Pourquoi l'appel \texttt{ctypes} est-il plus lent que l'appel pybind11, alors que les deux se terminent par les mêmes instructions machine~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:native-extensions:3}
+Que fait \texttt{forcecast} d'un tableau float32 passé à une fonction déclarée pour float64, et pourquoi est-ce dangereux pour
+\texttt{ewma\_into}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:4}
+Avec la \cref{prop:pl:native-extensions:loop}, $c_0 = 118$~ns, $c_1 = 1.4$~ns et $p = 60$~ns, à partir de combien d'éléments un appel sur le
+tableau entier est-il plus rapide que la boucle Python~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:5}
+Pourquoi la recherche as-of de numpy coûte-t-elle davantage par élément à mesure que les tableaux grandissent, alors que la passe de fusion ne le fait pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:native-extensions:6}
+Un noyau conserve un pointeur vers un tableau numpy entre deux appels pour le réutiliser. Décrire comment cela tourne mal, et ce que la règle de propriété interdit.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:native-extensions:7}
+\emph{Programmation.} Avec les fonctions du chapitre, calculer la recherche as-of de 100\,000 temps triés aléatoires dans 50\,000 autres par les quatre
+implémentations, et vérifier qu'elles concordent, y compris pour un temps de gauche avant le premier temps de droite et un temps après le dernier.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:native-extensions:8}
+\emph{Trouver la faille.} «~Notre extension C++ prend une liste de flottants Python, la convertit en \texttt{std::vector<double>}, calcule, et
+renvoie une nouvelle liste. Elle est plus rapide que numpy sur notre banc d'essai de dix nombres, donc nous l'utilisons partout.~»
+\end{exercise}
+
+\section{Problème~: le million d'appels}
+
+\begin{problem}[{Problème du week-end --- où franchir la frontière}]\label{pb:pl:native-extensions:1}
+Les noyaux du chapitre, leurs quatre implémentations, les deux liaisons et les mesures de \texttt{bench\_natext.py}.
+
+\medskip\noindent\textbf{Partie I --- La traversée.}
+\begin{enumerate}
+\item Que fait un appel natif en plus du calcul arithmétique~?
+\item Quels sont les coûts mesurés par appel pour les trois voies~?
+\item Pourquoi un appel natif par élément est-il plus lent que la fonction Python qu'il remplace~?
+\item Que permet le relâchement du verrou de l'interpréteur, et quand est-il sûr~?
+\item Qu'est-ce qu'une \omterm{def:pl:native-extensions:ffi}{interface binaire d'application}, et pourquoi l'interface C est-elle le terrain commun~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les deux liaisons.}
+\begin{enumerate}[resume]
+\item Que vérifie pybind11 que \texttt{ctypes} ne vérifie pas~?
+\item Que doit vérifier le wrapper \texttt{ctypes} lui-même~?
+\item Que se passe-t-il pour une vue à pas passée à chaque liaison~?
+\item Pourquoi \texttt{forcecast} n'est-il pas utilisé~?
+\item Qu'ajouterait PyO3 à la voie Rust~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Tableaux.}
+\begin{enumerate}[resume]
+\item Quels sont les coûts par élément de la moyenne sur tout le tableau à un million d'éléments, par voie~?
+\item Pourquoi les voies natives battent-elles le filtre de numpy à chaque longueur mesurée~?
+\item Quels sont les coûts par élément de la recherche as-of à un million, par voie~?
+\item À partir de quelle longueur la recherche Rust bat-elle celle de numpy~?
+\item Lequel des deux noyaux gagne le plus à passer en natif, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le coût par appel de chaque liaison, les longueurs au-delà desquelles chaque version native bat numpy, et le
+gain de déplacer la boucle, et non le corps, au franchissement de la frontière.
+\item Combien de temps une journée de deux cents millions de pas économise-t-elle en déplaçant la boucle en C++~?
+\item Quand une \omterm{def:pl:native-extensions:extension}{extension native} ne vaut-elle pas la peine d'être écrite~?
+\item Qu'exige la règle de propriété du noyau et de l'appelant~?
+\item En une phrase~: où doit se trouver la frontière entre Python et le code natif~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:native-extensions:1}
+Vous avez écrit une fonction en C++ pour accélérer une boucle Python, et elle est devenue plus lente~? Que s'est-il passé~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:native-extensions:2}
+Comment passez-vous un tableau numpy à C++ ou à Rust sans le copier, et que peut-il mal se passer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:native-extensions:3}
+Comparez pybind11, ctypes et un générateur de liaisons Rust pour exposer un noyau numérique à Python.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:native-extensions:4}
+Pourquoi une \omterm{def:pl:native-extensions:extension}{extension native} doit-elle relâcher le verrou de l'interpréteur, et que ne doit-elle pas faire pendant qu'il est relâché~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:native-extensions:5}
+Concevez la couche native d'une plateforme de recherche~: quels noyaux passent en natif, comment ils sont liés, construits, testés et distribués.
+\end{interviewq}

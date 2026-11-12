@@ -1,0 +1,459 @@
+\chapter{Passerelle d'ordres et gestion des ordres}\label{ch:ll:order-gateway-and-order-management}
+
+Une stratégie annule un ordre d'achat au repos de 100 lots et, dans la même microseconde, envoie son remplacement un tick plus bas. En
+chemin vers la bourse, l'annulation croise une exécution~: un vendeur vient de prendre l'ancien ordre. La bourse rejette l'annulation comme
+trop tard, accepte le nouvel ordre, et un second vendeur le prend à son tour. Pendant les quelques microsecondes qui séparent la décision de la stratégie et le
+rapport d'exécution, la firme détenait deux fois la position qu'elle croyait détenir, et une passerelle qui ne comptabilisait que les ordres qu'elle savait actifs
+laisserait la stratégie en envoyer un troisième. Rien dans cette histoire n'est un bogue au sens ordinaire~: chaque message était valide,
+et chaque partie a fait ce que le protocole prévoit. C'est ce qui arrive lorsque deux machines séparées par un réseau modifient chacune l'état d'un ordre
+sans attendre l'autre. Ce chapitre construit le composant qui maintient une vue fidèle des ordres de la firme pendant que
+cela se produit~: la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}, avec un automate d'états qui dispose de noms pour «~j'ai demandé et je n'ai pas encore de réponse~», un décompte d'exposition
+qui suppose le pire pour chaque ordre encore en vol, un limiteur qui préserve le budget de messages de la plateforme, et un
+rapprochement avec la copie de la journée que tient la bourse.
+
+\section{L'automate d'états de l'ordre}
+
+\begin{definition}[Passerelle d'ordres, automate d'états de l'ordre]\label{def:ll:order-gateway-and-order-management:gateway}
+Une \emph{passerelle d'ordres}\index{passerelle d'ordres} est le composant situé entre les stratégies d'une firme et la session de saisie des ordres d'une plateforme~:
+elle transforme les demandes des stratégies en messages de la plateforme, les rapports de la plateforme en états d'ordres, et refuse ce que les limites de la firme
+ou les règles de la plateforme interdisent. Un \emph{automate d'état de l'ordre}\index{automate d'état de l'ordre} est l'ensemble des états dans lesquels un ordre peut
+se trouver, tel que la firme le voit, avec les événements qui le font passer d'un état à l'autre~; la vue de la firme comprend les états \emph{en attente},
+atteints lorsque la firme a envoyé une demande et n'a pas encore reçu sa réponse.
+\end{definition}
+
+L'ordre côté plateforme a peu d'états~: actif, partiellement exécuté, puis exécuté, annulé ou expiré (simulateur du livre~10, son
+\texttt{PROTOCOL.md}). Celui de la firme en a davantage, parce que la firme est toujours un peu en retard. Après l'envoi d'un nouvel ordre, celui-ci est
+\emph{nouvel ordre en attente} jusqu'à l'arrivée de l'accusé de réception~; après une demande d'annulation ou de remplacement, il est \emph{annulation en attente} ou
+\emph{remplacement en attente} jusqu'à l'arrivée de la réponse, et entre-temps l'ordre peut encore être exécuté. FIX désigne les mêmes états dans son
+champ de statut d'ordre (\emph{PendingNew}, \emph{PendingCancel}, \emph{PendingReplace}, à côté de \emph{New}, \emph{PartiallyFilled},
+\emph{Filled}, \emph{Canceled} et \emph{Rejected}~; chapitre~15)~: le protocole admet lui-même que les deux côtés divergent pendant un
+certain temps. La \Cref{fig:ll:order-gateway-and-order-management:states} dessine l'automate de la firme.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,st/.style={draw,rounded corners=3pt,minimum width=1.9cm,minimum height=0.62cm,
+  align=center,fill=omDef!12},pend/.style={st,fill=omMeth!18,dashed},term/.style={st,fill=gray!12,double}]
+\node[pend] (pn) at (0,0) {nouvel ordre\\ en attente};
+\node[st] (live) at (3.3,0) {actif};
+\node[st] (part) at (6.6,0) {partiel};
+\node[term] (fil) at (9.9,0) {exécuté};
+\node[term] (rej) at (0,-2.4) {rejeté};
+\node[pend] (pc) at (3.3,-2.4) {annulation\\ en attente};
+\node[pend] (pr) at (6.6,-2.4) {remplacement\\ en attente};
+\node[term] (cxl) at (9.9,-2.4) {annulé};
+\draw[->] (pn) -- node[above]{accusé} (live);
+\draw[->] (live) -- node[above]{exécution} (part);
+\draw[->] (part) -- node[above,align=center]{dernière\\ exécution} (fil);
+\draw[->] (pn) -- node[left]{rejet} (rej);
+\draw[->] (live) -- node[left,align=right]{annulation\\ envoyée} (pc);
+\draw[->] (part) -- node[right,align=left]{remplacement\\ envoyé} (pr);
+\draw[->] (pr.north west) -- node[below,sloped]{remplacé} (live.south east);
+\draw[->] (pr) -- node[above]{annulé} (cxl);
+\draw[->,omThm,thick] (pr.north east) -- node[pos=0.72,right,align=left,text=omThm]{dernière\\ exécution} (fil.south west);
+\draw[->] (pc.south) -- ++(0,-0.7) -| node[pos=0.25,above]{annulé} (cxl.south);
+\draw[->,draw=omThm,thick] ([xshift=-4mm]pc.south) |- node[pos=0.75,below,text=omThm]{dernière exécution, puis « trop tard »}
+  (11.5,-3.9) |- (fil.east);
+\draw[->,omThm,thick] (pc.west) .. controls +(-0.9,0.8) and +(-0.2,0.9) .. node[pos=0.3,above left,text=omThm,inner sep=1pt]{exécution partielle} ([xshift=-6mm]pc.north);
+\end{tikzpicture}
+
+\omcaption{La vue de la firme sur un ordre. Les cadres en pointillés sont les états en attente, atteints lorsqu'une demande est envoyée et quittés lorsque sa
+réponse arrive~; en rouge, les exécutions qui atteignent un ordre après que la firme a demandé son annulation. Non représenté~: tout état ouvert peut aussi être
+annulé par la plateforme de sa propre initiative (perte de connexion, suspension de cotation, expiration), et le nouvel ordre en attente peut être exécuté ou annulé avant
+son accusé de réception. Seuls les états terminaux, doublés, sont définitifs~; la table du \cref{lst:ll:order-gateway-and-order-management:table} est
+la machine complète.}\label{fig:ll:order-gateway-and-order-management:states}
+\end{omfigure}
+
+Le chantier écrit la machine sous forme de tableau, une ligne par état et une colonne par événement, avec une marque pour les transitions qui
+ne sont pas autorisées (\cref{lst:ll:order-gateway-and-order-management:table}). Un tableau présente trois avantages sur un enchevêtrement de
+conditions. Il est complet par construction~: chaque couple état-événement possède une entrée, de sorte que la question «~que se passe-t-il si une exécution
+arrive pendant qu'un remplacement est en attente~?~» reçoit une réponse que quelqu'un a écrite. Il est une donnée~: la référence en Python, la passerelle C++
+et la passerelle Rust en contiennent chacune une copie, et les tests vérifient que les trois copies forment le même tableau, entrée par entrée,
+par rapport à \texttt{data/table.txt}. Enfin, un événement impossible est détecté et non absorbé~: un rapport que le tableau n'autorise pas
+est renvoyé comme erreur, et c'est ainsi que la première version du chantier a constaté qu'il n'existait pas de flèche d'\emph{actif} vers
+\emph{annulé}. La plateforme annule elle-même des ordres lorsqu'une session est perdue, lorsque la cotation est suspendue ou lorsqu'un ordre expire, et
+le test de conformité contre le serveur réel du livre~10, qui coupe volontairement une connexion, a heurté l'entrée manquante dès sa première exécution.
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{28}{38}{L'automate d'états de l'ordre sous forme de tableau~: l'état suivant pour chaque état
+et chaque événement, et une marque pour ce qui est interdit.}\label{lst:ll:order-gateway-and-order-management:table}
+
+Un remplacement mérite un mot. Le simulateur, comme la plupart des plateformes, attribue à l'ordre remplacé un nouvel identifiant client, et la passerelle
+conserve l'historique de l'ordre sous cet identifiant~; tant que le remplacement est en attente, l'ordre peut être exécuté sous son ancien identifiant, de sorte que la passerelle
+conserve les deux jusqu'à l'arrivée de la réponse. Savoir si l'ordre garde sa place dans la file relève de la règle de la plateforme (le rapport indique
+si la priorité a été conservée)~; la passerelle se contente de l'enregistrer.
+
+\section{Accusés de réception, ordres en vol et courses}
+
+\begin{definition}[Ordre en vol, course annulation--exécution]\label{def:ll:order-gateway-and-order-management:inflight}
+Un \emph{ordre en vol}\index{ordre en vol} est un ordre dans un état en attente~: une demande le concernant a été envoyée et sa
+réponse n'est pas arrivée, de sorte que l'ordre a pu changer chez la plateforme d'une manière que la firme ne connaît pas encore. Une \emph{course annulation--
+exécution}\index{course annulation--exécution} se produit lorsqu'une exécution et une demande d'annulation ou de remplacement du même ordre se croisent~: l'exécution a lieu
+chez la plateforme avant que la demande n'y arrive, et son rapport atteint la firme après que la demande a été envoyée.
+\end{definition}
+
+La \Cref{fig:ll:order-gateway-and-order-management:race} en dessine une. La stratégie envoie son annulation à l'instant $c$~; elle arrive chez
+la plateforme, après une latence unidirectionnelle $L$~; chaque rapport d'exécution met $d$ pour revenir. Toute exécution dans l'intervalle de $c - d$ à $c + L$
+entre en course avec l'annulation~: les exécutions antérieures à $c - d$ étaient connues au moment où la stratégie a décidé, et celles postérieures à $c + L$ ne peuvent pas se produire,
+puisque l'ordre n'existe plus. Si les exécutions arrivent selon un processus de Poisson de taux $\lambda$ sur un ordre au repos, la probabilité qu'une annulation rencontre
+au moins une est
+\[
+P(\text{course}) = 1 - e^{-\lambda (L + d)} \approx \lambda (L + d),
+\]
+pourvu que l'ordre soit resté au repos plus longtemps que $L + d$ avant l'annulation (un ordre annulé plus tôt a été exposé moins longtemps, et
+le problème du week-end en calcule la probabilité exacte). La course n'est pas une défaillance de la plateforme ni de la passerelle. C'est la
+latence du chemin, vue du point de vue de l'ordre, et les seuls moyens de la rendre plus rare sont de raccourcir le chemin ou d'annuler
+moins.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[thick] (0,0) node[above]{stratégie et passerelle} -- (0,-4.4);
+\draw[thick] (6.4,0) node[above]{plateforme} -- (6.4,-4.4);
+\fill[omThm!12] (6.3,-1.1) rectangle (6.5,-2.9);
+\draw[gray] (6.3,-1.1) -- (6.5,-1.1) node[pos=0,left,gray]{$c - d$};
+\draw[->,omDef,thick] (0,-1.9) node[left]{annulation envoyée, $c$} -- node[above,sloped,pos=0.22]{annulation, latence $L$} (6.4,-2.9);
+\draw[->,omThm,thick] (6.4,-1.6) node[right]{exécution} -- node[above,sloped,pos=0.4]{rapport d'exécution, délai $d$} (0,-2.9);
+\node[left,align=right] at (0,-2.9) {exécution arrive~:\\ état annulation en attente};
+\draw[->,omDef] (6.4,-2.9) -- node[below,sloped,pos=0.35]{« trop tard »} (0,-3.9);
+\node[right,align=left,omDef] at (6.4,-3.25) {annulation arrive à $c + L$~:\\ rien à annuler};
+\node[left] at (0,-3.9) {exécuté};
+\draw[decorate,decoration={brace,amplitude=4pt}] (7.1,-1.1) -- node[right=4pt,align=left]{une exécution ici entre en course avec\\ l'annulation~: de $c - d$\\ à $c + L$} (7.1,-2.9);
+\end{tikzpicture}
+
+\omcaption{Une \omterm{def:ll:order-gateway-and-order-management:inflight}{course annulation--exécution}. L'annulation part à $c$ et arrive $L$ plus tard~; une exécution sur la plateforme entre $c - d$ et $c + L$
+est rapportée après l'envoi de l'annulation. La passerelle, dans l'état \emph{annulation en attente}, applique l'exécution puis la réponse «~trop
+tard~» et finit dans l'état \emph{exécuté}.}\label{fig:ll:order-gateway-and-order-management:race}
+\end{omfigure}
+
+La construction le mesure. \texttt{firm\_ordergw\_sim.py} exécute la passerelle Python face au moteur d'appariement du livre~10~: une stratégie
+maintient un ordre d'achat en cours, le garde pendant une durée de moyenne \qty{1}{\milli\second} suivant une loi exponentielle, puis l'annule~; une
+contrepartie lui vend au hasard, 200 fois par seconde~; chaque rapport met \qty{20}{\micro\second} pour revenir.
+La \Cref{fig:ll:order-gateway-and-order-management:races} donne la fraction des annulations ayant rencontré une exécution, pour des latences unidirectionnelles
+allant de \qty{10}{\micro\second} à \qty{3}{\milli\second}. À \qty{100}{\micro\second}, 2.1~\% des annulations ont connu une \omterm{def:ll:order-gateway-and-order-management:inflight}{course annulation--exécution}, contre
+2.2~\% selon la formule exacte~; à \qty{10}{\micro\second}, elle vaut 0.65~\%. À \qty{1}{\milli\second}, la formule simple donnerait 18~\%
+et le moteur annonce 12~\%~: les ordres sont gardés à peu près aussi longtemps que le trajet, si bien que la fenêtre est souvent plus courte que $L + d$.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,xmin=8,xmax=4000,ymin=0,ymax=0.5,
+  xlabel={latence unidirectionnelle de l'annulation $L$ ($\mu$s)},ylabel={fraction des annulations en course},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\scriptsize,cells={anchor=west}},table/col sep=comma,
+  yticklabel style={/pgf/number format/fixed}]
+\addplot[omMeth,thick,dashed] table[x=latency_us,y=rested]{figdata/low-latency/21-order-gateway-and-order-management/race_curves.csv};
+\addlegendentry{$1 - e^{-\lambda (L + d)}$ (ordres restés au moins $L + d$)}
+\addplot[omDef,thick] table[x=latency_us,y=exact]{figdata/low-latency/21-order-gateway-and-order-management/race_curves.csv};
+\addlegendentry{exacte, ordres maintenus \qty{1}{\milli\second} en moyenne}
+\addplot[only marks,mark=*,omThm,mark size=2.2pt] table[x=latency_us,y=simulated]{figdata/low-latency/21-order-gateway-and-order-management/races.csv};
+\addlegendentry{passerelle face au moteur d'appariement}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:order-gateway-and-order-management:inflight}{Courses annulation--exécution} selon la latence de l'annulation, avec des exécutions au rythme de $\lambda = 200$ par seconde et des rapports
+retardés $d = \qty{20}{\micro\second}$. Les points correspondent à la passerelle Python face au moteur d'appariement du livre~10 (deux simulations à graine fixée de
+2\,000 ordres chacune par point)~; la courbe pleine est la probabilité exacte pour les ordres maintenus \qty{1}{\milli\second} en moyenne,
+la courbe en tirets, la formule pour les ordres restés au moins $L + d$ au moment de leur annulation. Données~: \texttt{fig\_races.py}
+(déterministe).}\label{fig:ll:order-gateway-and-order-management:races}
+\end{omfigure}
+
+Ce que fait la passerelle face à une course décide si elle est inoffensive. L'anecdote d'ouverture est la défaillance classique~: la passerelle a considéré
+un ordre comme disparu lorsqu'elle a \emph{envoyé} l'annulation, si bien que le remplacement passait sous la limite de position et que les deux ordres ont été exécutés. La règle
+qui l'empêche est la \emph{comptabilisation dans le pire cas}~: tant que la plateforme n'a pas répondu, un ordre compte pour tout ce qu'il pourrait encore
+faire. Un ordre dont l'annulation est en attente compte toute sa quantité restante~; un ordre dont le remplacement est en attente compte la plus grande de sa quantité ancienne et de sa
+nouvelle, car l'une ou l'autre peut être exécutée~; un ordre dont la création est en attente compte en totalité. L'exposition longue est alors la position plus la
+quantité restante dans le pire cas de chaque ordre d'achat ouvert, et un nouvel ordre n'est envoyé que s'il reste sous la limite une fois ajouté à celle-ci. Avec une
+limite de 100 lots, la passerelle de l'anecdote refuse le remplacement tant que la réponse à l'annulation n'est pas arrivée, et la position de la société ne
+dépasse jamais 100. Le prix se paie en opportunités~: pendant un aller-retour, la stratégie ne peut pas utiliser la quantité qu'elle tente
+de retirer.
+
+La passerelle tient cette exposition sous forme de sommes courantes, une par côté, mises à jour à chaque changement d'ordre~: on retire de l'ordre sa
+quantité restante dans le pire cas, on modifie l'ordre, puis on la réintègre (le \cref{lst:ll:order-gateway-and-order-management:change}). La vérification
+avant un nouvel ordre ne coûte alors qu'une addition et une comparaison (le \cref{lst:ll:order-gateway-and-order-management:new}), quel que soit
+le nombre d'ordres ouverts. Une passerelle qui recalcule l'exposition en parcourant ses ordres paie pour chacun d'eux à chaque
+nouvel ordre~: la \cref{fig:ll:order-gateway-and-order-management:exposure} mesure environ \qty{0.4}{\micro\second} pour mille
+ordres ouverts conservés dans un tableau et environ \qty{1.6}{\micro\second} dans une table de hachage, là où les sommes courantes coûtent moins que
+ce que le chronomètre peut résoudre. Un teneur de marché qui cote quelques centaines d'instruments a des milliers d'ordres ouverts toute la journée.
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{218}{225}{Exposition dans le pire cas tenue en sommes courantes~: chaque modification d'un ordre
+passe par \texttt{change}.}\label{lst:ll:order-gateway-and-order-management:change}
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{83}{98}{Un nouvel ordre~: la vérification de l'exposition dans le pire cas, le limiteur de messages,
+puis le message de la plateforme écrit en place avec le codec du chapitre~16.}\label{lst:ll:order-gateway-and-order-management:new}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,xmode=log,ymode=log,xmin=0.7,xmax=15000,ymin=0.5,ymax=40000,
+  xlabel={ordres ouverts},ylabel={vérification de l'exposition (ns)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=north west,legend style={font=\scriptsize,cells={anchor=west}},
+  table/col sep=comma]
+\addplot[omThm,thick,mark=square*] table[x=open_orders,y=map_ns]{figdata/low-latency/21-order-gateway-and-order-management/measured_exposure.csv};
+\addlegendentry{parcours d'une table de hachage}
+\addplot[omMeth,thick,mark=*] table[x=open_orders,y=array_ns]{figdata/low-latency/21-order-gateway-and-order-management/measured_exposure.csv};
+\addlegendentry{parcours d'un tableau}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coût de la vérification de l'exposition dans le pire cas avant chaque nouvel ordre, recalculée en parcourant les ordres ouverts, en fonction
+de leur nombre (médiane des appels chronométrés). Tenue en sommes courantes, comme dans \texttt{firm.ordergw}, elle coûte une addition, sous la
+résolution du chronomètre à chaque taille. Mesurée sur un portable (Intel Core Ultra 7 155H) sous WSL2. Données~:
+\texttt{bench\_gateway.py}.}\label{fig:ll:order-gateway-and-order-management:exposure}
+\end{omfigure}
+
+Le même banc d'essai mesure le travail complet de la passerelle pour chaque étape de la vie d'un ordre~: écrire un nouvel ordre, appliquer son
+accusé de réception, une exécution partielle, écrire l'annulation et appliquer sa réponse, chacune décodée depuis le rapport binaire de la plateforme.
+Chaque étape coûte de 4 à \qty{5}{\nano\second} à la médiane et de 5 à \qty{6}{\nano\second} au 99\up{e}
+centile~: la logique de la passerelle n'est pas là où vont les microsecondes du trajet d'un ordre. Elles passent par le réseau et le noyau
+(chapitre~13 et le livre~14), ainsi qu'aux contrôles de risque du chapitre suivant.
+
+\section{Limiteurs et budgets de messages}
+
+\begin{definition}[Seau à jetons (token bucket)]\label{def:ll:order-gateway-and-order-management:bucket}
+Un \emph{seau à jetons}\index{seau à jetons} (token bucket) est un limiteur de débit qui contient jusqu'à $b$ jetons et en gagne $r$ par seconde~; un
+message ne peut être envoyé que si un jeton est disponible, et son envoi en consomme un. Il autorise des rafales allant jusqu'à $b$ messages et, sur
+tout intervalle de longueur $T$, au plus $b + rT$ messages.
+\end{definition}
+
+Les plateformes limitent le nombre de messages qu'une session peut envoyer~: un débit par seconde, parfois une rafale, parfois un poids par type de message
+ou un rapport entre ordres et transactions (le limiteur de messages du livre~11, chapitre~10, et le simulateur du livre~10, qui rejette
+l'excès avec le motif \texttt{T}). Une passerelle qui compte sur la plateforme pour faire respecter la limite n'en est informée que par les rejets,
+après coup, et une plateforme peut déconnecter une session qui continue à la dépasser. La passerelle tient donc son propre budget, fixé
+légèrement en dessous de celui de la plateforme, et refuse localement ce qui serait rejeté à distance. Le seau de la construction compte en
+nano-jetons entiers, afin que les passerelles Python, C++ et Rust concordent jusqu'au dernier message sur le même journal
+(le \cref{lst:ll:order-gateway-and-order-management:bucket}).
+
+\omcode{code/firm/ordergw/cpp/firm_ordergw.hpp}{43}{50}{Le seau à jetons en nano-jetons entiers~: recharge pour le temps écoulé,
+puis consommer un jeton ou refuser.}\label{lst:ll:order-gateway-and-order-management:bucket}
+
+Que faire d'un message refusé relève de la stratégie, non de la passerelle. Une annulation refusée par le limiteur est le pire
+des cas~: l'ordre reste sur le marché alors que la stratégie voulait le sortir. Les passerelles réservent donc une partie du budget aux annulations,
+ou laissent passer les annulations avant les nouveaux ordres lorsque le budget est insuffisant~; la passerelle de la construction signale le motif de chaque refus
+(limiteur, exposition, état) afin que la stratégie distingue un budget épuisé d'une limite. Le test de remplacement de la construction exécute une
+stratégie qui remplace son ordre une fois par milliseconde en moyenne, face à un budget de 300 messages par seconde avec une rafale de deux~:
+la passerelle refuse 111 de ses requêtes faute de budget, et la stratégie réessaie.
+
+\section{Sessions~: connexion, numéros de séquence, annulation à la déconnexion}
+
+La session de saisie des ordres de la plateforme (livre~10, chapitre~26) transporte les messages de la passerelle. Le simulateur du livre~10 parle SoupBinTCP~:
+le client se connecte avec un nom d'utilisateur et un mot de passe~; ses messages ne sont pas numérotés, alors que les rapports du serveur le sont, numérotés
+à partir de un pour chaque session, mais les numéros ne circulent pas sur le fil~: chaque côté les compte. Un client qui perd sa connexion se reconnecte
+en demandant le prochain rapport qu'il n'a pas vu, et le serveur rejoue tous les rapports à partir de ce numéro. La partie du protocole qui concerne le client
+est courte (\cref{lst:ll:order-gateway-and-order-management:session})~: elle compte les messages numérotés, demande le suivant
+au moment de la connexion, vérifie que le serveur repart de ce numéro, envoie un \omterm{def:ll:protocols-i-fix:session}{heartbeat} après une seconde de silence, et considère le serveur comme mort
+au bout de quinze secondes.
+
+\omcode{code/firm/ordergw/firm_ordergw.py}{291}{305}{Le côté client de la session de saisie des ordres~: une connexion acceptée au
+mauvais numéro de séquence est une erreur, non un détail.}\label{lst:ll:order-gateway-and-order-management:session}
+
+Une connexion perdue est le cas où la comptabilité du pire cas prouve son utilité. Tant que la passerelle est déconnectée, elle ignore ce que font ses
+ordres~: ils peuvent être en cours d'exécution, ou la plateforme peut les avoir annulés. La plupart des plateformes proposent, et beaucoup exigent, une annulation à la
+déconnexion~: la plateforme annule les ordres au repos de la session lorsqu'elle détecte la perte de la connexion (le simulateur le fait
+par défaut, avec le motif d'annulation \texttt{D}). La passerelle les compte encore en totalité tant que les rapports ne disent pas le contraire, car
+l'annulation à la déconnexion est une fonctionnalité de la plateforme, non une garantie pour la société~: elle n'agit que sur les ordres qu'elle couvre, au moment où elle
+détecte la perte, et une exécution peut la précéder. Le test de conformité fait exactement cela face au serveur en direct du livre~10 sur l'interface
+loopback~: trois ordres partent, un est exécuté, la connexion est coupée, l'exposition reste à 300 lots tant que la passerelle est
+absente, et après la nouvelle connexion les rapports rejoués annulent les deux autres et la ramènent à 100.
+
+\begin{dated}{2026-09}{Annulation à la déconnexion et drop copy sur une bourse}\label{dat:ll:order-gateway-and-order-management:cme}
+La documentation client de CME Group (consultée en septembre 2026) décrit le Cancel On Disconnect pour ses sessions de saisie des ordres iLink~: lorsqu'une
+perte de connexion est détectée, elle annule tous les ordres au repos sur contrats à terme et sur options de la session déconnectée,
+à l'exception des ordres good-till-cancelled et good-till-date, et les nouvelles sessions sont créées avec cette option activée par défaut. Son service Drop Copy
+envoie en temps réel des copies des rapports d'exécution et des accusés de réception transmis sur les sessions iLink, par une voie distincte et
+dédiée.
+\end{dated}
+
+\section{Drop copies et réconciliation}
+
+\begin{definition}[Drop copy]\label{def:ll:order-gateway-and-order-management:dropcopy}
+Un \emph{drop copy}\index{drop copy} est une session distincte sur laquelle la plateforme envoie des copies des rapports des sessions de négociation de la société
+(au moins ses exécutions et ses annulations) au moment même où elle envoie les originaux~; elle est en lecture seule et sert de relevé indépendant
+des ordres et des exécutions de la société.
+\end{definition}
+
+La vision qu'a la passerelle des ordres de la société se construit à partir des rapports reçus, appliqués dans l'ordre~; tout rapport perdu, dupliqué ou mal appliqué
+rend la vision fausse, et une vision fausse ne se détecte qu'en la comparant à une autre. Le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} est cette autre
+vision, venant de la plateforme, sur une autre connexion, souvent lue par un autre processus (le simulateur du livre~10 offre une session de
+ce type par société). La réconciliation compare les deux~: pour chaque ordre, la quantité exécutée et s'il a été annulé
+(\cref{lst:ll:order-gateway-and-order-management:reconcile}). Chaque écart est une \emph{rupture}, et une rupture s'instruit,
+on ne la corrige pas en écrasant un des deux côtés~: un ordre que le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} montre exécuté et que la passerelle montre actif est un rapport perdu et une
+position inconnue~; le cas inverse est un rapport appliqué deux fois.
+
+\omcode{code/firm/ordergw/firm_ordergw.py}{189}{203}{Réconciliation avec le drop copy~: quantités exécutées et annulations,
+ordre par ordre~; tout écart est une rupture.}\label{lst:ll:order-gateway-and-order-management:reconcile}
+
+Dans la construction, chaque simulation et le test en direct se terminent sans aucune rupture, et les tests de propriétés garantissent que ce n'est pas
+un coup de chance~: sur des entrelacements aléatoires d'exécutions, d'annulations, de remplacements et de latences allant de \qty{5}{\micro\second} à \qty{2}{\milli\second},
+aucun ordre n'a jamais une quantité exécutée supérieure à la quantité passée, aucune quantité restante n'est négative, la position égale la somme des exécutions, et
+l'exposition dans le pire cas n'est jamais inférieure à la position~; et avec une limite de 100 lots, la position face au moteur d'appariement
+ne dépasse jamais 100. La société réconcilie à plusieurs rythmes~: en continu avec le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy}, chaque matin avec
+les registres du courtier (le livre~1, chapitre~7), et le système de gestion des ordres au-dessus de la passerelle (livre~10,
+chapitre~20) avec les comptes du portefeuille.
+
+\section{Tutoriel~: courses, limiteurs et une réconciliation}\label{tut:ll:order-gateway-and-order-management:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Faire tourner la passerelle face au moteur d'appariement, compter ses courses, rejouer son journal dans trois langages, et
+la réconcilier avec le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} d'une session en direct. \textbf{État final~:}
+\cref{fig:ll:order-gateway-and-order-management:races}, les rejeux identiques à \texttt{data/expected.txt}, et une réconciliation
+sans aucune rupture.
+\begin{tutsteps}
+\item \textbf{Courses.} \texttt{python fig\_races.py} lance \texttt{firm\_ordergw\_sim.run} pour six latences et écrit les
+fractions qui figurent dans la \cref{fig:ll:order-gateway-and-order-management:races}, à côté de la formule exacte de \texttt{ll\_gateway.py}.
+\item \textbf{Journaux.} \texttt{make\_ordergw\_fixtures.py} enregistre deux exécutions (annulation et nouvel ordre~; annulation-remplacement sous un
+budget serré) sous forme de journaux de requêtes et de rapports~; les passerelles C++ et Rust les rejouent, en refaisant chaque requête avec le même
+résultat, et affichent les synthèses qu'affiche la référence Python. Le test C++ fournit aussi les rapports sous forme de messages binaires encodés,
+et ne compte aucune allocation.
+\item \textbf{Session.}
+\texttt{tests/test\_live\_session.py} démarre le serveur en direct du livre~10, connecte une session de négociation, un \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} et une contrepartie, coupe la connexion de la session de négociation, se reconnecte, et réconcilie.
+\item \textbf{Coûts.} \texttt{python bench\_gateway.py} mesure chaque étape de la vie d'un ordre et le contrôle d'exposition face au
+nombre d'ordres ouverts.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Abaisser le budget du test de remplacement à 100 messages par seconde et observer les refus~; faire
+arriver les exécutions de la contrepartie par rafales plutôt qu'à un rythme constant, et comparer le nombre de courses à la formule.
+\end{tutorial}
+
+\section{Construction~: la passerelle d'ordres}\label{bld:ll:order-gateway-and-order-management:ordergw}
+
+\begin{build}
+\bfield{Rôle} Le point d'accès unique de la société à la saisie des ordres de la plateforme~: chaque ordre venant du moteur de stratégie (chapitre~20) passe
+par elle, après la barrière de risque (chapitre~22)~; son journal est consigné (chapitre~23), et son état survit à une bascule (failover)
+(chapitre~24).
+\bfield{Interface} Référence Python \texttt{firm\_ordergw}~: \texttt{TABLE}, \texttt{transition}, \texttt{TokenBucket},
+\texttt{Gateway(rate, burst, max\_long, max\_short)} avec \texttt{new}, \texttt{cancel}, \texttt{replace}, \texttt{on\_report},
+\texttt{worst\_long}, \texttt{worst\_short}, \texttt{races}~; \texttt{Session}, \texttt{frames}, \texttt{reconcile},
+\texttt{replay}, \texttt{summary}~; \texttt{firm\_ordergw\_sim.run} face au moteur du livre~10. C++20 \texttt{firm::ogw}~:
+\texttt{Gateway(Limits)} avec \texttt{new\_order}, \texttt{cancel}, \texttt{replace} qui écrivent sur place les messages de la plateforme,
+\texttt{on\_report} et \texttt{on\_wire}, \texttt{summary}. Rust \texttt{firm\_ordergw}~: \texttt{Gateway}, \texttt{replay}.
+\bfield{Règles} Chaque ordre ouvert compte pour le pire qu'il peut encore faire~; rien n'est envoyé au-delà de la limite d'exposition ni du budget~;
+un rapport que la table n'autorise pas est une erreur~; un ordre est conservé jusqu'à un rapport terminal~; les trois passerelles tiennent la même
+table~; aucune allocation par message.
+\bfield{Tests d'acceptation} \texttt{code/firm/ordergw/}~: la table identique dans trois langages~; les deux journaux rejoués jusqu'aux
+synthèses versionnées en Python, C++ (à partir des champs et à partir du fil) et Rust~; tests de propriétés sur des exécutions aléatoires face au
+moteur d'appariement~; la limite d'exposition tenue face au moteur~; la double position de la passerelle naïve reproduite et refusée par
+la comptabilité du pire cas~; la fraction de courses à moins d'un point de la formule~; la session en direct avec annulation à la déconnexion, le rejeu
+et une réconciliation sans aucune rupture.
+\bfield{Pour aller plus loin} Annulation de masse (mass cancel) et cotation de masse (mass quote)~; un budget réservé aux annulations~; la couche de session en C++, adossée au
+\texttt{exchsim\_client.hpp} du livre~10~; \omterm{def:ll:protocols-i-fix:session}{sessions FIX} par le moteur du chapitre~15.
+\end{build}
+
+\begin{omsources}
+\item CME Group Client Systems Wiki, \emph{Cancel on Disconnect}, et \emph{Drop Copy 4.0 Service for iLink}.
+\item FIX Trading Community, FIX Latest, jeu de codes \emph{OrdStatus}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:1}
+Un ordre est en attente d'annulation. Une exécution portant sur toute sa quantité restante arrive, puis le rejet de l'annulation
+par la plateforme, arrivé trop tard. Donner l'état de l'ordre après chaque rapport, et dire ce que la passerelle doit compter comme quantité restante entre les deux.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:2}
+Un \omterm{def:ll:order-gateway-and-order-management:bucket}{seau à jetons} (token bucket) gagne 300 jetons par seconde et en contient au plus 2~; il est plein à l'instant 0. Des messages sont envoyés aux instants 0, 0, 0, 1, 4 et
+5 millisecondes. Lesquels passent~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:order-gateway-and-order-management:3}
+La limite longue est de 500 lots. La position est longue de 200 lots, et deux ordres d'achat de 100 lots sont en cours. La stratégie
+demande de remplacer l'un d'eux par un achat de 300. La passerelle envoie-t-elle le remplacement~? Quelle est la plus grande nouvelle quantité qu'elle enverrait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:4}
+Des exécutions arrivent à raison de 50 par seconde sur un ordre au repos, l'annulation met \qty{300}{\micro\second} pour atteindre la plateforme et les rapports
+mettent \qty{50}{\micro\second} pour revenir. Quelle fraction des annulations entre en course avec une exécution~? Combien de courses une stratégie qui annule
+20\,000 ordres par jour doit-elle en attendre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:5}
+Le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} montre deux exécutions de 60 lots pour l'ordre 17, toutes deux avec le numéro d'appariement 88\,412~; la passerelle
+indique l'ordre 17 exécuté pour 60. Quel côté a tort, et que la réconciliation aurait-elle dû faire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:order-gateway-and-order-management:6}
+Une passerelle recalcule l'exposition en parcourant une table de hachage de ses ordres ouverts avant chaque nouvel ordre. Avec mille ordres ouverts,
+que cela ajoute-t-il à chaque ordre selon la \cref{fig:ll:order-gateway-and-order-management:exposure}, et comment cela se compare-t-il
+au travail propre de la passerelle par message~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:order-gateway-and-order-management:7}
+\emph{Programmation.} Ajouter l'annulation de masse (mass cancel) à la passerelle~: une seule requête qui annule chaque ordre ouvert d'un côté. Par quels états passe chaque ordre,
+que compte l'exposition jusqu'à l'arrivée des réponses, et comment le tester contre le moteur du livre~10~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:order-gateway-and-order-management:8}
+\emph{Trouver la faille.} «~Pour garder la table des ordres petite, notre passerelle libère l'emplacement d'un ordre dès qu'elle
+envoie l'annulation~: la stratégie ne veut plus de cet ordre.~»
+\end{exercise}
+
+\section{Problème~: L'annulation qui a croisé une exécution}
+
+\begin{problem}[{Problème du week-end --- la fenêtre dans laquelle une annulation peut se perdre}]\label{pb:ll:order-gateway-and-order-management:1}
+Un teneur de marché cote des ordres d'achat de 100 lots, garde chacun en moyenne une milliseconde, puis l'annule. Les exécutions arrivent
+à $\lambda = 200$ par seconde sur un ordre au repos, les rapports mettent $d = \qty{20}{\micro\second}$ pour revenir, et l'annulation met
+$L$ pour atteindre la plateforme. Utiliser la \cref{fig:ll:order-gateway-and-order-management:races} (\texttt{races.csv}).
+
+\medskip\noindent\textbf{Partie I --- La fenêtre.}
+\begin{enumerate}
+\item Expliquer pourquoi une exécution à la plateforme située entre $c - d$ et $c + L$ entre en course avec une annulation envoyée à $c$, et
+pourquoi les exécutions hors de cet intervalle n'y entrent pas.
+\item Établir $P(\text{course}) = 1 - e^{-\lambda(L + d)}$ pour un ordre resté au repos depuis au moins $L + d$ lorsque l'annulation est envoyée.
+\item Calculer cette probabilité pour $L = \qty{10}{\micro\second}$, \qty{100}{\micro\second} et \qty{1}{\milli\second}.
+\item Montrer qu'elle vaut à peu près $\lambda (L + d)$ lorsque ce produit est petit, et dire à partir de quelle valeur il l'est.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La mesure.}
+\begin{enumerate}[resume]
+\item Lire les fractions simulées aux trois mêmes latences dans les données de la figure.
+\item Pourquoi la formule simple les surestime-t-elle à \qty{1}{\milli\second}~?
+\item Pour un ordre tenu pendant un temps $h$, la fenêtre vaut $\min(h, L + d)$. Que devient la probabilité de course lorsque $L$ devient
+très supérieur à la durée de détention~?
+\item Le journal des annulations engagées (latence \qty{100}{\micro\second}) compte 6 courses sur 245 annulations. Est-ce compatible avec le
+la figure~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les dégâts.}
+\begin{enumerate}[resume]
+\item Une passerelle naïve compte un ordre comme disparu dès qu'elle envoie l'annulation, et la stratégie envoie aussitôt un remplacement. Quelle
+position la société peut-elle atteindre après une course, avec une limite de 100 lots~?
+\item Avec $n$ courses dont tous les remplacements sont encore en cours, quelle est la pire sur-position~?
+\item Que fait à la place la comptabilisation dans le pire cas, et que coûte-t-elle à la stratégie~?
+\item À \qty{100}{\micro\second}, combien de courses une stratégie qui annule 40\,000 fois par jour doit-elle en attendre~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la probabilité de course par annulation, et la pire sur-position sans
+comptabilisation des \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol}.
+\item Quelles deux grandeurs une société contrôle-t-elle pour réduire les courses, et laquelle ne contrôle-t-elle pas~?
+\item Pourquoi diviser par deux la latence dans un sens ne divise-t-il pas par deux les courses lorsque $d$ est grand~?
+\item Pourquoi une course n'est-elle pas une erreur à signaler à la plateforme~?
+\item Pourquoi la passerelle doit-elle garder un ordre annulé dans sa table jusqu'au rapport terminal~?
+\item Que change un remplacement dans l'analyse~?
+\item Comment vérifier, un jour de production, que les courses observées correspondent à la formule~?
+\item En une phrase~: quelle est la règle qui rend les courses inoffensives~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:order-gateway-and-order-management:1}
+Par quels états passe un ordre dans une \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}, et pourquoi y en a-t-il davantage qu'à la bourse~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:order-gateway-and-order-management:2}
+Vous envoyez une annulation et recevez une exécution pour le même ordre. Que s'est-il passé, et que doit faire votre système~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:order-gateway-and-order-management:3}
+Implémentez un limiteur de débit pour une session de la bourse. Que faites-vous d'une annulation lorsque le budget est épuisé~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:ll:order-gateway-and-order-management:4}
+Votre connexion à la bourse tombe pendant deux secondes. Que savez-vous de vos ordres, et que faites-vous
+à la reconnexion~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:order-gateway-and-order-management:5}
+Comment vérifier une limite de position en temps constant avec des milliers d'ordres ouverts~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:order-gateway-and-order-management:6}
+Concevez la couche de gestion des ordres d'un teneur de marché sur trois plateformes. Quelle est la source de vérité pour les positions, et comment
+savez-vous qu'elle est juste~?
+\end{interviewq}

@@ -1,0 +1,312 @@
+\chapter{Contrôles de risque}\label{ch:hf:risk-controls}
+
+Le 1\up{er} août 2012, le système de routage d'un teneur de marché a envoyé des millions d'ordres sur le marché en environ quarante-cinq minutes. Il a obtenu plus de 4
+millions d'exécutions sur 154 actions, pour plus de 397 millions d'actions, et perdu plus de 460~millions de dollars. L'ordonnance du régulateur, rendue ensuite, se lit comme une
+liste des contrôles qui lui manquaient. Dans la reconstruction de ce chapitre, une \omterm{def:hf:risk-controls:loss}{limite de perte} de 2~millions de dollars, vérifiée chaque seconde, aurait arrêté
+la même course folle au bout de douze secondes et de 2.1~millions de dollars, sans se déclencher une seule fois sur 2\,500 jours ordinaires~; un limiteur de débit d'ordres, le contrôle le plus
+souvent cité en premier, ne l'aurait pas arrêtée du tout.
+
+\section{Limites pré-négociation}
+
+Les ordres d'un teneur de marché passent par une porte de contrôle pré-négociation avant d'atteindre une plateforme~: un ensemble de vérifications qui refusent tout ordre enfreignant une limite. Le
+livre~13, chapitre~22, construit la porte qui exécute ces vérifications en nanosecondes~; ce chapitre fixe la politique qu'elle applique.
+
+\begin{definition}[Contrôle de risque pré-négociation]\label{def:hf:risk-controls:pretrade}
+Un \emph{contrôle de risque pré-négociation}\index{contrôle de risque pré-négociation} est un test qu'un ordre doit réussir avant d'être envoyé à une plateforme, au regard de limites portant sur sa taille,
+sa valeur et son prix, ainsi que sur les positions, les ordres ouverts et les expositions qu'il créerait, l'ordre étant refusé si une limite serait enfreinte.
+\end{definition}
+
+\begin{definition}[Tunnel de prix]\label{def:hf:risk-controls:collar}
+Un \emph{tunnel de prix}\index{tunnel de prix} (price collar) est une limite pré-négociation sur l'écart maximal entre le prix d'un ordre et un prix de référence (la dernière transaction, le mid, une
+fair value), exprimé en points de base ou en ticks~; au-delà duquel un achat, ou en deçà duquel une vente, est refusé comme erreur probable.
+\end{definition}
+
+Les limites forment une hiérarchie (voir la \cref{fig:hf:risk-controls:hierarchy})~: la société, ses desks, leurs stratégies, puis les instruments. Chaque niveau plafonne ce que
+peuvent cumuler les niveaux inférieurs. Le schéma du chapitre (\texttt{firm.riskctl}) l'écrit sous la forme d'un instantané que la porte peut charger~: exposition brute et \omterm{def:hf:risk-controls:loss}{limites de perte}
+pour la société et pour chaque desk, un débit d'ordres, des ordres ouverts, une \omterm{def:hf:risk-controls:loss}{limite de perte} et une limite de position pour chaque stratégie, ainsi qu'un collar, une quantité maximale
+un notionnel maximal et des limites à l'achat et à la vente pour chaque instrument. Un instantané est validé avant emploi (chaque desk dans les limites de la société, chaque
+stratégie rattachée à un desk connu) puis exporté avec la section de la porte, que la porte du livre~13 lit telle quelle.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,>=stealth,box/.style={draw,rounded corners,fill=omThm!8,minimum width=2.4cm,minimum height=0.7cm,align=center}]
+\node[box] (f) at (0,2.4) {société\\exposition brute, perte, messages};
+\node[box] (d1) at (-2.2,1.2) {desk\\exposition brute, perte};
+\node[box] (d2) at (2.2,1.2) {desk\\exposition brute, perte};
+\node[box] (s1) at (-3.9,0) {stratégie\\débit, ouverts, perte};
+\node[box] (s2) at (-0.9,0) {stratégie};
+\node[box] (s3) at (2.2,0) {stratégie};
+\node[box,fill=gray!10] (i) at (0,-1.2) {instruments~: collar, taille, notionnel, longs, shorts};
+\draw[->] (f) -- (d1); \draw[->] (f) -- (d2); \draw[->] (d1) -- (s1); \draw[->] (d1) -- (s2); \draw[->] (d2) -- (s3);
+\node[box,fill=omDef!10] (g) at (6.8,1.2) {porte pré-négociation\\(refus)};
+\node[box,fill=omDef!10] (m) at (6.8,0) {moniteur post-négociation\\(perte, position, débit)};
+\node[box,fill=omDef!20] (k) at (6.8,-1.2) {kill switch\\(annulation, aplatissement, blocage)};
+\draw[->] (m) -- (k);
+\draw[->,dashed] (2.2,2.4) -- node[above] {instantané des limites} (6.8,2.4) -- (g);
+\end{tikzpicture}
+
+\omcaption{La hiérarchie des limites et les trois endroits où elle agit~: la porte pré-négociation refuse un ordre qui enfreint une limite~; le moniteur post-négociation surveille
+les pertes, les positions et les débits de messages et déclenche le \omterm{def:hf:risk-controls:kill}{kill switch}, qui annule les ordres ouverts, aplatit les positions et bloque les nouveaux ordres au niveau
+qui a été franchi. Source~: \texttt{firm.riskctl}~; la porte est le \texttt{firm.riskgate} du livre~13.}\label{fig:hf:risk-controls:hierarchy}
+\end{omfigure}
+
+\section{Limites de position, de perte et de messages}
+
+\begin{definition}[Limite de perte]\label{def:hf:risk-controls:loss}
+Une \emph{limite de perte}\index{limite de perte} est un seuil portant sur la perte réalisée augmentée de la perte en valeur de marché d'une stratégie, d'un desk ou de la société sur une période (une journée,
+en général), au-delà duquel la perte déclenche une action d'arrêt à ce niveau.
+\end{definition}
+
+Les limites de position et de perte sont vérifiées après les transactions comme avant elles~: la porte peut refuser un ordre qui dépasserait une position, mais seul un
+moniteur qui valorise les positions au marché voit une perte se constituer (voir le \cref{lst:hf:risk-controls:monitor}). Une \omterm{def:hf:risk-controls:loss}{limite de perte} est le contrôle le plus direct de tous,
+puisqu'elle borne ce qu'elle protège, mais elle n'agit qu'une fois la perte survenue et seulement aussi souvent que les positions sont valorisées. Les limites de messages
+(les limiteurs et les ratios ordres sur transactions du chapitre~10) protègent la plateforme et la réputation de la société auprès d'elle~; la limite que la société fixe au nombre de messages par seconde est un
+moniteur de l'ensemble de la société, et non d'une stratégie.
+
+\section{Tunnels de prix et contrôles de saisie}
+
+Les tunnels et les contrôles de taille repèrent l'erreur dans un ordre unique~: un prix loin du marché, une quantité ou un notionnel très au-dessus de la normale. Le 2 mai 2022, une
+banque, un trader qui voulait vendre un panier de 58~millions de dollars en a créé un de 444~milliards de dollars~; les contrôles de la banque en ont bloqué 255~milliards de dollars, mais en ont laissé passer
+189~milliards de dollars jusqu'à un algorithme de trading, qui a vendu environ 1.4~milliard de dollars sur les marchés européens avant d'être annulé. Le régulateur britannique de la conduite des affaires, qui
+a infligé à la banque une amende de 27.8~millions de livres en 2024, a constaté qu'aucun blocage ferme n'aurait rejeté le panier dans sa totalité, que le trader pouvait fermer une alerte surgissante
+sans la lire, et que la surveillance en temps réel était trop lente.
+
+\begin{dated}{2026-09}{Les règles sur l'accès au marché et le trading algorithmique}\label{dat:hf:risk-controls:rules}
+La SEC a adopté la Rule 15c3-5 en novembre 2010~: les courtiers ou dealers ayant un accès au marché doivent maintenir des contrôles de gestion des risques raisonnablement conçus
+pour empêcher les ordres erronés et les ordres qui dépassent les seuils de crédit et de capital fixés à l'avance, et leur directeur général doit les certifier. Son ordonnance du
+16 octobre 2013 a infligé au teneur de marché de la course folle de 2012 une amende de 12~millions de dollars pour violation de la règle. Dans l'Union européenne, le Commission Delegated
+Regulation (EU) 2017/589 exige qu'une entreprise d'investissement puisse annuler immédiatement, à titre de mesure d'urgence, tout ou partie de ses ordres non exécutés
+sur tout ou partie des plateformes, et identifier l'algorithme et le trader responsables de chaque ordre. La Financial Conduct Authority britannique a infligé à une banque
+une amende de 27\,766\,200~livres le 22 mai 2024 pour l'erreur de panier de 2022, et la Prudential Regulation Authority une amende supplémentaire de 33\,880\,000~livres.
+\end{dated}
+
+\begin{definition}[Market Access Rule]\label{def:hf:risk-controls:access}
+La \emph{Market Access Rule}\index{Market Access Rule} est la Rule 15c3-5 de la SEC, qui exige qu'un broker-dealer ayant accès à une bourse ou à un système de négociation
+alternatif (ATS), pour son propre compte ou pour celui de ses clients, dispose de contrôles pré-négociation documentés et régulièrement revus contre les ordres erronés et les ordres
+au-delà des seuils de crédit et de capital fixés à l'avance, sous son contrôle direct et exclusif.
+\end{definition}
+
+\section{Kill switches~: qui les actionne et quand}
+
+\begin{definition}[Kill switch]\label{def:hf:risk-controls:kill}
+Un \emph{kill switch}\index{kill switch} est un contrôle qui, lorsqu'il est déclenché par une personne ou par un moniteur, arrête la négociation d'une stratégie, d'un desk ou de la société entière
+d'un seul coup~: il annule ses ordres ouverts, refuse les nouveaux et, si cela est configuré ainsi, aplatit ses positions, et il enregistre qui l'a déclenché et pourquoi.
+\end{definition}
+
+La course folle du chapitre (voir le \cref{lst:hf:risk-controls:runaway}) reprend les chiffres de l'ordonnance de la SEC~: environ 1\,480 ordres par seconde de 100 actions pendant 45
+minutes, une perte de 1.16~\$ par action négociée, et 2.46~millions de dollars par seconde de position brute (les 3.5~milliards de dollars à l'achat et les 3.15~milliards de dollars à la vente où elle
+s'est achevée). L'arrêt aplatit la position à 0.2~\% de sa valeur. Chaque contrôle, seul, l'arrête à un moment différent
+(voir la \cref{fig:hf:risk-controls:controls}), et chacun se déclenche sur une part des jours ordinaires d'un livre légitime (débits de pointe d'environ 300 messages
+par seconde, positions brutes d'environ 150~millions de dollars, drawdowns intrajournaliers d'environ 150\,000~\$, ordres à quelques dizaines de points de base de leurs références).
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}%
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{6.0cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+contrôle & arrêt après & perte & se déclenche les jours ordinaires\\
+\midrule
+aucun (les 45 minutes de 2012) & 2\,700 s & 477~millions de dollars & --\\
+une personne à 5 minutes & 300 s & 53~millions de dollars & --\\
+limiteur de débit, 500 par seconde & jamais & 161~millions de dollars & 10.2~\%\\
+\omterm{def:hf:risk-controls:collar}{tunnel de prix}, 5~\% & 600 s & 106~millions de dollars & 0~\%\\
+seuil de capital, 1~milliard de dollars brut & 407 s & 72~millions de dollars & 0~\%\\
+limite de position, 250~millions de dollars brut & 102 s & 18~millions de dollars & 7.6~\%\\
+\omterm{def:hf:risk-controls:loss}{limite de perte}, 2~millions de dollars, chaque seconde & 12 s & 2.1~millions de dollars & 0~\%\\
+tous ensemble & 35 s & 2.1~millions de dollars & 10.2~\%\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=12pt,ymode=log,log basis y=10,ymin=1,ymax=900,xmin=-0.6,xmax=7.6,
+  xtick={0,1,2,3,4,5,6,7},xticklabels={aucun,{personne, 5 min},limiteur,tunnel,capital,position,{limite de perte},tous},
+  xticklabel style={font=\scriptsize,rotate=25,anchor=north east},ylabel={\small perte de l'emballement (millions de dollars)},
+  tick label style={font=\footnotesize},grid=major,grid style={gray!25},table/col sep=comma,nodes near coords,
+  nodes near coords style={font=\scriptsize},point meta=rawy]
+\addplot[fill=omThm!60,draw=omThm] table[x=i,y=loss]{figdata/hft/27-risk-controls/controls.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La perte d'un emballement, calquée sur l'incident de 2012, selon chaque contrôle seul puis selon l'ensemble de ces contrôles (échelle logarithmique, en millions de dollars)~:
+aucun contrôle (arrêté à la main au bout de 45 minutes), une personne à 5 minutes, un limiteur de débit de 500 ordres par seconde, un \omterm{def:hf:risk-controls:collar}{tunnel de prix} de 5~\%, un seuil de capital
+de 1~milliard de dollars, une limite de position de 250~millions de dollars et une \omterm{def:hf:risk-controls:loss}{limite de perte} de 2~millions de dollars contrôlée chaque seconde. Données~: \texttt{hf\_risk.table}.}\label{fig:hf:risk-controls:controls}
+\end{omfigure}
+
+Le limiteur de débit, souvent le premier contrôle cité, n'arrête rien~: il ralentit l'emballement jusqu'au tiers, et la perte suit, soit 161~millions de dollars à la fin.
+Le \omterm{def:hf:risk-controls:collar}{tunnel de prix} et le seuil de capital, les contrôles que la \omterm{def:hf:risk-controls:access}{Market Access Rule} impose, l'arrêtent au bout de dix et sept minutes, pour 106 et 72
+millions de dollars. La limite de position l'arrête en moins de deux minutes~; la \omterm{def:hf:risk-controls:loss}{limite de perte}, en douze secondes. Ensemble, ils l'arrêtent à 35 secondes~: le limiteur de débit,
+en ralentissant l'emballement, retarde la \omterm{def:hf:risk-controls:loss}{limite de perte}, mais la perte reste la même.
+
+Chaque seuil est un compromis (la \cref{fig:hf:risk-controls:tradeoff})~: une \omterm{def:hf:risk-controls:loss}{limite de perte} plus serrée arrête l'emballement plus tôt, mais se déclenche les jours ordinaires, dans 2~\%
+des cas à 1~million de dollars, dans 19~\% des cas à 500\,000~dollars~; une limite de position assez serrée pour l'arrêter en une minute se déclenche sur la moitié des jours. La \omterm{def:hf:risk-controls:loss}{limite de perte} domine~:
+pour le même nombre de fausses alertes, elle arrête l'emballement bien plus tôt, parce qu'elle mesure ce qui compte. La limite de position attrape ce que la \omterm{def:hf:risk-controls:loss}{limite de perte}
+ne peut pas voir~: un emballement qui n'a pas encore perdu d'argent.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xlabel={\small jours ordinaires où le contrôle se déclenche (\%)},ylabel={\small perte de l'emballement (millions de dollars)},
+  xmin=-2,xmax=92,ymode=log,log basis y=10,ymin=0.4,ymax=60,tick label style={font=\footnotesize},grid=major,grid style={gray!25},
+  table/col sep=comma,legend style={font=\scriptsize,at={(0.97,0.97)},anchor=north east}]
+\addplot[omThm,thick,mark=*,mark size=1.4pt] table[x=false,y=loss]{figdata/hft/27-risk-controls/sweep_loss.csv};
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.3pt] table[x=false,y=loss]{figdata/hft/27-risk-controls/sweep_position.csv};
+\legend{{limite de perte, 0.5--4 millions de dollars},{limite de position, 100--600 millions de dollars}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le compromis d'un seuil~: la perte de l'emballement sous une \omterm{def:hf:risk-controls:loss}{limite de perte} (de 0.5 à 4~millions de dollars) et sous une limite de position brute (de 100 à
+600~millions de dollars), en regard de la part des 2\,500 jours ordinaires où chacune se serait déclenchée. Données~: \texttt{hf\_risk.sweep}.}\label{fig:hf:risk-controls:tradeoff}
+\end{omfigure}
+
+Qui actionne le \omterm{def:hf:risk-controls:kill}{kill switch} compte autant que le moment. Un moniteur réagit en une seconde~; une personne met des minutes à voir, comprendre et agir, et en 2012 elle a mis
+quarante-cinq minutes. Le \omterm{def:hf:risk-controls:kill}{kill switch} doit être accessible au moniteur comme à une personne, doit annuler avant de liquider, doit agir sur toutes les plateformes à la fois (comme
+l'exige la règle européenne), et doit laisser une trace d'audit de qui l'a actionné et pourquoi (\texttt{firm.riskctl.KillSwitch}).
+
+\section{Exigences réglementaires pour les firmes algorithmiques}
+
+Les règles de l'encadré daté convergent vers les mêmes contrôles~: limites avant négociation sur le prix, la taille et la valeur~; limites de crédit et de capital~; une fonction
+de coupure~; savoir quel algorithme et quel trader ont envoyé chaque ordre~; et une revue des contrôles par la direction. Les injonctions des régulateurs se lisent comme des descriptions
+de ce qui a mal tourné lorsqu'un de ces contrôles manquait~: en 2012, aucun contrôle du capital global engagé par les ordres, et aucune alerte automatisée n'a conduit à agir
+à temps~; en 2022, un contrôle de taille pouvait être contourné et la surveillance était trop lente pour agir.
+
+\section{Tutoriel~: quarante-cinq minutes}\label{tut:hf:risk-controls:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Écrire l'instantané des limites, l'exporter pour la passerelle, et mesurer ce que chaque contrôle aurait sauvé face à un emballement de type 2012 et
+ce qu'il coûte les jours ordinaires. \textbf{État final~:} le tableau et les trois figures.
+\begin{tutsteps}
+\item \textbf{L'instantané}~: \texttt{firm.riskctl.validate} et \texttt{export}~; \texttt{riskctl\_fixture.py} écrit
+\texttt{data/limits.json}, que charge \texttt{firm.riskgate.from\_riskctl} du livre~13.
+\item \textbf{Le moniteur}~: les marques, les \omterm{def:hf:risk-controls:loss}{limites de perte} et les actions de coupure à chaque niveau.
+\omcode{code/firm/riskctl/firm_riskctl.py}{126}{143}{Met les positions au prix du marché, somme les stratégies par desk et pour la firme, et coupe au niveau dont la limite de perte est franchie.}\label{lst:hf:risk-controls:monitor}
+\item \textbf{L'emballement} sous chaque contrôle.
+\omcode{code/firm/riskctl/firm_riskctl.py}{169}{188}{Le temps d'arrêt de chaque contrôle~; le premier qui arrête l'emballement, lequel est alors liquidé.}\label{lst:hf:risk-controls:runaway}
+\item \textbf{Les jours ordinaires} et les balayages de seuils (\texttt{hf\_risk.table}, \texttt{hf\_risk.sweep}).
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Rejouer l'emballement à travers la passerelle du livre~13 sur \texttt{firm.exchsim} (sa \texttt{firm\_riskgate\_runaway}), ajouter un
+second emballement qui perd lentement, et voir quel contrôle le détecte~; rendre la \omterm{def:hf:risk-controls:loss}{limite de perte} fondée sur le drawdown intrajournalier.
+\end{tutorial}
+
+\section{Construction~: les contrôles de risque}\label{bld:hf:risk-controls:riskctl}
+
+\begin{build}
+\bfield{Rôle} Assurer la politique des limites (hiérarchie, schéma, validation), les moniteurs post-négociation et le \omterm{def:hf:risk-controls:kill}{kill switch}~; fournir à la passerelle pré-négociation
+son instantané.
+\bfield{Interface} \texttt{validate(limits)}, \texttt{to\_riskgate(limits)}, \texttt{export(limits)}, \texttt{KillSwitch},
+\texttt{Monitor(limits, switch)} avec \texttt{on\_fill}, \texttt{mark}, \texttt{on\_message}~; \texttt{runaway(controls)}, \texttt{normal\_days(controls)}. Le schéma,
+version 1, figure dans la docstring du module et constitue le contrat avec \texttt{firm.riskgate} du livre~13.
+\bfield{Règles} Dollars, actions, nanosecondes~; un desk dans les limites de la firme~; les coupures enregistrées avec leur motif~; annuler avant de liquider.
+\bfield{Tests d'acceptation} \texttt{code/firm/riskctl/tests/}~: la validation détecte un desk au-dessus de la firme et un desk inconnu~; la passerelle de la section à la main~;
+l'instantané exporté est identique au fixture, et la passerelle du livre~13 le charge et refuse un ordre hors du collar~; le moniteur coupe une stratégie au-delà de sa \omterm{def:hf:risk-controls:loss}{limite de perte}
+et la firme au-delà de son débit de messages, et l'audit enregistre la coupure et la reprise~; l'emballement et les jours ordinaires se comportent comme dans le chapitre.
+\bfield{Pour aller plus loin} Limites de drawdown intrajournalier~; coupure par plateforme~; limites modifiées au cours de la journée avec des instantanés versionnés.
+\end{build}
+
+\begin{omsources}
+\item US Securities and Exchange Commission, \emph{In the Matter of Knight Capital Americas LLC}, Release No.\ 34-70694, 16 octobre 2013.
+\item Commission Delegated Regulation (EU) 2017/589, article 12 (fonction de coupure).
+\item Financial Conduct Authority, FCA fines CGML £27\,766\,200 for failures in its trading systems and controls, 22 mai 2024.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:hf:risk-controls:1}
+L'emballement perd 1.16~\$ par action sur 148\,100 actions par seconde. Au bout de combien de temps une \omterm{def:hf:risk-controls:loss}{limite de perte} de 2~millions de dollars, contrôlée chaque seconde, se déclenche-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:risk-controls:2}
+La position brute croît de 2.46~millions de dollars par seconde. Quand une limite de position de 250~millions de dollars l'arrête-t-elle, et un seuil de capital de 1~milliard de dollars~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:hf:risk-controls:3}
+Un ordre d'achat est fixé à 42.10~\$ pour une référence de 40.00~\$. Un \omterm{def:hf:risk-controls:collar}{tunnel de prix} de 5~\% le refuse-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:risk-controls:4}
+Pourquoi le limiteur de débit n'arrête-t-il pas l'emballement, et à quoi sert-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:risk-controls:5}
+Pourquoi ajouter tous les contrôles arrête-t-il l'emballement plus tard (35 secondes) que la seule \omterm{def:hf:risk-controls:loss}{limite de perte} (12)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:hf:risk-controls:6}
+Quelle doit être la première action d'un \omterm{def:hf:risk-controls:kill}{kill switch}~: annuler les ordres ou liquider les positions~? Pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:risk-controls:7}
+\emph{Programmation.} Avec \texttt{hf\_risk.sweep}, quelle \omterm{def:hf:risk-controls:loss}{limite de perte} se déclenche sur au plus 1~\% des jours ordinaires, et que laisse perdre l'emballement~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:hf:risk-controls:8}
+\emph{Trouver la faille.} «~Notre algorithme n'a jamais perdu plus de 500\,000~\$ en une journée, donc une \omterm{def:hf:risk-controls:loss}{limite de perte} de 500\,000~\$ ne nous coûte rien.~»
+\end{exercise}
+
+\section{Problème~: quarante-cinq minutes}
+
+\begin{problem}[{Problème du week-end --- quarante-cinq minutes}]\label{pb:hf:risk-controls:1}
+Une entreprise de teneur de marché fixe ses contrôles de risque après avoir lu l'ordonnance de 2012.
+
+\medskip\noindent\textbf{Partie I --- L'incident et les règles.}
+\begin{enumerate}
+\item Résumer ce qui s'est passé le 1\up{er} août 2012, selon l'ordonnance de la SEC.
+\item Définir la \omterm{def:hf:risk-controls:access}{Market Access Rule} et ce qu'elle exige.
+\item Que exige la fonctionnalité de kill de l'UE~?
+\item Qu'est-ce qui a mal tourné dans l'erreur de panier de 2022, selon le compte rendu de la FCA~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les contrôles.}
+\begin{enumerate}[resume]
+\item Définir un \omterm{def:hf:risk-controls:pretrade}{contrôle de risque pré-négociation} et un \omterm{def:hf:risk-controls:collar}{tunnel de prix}.
+\item Définir une \omterm{def:hf:risk-controls:loss}{limite de perte} et un \omterm{def:hf:risk-controls:kill}{kill switch}.
+\item Décrire la hiérarchie des limites et la validation de l'instantané.
+\item Comment l'instantané atteint-il la porte de la nanoseconde~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Mesures.}
+\begin{enumerate}[resume]
+\item Donner le temps d'arrêt et la perte sous chaque contrôle.
+\item Quels contrôles se déclenchent les jours ordinaires, et à quelle fréquence~?
+\item Décrire les compromis entre \omterm{def:hf:risk-controls:loss}{limite de perte} et limite de position.
+\item Pourquoi la \omterm{def:hf:risk-controls:loss}{limite de perte} domine-t-elle, et qu'apporte la limite de position~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la perte que l'emballement aurait subie sous chaque contrôle, et le premier contrôle qui l'arrête.
+\item Quel ensemble de contrôles feriez-vous fonctionner, avec quels seuils~?
+\item Qui doit pouvoir actionner le \omterm{def:hf:risk-controls:kill}{kill switch}, et en combien de temps~?
+\item Que doit consigner la piste d'audit~?
+\item De quoi a besoin un emballement qui perd lentement~?
+\item Comment tester les contrôles en l'absence d'emballement~?
+\item Que doit certifier le directeur général d'une entreprise~?
+\item En une phrase~: que rapporte un contrôle de risque~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{risque}]\label{iq:hf:risk-controls:1}
+Énumérez les contrôles pré-négociation que vous exigeriez sur chaque ordre, dans l'ordre où vous les exécuteriez.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:hf:risk-controls:2}
+Votre passerelle refuse les ordres lorsque son instantané des limites est périmé. Pourquoi échouer en position fermée, et que pourrait-il mal se passer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:hf:risk-controls:3}
+Votre stratégie a atteint sa \omterm{def:hf:risk-controls:loss}{limite de perte} à 10~h~05 un jour volatil et a été liquidée. Le marché s'est redressé à 10~h~30. La limite était-elle fausse~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{risque}]\label{iq:hf:risk-controls:4}
+Comment fixeriez-vous la limite de position d'une stratégie à partir de son historique~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:hf:risk-controls:5}
+Concevez le \omterm{def:hf:risk-controls:kill}{kill switch} d'une entreprise connectée à 20 plateformes par l'intermédiaire de 3 passerelles. Que doit-il se produire dans la première milliseconde~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:hf:risk-controls:6}
+Les replis quotidiens ordinaires suivant une loi normale de moyenne $\mu$ et d'écart type $\sigma$, et un emballement perdant à la vitesse $\ell$ par seconde, déterminez la \omterm{def:hf:risk-controls:loss}{limite de perte}
+qui minimise le coût espéré des fausses alertes plus la perte espérée de l'emballement, sachant qu'un emballement survient une fois tous les $N$ jours.
+\end{interviewq}

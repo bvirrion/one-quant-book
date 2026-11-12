@@ -1,0 +1,320 @@
+\chapter{Services de positions et de P\&L}\label{ch:pl:position-and-pnl-services}
+
+Trente-trois minutes après le début de la session, la session de saisie des ordres a été coupée pendant quatre secondes. Quatre exécutions ont eu lieu pendant la coupure, et
+à son rétablissement, les rapports d'exécution de la stratégie la faisaient apparaître 500 actions moins vendeuse que ne le faisait la drop copy de la plateforme. Le \omterm{def:pl:position-and-pnl-services:service}{service de positions} devait
+trancher entre les deux. La réponse est qu'il ne faut croire ni l'une ni l'autre tant qu'elles ne concordent pas~: compter chaque exécution signalée par une source, une seule fois, et dire que la
+position est en attente tant que les sources ne concordent pas. Tous les chiffres aval --- risque (chapitre~18), limites, P\&L, les livres qui se clôturent la nuit ---
+partent des positions, et les positions partent d'exécutions qui arrivent en double, en retard, dans le désordre, et qui sont parfois annulées.
+
+\section{Positions à partir des exécutions}
+
+\begin{definition}[Service de positions]\label{def:pl:position-and-pnl-services:service}
+Un \emph{service de positions}\index{service de positions} (position service) tient à jour les positions et le P\&L de la société par compte et par instrument à partir de ses exécutions,
+fusionnées à partir de chaque source qui les signale, et les sert à tout instant, en date de négociation ou en date de règlement, avec un statut qui indique
+si ses sources concordent.
+\end{definition}
+
+\begin{definition}[Identifiant d'exécution]\label{def:pl:position-and-pnl-services:execid}
+Un \emph{identifiant d'exécution}\index{identifiant d'exécution} (execution identifier) est l'identifiant unique attribué par la plateforme à une exécution (dans le simulateur, son numéro
+d'appariement avec l'identifiant client de l'ordre)~; c'est lui qui permet de reconnaître sans ambiguïté une exécution signalée par deux sources, ou deux fois par une même source.
+\end{definition}
+
+Le service du chapitre (\texttt{firm.posservice}) stocke les exécutions indexées par cet identifiant et ne stocke jamais de position~: chaque position est
+calculée en rejouant les exécutions dans l'ordre chronologique au moyen du gestionnaire exact du livre~1 (\texttt{firm.pnl}), où la quantité et le cash sont des
+entiers, de sorte que le cash plus la quantité multipliée par la valorisation, moins les frais, soit exact à la dix-millième de dollar près. Stocker les événements plutôt que leur
+somme rend l'ordre d'arrivée sans importance, rend les doublons inoffensifs (traitement idempotent, livre~13, chapitre~24) et rend toute position passée
+recalculable.
+
+\omcode{code/firm/posservice/firm_posservice.py}{59}{71}{Exécutions venant de n'importe quelle source, comptées une seule fois~; annulations et corrections conservées comme événements,
+non appliquées en modifiant le passé.}\label{lst:pl:position-and-pnl-services:events}
+
+\omcode{code/firm/posservice/firm_posservice.py}{74}{97}{Une position est un rejeu~: les exécutions en vigueur à un instant donné (annulations et corrections
+appliquées si elles sont connues à cet instant), dans l'ordre chronologique, à travers le gestionnaire exact.}\label{lst:pl:position-and-pnl-services:position}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.8cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!12,minimum width=2.8cm] (s) at (0,1.3) {session de saisie\\ des ordres~: rapports\\ d'exécution};
+\node[box,fill=omMeth!12,minimum width=2.8cm] (d) at (0,0) {drop copy~: chaque\\ exécution, avec\\ un léger retard};
+\node[box,fill=omMeth!12,minimum width=2.8cm] (b) at (0,-1.3) {avis de la plateforme~:\\ annulations,\\ corrections};
+\node[box,fill=omDef!15,minimum width=3.4cm,minimum height=2.6cm] (p) at (4.6,0) {service de positions\\ exécutions indexées par\\ identifiant d'exécution\\ statut~: concordant\\ ou en attente};
+\node[box,fill=gray!10,minimum width=3.4cm] (v) at (9.2,1.2) {vues~: date de négociation,\\ date de règlement~; valorisations~:\\ intrajournalières, de fin de journée};
+\node[box,fill=gray!10,minimum width=3.4cm] (r) at (9.2,-1.2) {rapprochement avec\\ le relevé de compensation};
+\foreach \x in {s,d,b} {\draw[->] (\x.east) -- (p.west|-\x.east);}
+\draw[->] (p.east) -- (v.west); \draw[->] (p.east) -- (r.west);
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:pl:position-and-pnl-services:service}{service de positions}. Les exécutions arrivent de la session et de la drop copy, les annulations et corrections de la plateforme~; le service
+conserve les exécutions, non les positions, et calcule chaque vue à partir d'elles~; le relevé de la chambre de compensation est le contrôle en
+bout de chaîne.}\label{fig:pl:position-and-pnl-services:service}
+\end{omfigure}
+
+\section{Deux flux d'une même réalité~: sessions et drop copies}
+
+La session de saisie des ordres signale les exécutions des ordres qu'elle a envoyés~; la drop copy (livre~13, chapitre~21) envoie à la société une copie de chaque
+exécution de ses sessions sur une connexion distincte, précisément au moment où la première tombe. Une session qui se coupe puis se reconnecte en demandant
+uniquement les nouveaux messages ne reçoit jamais les rapports générés pendant la coupure~; une drop copy qui accuse un léger retard (50~millisecondes ici) les a. Le service prend
+les deux, compte chaque exécution une seule fois et compare les deux ensembles~: lorsqu'ils diffèrent, la position qu'il sert est l'union,
+et son statut est en attente.
+
+\omcode{code/firm/posservice/firm_posservice.py}{99}{107}{Le statut~: concordant lorsque chaque source a signalé les mêmes exécutions, en attente
+sinon, avec les exécutions qui manquent à chaque source.}\label{lst:pl:position-and-pnl-services:status}
+
+\section{Annulations, corrections et exécutions tardives}
+
+\begin{definition}[Annulation de transaction]\label{def:pl:position-and-pnl-services:bust}
+Une \emph{annulation de transaction}\index{annulation de transaction} (trade bust) est l'annulation d'une exécution par la plateforme après qu'elle a eu lieu --- par exemple au titre de
+ses règles sur les transactions manifestement erronées (livre~1, chapitre~31) --- de sorte que, pour le relevé de la chambre de compensation, la transaction n'a jamais eu lieu.
+\end{definition}
+
+Une annulation arrive quelques minutes ou quelques heures après l'exécution~; une correction modifie le prix ou la quantité d'une exécution. Le service applique les deux
+comme des événements horodatés, de sorte que la position à un instant quelconque puisse être calculée telle qu'elle était connue alors (l'annulation pas encore reçue)
+ou telle qu'elle est connue maintenant (la transaction n'a jamais eu lieu). Une exécution tardive --- un rapport d'exécution qui arrive après que la position a été lue --- n'est qu'un
+événement en retard~: le rejeu le remet à sa place.
+
+\section{P\&L intrajournalier et valorisations de fin de journée}
+
+\begin{definition}[P\&L intrajournalier, valorisation de fin de journée]\label{def:pl:position-and-pnl-services:marks}
+Le \emph{P\&L intrajournalier}\index{P\&L intrajournalier} (intraday P\&L) est le P\&L des positions valorisées aux cours de marché courants au cours de la journée, pour le suivi et les limites.
+La \emph{valorisation de fin de journée}\index{valorisation de fin de journée} (end-of-day mark) est le prix auquel les positions sont valorisées pour le P\&L officiel et les livres de la journée, généralement
+le cours de clôture officiel, fixé par la politique de valorisation plutôt que par la dernière cotation que la stratégie a eu l'occasion de voir.
+\end{definition}
+
+Le chapitre valorise la journée au mid du flux et la clôture au dernier échange de la plateforme, qui tient lieu de cours de clôture officiel. Le P\&L est
+exact~: \texttt{firm.pnl} conserve le cash et la quantité sous forme d'entiers, et les parts réalisée et latente selon le coût moyen (livre~1, chapitre~7)
+s'additionnent, frais compris, pour donner le total à la valorisation.
+
+\section{Début de journée et livres qui se clôturent}
+
+\begin{definition}[Position de début de journée, position en date de négociation, position en date de règlement]\label{def:pl:position-and-pnl-services:sod}
+La \emph{position de début de journée}\index{position de début de journée} (start-of-day position) est la position avec laquelle une journée commence~: la position de fin de journée de la veille,
+rapprochée. La \emph{position en date de négociation}\index{position en date de négociation} (trade-date position) compte chaque exécution à partir du moment où elle se négocie~; la
+\emph{position en date de règlement}\index{position en date de règlement} (settlement-date position) ne la compte qu'à partir de sa date de règlement (un jour ouvré plus tard pour les actions américaines,
+livre~1, chapitre~5), ce que reflètent la conservation des titres et le cash.
+\end{definition}
+
+À la fin de la journée, le service enregistre chaque position avec sa \omterm{def:pl:position-and-pnl-services:marks}{valorisation de fin de journée} et son total~; la \omterm{def:pl:position-and-pnl-services:sod}{position de début de journée} du lendemain est cet
+enregistrement. Le relevé de la chambre de compensation --- les exécutions qu'elle a compensées, les annulations retirées --- est le contrôle~: le service rapproche ses positions
+de ce relevé et signale chaque écart de rapprochement (break) avant que la journée suivante ne commence.
+
+\section{Quatre secondes sans session}
+
+L'expérience du chapitre fait tourner une stratégie de cotation (500 actions de chaque côté, une limite d'inventaire de 5\,000 actions, ordres laissés en attente si la session
+se coupe) pendant une heure sur dix sessions \texttt{firm.tape} du simulateur du livre~10, chacune avec une session de drop copy. À une minute tirée au hasard, la session de saisie des ordres
+est coupée pendant quatre secondes~; le client se reconnecte en ne demandant que les nouveaux messages, et l'équipe des opérations demande un rejeu des rapports manqués une
+minute plus tard. À la minute~50, la plateforme annule l'exécution la plus proche de la minute~30. Trois services sont comparés au relevé de la chambre de compensation~: rapports de session
+seuls~; session et drop copy fusionnées~; fusionnées avec l'annulation appliquée.
+
+\omcode{code/platforms/17-position-and-pnl-services/python/pl_posservice.py}{72}{91}{Les trois services alimentés dans l'ordre d'arrivée~: les rapports de la session
+(les rapports perdus seulement au rejeu), la drop copy avec 50~millisecondes de retard, et l'avis d'annulation.}\label{lst:pl:position-and-pnl-services:feed}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,xlabel={minutes depuis le début de la session},ylabel={position moins relevé (actions)},xmin=25,xmax=60,
+  ymin=-50,ymax=700,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=t_min,y expr=\thisrow{session}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\addplot[color=omDef,thick,const plot] table[x=t_min,y expr=\thisrow{merged}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\addplot[color=black,thick,dashed,const plot] table[x=t_min,y expr=\thisrow{merged_bust}-\thisrow{truth}]
+  {figdata/platforms/17-position-and-pnl-services/timeline.csv};
+\node[omThm,font=\scriptsize,anchor=north west] at (axis cs:34,585) {session seule~: quatre exécutions perdues à la minute 33};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:50.5,120) {avec drop copy};
+\node[font=\scriptsize,anchor=east] at (axis cs:49.5,45) {avec drop copy et annulation};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La position de chaque service moins celle de l'état de compensation, pendant l'heure de la graine~3 (échantillonnée toutes les cinq secondes). L'exécution annulée
+de la minute~30 écarte chaque service de 100 actions de l'état~; la panne de la minute~33 ajoute 500 au service de session seule~; le service avec le drop copy et l'annulation
+concorde avec l'état à partir de l'avis d'annulation de la minute~50. Données~:
+\texttt{fig\_posservice.py}.}\label{fig:pl:position-and-pnl-services:timeline}
+\end{omfigure}
+
+\begin{example}[Graine 3]\label{ex:pl:position-and-pnl-services:seed3}
+La session tombe à la minute~33 et quatre exécutions ont lieu en quatre secondes~; le service de session seule est écarté de 500 actions à partir de là. Le
+service fusionné les reçoit 50~millisecondes après qu'elles ont eu lieu, par le drop copy, et signale sa position comme en attente pendant 62~secondes, jusqu'à ce que le
+rejeu remette la session en accord. Les deux portent l'exécution de la minute~30, que la plateforme annule à la minute~50~; seul le service qui
+applique l'avis concorde avec l'état de compensation à la clôture. À la clôture, l'état affiche $-3\,300$ actions et $-\$3\,493$~; le
+service de session seule est écarté de 600 actions et de 252~\$, le service fusionné de 100 actions et de 47~\$, le service fusionné avec l'annulation est exact.
+\end{example}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+service & erreur moyenne $|$de position$|$ (actions) & erreur moyenne $|$de P\&L$|$ (\$) \\
+\midrule
+session seule & 290 & 52.4 \\
+avec le drop copy & 220 & 28.4 \\
+avec le drop copy et l'annulation & 0 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Erreurs à la clôture par rapport à l'état de compensation, moyennées sur dix sessions d'une heure, chacune avec une panne de quatre secondes à une
+minute tirée au sort et une exécution annulée vingt minutes après sa survenue.}\label{tab:pl:position-and-pnl-services:close}
+\end{table}
+
+Sur les dix sessions (\cref{tab:pl:position-and-pnl-services:close}), la panne coûte peu exécution par exécution --- elle touche
+des exécutions dans quatre sessions (une, quatre, trois et une), car en quatre secondes une stratégie de cotation négocie rarement --- et l'annulation coûte
+quelque chose chaque jour. Sans le drop copy, le service termine la journée en moyenne à 290 actions et à 52~\$ d'écart~; avec lui, à 220 actions et 28~\$ d'écart, dont
+la totalité provient de l'annulation~; avec l'annulation appliquée, il est exact. Dans les sessions où la panne a fait perdre des exécutions, le service fusionné a signalé une position en attente pendant 60 à
+63~secondes, jusqu'au rejeu~; sans rejeu, il l'aurait signalée en attente jusqu'à ce que quelqu'un regarde.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,ybar,bar width=5pt,ylabel={erreur de position à la clôture (actions)},
+  xlabel={session (graine)},xtick={1,2,3,4,5,6,7,8,9,10},ymin=-700,ymax=700,grid=major,grid style={gray!20},tick label style={font=\small},
+  label style={font=\small},table/col sep=comma,legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=3}]
+\addplot[fill=omThm!45,draw=omThm] table[x=seed,y=session_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{session seule}
+\addplot[fill=omDef!45,draw=omDef] table[x=seed,y=merged_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{avec drop copy}
+\addplot[fill=black!30,draw=black] table[x=seed,y=merged_bust_pos_err]{figdata/platforms/17-position-and-pnl-services/at_close.csv};
+\addlegendentry{avec drop copy et annulation}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Position de chaque service moins celle de l'état de compensation à la clôture, session par session. Sans le drop copy, l'erreur est la
+somme des exécutions perdues et de l'exécution annulée~; avec lui, la seule exécution annulée~; avec l'annulation appliquée, rien (la troisième barre est nulle partout).
+Données~: \texttt{fig\_posservice.py}.}\label{fig:pl:position-and-pnl-services:close}
+\end{omfigure}
+
+\begin{remark}[Ce qu'apporte l'attente]\label{rem:pl:position-and-pnl-services:pending}
+Un statut en attente transforme une erreur silencieuse en erreur visible. La position du service fusionné était juste pendant la panne, mais seul le
+désaccord entre ses sources a signalé que quelque chose était arrivé à la session~; le service de session seule était faux et sûr de lui. Le risque
+(chapitre~18) doit traiter une position en attente comme l'union de ce que rapporte n'importe quelle source --- l'exposition la plus grande --- jusqu'à ce qu'elle concorde.
+\end{remark}
+
+\section{Tutoriel~: une journée, trois sources, un état}\label{tut:pl:position-and-pnl-services:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire les positions à partir de deux flux d'exécutions et d'une annulation, observer leur désaccord puis leur accord, et les rapprocher de l'état de compensation.
+\textbf{État final~:} \cref{fig:pl:position-and-pnl-services:timeline} et \cref{tab:pl:position-and-pnl-services:close}.
+\begin{tutsteps}
+\item \textbf{Une journée}~: \texttt{pl\_posservice.day(seed)} lance le simulateur avec une session de drop copy et une panne programmée.
+\item \textbf{Services}~: \texttt{services(d)}~; \texttt{status} et \texttt{missing} pendant la panne.
+\item \textbf{L'état}~: \texttt{truth(d)}~; \texttt{reconcile(service, statement)}.
+\item \textbf{La clôture}~: \texttt{at\_close()} sur dix graines~; \texttt{end\_of\_day} et \texttt{start\_of\_day} pour le roll.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Annuler les ordres à la déconnexion et voir ce que coûte alors la panne~; retarder le drop copy d'une seconde et observer les
+fenêtres d'attente s'allonger.
+\end{tutorial}
+
+\section{Construction~: le service de positions}\label{bld:pl:position-and-pnl-services:posservice}
+
+\begin{build}
+\bfield{Rôle} Une source unique de positions et de P\&L pour le risque, les limites, le reporting et les livres, correcte face aux rapports en double, en retard ou manquants,
+aux annulations et aux corrections, et honnête lorsqu'elle n'est pas sûre.
+\bfield{Interface} \texttt{Execution}~; \texttt{PositionService(sources)} avec \texttt{on\_execution}, \texttt{on\_bust},
+\texttt{on\_correction}, \texttt{position(account, symbol, as\_of, view, date)}, \texttt{status}, \texttt{missing}, \texttt{pnl},
+\texttt{end\_of\_day}, \texttt{start\_of\_day}~; \texttt{reconcile}.
+\bfield{Règles} Les exécutions sont stockées, les positions calculées~; un \omterm{def:pl:position-and-pnl-services:execid}{identifiant d'exécution} ne compte qu'une fois~; les annulations et les corrections sont des événements datés~;
+quantités entières et espèces (\texttt{firm.pnl})~; en attente dès que les sources se contredisent.
+\bfield{Tests d'acceptation} \texttt{code/firm/posservice/tests/}~: fusion et statut idempotents~; P\&L exact et indépendant de l'ordre d'arrivée~;
+annulations et corrections datées~; vues en date de négociation et en date de règlement, roll de fin de journée et écarts de rapprochement.
+\bfield{Pour aller plus loin} De nombreux comptes et instruments, avec des allocations à partir d'un compte à coût moyen~; opérations sur titres touchant les positions (chapitre~6)~;
+les événements du service journalisés et rejoués (chapitre~12).
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~1, chapitres 5, 7 et 31 (règlement-livraison, positions et P\&L, transactions erronées)~; One Quant Book~13, chapitres 21 et 24 (drop
+copies, traitement idempotent)~; One Quant Book~10, chapitre~26 (le drop copy du simulateur et les pannes de session).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:1}
+Une même exécution arrive de la session, puis deux fois du drop copy. Déterminer la position et en expliquer la raison.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:2}
+Un achat de 100 à 100.00~\$ et une vente de 300 à 100.02~\$, valorisés à 100.00~\$. Calculer la position, le P\&L réalisé et le P\&L latent.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:position-and-pnl-services:3}
+Expliquer pourquoi une transaction annulée est retirée comme un événement plutôt que supprimée du stockage.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:4}
+Pourquoi l'interruption n'a-t-elle fait perdre des exécutions que dans quatre des dix sessions, et qu'est-ce qui changerait cela~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:5}
+Une transaction du vendredi se règle le jour ouvré suivant. Que montrent les vues en date de négociation et en date de règlement le vendredi soir et le lundi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:position-and-pnl-services:6}
+La position du service fusionné était juste pendant l'interruption. Pourquoi son statut en attente reste-t-il utile~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:position-and-pnl-services:7}
+\emph{Programmation.} Exécuter \texttt{at\_close} avec la stratégie qui annule ses ordres à la déconnexion. Que deviennent les exécutions perdues pendant l'interruption~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:position-and-pnl-services:8}
+\emph{Trouver la faille.} «~Notre \omterm{def:pl:position-and-pnl-services:service}{service de positions} ajoute chaque exécution à la position dès son arrivée, et se recale sur le fichier de compensation chaque matin, donc
+il est juste au moins une fois par jour.~»
+\end{exercise}
+
+\section{Problème~: quatre secondes sans session}
+
+\begin{problem}[{Problème du week-end --- positions issues de deux flux et une annulation de transaction}]\label{pb:pl:position-and-pnl-services:1}
+La stratégie du chapitre, dix sessions, une interruption de quatre secondes et une \omterm{def:pl:position-and-pnl-services:bust}{annulation de transaction} (trade bust) par session.
+
+\medskip\noindent\textbf{Partie I --- Le service.}
+\begin{enumerate}
+\item Que stocke le service, et comment calcule-t-il une position~?
+\item Qu'est-ce qui fait que deux rapports désignent la même exécution~?
+\item Que dit le statut, et quand~?
+\item Comment le service traite-t-il une \omterm{def:pl:position-and-pnl-services:bust}{annulation de transaction} et une correction~?
+\item Qu'est-ce qui garantit l'exactitude du P\&L~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les sources.}
+\begin{enumerate}[resume]
+\item Pourquoi une session perd-elle des rapports lors d'une interruption~?
+\item Qu'apporte le drop copy, et à quel coût~?
+\item Qu'est-ce qu'un rejeu, et pourquoi le demande-t-on~?
+\item Que représente le relevé de compensation~?
+\item Quand chaque service concorde-t-il avec le relevé~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La journée.}
+\begin{enumerate}[resume]
+\item Dans combien de sessions l'interruption a-t-elle fait perdre des exécutions, et combien~?
+\item Combien de temps le service fusionné est-il resté en attente~?
+\item Quelles ont été les erreurs à la clôture dans la graine~3~?
+\item Quelles ont été les erreurs moyennes sur les dix sessions~?
+\item Quelle erreur le drop copy supprime-t-il, et laquelle non~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'erreur de position et de P\&L à la clôture sans le drop copy, avec lui, et avec lui plus l'\omterm{def:pl:position-and-pnl-services:bust}{annulation de transaction},
+ainsi que le délai avant que le service concorde avec le relevé de compensation.
+\item Que doit faire le risque d'une position en attente~?
+\item Que doit-il se passer au début du jour suivant~?
+\item Que surveilleriez-vous sur le \omterm{def:pl:position-and-pnl-services:service}{service de positions} lui-même~?
+\item En une phrase~: qu'est-ce qui rend une position fiable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:position-and-pnl-services:1}
+Comment rendez-vous un \omterm{def:pl:position-and-pnl-services:service}{service de positions} robuste aux rapports d'exécution en double~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:position-and-pnl-services:2}
+Votre session de saisie des ordres a été interrompue pendant quelques secondes. Comment savez-vous que votre position est juste~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:position-and-pnl-services:3}
+Pourquoi stocker les exécutions plutôt que les positions~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:position-and-pnl-services:4}
+Quelle est la différence entre les \omterm{def:pl:position-and-pnl-services:sod}{positions en date de négociation} et en date de règlement, et qui utilise chacune~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:position-and-pnl-services:5}
+Concevez le \omterm{def:pl:position-and-pnl-services:service}{service de positions} et de P\&L d'une société de trading multistratégie.
+\end{interviewq}

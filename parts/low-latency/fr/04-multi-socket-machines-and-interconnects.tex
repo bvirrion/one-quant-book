@@ -1,0 +1,328 @@
+\chapter{Machines multi-sockets et interconnexions}\label{ch:ll:multi-socket-machines-and-interconnects}
+
+Un serveur de trading à deux sockets de processeur, une carte réseau dans un emplacement relié au second socket, et un thread de stratégie
+que le système d'exploitation a lancé par hasard sur le premier~: chaque paquet reçu par la carte était écrit près du socket 1
+et lu depuis le socket 0, et chaque ordre faisait le trajet inverse. Chaque traversée coûte environ une centaine
+de nanosecondes de plus que le fait de rester sur un seul socket, plusieurs fois par message, sur un chemin dont le budget logiciel total tient en
+quelques microsecondes. Personne n'avait choisi le placement~; personne n'avait regardé la topologie de la machine. Ce chapitre décrit
+la machine au-dessus du cœur~: la mémoire rattachée aux sockets, les liens entre sockets, le bus qui relie la carte réseau,
+et la manière de lire l'ensemble depuis le système d'exploitation et de placer un processus de trading dessus.
+
+\section{Accès mémoire non uniforme}
+
+\begin{definition}[Accès mémoire non uniforme, nœud NUMA]\label{def:ll:multi-socket-machines-and-interconnects:numa}
+Dans une machine à \emph{accès mémoire non uniforme}\index{accès mémoire non uniforme} (NUMA), chaque socket de processeur possède ses
+propres contrôleurs mémoire et sa propre mémoire~; un cœur accède plus vite à la mémoire de son propre socket qu'à celle d'un autre socket, laquelle est atteinte
+par l'\omterm{def:ll:multi-socket-machines-and-interconnects:link}{interconnexion entre sockets}. Un \emph{nœud NUMA}\index{nœud NUMA} est un ensemble de CPU et de la mémoire qui leur est proche,
+en général un socket (ou une partie d'un socket).
+\end{definition}
+
+\begin{definition}[Allocation au premier accès]\label{def:ll:multi-socket-machines-and-interconnects:first}
+Avec l'\emph{allocation au premier accès}\index{allocation au premier accès} (first touch), la politique par défaut de Linux, une page de mémoire est
+placée sur le \omterm{def:ll:multi-socket-machines-and-interconnects:numa}{nœud NUMA} du CPU qui l'écrit en premier (le défaut de page qui la crée), et non sur celui qui a alloué
+la plage d'adresses.
+\end{definition}
+
+Le premier accès fait du placement une question de savoir qui initialise quoi. Un processus de trading qui construit ses carnets d'ordres, ses files
+circulaires et ses réserves dans son thread principal au démarrage, avant de créer ses threads, les place tous sur le nœud du thread principal,
+quel que soit le nœud où les threads critiques s'exécutent ensuite. La règle~: épingler d'abord chaque thread critique (chapitre~9), puis le laisser allouer et initialiser
+ses propres données~; ou lier la mémoire explicitement (\texttt{numactl --membind}, \texttt{mbind}).
+
+\begin{example}[Un carnet d'ordres alloué sur le mauvais nœud]\label{ex:ll:multi-socket-machines-and-interconnects:touch}
+Le thread principal, sur le nœud 0, alloue puis remplit à zéro 64~MiB de carnets d'ordres avec de \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} au démarrage, puis lance le
+thread du flux de marché sur le nœud 1. Chaque mise à jour du carnet atteint désormais la mémoire de l'autre socket. La correction tient en une ligne~: déplacer
+l'initialisation dans le thread du flux de marché, après qu'il s'est épinglé, ou transmettre le nœud à l'allocateur.
+\end{example}
+
+\section{L'interconnexion entre sockets et les caches distants}
+
+\begin{definition}[Interconnexion entre sockets]\label{def:ll:multi-socket-machines-and-interconnects:link}
+L'\emph{interconnexion entre sockets}\index{interconnexion entre sockets} est l'ensemble des liaisons point à point entre les sockets de processeur
+d'une machine, qui acheminent les accès mémoire distants et le trafic de \omterm{def:ll:memory-hierarchy-and-caches:coherence}{cohérence de cache} entre sockets.
+\end{definition}
+
+Toute transaction de cohérence du chapitre~3 qui concerne une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} détenue sur l'autre socket traverse l'interconnexion. Une
+mesure publiée sur un serveur à deux sockets d'une génération récente d'Intel a montré que le rebond d'une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} entre deux
+cœurs prenait en moyenne 59~nanosecondes au sein d'un même socket (81 au pire) et 138~nanosecondes d'un socket à l'autre~; les
+anciennes générations étaient similaires, jusqu'à 150 d'un socket à l'autre. Un passage de relais entre deux threads, le feed handler publiant un message et
+la stratégie qui le lit, est exactement un tel rebond (chapitre~12)~: placé sur deux sockets, son coût plus que double.
+
+La même mesure sur l'ordinateur portable de ce livre, qui possède un seul socket et tourne sous un hyperviseur, est
+la \cref{fig:ll:multi-socket-machines-and-interconnects:c2c}. Elle présente une structure~: des paires de CPU virtuels voisins se transmettent une
+\omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} en environ 40~nanosecondes, la plupart des autres paires en 170 à 200. Les cœurs physiques de l'ordinateur portable sont regroupés en grappes partageant
+un cache de second niveau, et les CPU virtuels leur sont associés par l'hyperviseur, sans que le système invité le voie~; la
+matrice, et non la numérotation des CPU, qui indique quels threads doivent communiquer entre eux.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.6cm,height=8.6cm,view={0}{90},xmin=-0.5,xmax=21.5,ymin=-0.5,ymax=21.5,y dir=reverse,
+  xtick={0,3,6,9,12,15,18,21},ytick={0,3,6,9,12,15,18,21},xlabel={CPU},ylabel={CPU},
+  tick label style={font=\small},label style={font=\small},
+  colormap={om}{color(0)=(white) color(0.3)=(omDef!30) color(1)=(omDef)},
+  colorbar,colorbar style={ylabel={ns, sens unique},ylabel style={font=\small},tick label style={font=\footnotesize}},
+  point meta min=0,point meta max=200,table/col sep=comma]
+\addplot[matrix plot*,mesh/cols=22,point meta=explicit] table[x=b,y=a,meta=ns]{figdata/low-latency/04-multi-socket-machines-and-interconnects/measured_c2c.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Latence, dans un sens, du passage d'une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} entre deux threads épinglés sur deux des 22 CPU virtuels de l'ordinateur portable
+(20\,000 allers-retours, meilleur de trois). Les CPU voisins sont rapides~; les autres sont quatre à cinq fois plus lents. Mesuré sur un
+ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~: \texttt{bench\_c2c.py}.}\label{fig:ll:multi-socket-machines-and-interconnects:c2c}
+\end{omfigure}
+
+\section{Le bus périphérique et l'accès direct à la mémoire}
+
+\begin{definition}[PCI Express, accès direct à la mémoire]\label{def:ll:multi-socket-machines-and-interconnects:pcie}
+\emph{PCI Express}\index{PCI Express} (PCIe) est le bus série point à point qui relie les périphériques (cartes réseau,
+stockage, accélérateurs) à un socket de processeur, en lignes regroupées par 1 à 16.
+Dans l'\emph{accès direct à la mémoire}\index{accès direct à la mémoire} (DMA), un périphérique lit et écrit lui-même la mémoire de l'hôte, sans que le processeur recopie chaque octet~: une carte réseau
+écrit chaque paquet reçu dans un tampon que le pilote lui a fourni et signale son arrivée par un descripteur, une interruption
+ou par un indicateur que le programme interroge.
+\end{definition}
+
+\begin{definition}[Accès direct au cache]\label{def:ll:multi-socket-machines-and-interconnects:dca}
+L'\emph{accès direct au cache}\index{accès direct au cache} (DCA) permet aux écritures DMA d'un périphérique d'atterrir dans le cache de dernier niveau
+plutôt que dans la mémoire, afin que le cœur qui traite les données les trouve dans le cache~; l'implémentation d'Intel (Data Direct I/O)
+est transparente pour le logiciel.
+\end{definition}
+
+Chaque emplacement PCIe appartient à un socket~: ses lignes proviennent du processeur de ce socket. Les paquets d'une carte arrivent donc dans
+le cache ou la mémoire de ce socket, et les registres de la carte, que le programme écrit pour émettre, sont de l'autre côté de l'interconnexion
+depuis n'importe quel cœur de l'autre socket. Chaque transaction sur le bus ajoute sa propre latence, raison pour laquelle les cartes réseau à faible latence et leurs pilotes en espace utilisateur
+réduisent le nombre de transactions sur le bus par paquet (le livre~14, chapitre~3).
+
+\begin{dated}{2026-09}{Générations de PCI Express}\label{dat:ll:multi-socket-machines-and-interconnects:pcie}
+PCIe 4.0 transmet à 16~GT/s par ligne et PCIe 5.0, dont la spécification publiée par le PCI-SIG en mai 2019, à 32~GT/s~; les deux
+encodent 128 bits dans 130. Une liaison PCIe 5.0 à 16 lignes transporte donc $32 \times 16 \times 128/130/8 \approx 63$~Go/s dans chaque
+sens, bien plus que n'en exige un port réseau de 100~Gb/s (12.5~Go/s)~: pour une carte de trading, le bus compte pour sa latence,
+et non sa bande passante.
+\end{dated}
+
+\section{Où se place la carte réseau}
+
+\begin{definition}[Localité du périphérique]\label{def:ll:multi-socket-machines-and-interconnects:locality}
+La \emph{localité du périphérique}\index{localité du périphérique} d'un thread ou d'un tampon est son \omterm{def:ll:multi-socket-machines-and-interconnects:numa}{nœud NUMA} par rapport au périphérique avec lequel il
+échange des données~: locale lorsqu'ils se trouvent sur le même nœud, distante sinon.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  sock/.style={draw=omDef,fill=omDef!6,rounded corners=3pt,minimum width=4.2cm,minimum height=2.4cm},
+  mem/.style={draw=gray,fill=gray!12,minimum width=4.2cm,minimum height=0.55cm},
+  thr/.style={draw=omThm,fill=omThm!12,rounded corners=2pt,minimum width=1.6cm,minimum height=0.5cm}]
+\node[mem] (m0) at (0,2.1) {mémoire du nœud 0};
+\node[mem] (m1) at (7,2.1) {mémoire du nœud 1};
+\node[sock] (s0) at (0,0) {};
+\node[sock] (s1) at (7,0) {};
+\node[anchor=north] at (s0.north) {socket 0~: cœurs, caches};
+\node[anchor=north] at (s1.north) {socket 1~: cœurs, caches};
+\node[thr] (bad) at (0,-0.35) {stratégie (distante)};
+\node[thr,fill=omMeth!15,draw=omMeth] (good) at (7,-0.35) {stratégie (locale)};
+\draw[thick] (m0) -- (s0); \draw[thick] (m1) -- (s1);
+\draw[<->,very thick,omProp] (s0.east) -- node[above,align=center]{interconnexion\\ 138 ns par ligne} (s1.west);
+\node[draw=black,fill=gray!20,minimum width=2.4cm,minimum height=0.6cm] (nic) at (7,-2.3) {carte réseau};
+\draw[<->,thick] (nic) -- node[right]{lignes PCIe du socket 1} (s1.south);
+\end{tikzpicture}
+
+\omcaption{Un serveur à deux sockets dont la carte réseau est reliée au socket 1. Un thread de stratégie sur le socket 1 lit les paquets depuis
+son propre cache~; un thread sur le socket 0 va chercher chaque ligne de paquet, et envoie chaque ordre, à travers l'interconnexion, à environ 138
+nanosecondes par ligne, contre 59 à l'intérieur d'un socket (moyennes publiées pour une génération récente).}\label{fig:ll:multi-socket-machines-and-interconnects:server}
+\end{omfigure}
+
+\begin{proposition}[Coût d'un placement distant]\label{prop:ll:multi-socket-machines-and-interconnects:remote}
+Si un message apporte $k_{\mathrm{in}}$ \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} de la carte vers le thread critique, et qu'un ordre en renvoie $k_{\mathrm{out}}$,
+chacune transférée l'une après l'autre, et qu'une ligne coûte $c_{\mathrm L}$ à l'intérieur du socket et $c_{\mathrm R}$ à travers lui, alors
+le placement distant ajoute $(k_{\mathrm{in}} + k_{\mathrm{out}})(c_{\mathrm R} - c_{\mathrm L})$ à la \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade}.
+\end{proposition}
+
+\begin{proof}
+Chacun des $k_{\mathrm{in}} + k_{\mathrm{out}}$ transferts dépendants coûte $c_{\mathrm R}$ au lieu de $c_{\mathrm L}$~; le reste
+du chemin reste inchangé.
+\end{proof}
+
+Avec deux lignes dans chaque sens et les valeurs publiées de 59 et 138 nanosecondes, la proposition donne 316 nanosecondes par message~:
+plus d'un dixième des \qty{2.5}{\micro\second} qu'un très bon système logiciel met du fil à la sortie du fil (chapitre~1). Les
+règles de placement en découlent~: la carte, les threads critiques et leur mémoire sur un même nœud~; chaque thread critique sur son propre cœur physique,
+son frère d'hyper-threading inactif~; les interruptions des autres périphériques et le travail du système d'exploitation sur l'autre nœud ou
+sur des cœurs de service (chapitre~13)~; et chaque thread qui échange des données avec le chemin critique (hot path) par message (la barrière de risque (risk gate),
+l'anneau du journal) sur le même nœud.
+
+\section{Lire la topologie d'une machine}
+
+Linux expose la topologie dans sysfs. Le boîtier physique, le cœur et les frères d'hyper-threading de chaque CPU se trouvent sous
+\path{/sys/devices/system/cpu/cpu*/topology/}~; les CPU de chaque nœud se trouvent dans \path{/sys/devices/system/node/node*/cpulist}~;
+le nœud de chaque périphérique PCI se trouve dans \path{/sys/bus/pci/devices/*/numa_node}, qui contient $-1$ lorsque le firmware ne l'a pas indiqué~; et
+le périphérique derrière une interface réseau est le lien \path{/sys/class/net/<name>/device}. Des outils tels que
+\texttt{lscpu}, \texttt{numactl --hardware} et \texttt{lstopo} affichent les mêmes informations~; un plan de placement doit les lire
+lui-même, afin qu'une carte déplacée ou un nouveau serveur ne puisse pas invalider le plan en silence.
+
+Cet ordinateur portable montre ce qui peut mal tourner. Linux voit un seul nœud, 22 CPU décrits comme onze cœurs à deux threads (le processeur
+compte 6 cœurs de performance à deux threads et 10 cœurs efficaces à un seul thread), et une interface réseau qui est un adaptateur
+synthétique de l'hyperviseur, et non un périphérique PCI~: il n'existe aucune carte dont il faudrait être local. La construction de ce chapitre
+traite donc un nœud inconnu comme un fait à signaler, et non comme une valeur à deviner.
+
+\section{Tutoriel~: un plan de placement et la matrice cœur à cœur}\label{tut:ll:multi-socket-machines-and-interconnects:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Lire la topologie d'une machine, placer les threads critiques d'un processus de trading sur celle-ci, vérifier le plan, et mesurer
+le coût d'un passage de relais entre chaque paire de CPU. \textbf{État final~:} un plan vérifié pour une maquette à deux sockets et pour
+cet ordinateur portable, et la \cref{fig:ll:multi-socket-machines-and-interconnects:c2c}.
+\begin{tutsteps}
+\item \textbf{Lire l'arborescence.} \texttt{read\_topology(root)} analyse les fichiers sysfs décrits plus haut~; les tests l'exécutent sur deux
+arborescences synthétiques écrites par \texttt{make\_coreplan\_fixture.py} (un serveur à deux sockets de 32 CPU dont la carte est sur le nœud 1, et une
+machine à un seul nœud dont le nœud de la carte est inconnu).
+\item \textbf{Placer.} Les rôles critiques prennent les cœurs physiques de numéro le plus élevé du nœud de la carte, un chacun, en laissant leurs
+frères inactifs~; le cœur du CPU 0 et tous les autres CPU sont confiés au service.
+\omcode{code/firm/coreplan/firm_coreplan.py}{115}{131}{Un plan de placement à partir de la topologie.}\label{lst:ll:multi-socket-machines-and-interconnects:plan}
+\item \textbf{Vérifier.} \texttt{check(plan, topo)} liste chaque règle violée~: un thread critique sur le mauvais nœud, deux threads critiques
+sur un même cœur physique, un frère actif, le CPU 0 hors du service.
+\item \textbf{Mesurer les passages de relais.} Deux threads épinglés se renvoient un drapeau atomique rembourré~; le temps par transfert
+dans un sens est la latence cœur à cœur. \texttt{python bench\_c2c.py} l'exécute pour chaque paire.
+\omcode{code/low-latency/04-multi-socket-machines-and-interconnects/cpp/ll_c2c.hpp}{23}{50}{Renvoi d'une ligne de cache entre deux threads épinglés.}\label{lst:ll:multi-socket-machines-and-interconnects:pingpong}
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une règle à \texttt{check} pour que le journal soit lui aussi sur le nœud de la carte, et décider
+s'il doit l'être~; relancer le ping-pong avec le drapeau et une charge de quatre lignes, puis comparer le coût par ligne.
+\end{tutorial}
+
+\section{Construction~: le plan de placement des cœurs}\label{bld:ll:multi-socket-machines-and-interconnects:coreplan}
+
+\begin{build}
+\bfield{Rôle} Une description unique de l'endroit où s'exécute chaque thread du processus de trading, dérivée de la machine plutôt que
+saisie à la main~: le chapitre~9 épingle les threads à partir d'elle, le chapitre~13 audite un hôte par rapport à elle, le chapitre~26 l'enregistre avec chaque
+mesure.
+\bfield{Interface} Python \texttt{firm\_coreplan}~: \texttt{read\_topology(root)} renvoyant \texttt{Topology} (CPU avec
+boîtier, cœur, nœud et frères~; nœuds~; cartes PCI avec nœud et CPU locaux~; interfaces), \texttt{Topology.card\_for(ifname)},
+\texttt{plan(topo, ifname, hot, cold)} renvoyant \texttt{Plan(node, roles, idle, housekeeping)},
+\texttt{check(plan, topo)}, \texttt{remote\_penalty\_ns}.
+\bfield{Règles} Rôles critiques sur le nœud de la carte, un cœur physique chacun, frères inactifs, jamais le cœur du CPU 0~; un nœud inconnu
+($-1$) se rabat sur le nœud le plus bas et est signalé~; le plan échoue bruyamment lorsque le nœud a trop peu de cœurs.
+\bfield{Tests d'acceptation} \texttt{code/firm/coreplan/tests/}~: analyse des listes de CPU~; la topologie de la maquette à deux sockets et un
+plan sûr sur le nœud 1~; les plans dont un thread est sur le mauvais socket et ceux dont deux threads sont sur un même cœur sont détectés~; la maquette à un seul nœud avec
+une carte inconnue.
+\bfield{Pour aller plus loin} Lire la topologie du cache (\path{/sys/devices/system/cpu/cpu*/cache/}) et placer les threads qui échangent des données par
+message sur des cœurs partageant un niveau de cache~; inclure la matrice cœur à cœur mesurée dans le plan.
+\end{build}
+
+\begin{omsources}
+\item Chips and Cheese, ``Core to core latency data on large systems'', 2023.
+\item Documentation du noyau Linux, ``NUMA memory policy''~; documentation ABI, \texttt{sysfs-bus-pci}.
+\item Intel, ``Intel Data Direct I/O technology''.
+\item PCI-SIG, PCI Express 5.0 specification announcement, 2019.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:1}
+Quelle est la bande passante utile dans chaque sens d'un lien PCIe 4.0 à 8 voies~? Suffit-elle pour deux ports de 25~Gb/s~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:2}
+Un paquet de 300 octets arrive dans le cache du socket de la carte. Combien de \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} un cœur de l'autre socket doit-il aller chercher
+pour le lire~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:multi-socket-machines-and-interconnects:3}
+\path{/sys/bus/pci/devices/0000:81:00.0/numa_node} contient 1 et la stratégie s'exécute sur le CPU 5, dont le nœud est 0. Que
+donne la \cref{prop:ll:multi-socket-machines-and-interconnects:remote} avec trois lignes entrantes, une sortante, et les
+valeurs publiées~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:4}
+Le feed handler, épinglé sur le nœud 1, publie chaque message dans un anneau que le thread principal a alloué et mis à zéro au
+démarrage sur le nœud 0. Où va chaque écriture, et comment corriger cela~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:5}
+Lire la \cref{fig:ll:multi-socket-machines-and-interconnects:c2c}~: quelles paires de CPU attribuer à un thread de flux et à un
+thread de stratégie qui se passent chaque message, et quel serait le coût d'un passage de relais entre la paire choisie et une paire quelconque~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:6}
+Expliquer pourquoi le frère hyper-threading d'un thread chaud doit rester inactif, et ce que le plan y perd sur l'installation à deux sockets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:7}
+\emph{Programmation.} Étendre \texttt{firm\_coreplan.plan} pour placer quatre threads chauds sur un nœud ne disposant que de trois cœurs physiques utilisables
+en partageant un cœur entre les deux threads qui échangent le moins de données. Quelle paire choisir dans un pipeline de flux, de carnet,
+de stratégie et de passerelle, et que doit accepter \texttt{check}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:multi-socket-machines-and-interconnects:8}
+\emph{Trouver la faille.} «~Nous avons épinglé notre stratégie avec \texttt{taskset -c 5} dans le script de démarrage du service, elle est
+donc sur le bon socket.~»
+\end{exercise}
+
+\section{Problème~: mauvais socket}
+
+\begin{problem}[{Problème du week-end --- un serveur que personne n'avait examiné}]\label{pb:ll:multi-socket-machines-and-interconnects:1}
+Le nouveau serveur à deux sockets d'une société a sa carte réseau sur le nœud 1. Le feed handler, la stratégie et la passerelle ont été lancés par un
+script sans aucun épinglage, et l'ordonnanceur les a placés sur le nœud 0. Chaque message de données de marché apporte deux \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} à la
+stratégie~; chaque ordre envoie deux lignes à la carte. Prendre les chiffres publiés~: 59 nanosecondes par ligne au sein d'un socket, 138
+entre sockets.
+
+\medskip\noindent\textbf{Partie I --- La topologie.}
+\begin{enumerate}
+\item Quels fichiers sysfs indiquent le nœud de la carte et celui de chaque CPU~?
+\item Sur l'installation \texttt{two\_socket}, quels CPU se trouvent sur le nœud 1, et quels sont les frères du CPU 17~?
+\item Que renvoie \texttt{plan} pour les trois rôles chauds, et quels CPU laisse-t-il inactifs~?
+\item Pourquoi le plan n'utilise-t-il jamais le cœur du CPU 0~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La pénalité.}
+\begin{enumerate}[resume]
+\item Appliquer la \cref{prop:ll:multi-socket-machines-and-interconnects:remote}~: que coûte par message le mauvais socket~?
+\item Quelle fraction d'un budget fil-à-fil de \qty{2.5}{\micro\second} cela représente-t-elle~?
+\item Si la stratégie lit aussi son carnet d'ordres, alloué par le thread principal sur le nœud 0, que se passe-t-il lorsque les threads sont
+déplacés sur le nœud 1 sans déplacer le carnet~?
+\item Laquelle des deux erreurs est la plus grave, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Passages de relais.}
+\begin{enumerate}[resume]
+\item Le thread de flux remet chaque message à la stratégie par un anneau~: une ligne dans chaque sens. Quel est le coût du passage de relais
+au sein d'un socket, et entre sockets~?
+\item Sur cet ordinateur portable, combien coûte un passage entre CPU voisins, et entre les autres (\cref{fig:ll:multi-socket-machines-and-interconnects:c2c})~?
+\item Comment choisir les deux CPU à partir de la seule matrice~?
+\item Pourquoi la matrice peut-elle changer d'un démarrage de machine virtuelle à l'autre~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- La correction.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la latence ajoutée par message par le mauvais socket, en nanosecondes et en fraction
+d'un budget de \qty{2.5}{\micro\second}.
+\item Écrire les étapes de la correction, dans l'ordre.
+\item Comment vérifier, après la correction, que chaque thread s'exécute là où le plan le prévoit~?
+\item Que doit-il se passer lorsqu'un changement matériel déplace la carte sur le nœud 0~?
+\item Les interruptions d'autres périphériques doivent-elles être éloignées des cœurs chauds~?
+\item Que signifie \texttt{numa\_node} $= -1$, et que doit faire le plan~?
+\item Que faut-il consigner avec chaque mesure de latence pour qu'un changement de placement reste visible plus tard~?
+\item En une phrase~: pourquoi le placement est-il une décision de latence~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:1}
+Qu'est-ce que NUMA, et que signifie-t-il pour un processus sensible à la latence~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:2}
+Qu'est-ce que l'\omterm{def:ll:multi-socket-machines-and-interconnects:first}{allocation au premier accès} (first touch), et comment peut-elle placer la mémoire d'un thread sur le mauvais nœud~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:3}
+Comment savoir, sous Linux, à quel socket est reliée une carte réseau~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:4}
+Deux threads échangent un message par microseconde. Où les placeriez-vous sur une machine à deux sockets, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:5}
+Qu'est-ce que le DMA, et qu'est-ce que l'\omterm{def:ll:multi-socket-machines-and-interconnects:dca}{accès direct au cache} change pour le chemin d'un paquet jusqu'à l'application~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:multi-socket-machines-and-interconnects:6}
+Concevez une procédure de démarrage pour un processus de trading qui garantisse le bon placement de ses threads et de sa mémoire sur
+n'importe quel serveur de la flotte.
+\end{interviewq}

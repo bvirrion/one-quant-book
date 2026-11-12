@@ -1,0 +1,350 @@
+\chapter{Grands modèles de langage en finance}\label{ch:ml:large-language-models-in-finance}
+
+Un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} à qui l'on demande si des titres de sa propre période d'entraînement sont une bonne nouvelle pour l'action a raison dans 70~\% des
+cas~; interrogé sur des titres rédigés après la fin de ses données d'entraînement, il a raison dans 56~\% des cas. Le premier chiffre mesure
+sa mémoire, le second son jugement, et un backtest qui mélange les deux ne mesure rien. Le modèle en question est celui de ce
+chapitre~: un \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} de 107\,000 paramètres entraîné en une minute sur les titres synthétiques du chapitre~13, assez petit pour
+être réentraîné avec et sans la période d'évaluation dans ses données. Le protocole qu'il teste est celui dont un desk a besoin pour
+les modèles commerciaux dont il ne voit pas les données d'entraînement. Le chapitre passe ensuite à l'usage des \omterm{def:ml:large-language-models-in-finance:lm}{modèles de langage} en
+pratique~: lecture à grande échelle de dépôts et d'actualités par recherche documentaire, exécution de tâches de recherche comme agents, et ce qu'un desk peut
+et ce qu'il ne peut pas leur confier. Rien dans ce chapitre n'appelle un service en réseau et ne télécharge de modèle~; chaque chiffre provient de code local
+accompagné de tests.
+
+\section{Modèles de langage et leur entraînement}
+
+\begin{definition}[Modèle de langage, grand modèle de langage]\label{def:ml:large-language-models-in-finance:lm}
+Un \emph{modèle de langage}\index{modèle de langage} attribue des probabilités à des séquences de jetons, généralement par la probabilité conditionnelle
+de chaque jeton sachant les précédents, $\P(w_t\mid w_1,\dots,w_{t-1})$~; il génère un texte en tirant un
+jeton à la fois. Un \emph{grand modèle de langage}\index{grand modèle de langage} (LLM) est un modèle de langage à base de \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} (chapitre~8)
+à plusieurs milliards de paramètres, préentraîné (chapitre~10) sur une large part des textes publics d'internet et des livres, puis
+affiné pour suivre des instructions.
+\end{definition}
+
+\begin{definition}[Prompt, fenêtre de contexte, date de coupure de l'entraînement]\label{def:ml:large-language-models-in-finance:prompt}
+Un \emph{prompt}\index{prompt} est le texte donné à un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage}, qu'il poursuit. La \emph{fenêtre de
+contexte}\index{fenêtre de contexte} est le plus grand nombre de jetons sur lesquels le modèle peut conditionner à la fois, prompt et réponse
+réunis. La \emph{date de coupure de l'entraînement}\index{date de coupure de l'entraînement} est la date du texte le plus récent des données d'entraînement du modèle~:
+le modèle peut connaître tout ce qui a été publié avant cette date et ignore tout ce qui l'a été après, sauf ce que lui indique le prompt.
+\end{definition}
+
+Le \Cref{lst:ml:llm:tinylm} présente l'architecture à échelle réduite~: plongements de jetons et de positions, deux couches
+d'auto-attention causale (un jeton ne porte son attention que sur les jetons précédents), et une projection vers les 505 mots du vocabulaire. Il est
+entraîné, comme ses grands cousins, à prédire chaque jeton suivant. Son texte d'entraînement est le corpus du chapitre~13, tronqué à ses premiers
+10\,000 titres, écrit sous forme de phrases telles que \texttt{w190 apex mining beat estimates amid copper demand => up}~: une semaine,
+l'entreprise, le titre, et, après la flèche, ce qu'a fait l'action (hausse ou baisse, soit le signe du rendement de réaction). Interroger le
+modèle sur un titre revient à lui soumettre tout ce qui précède la flèche et à comparer les probabilités qu'il attribue à
+\texttt{up} et \texttt{down}. Deux exemplaires sont entraînés~: un modèle \emph{propre}, dont les données d'entraînement s'arrêtent au jour 907, et un
+modèle \emph{contaminé}, dont les données vont jusqu'au jour 1\,210~; les deux sont évalués sur les 5\,972 titres antérieurs au jour 907, les 2\,016
+titres compris entre les deux dates de coupure et les 2\,012 postérieurs aux deux.
+
+Les grands modèles se construisent de la même façon, à une échelle que ce chapitre ne peut atteindre~: BloombergGPT (Wu et coauteurs, 2023), par
+exemple, est un modèle de 50 milliards de paramètres entraîné sur un jeu de données financières de 363 milliards de jetons, construit à partir des sources de Bloomberg
+auxquelles s'ajoutent 345 milliards de jetons de texte général. Ce qui se transpose du modèle réduit, c'est le protocole, et non les chiffres.
+
+\section{Dépôts, conférences et actualités à grande échelle~: recherche documentaire}
+
+Un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} ne connaît que ses données d'entraînement et son \omterm{def:ml:large-language-models-in-finance:prompt}{prompt}. Pour répondre à des questions sur une collection de documents qui change
+chaque jour (dépôts, transcriptions, actualités), on lui fournit les passages pertinents dans son \omterm{def:ml:large-language-models-in-finance:prompt}{prompt}.
+
+\begin{definition}[Génération augmentée par la recherche, BM25]\label{def:ml:large-language-models-in-finance:rag}
+La \emph{génération augmentée par la recherche}\index{génération augmentée par la recherche} (RAG) répond à une question en récupérant
+d'abord les passages pertinents pour y répondre dans une collection de documents, puis à produire la réponse à partir d'un \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} qui les contient (Lewis
+et coauteurs, 2020). Le \emph{BM25}\index{BM25} est le score lexical de référence de la recherche~: pour chaque terme de la requête présent dans un
+passage, l'inverse de la fréquence documentaire du terme, multipliée par une fonction saturante de son nombre d'occurrences dans le passage, normalisée par la
+longueur du passage (Robertson et Zaragoza, 2009).
+\end{definition}
+
+La collection du chapitre compte 540 passages issus de 135 dépôts annuels synthétiques, un passage par entreprise, exercice et
+indicateur (chiffre d'affaires, dette nette, effectifs, dépenses d'investissement), chacun rédigé avec l'un de trois synonymes («~revenue~», «~sales~»
+ou «~turnover~») et deux mots de contexte. Une question est posée sur chaque passage, formulée avec un synonyme tiré au hasard, de sorte
+qu'environ un tiers emploie le mot propre au passage~; la réponse est extraite du premier passage classé, ce qui fait qu'un bon passage
+donne le bon chiffre. La \Cref{fig:ml:llm:retrieval} compare quatre recherches. Le \omterm{def:ml:large-language-models-in-finance:rag}{BM25} (\cref{lst:ml:llm:bm25}) retrouve chaque
+passage visé avec ses propres mots et 5.0~\% des autres~: une question sur «~sales~» aboutit au passage d'une autre entreprise
+La recherche dense, soit le cosinus entre les moyennes des \omterm{def:ml:text-from-bag-of-words-to-embeddings:embedding}{plongements de mots} de la question et du passage, sait que
+«~sales~» veut dire chiffre d'affaires (les plongements, entraînés sur 5\,000 phrases générales d'affaires, placent les trois synonymes à un cosinus
+supérieur à 0.99), mais pas quelle entreprise est visée~: 1.1~\%. Ajouter les deux scores standardisés n'aide guère (18.2~\%). Élargir
+la requête par les plus proches voisins de ses mots dans l'espace des plongements avant de lancer \omterm{def:ml:large-language-models-in-finance:rag}{BM25} retrouve 89.1~\% des questions reformulées et 86.3~\% des
+autres~: 88.1~\% au total.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.8cm,ybar,bar width=12pt,ymin=0,ymax=110,ylabel={bon passage (\%)},area legend,
+  xtick={0,1,2,3},xticklabels={BM25,dense,hybride,BM25 élargi},tick label style={font=\small},label style={font=\small},
+  enlarge x limits=0.18,grid=major,grid style={gray!25},legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,
+  draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},legend columns=2,table/col sep=comma]
+\addplot[fill=omDef,draw=none] table[x=i,y=same]{figdata/ml/14-large-language-models-in-finance/retrieval.csv};
+\addplot[fill=omThm,draw=none] table[x=i,y=other]{figdata/ml/14-large-language-models-in-finance/retrieval.csv};
+\legend{la question reprend le mot du passage,la question emploie un synonyme}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Part des 540 questions dont le premier passage classé est celui visé, selon la méthode de recherche et la formulation. Données~:
+\texttt{ml\_llm.retrieval}.}\label{fig:ml:llm:retrieval}
+\end{omfigure}
+
+\begin{definition}[Hallucination]\label{def:ml:large-language-models-in-finance:hallucination}
+Une \emph{hallucination}\index{hallucination} est une réponse fluide qui n'est étayée ni par les données fournies au modèle ni par les faits~: un
+chiffre, une citation ou une référence produits parce qu'il s'agit d'un texte probable, et non parce qu'il est vrai.
+\end{definition}
+
+Un système de recherche qui répond toujours hallucine par construction sur les questions auxquelles sa collection ne peut pas répondre. Sur 300
+questions portant sur des couples entreprise-année sans dépôt, la recherche élargie renvoie à chaque fois un passage et un chiffre. Un contrôle
+d'ancrage, qui ne répond que lorsque le passage nomme l'entreprise et l'exercice de la question, s'abstient sur les 300~; sur les questions
+auxquelles il peut répondre, il refuse 11.9~\%, soit exactement les 64 sur 540 dont le premier passage concernait une autre entreprise ou un autre exercice, ce qui aurait
+été une erreur. Un modèle génératif placé au-dessus de la recherche exige la même rigueur~: citer le passage, vérifier les entités et
+s'abstenir plutôt que de deviner.
+
+\section{Évaluation sans fuite depuis la date de coupure de l'entraînement}
+
+\begin{definition}[Mémorisation, test d'anonymisation]\label{def:ml:large-language-models-in-finance:memo}
+La \emph{mémorisation}\index{mémorisation} est la capacité d'un modèle à reproduire des exemples d'entraînement précis, y compris leurs
+résultats, plutôt qu'une règle qui se généralise~; les \omterm{def:ml:large-language-models-in-finance:lm}{modèles de langage} mémorisent un texte vu ne serait-ce qu'une fois (Carlini et coauteurs, 2021).
+Le \emph{test d'anonymisation}\index{test d'anonymisation} remplace les identifiants d'une entrée (noms d'entreprises, tickers, dates)
+par des marqueurs et mesure de combien baisse la précision du modèle~: un modèle qui lit le texte perd peu, un modèle qui
+se rappelle l'événement perd ce souvenir.
+\end{definition}
+
+Évaluer un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} commercial sur des titres historiques relève, sous une forme nouvelle, du biais d'anticipation (look-ahead bias, livre~7, chapitre~3)~: le
+modèle peut avoir lu le titre et ce que l'action a fait ensuite. La \Cref{fig:ml:llm:contamination} mesure les deux tests sur les
+deux modèles du chapitre. Sur les titres antérieurs au jour 907, que les deux ont vus avec leurs résultats, le modèle propre a raison dans 69.7~\% des
+cas, et le modèle contaminé dans 65.4~\% avec les noms et les semaines, et dans 57.7~\% et 57.2~\% sans~: cet écart est de la mémoire. Entre les deux dates de coupure, le modèle contaminé a raison
+dans 64.8~\% des cas, et le modèle propre dans 56.2~\%, et l'anonymisation ramène le modèle contaminé à 57.0~\% et laisse le
+modèle propre là où il était (56.0~\%). Après les deux dates de coupure, le modèle contaminé a raison dans 59.2~\% des cas, le propre dans 56.3~\%, les deux
+restant sous les 61.6~\% qu'atteint le signe de l'effet injecté.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,ybar,bar width=8pt,ymin=50,ymax=72,ylabel={bonne direction (\%)},area legend,
+  xtick={0,1,2},xticklabels={{avant les deux\\dates de coupure},{entre les dates\\de coupure},{après les deux\\dates de coupure}},xticklabel style={align=center},tick label style={font=\small},
+  label style={font=\small},xmin=-0.5,xmax=2.5,grid=major,grid style={gray!25},legend columns=2,
+  legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef,draw=none,bar shift=-13.5pt] table[x=i,y=clean]{figdata/ml/14-large-language-models-in-finance/contamination.csv};
+\addplot[fill=omDef!40,draw=none,bar shift=-4.5pt] table[x=i,y=cleananon]{figdata/ml/14-large-language-models-in-finance/contamination.csv};
+\addplot[fill=omThm,draw=none,bar shift=4.5pt] table[x=i,y=contam]{figdata/ml/14-large-language-models-in-finance/contamination.csv};
+\addplot[fill=omThm!40,draw=none,bar shift=13.5pt] table[x=i,y=contamanon]{figdata/ml/14-large-language-models-in-finance/contamination.csv};
+\addplot[black!70,dashed,thick,sharp plot,forget plot] table[x=x,y=y]{figdata/ml/14-large-language-models-in-finance/ceiling.csv};
+\legend{propre,propre anonymisé,contaminé,contaminé anonymisé}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Part des titres dont chaque modèle prédit correctement la direction, par période, avec les noms et les semaines, et avec
+des marqueurs. Les données d'entraînement du modèle propre s'arrêtent à la première date de coupure, celles du modèle contaminé à la seconde. En pointillés~: le
+signe de l'effet injecté. Données~: \texttt{ml\_llm.contamination}.}\label{fig:ml:llm:contamination}
+\end{omfigure}
+
+Le résultat nommé du chapitre suit. La \emph{prime de \omterm{def:ml:large-language-models-in-finance:memo}{mémorisation}}, soit la précision entre les deux dates de coupure moins la précision
+après les deux, vaut 5.6 points pour le modèle contaminé et $-0.1$ pour le modèle propre~; la \emph{perte due à l'anonymisation}, entre les
+dates de coupure, vaut 7.8 points pour le modèle contaminé et 0.2 pour le modèle propre. Les deux tests détectent la contamination sans
+connaître les données d'entraînement, et c'est précisément leur rôle~: un desk qui évalue un modèle dont il doute de la date de coupure les lance, et
+ne fait confiance qu'aux chiffres postérieurs à la date de coupure annoncée. La littérature a observé les mêmes deux effets sur de vrais modèles. Lopez-Lira et
+Tang (2023) ont évalué GPT-4 sur des titres publiés après sa date de coupure des connaissances, pour cette raison~; Glasserman et Lin (2023)
+ont comparé des titres originaux à des titres débarrassés des identifiants de l'entreprise et ont constaté, dans l'échantillon, que les versions anonymisées
+donnaient de meilleurs résultats~: la connaissance générale de l'entreprise distrayait davantage le modèle que le biais d'anticipation ne l'aidait. Le jouet n'a aucune
+connaissance générale qui pourrait le distraire, et après les deux dates de coupure, l'anonymisation coûte à chaque modèle environ un point (59.2~\% à 58.1~\%,
+56.3~\% à 55.3~\%)~: le \omterm{def:ml:large-language-models-in-finance:memo}{test d'anonymisation} est un test de mémoire, et sa perte doit se lire à l'aune de ce faible coût.
+
+\begin{method}[Évaluer un modèle de langage sur des données de marché]\label{met:ml:llm:method}
+\begin{enumerate}
+\item Établir la \omterm{def:ml:large-language-models-in-finance:prompt}{date de coupure de l'entraînement} à partir de la documentation du fournisseur, et traiter tout ce qui la précède comme dans l'échantillon.
+\item Ne calculer les scores que sur les textes publiés après la date de coupure~; si un historique antérieur doit être utilisé, présenter le \omterm{def:ml:large-language-models-in-finance:memo}{test d'anonymisation} et
+la précision par période, et s'attendre à ce qu'ils divergent.
+\item Figer la version du modèle, le \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} et les paramètres de décodage dans le journal de recherche (livre~7, chapitre~1)~: une
+mise à jour silencieuse du fournisseur constitue un nouveau modèle.
+\item Comparer à une référence peu coûteuse (un dictionnaire, un modèle tf-idf) sur les mêmes titres et le même horizon.
+\end{enumerate}
+\end{method}
+
+\section{Agents dans les flux de travail de recherche}
+
+\begin{definition}[Agent à modèle de langage, appel d'outil]\label{def:ml:large-language-models-in-finance:agent}
+Un \emph{agent à modèle de langage}\index{agent à modèle de langage} est une boucle dans laquelle un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} choisit des actions, observe leurs
+résultats et décide de l'action suivante jusqu'à ce qu'une tâche soit achevée (Yao et coauteurs, 2023). Un \emph{appel d'outil}\index{appel d'outil} est
+l'une de ces actions~: le modèle émet une requête structurée (un nom de fonction et des arguments) que le programme qui l'entoure exécute,
+en renvoyant le résultat au modèle.
+\end{definition}
+
+Un agent capable de chercher, de calculer et de lancer des backtests est un assistant de recherche qui présente les mêmes modes de défaillance qu'un analyste junior,
+à une vitesse de machine~: il utilisera des données qu'il ne devrait pas utiliser. La \Cref{lst:ml:llm:tools} est le harnais de la maison~: les outils sont enregistrés par
+nom, un outil daté reçoit la date de référence de la tâche, et tout résultat publié après celle-ci est refusé, et chaque appel,
+qu'il soit autorisé ou refusé, est consigné dans le journal. L'agent du chapitre est un plan fixe plutôt qu'un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage}, de façon que son comportement
+puisse être testé~: interrogé, à une date tirée au hasard, sur le dernier chiffre annuel d'une entreprise, il effectue une recherche, retient les passages qui concernent
+l'entreprise et la métrique, et répond à partir du dernier exercice fiscal trouvé. Sur 400 questions de ce type, sans le garde-fou, 80.8~\%
+des réponses proviennent de dépôts publiés après la date de référence et 19.2~\% sont exactes~; avec le garde-fou, aucune n'en provient et toutes sont exactes, et
+chaque question laisse un appel journalisé.
+
+\section{Ce qu'un desk peut et ne peut pas déléguer}
+
+Les \omterm{def:ml:large-language-models-in-finance:lm}{modèles de langage} excellent dans le travail situé entre les données et la décision, qui coûte cher aux personnes et se vérifie à bon compte~: extraire
+des champs dans les dépôts, résumer une conférence téléphonique en la comparant à la précédente, rédiger du code et des tests, étiqueter les actualités par événements et
+entités, répondre à des questions sur une collection en citant le passage. Chacune de ces tâches produit un résultat vérifiable. Ce qui ne peut pas
+être délégué, c'est ce qui ne se vérifie pas à bon compte~: la décision de trader, le jugement selon lequel un backtest est propre, l'affirmation
+qu'un chiffre est juste alors qu'aucun passage ne la soutient. Trois règles fixent la frontière. Rien de ce que renvoie le modèle entre dans une
+position ou dans un rapport sans une source qu'une personne ou un test peut vérifier. Les informations privilégiées (livre~7,
+chapitre~12) restent à l'écart des \omterm{def:ml:large-language-models-in-finance:prompt}{prompts} envoyés à des services que la maison ne contrôle pas, puisqu'un \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} est une divulgation. Et chaque appel de modèle
+qui alimente la recherche est consigné avec sa version, son \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} et sa sortie, de sorte que le résultat puisse être reproduit ou, à défaut,
+expliqué. Kim, Muhn et Nikolaev (2024) rapportent que GPT-4, à qui l'on donnait des états financiers standardisés et anonymes, a prédit
+la direction des variations de résultats mieux que les analystes~; c'est l'anonymisation qui a rendu le résultat crédible.
+
+\section{Tutoriel~: le modèle qui savait}\label{tut:ml:large-language-models-in-finance:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Entraîner un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} propre et un modèle contaminé sur les titres du chapitre~13, et mesurer la prime de
+\omterm{def:ml:large-language-models-in-finance:memo}{mémorisation} et la perte due à l'anonymisation~; comparer quatre méthodes de recherche et un contrôle d'ancrage~; lancer l'agent avec et sans son
+garde-fou. \textbf{État final~:} \cref{fig:ml:llm:contamination,fig:ml:llm:retrieval}.
+\begin{tutsteps}
+\item \textbf{Un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} à décodeur seul, à l'échelle du jouet.}
+\omcode{code/firm/llmeval/firm_llmeval.py}{51}{67}{Un modèle de langage causal à transformer.}\label{lst:ml:llm:tinylm}
+\item \textbf{\omterm{def:ml:large-language-models-in-finance:rag}{BM25}.}
+\omcode{code/firm/llmeval/firm_llmeval.py}{122}{143}{Le score BM25.}\label{lst:ml:llm:bm25}
+\item \textbf{Outils point-in-time.}
+\omcode{code/firm/llmeval/firm_llmeval.py}{168}{192}{Un registre d'outils avec un garde-fou point-in-time et un journal.}\label{lst:ml:llm:tools}
+\item \textbf{Lancer} \texttt{ml\_llm.contamination()} (environ une minute sur un cœur), \texttt{verdict()}, \texttt{retrieval()},
+\texttt{unanswerable()}, \texttt{agent\_run()} et \texttt{fig\_llm.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Entraîner le modèle contaminé sur moins d'\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} et observer la prime rétrécir~; remplacer les noms d'entreprises
+entre les titres (un test de permutation d'entités) au lieu de les supprimer.
+\end{tutorial}
+
+\section{Construction~: évaluer les modèles de langage sans fuite}\label{bld:ml:large-language-models-in-finance:llmeval}
+
+\begin{build}
+\bfield{Rôle} \omterm{def:ml:large-language-models-in-finance:lm}{Modèles de langage} et recherche utilisés là où leur sortie peut être vérifiée, et évalués seulement là où leurs
+données d'entraînement ne peuvent pas avoir vu la réponse.
+\bfield{Interface} \texttt{Vocab}, \texttt{TinyLM(vocab\_size, d, heads, layers, max\_len)},
+\texttt{train\_lm(model, seqs, epochs, lr, batch, seed)}, \texttt{next\_logprobs(model, prefixes)}~; \texttt{BM25(docs, k1, b)}, \texttt{dense\_scores},
+\texttt{expand\_query}, \texttt{hybrid}~; \texttt{ToolRegistry(as\_of)} avec \texttt{register(name, fn, dated)},
+\texttt{call(name, **kw)} et \texttt{log}.
+\bfield{Règles} Aucun appel réseau et aucun poids téléchargé dans les tests~; scores présentés par période par rapport à la \omterm{def:ml:large-language-models-in-finance:prompt}{date de
+coupure de l'entraînement}~; chaque \omterm{def:ml:large-language-models-in-finance:agent}{appel d'outil} journalisé~; les outils datés refusent tout élément postérieur à la date de référence.
+\bfield{Tests d'acceptation} \texttt{code/firm/llmeval/tests/}~: le \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} mémorise un petit corpus et est causal (la
+prédiction d'un jeton ne change pas avec les jetons suivants)~; l'entraînement est déterministe~; \omterm{def:ml:large-language-models-in-finance:rag}{BM25} coïncide avec sa formule sur un exemple calculé à la main~;
+l'expansion de requête n'ajoute que des voisins proches~; le registre refuse un document futur, journalise chaque appel et rejette les outils
+inconnus.
+\bfield{Pour aller plus loin} Un modèle à poids ouverts exécuté localement derrière la même interface, lancé hors ligne~; un test de permutation d'entités~; un registre de \omterm{def:ml:large-language-models-in-finance:prompt}{prompts} et de versions
+dans l'outil de suivi d'expériences (chapitre~25).
+\end{build}
+
+\begin{omsources}
+\item A.~Vaswani et coauteurs, «~Attention is all you need~», arXiv:1706.03762, 2017.
+\item P.~Lewis et coauteurs, «~Retrieval-augmented generation for knowledge-intensive NLP tasks~», arXiv:2005.11401, 2020.
+\item S.~Robertson et H.~Zaragoza, «~The probabilistic relevance framework: BM25 and beyond~», \emph{Foundations and Trends
+in Information Retrieval} 3(4), 2009.
+\item N.~Carlini et coauteurs, «~Extracting training data from large language models~», arXiv:2012.07805, 2021.
+\item A.~Lopez-Lira et Y.~Tang, «~Can ChatGPT forecast stock price movements? Return predictability and large language
+models~», arXiv:2304.07619, 2023.
+\item P.~Glasserman et C.~Lin, «~Assessing look-ahead bias in stock return predictions generated by GPT sentiment
+analysis~», arXiv:2309.17322, 2023.
+\item S.~Wu et coauteurs, «~BloombergGPT: a large language model for finance~», arXiv:2303.17564, 2023.
+\item S.~Yao et coauteurs, «~ReAct: synergizing reasoning and acting in language models~», arXiv:2210.03629, 2023.
+\item A.~Kim, M.~Muhn et V.~Nikolaev, «~Financial statement analysis with large language models~», arXiv:2407.17866, 2024.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:large-language-models-in-finance:1}
+La documentation d'un modèle indique une \omterm{def:ml:large-language-models-in-finance:prompt}{date de coupure de l'entraînement} fixée au 30 juin. Un backtest couvre la période allant de janvier de l'année précédente à décembre.
+Quelle partie de ce backtest permet de mesurer le jugement du modèle, et que mesure le reste~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:large-language-models-in-finance:2}
+Calculer la contribution \omterm{def:ml:large-language-models-in-finance:rag}{BM25} d'un terme de fréquence documentaire 45 parmi 540 passages, apparaissant une fois dans un passage de
+longueur moyenne, avec $k_1 = 1.5$ et $b = 0.75$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:large-language-models-in-finance:3}
+À partir de la \cref{fig:ml:llm:contamination}, calculer la prime de \omterm{def:ml:large-language-models-in-finance:memo}{mémorisation} et la perte d'anonymisation de chaque modèle.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:large-language-models-in-finance:4}
+Pourquoi la recherche dense seule ne retrouve-t-elle presque aucun des bons passages, et pourquoi ajouter son score à celui de \omterm{def:ml:large-language-models-in-finance:rag}{BM25} aide-t-il si
+peu~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:large-language-models-in-finance:5}
+Pourquoi le modèle contaminé est-il meilleur que le modèle non contaminé après les deux dates de coupure (59.2~\% contre 56.3~\%)~? Est-ce une preuve de
+jugement~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:large-language-models-in-finance:6}
+\emph{Trouver la faille.} «~Nous avons demandé au modèle le sens de 10\,000 titres de 2015 à 2023 et il a eu raison dans 70~\% des
+cas, bien au-dessus des 56~\% de notre modèle tf-idf~; nous avons retiré les noms d'entreprises à titre de contrôle et il était encore à 65~\%.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:large-language-models-in-finance:7}
+\emph{Programmation.} Vérifier que \texttt{TinyLM} est causal~: modifier le dernier jeton d'un \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} et contrôler que les prédictions du
+modèle à toutes les positions antérieures restent inchangées. Qu'est-ce qui, dans le code, le garantit~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:large-language-models-in-finance:8}
+Concevoir une tâche pour un agent (question de recherche, outils, date de référence, contrôles) pour «~lequel de nos signaux s'est le plus dégradé le trimestre dernier~?~»,
+et lister ce que le journal doit contenir pour qu'un relecteur puisse reproduire la réponse.
+\end{exercise}
+
+\section{Problème~: Le modèle qui savait}
+
+\begin{problem}[{Problème du week-end --- mémoire ou jugement}]\label{pb:ml:large-language-models-in-finance:1}
+Les deux \omterm{def:ml:large-language-models-in-finance:lm}{modèles de langage} du chapitre, son corpus de dépôts réglementaires et son agent.
+
+\medskip\noindent\textbf{Partie I --- Les modèles.}
+\begin{enumerate}
+\item Que voit chaque modèle à l'entraînement, et comment l'interroge-t-on sur un titre~?
+\item Quelle est la taille du modèle et celle de son vocabulaire, et pourquoi le protocole compte-t-il davantage que la taille~?
+\item Quelle est la meilleure exactitude disponible après les deux dates de coupure, et pourquoi n'est-elle pas plus élevée~?
+\item Pourquoi un titre d'entraînement sur dix est-il anonymisé~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Contamination.}
+\begin{enumerate}[resume]
+\item Quelles sont les exactitudes des deux modèles avant les deux dates de coupure, et que montre là l'exactitude anonymisée~?
+\item Quelles sont-elles entre les deux dates de coupure, et qu'est-ce qui explique l'écart~?
+\item Quel effet l'anonymisation a-t-elle sur chaque modèle entre les deux dates de coupure~?
+\item Que dit la littérature de ces deux mêmes effets dans les modèles réels~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Recherche et agents.}
+\begin{enumerate}[resume]
+\item Comment se comportent les quatre recherches avec la question formulée dans les termes du passage, puis avec d'autres mots~?
+\item Que coûte le contrôle d'ancrage et que rapporte-t-il~?
+\item Que fait l'agent sans son garde-fou~?
+\item Que doit contenir le journal d'une exécution d'agent~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la prime de \omterm{def:ml:large-language-models-in-finance:memo}{mémorisation} et la perte d'anonymisation pour le modèle contaminé et le
+modèle non contaminé.
+\item Comment évalue-t-on un modèle de sentiment sur l'actualité d'un fournisseur, construit sur un LLM~?
+\item Quelles tâches confierait-on d'abord à un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} sur un desk de recherche~?
+\item Qu'est-ce qui ne doit jamais entrer dans un \omterm{def:ml:large-language-models-in-finance:prompt}{prompt} envoyé hors de la société~?
+\item Pourquoi le backtest d'un agent peut-il être moins bon que celui d'une personne~?
+\item Comment rend-on reproductible un résultat de recherche fondé sur un LLM~?
+\item Dans quel cas faut-il affiner un modèle plutôt que de le piloter par un \omterm{def:ml:large-language-models-in-finance:prompt}{prompt}~?
+\item En une phrase~: que mesure l'exactitude d'un \omterm{def:ml:large-language-models-in-finance:lm}{modèle de langage} sur des données historiques~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:large-language-models-in-finance:1}
+Qu'est-ce qu'une \omterm{def:ml:large-language-models-in-finance:prompt}{date de coupure de l'entraînement}, et pourquoi compte-t-elle pour un backtest qui utilise un LLM~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:large-language-models-in-finance:2}
+Pouvez-vous expliquer la \omterm{def:ml:large-language-models-in-finance:rag}{génération augmentée par la recherche}~? Comment évalueriez-vous l'étape de recherche séparément de la génération~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:large-language-models-in-finance:3}
+Comment testeriez-vous si la capacité apparente de prévision d'un LLM relève de la \omterm{def:ml:large-language-models-in-finance:memo}{mémorisation}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:large-language-models-in-finance:4}
+\omterm{def:ml:large-language-models-in-finance:rag}{BM25} ou plongements pour la recherche dans les dépôts réglementaires~? Pouvez-vous défendre un choix de conception~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:large-language-models-in-finance:5}
+Comment empêcheriez-vous un agent de recherche d'utiliser des données postérieures à la date de référence, et comment prouveriez-vous qu'il ne l'a pas fait~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur, trader}]\label{iq:ml:large-language-models-in-finance:6}
+Un fournisseur vend un score de sentiment fondé sur un LLM, affichant un ratio de Sharpe de 3 sur dix ans de backtest. Que demandez-vous avant un essai~?
+\end{interviewq}

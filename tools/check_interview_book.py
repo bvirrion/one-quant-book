@@ -340,7 +340,9 @@ def main():
     if stems != sorted(stems):
         bad("part.tex", "chapters are not in the outline's number order")
     labels = re.findall(r"\\label\{([^}]*)\}", "".join(
-        p.read_text(encoding="utf-8") for p in PARTS.rglob("*.tex") if p.name != "tracks.tex"))
+        p.read_text(encoding="utf-8") for p in PARTS.rglob("*.tex") if p.name != "tracks.tex"
+        # the English book only: a language edition (parts/<book>/fr/, solutions/fr/, generated/fr/) repeats its labels
+        and not any(re.fullmatch(r"[a-z]{2}", d) for d in p.relative_to(PARTS).parts[:-1])))
     dups = {x for x in labels if labels.count(x) > 1}
     if dups:
         bad("book", f"duplicate labels {sorted(dups)[:5]}")

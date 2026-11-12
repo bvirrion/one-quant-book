@@ -1,0 +1,295 @@
+\chapter{Rust pour la faible latence}\label{ch:ll:rust-for-low-latency}
+
+Le jumeau Rust du décodeur de messages de ce livre décode un message en environ onze nanosecondes sur ce portable, à moins d'un cinquième
+de l'original C++ d'un passage à l'autre. Les deux vérifient chaque longueur avant de lire, aucun n'alloue par message, et la
+version Rust a été écrite sans un seul bloc \texttt{unsafe}. Ce que Rust change n'est pas la vitesse mais l'endroit où les erreurs
+sont détectées~: une \omterm{def:ll:rust-for-low-latency:race}{course aux données} ou une référence pendante est une erreur de compilation, un indice hors bornes donne une panique
+contrôlée au lieu d'une lecture silencieuse de la mémoire d'autrui. Ce chapitre examine Rust sur le chemin critique (hot path) de la
+même manière que les chapitres~6 à~8 ont examiné C++~: quelles abstractions ne coûtent vraiment rien, où se trouvent les
+vérifications et quand le compilateur les supprime, comment écrire du code \texttt{unsafe} qui reste sûr, comment maîtriser
+l'allocation et les threads, et où le mécanisme asynchrone de Rust a sa place dans un système de trading et où il n'en a pas.
+
+\section{Abstractions à coût nul, vérifiées}
+
+\begin{definition}[Abstraction à coût nul]\label{def:ll:rust-for-low-latency:zero}
+Une \emph{abstraction à coût nul}\index{abstraction à coût nul} se compile en le code qu'un programmeur aurait écrit à la main
+sans elle~: la commodité de l'abstraction est résolue à la compilation et ne laisse aucune trace à l'exécution. La formule vient
+du C++~: «~ce que vous n'utilisez pas, vous ne le payez pas~; et ce que vous utilisez, vous ne sauriez pas le coder mieux à la main~»
+(Stroustrup).
+\end{definition}
+
+Les itérateurs, les fermetures, les génériques et \texttt{Option} sont conçus pour être à coût nul en Rust~: ils sont monomorphisés comme
+les modèles C++ et intégrés en ligne. L'affirmation se vérifie de la même façon qu'au chapitre~7, dans l'assembleur. Le Rust sûr ajoute
+une chose que le C++ n'a pas~: chaque indice de tranche est vérifié par rapport à la longueur de la tranche.
+
+\begin{definition}[Élimination des vérifications de bornes]\label{def:ll:rust-for-low-latency:bce}
+L'\emph{élimination des vérifications de bornes}\index{élimination des vérifications de bornes} est la suppression, par le compilateur,
+d'un contrôle d'indice dont il peut prouver qu'il réussit toujours~: un compteur de boucle borné par la longueur propre de la tranche, un
+indice déjà comparé, un itérateur qui ne produit que des positions valides.
+\end{definition}
+
+Le \cref{lst:ll:rust-for-low-latency:counted} est l'assembleur d'une boucle \texttt{for i in 0..v.len() \{ s += v[i] \}} compilée
+par \texttt{rustc -O}~: il ne reste ni comparaison avec la longueur ni appel au gestionnaire de panique, et LLVM a vectorisé la
+boucle quatre éléments à la fois. Le \cref{lst:ll:rust-for-low-latency:checked} lit un élément à un indice que le compilateur ne
+connaît pas~: une comparaison, un branchement prédit, et le chemin de panique placé hors de la ligne. Lorsque la vérification ne peut
+pas être supprimée, elle coûte peu, pourvu qu'elle soit prédite et que le chargement qu'elle protège soit la partie lente~: dans la
+\cref{fig:ll:rust-for-low-latency:twins}, un gather de 65\,536 éléments à travers une table d'indices dispersés coûte la même
+chose, à la marge d'erreur près, avec et sans vérification, dans les deux langages.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/asm/sum_counted.s}{1}{40}{Une boucle comptée sur une tranche, rustc 1.97 -O~: pas de vérification de bornes, vectorisée.}\label{lst:ll:rust-for-low-latency:counted}
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/asm/get_checked.s}{1}{12}{Une lecture indicée à un indice inconnu~: une comparaison et un branchement vers le gestionnaire de panique.}\label{lst:ll:rust-for-low-latency:checked}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=dec,width=4.6cm,height=5.4cm,ybar,bar width=12pt,ymin=0,symbolic x coords={decode},xtick=data,xticklabels={décodage},
+  enlarge x limits=0.8,title={\small ns par message},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=task,y=cpp]{figdata/low-latency/09-rust-for-low-latency/measured_decode.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=task,y=rust]{figdata/low-latency/09-rust-for-low-latency/measured_decode.csv};
+\end{axis}
+\begin{axis}[at={(dec.east)},anchor=west,xshift=1.5cm,width=8.6cm,height=5.4cm,ybar,bar width=10pt,ymin=0,
+  symbolic x coords={counted loop,gather checked,gather unchecked},xtick=data,enlarge x limits=0.25,
+  xticklabels={{boucle\\comptée},{gather\\avec contrôle},{gather\\sans contrôle}},xticklabel style={align=center},
+  title={\small ns par élément},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.3,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=task,y=cpp]{figdata/low-latency/09-rust-for-low-latency/measured_loops.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=task,y=rust]{figdata/low-latency/09-rust-for-low-latency/measured_loops.csv};
+\legend{C++ (g++ -O2),Rust (rustc -O)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les jumeaux C++ et Rust~: décodage de l'échantillon du livre~1 avec le décodeur de chaque langage (à gauche), et somme de
+65\,536 entiers dans l'ordre, puis à travers une table d'indices dispersés avec et sans vérifications de bornes (à droite). Mesuré sur un
+portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés, épinglé sur un seul processeur. Données~: \texttt{bench\_rust.py}.}\label{fig:ll:rust-for-low-latency:twins}
+\end{omfigure}
+
+\section{Code unsafe et ses limites}
+
+Les garanties de Rust valent pour le code sûr~; les blocs \texttt{unsafe} sont l'endroit où le programmeur reprend à son compte les
+obligations de preuve du compilateur~: déréférencer des pointeurs bruts, appeler des fonctions C, contourner les vérifications de bornes,
+implémenter des structures sans verrou (chapitre~11).
+
+\begin{definition}[Abstraction saine]\label{def:ll:rust-for-low-latency:sound}
+Une abstraction construite sur du code \texttt{unsafe} est \emph{saine}\index{abstraction saine} (sound) si aucune suite d'appels à son interface
+sûre, aussi inhabituelle soit-elle, ne peut provoquer de \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{comportement indéfini}~: les invariants sur lesquels s'appuie le code unsafe sont
+établis et maintenus par l'abstraction elle-même, et non supposés chez ses appelants.
+\end{definition}
+
+La discipline consiste à garder la zone unsafe réduite et à consigner, à côté de chaque bloc, la raison pour laquelle il est sûr. Le
+gather du \cref{lst:ll:rust-for-low-latency:sound} ne saute la vérification par élément qu'après que les indices ont été validés
+une fois, et refuse une tranche dont la longueur n'est pas celle contre laquelle ils ont été validés~: quel que soit l'appel, il ne peut
+pas lire hors bornes. Une fonction dont la sûreté dépend de son appelant est elle-même marquée \texttt{unsafe}, avec une section
+\texttt{\# Safety} qui énonce le contrat~; \texttt{clippy} rejette une fonction publique qui déréférence un argument pointeur brut sans cela.
+Les mêmes questions se posent pour le code C++, où chaque ligne est unsafe~; Rust les rend locales.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/src/lib.rs}{58}{72}{Une interface sûre au-dessus d'un gather sans contrôle.}\label{lst:ll:rust-for-low-latency:sound}
+
+\section{Maîtriser l'allocation}
+
+\begin{definition}[Allocateur global]\label{def:ll:rust-for-low-latency:alloc}
+L'\emph{allocateur global}\index{allocateur global} d'un programme Rust est l'allocateur qui se cache derrière \texttt{Box}, \texttt{Vec},
+\texttt{String} et toutes les collections standard~; un programme peut le remplacer par tout type implémentant \texttt{GlobalAlloc},
+déclaré avec \texttt{\#[global\_allocator]}, par exemple un type qui compte les allocations dans les tests.
+\end{definition}
+
+Les types standard de Rust allouent à des endroits légèrement différents de ceux du C++, et les différences comptent sur un chemin critique. Une
+\texttt{String} n'a pas de tampon intégré, de sorte qu'un symbole de quatre lettres alloue déjà~; un \texttt{Vec} réserve de la place pour
+quatre petits éléments à sa première insertion, si bien que trois remplissages coûtent une allocation au lieu de trois~; \texttt{HashMap::entry}
+déplace la clé dans la table au lieu de la copier. Mesurée avec \texttt{firm\_arena::CountingAlloc}, la version Rust du premier jet du
+gestionnaire du chapitre~6 (\cref{lst:ll:rust-for-low-latency:naive}) allouait cinq fois par message là où la version C++ allouait neuf fois,
+et la version corrigée n'alloue jamais. Le remède est le même qu'en C++~: tableaux de taille fixe, réservoirs d'indices, tableaux d'octets
+pour les identifiants, pas de fermetures boxées sur le chemin critique, et un test qui vérifie le compte.
+
+\omcode{code/low-latency/09-rust-for-low-latency/rust/src/lib.rs}{89}{102}{Le premier jet du chapitre~6 en Rust~: cinq allocations par message.}\label{lst:ll:rust-for-low-latency:naive}
+
+\section{Threads, épinglage et ce que garantit le système de types}
+
+\begin{definition}[Course aux données]\label{def:ll:rust-for-low-latency:race}
+Une \emph{course aux données}\index{course aux données} se produit lorsque deux threads accèdent simultanément à la même zone mémoire, qu'au moins
+un accès est une écriture et qu'au moins un n'est pas atomique. En C++, c'est un \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{comportement indéfini}~; en Rust sûr, elle ne peut pas
+s'écrire~: les traits \texttt{Send} et \texttt{Sync}, qui marquent les types pouvant être déplacés ou partagés entre threads, et la règle
+selon laquelle une référence mutable est exclusive, sont vérifiés à la compilation.
+\end{definition}
+
+Le crate du chapitre contient un test de documentation marqué \texttt{compile\_fail}~: un thread qui incrémente un élément d'un
+vecteur pendant que son propriétaire l'écrit aussi. Le test ne réussit que si le compilateur rejette le programme, ce qui est le cas,
+car le thread lancé emprunte le vecteur de manière mutable alors qu'il est encore utilisé. Ce que le système de types ne fournit pas
+c'est le placement~: la bibliothèque standard ne peut pas épingler un thread à un processeur. \texttt{firm.affinity} déclare les deux fonctions C dont il a besoin,
+les appelle dans des blocs \texttt{unsafe} en énonçant la raison, et vérifie le résultat avec \texttt{sched\_getcpu}
+(\cref{lst:ll:rust-for-low-latency:pin})~; son jumeau C++ fait de même avec \texttt{pthread\_setaffinity\_np}. Les deux lisent
+le plan rôle-processeur qu'écrit \texttt{firm.coreplan} (chapitre~4).
+
+\omcode{code/firm/affinity/rust/src/lib.rs}{36}{45}{Épinglage du thread appelant depuis Rust à travers la bibliothèque C.}\label{lst:ll:rust-for-low-latency:pin}
+
+\section{Où l'asynchrone a sa place et où il n'en a pas}
+
+\begin{definition}[Moteur d'exécution asynchrone]\label{def:ll:rust-for-low-latency:async}
+Un \emph{moteur d'exécution asynchrone}\index{moteur d'exécution asynchrone} (async runtime) exécute de nombreuses tâches écrites sous forme de fonctions \texttt{async} sur quelques threads~: une tâche
+qui doit attendre (une socket, une minuterie) rend la main à l'ordonnanceur du moteur, qui la reprend lorsque l'événement
+survient, éventuellement sur un autre thread.
+\end{definition}
+
+Le code asynchrone est la manière dont Rust sert à moindre coût de nombreuses connexions lentes, et une société de trading en possède beaucoup~: les interfaces REST des plateformes, les flux WebSocket
+de données de marché de plusieurs dizaines de plateformes de crypto-actifs (chapitre~17), les sessions de drop copy, les services internes. Le chemin critique est le
+cas inverse~: un thread occupé par rôle, épinglé, qui tourne sur son entrée et ne cède jamais la main. Un ordonnanceur qui peut déplacer une tâche entre
+threads, ou la retarder derrière une autre, ajoute précisément la \omterm{def:ll:where-latency-comes-from:tail}{gigue} que le chemin critique existe pour éviter. Les auteurs du moteur le
+plus utilisé le disent eux-mêmes~: il est conçu pour des applications dont les tâches passent l'essentiel de leur temps à attendre
+des entrées et sorties, et non pour accélérer le calcul. La répartition habituelle est un chemin critique synchrone et épinglé, alimenté et vidé par
+des anneaux sans verrou (chapitre~12), entouré de services asynchrones pour tout ce qui peut attendre.
+
+\section{Tutoriel~: le jumeau Rust, mesuré}\label{tut:ll:rust-for-low-latency:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Vérifier les abstractions de Rust dans l'assembleur, compter ses allocations, épingler un thread et comparer les jumeaux.
+\textbf{État final~:} les deux listings d'assembleur, les comptes d'allocations et la \cref{fig:ll:rust-for-low-latency:twins}.
+\begin{tutsteps}
+\item \textbf{Assembleur.} \texttt{python ll\_rustasm.py} compile le crate avec \texttt{rustc -O --emit asm} et extrait
+\texttt{sum\_counted} et \texttt{get\_checked}, exportées avec \texttt{\#[no\_mangle]} afin que leurs noms soient stables.
+\item \textbf{Sûreté et course détectée à la compilation.} \texttt{cargo test} exécute les tests unitaires et le test \texttt{compile\_fail}
+de documentation~; clippy s'exécute avec \texttt{-D warnings}.
+\item \textbf{Allocations.} Le test installe \texttt{CountingAlloc} comme \omterm{def:ll:rust-for-low-latency:alloc}{allocateur global} et vérifie cinq allocations
+par message pour le brouillon, et aucune pour le gestionnaire corrigé.
+\item \textbf{Épinglage.} \texttt{firm\_affinity::apply(plan, role)} épingle un thread et vérifie son processeur.
+\item \textbf{Mesurer} avec \texttt{python bench\_rust.py}~: il construit le benchmark du crate avec
+\texttt{cargo build --release} et le jumeau C++ avec g++, puis exécute les deux épinglés.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer la recherche linéaire du gestionnaire corrigé par une petite table à adressage ouvert et garder le
+nombre d'allocations à zéro~; compiler le jumeau C++ avec \texttt{-O3} et voir alors quel langage a la boucle comptée la plus rapide.
+\end{tutorial}
+
+\section{Construction~: placement des threads par rôle}\label{bld:ll:rust-for-low-latency:affinity}
+
+\begin{build}
+\bfield{Rôle} Chaque thread critique de la partie~IV est épinglé au processeur que le plan de placement attribue à son rôle, et le signale~;
+les mesures du chapitre~26 consignent où chaque thread s'est exécuté.
+\bfield{Interface} Rust \texttt{firm\_affinity}~: \texttt{read\_plan(text)}, \texttt{read\_plan\_file(path)},
+\texttt{pin\_current(cpu)}, \texttt{current\_cpu()}, \texttt{allowed()}, \texttt{apply(plan, role)}. C++20
+\texttt{firm::affinity}~: \texttt{read\_plan(path)}, \texttt{pin\_current}, \texttt{current\_cpu}, \texttt{name\_current},
+\texttt{apply}. Python \texttt{firm\_coreplan.write\_plan} et \texttt{read\_plan} produisent et lisent le fichier de plan.
+\bfield{Règles} Un thread est épinglé avant d'allouer de la mémoire ou de toucher à ses données~; \texttt{apply} échoue, plutôt que de continuer
+sans épinglage, si le rôle manque, si le noyau refuse, ou si le thread n'est pas sur son processeur après coup~; chaque appel \texttt{unsafe}
+porte son argument de sûreté.
+\bfield{Tests d'acceptation} \texttt{code/firm/affinity/}~: le plan d'exemple lu dans les deux langages~; un thread épinglé à un processeur
+autorisé et vérifié~; un rôle manquant refusé. \texttt{code/firm/coreplan/}~: l'aller-retour du fichier de plan.
+\bfield{Pour aller plus loin} Donner au thread son nom pour \texttt{top} et \texttt{perf}~; refuser de démarrer lorsque le plan place deux rôles critiques
+sur des threads frères.
+\end{build}
+
+\begin{omsources}
+\item B.~Stroustrup, «~Abstraction and the C++ machine model~», 2005.
+\item The Rustonomicon, «~Send and Sync~»~; The Rust Reference, «~Unsafety~».
+\item Tokio, tutoriel, «~When not to use Tokio~».
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:1}
+D'après la \cref{fig:ll:rust-for-low-latency:twins}, de quel facteur le décodeur Rust est-il plus lent ou plus rapide que celui en C++, et
+que coûte cela à 5 millions de messages par seconde~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:2}
+Lesquelles de ces opérations allouent en Rust~: \texttt{\textquotedbl{}ESZ6\textquotedbl{}.to\_string()}~; \texttt{Vec::<u64>::new()}~; le premier
+\texttt{push} dedans~; \texttt{[0u8; 24]}~; \texttt{Box::new(3)}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:rust-for-low-latency:3}
+Pourquoi le gestionnaire brouillon en Rust alloue-t-il cinq fois là où celui en C++ alloue neuf fois~? Expliquer la différence
+point par point.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:4}
+Lire le \cref{lst:ll:rust-for-low-latency:counted}~: combien d'éléments la boucle sur le vecteur ajoute-t-elle à chaque itération, et qu'est-ce qui traite les
+longueurs qui ne sont pas multiples de quatre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:5}
+Pourquoi supprimer la vérification de bornes dans la collecte ne la rend-il pas plus rapide ici~? Quand le ferait-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:rust-for-low-latency:6}
+\texttt{CheckedIndex} reste-t-il sûr si \texttt{sum} ne compare pas \texttt{v.len()} avec \texttt{len}~? Donner une
+séquence d'appels qui le casserait.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:rust-for-low-latency:7}
+\emph{Programmation.} Écrire la boucle critique du décodeur Rust sur \texttt{decode(\&data).flatten()} avec un \texttt{match} explicite sur
+le résultat à la place, compter les allocations avec \texttt{CountingAlloc}, et vérifier dans l'assembleur l'absence de paniques. Qu'est-ce qui change~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:rust-for-low-latency:8}
+\emph{Trouver la faille.} «~Notre gestionnaire de données de marché est une tâche asynchrone sur un moteur multi-thread afin qu'il passe à l'échelle avec le
+nombre de cœurs.~»
+\end{exercise}
+
+\section{Problème~: Le portage}
+
+\begin{problem}[{Problème du week-end --- réécriture du chemin de flux en Rust}]\label{pb:ll:rust-for-low-latency:1}
+Une société envisage de porter son feed handler et son constructeur de carnet d'ordres de C++ vers Rust. L'équipe mesure les jumeaux
+(\cref{fig:ll:rust-for-low-latency:twins}), compte les allocations et lit l'assembleur.
+
+\medskip\noindent\textbf{Partie I --- Vitesse.}
+\begin{enumerate}
+\item Combien coûte chaque décodeur par message, et quel est le rapport~?
+\item Pourquoi la boucle comptée en Rust est-elle plus rapide que celle en C++ avec les options utilisées~?
+\item Que faudrait-il pour que la boucle C++ atteigne le même niveau~?
+\item Que disent les mesures gather au sujet des vérifications de bornes sur cette charge de travail~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Allocation.}
+\begin{enumerate}[resume]
+\item Combien d'allocations par message fait chaque brouillon, et chaque gestionnaire corrigé~?
+\item Quel type Rust alloue là où le type C++ n'allouait pas~?
+\item Comment le test impose-t-il zéro allocation en Rust~?
+\item Que se passe-t-il si une dépendance alloue sur le chemin critique sans que l'équipe le sache~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Sûreté.}
+\begin{enumerate}[resume]
+\item Quelle classe de bogues le portage supprime-t-il à la compilation~?
+\item Où \texttt{unsafe} subsiste-t-il dans le code Rust de la société, et pourquoi~?
+\item Que promet une \omterm{def:ll:rust-for-low-latency:sound}{abstraction saine} à ses appelants~?
+\item Que signifie une panique sur le chemin critique en production, et comment faut-il la traiter~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- La décision.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le rapport Rust sur C++ du temps par message pour le décodeur, et les allocations par
+message de chaque brouillon et gestionnaire corrigé.
+\item La différence de vitesse est-elle une raison de ne pas porter~?
+\item Que porterait-on en premier, et pourquoi~?
+\item Où l'async Rust a-t-il sa place dans les systèmes de la société~?
+\item Comment les deux langages partagent-ils le plan de placement et les jeux de test de la société~?
+\item Que perdrait l'équipe en portant le code, hormis la vitesse~?
+\item Comment garderait-on les deux implémentations équivalentes pendant la transition~?
+\item En une phrase~: que change Rust pour une équipe de latence faible~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:1}
+Que signifie «~\omterm{def:ll:rust-for-low-latency:zero}{abstraction à coût nul}~», et comment vérifieriez-vous cette affirmation pour une chaîne d'itérateurs~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:2}
+Les vérifications de bornes rendent-elles Rust lent~? Quand coûtent-elles, et comment les supprimeriez-vous en toute sûreté~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:3}
+Qu'est-ce qui rend une abstraction \texttt{unsafe} \omterm{def:ll:rust-for-low-latency:sound}{saine}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:4}
+Comment Rust empêche-t-il les \omterm{def:ll:rust-for-low-latency:race}{courses aux données}, et que n'empêche-t-il pas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:5}
+Utiliseriez-vous l'async Rust sur un chemin critique de trading~? Pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:rust-for-low-latency:6}
+Comment prouveriez-vous qu'un composant Rust ne fait aucune allocation sur le tas après le démarrage, y compris dans ses dépendances~?
+\end{interviewq}

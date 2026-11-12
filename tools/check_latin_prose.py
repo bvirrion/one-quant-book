@@ -770,9 +770,11 @@ def check_duplicated_lines(path, body, en_body, findings, lang=None):
             continue
         if not _has_lowercase_word(s, lang) or _word_count(s) < 3:
             continue
-        # Prose only: drawing code and math are copied verbatim by design.
+        # Prose only: drawing code and math are copied verbatim by design. A row
+        # of the interview books' generated tracks table (\hyperref + counts) is
+        # identical when the chapter title is (Book 20 fr, "C++", 2026-11-12).
         if re.search(r"\\(?:draw|fill|path|node|addplot|foreach|coordinate|"
-                     r"begin|end|label|cref|ref|index|input|item|omterm)\b", s) or "$" in s:
+                     r"begin|end|label|cref|ref|hyperref|index|input|item|omterm)\b", s) or "$" in s:
             continue
         if DRAW_OPTION_LINE.match(s):
             continue
@@ -1267,6 +1269,46 @@ ALLOWED_BY_LANG["fr"] |= {
     "checkpointing", "multistart", "mirroring",
 }
 
+
+# One Quant Book 13 (low-latency, French, 2026-11-12): its measured charts label
+# their bars with the C++ and Linux identifiers being timed (memory orders, clock
+# sources, compiler flags, logging calls), printed in English in every language.
+# Only identifiers, never a prose word the chapters translate.
+ALLOWED_BY_LANG["fr"] |= {
+    "rdtsc", "rdtscp", "gettimeofday", "steady", "clock", "native", "lto", "pgo", "pmr",
+    "new", "delete", "relaxed", "release", "acquire", "seq", "cst", "binlog", "snprintf",
+    "fprintf", "ostringstream", "firm", "rustc", "fast", "math",   # -ffast-math
+}
+
+# One Quant Book 14 (networks, French, 2026-11-12): figure nodes that read the same in French. AWS zone ids
+# (use1-az4), French words (participant, zone, colocation) and the desk's "ticker plant".
+ALLOWED_BY_LANG["fr"] |= {"use", "az", "participant", "zone", "colocation", "ticker", "plant"}
+
+# One Quant Book 15 (platforms, French, 2026-11-12): product names in a legend (DuckDB, Polars, SQLite, pandas, numpy),
+# column and key names drawn in figures (sym, ts, bid, ask, instrument_id, account_id), symbolic coordinates that are a
+# CSV's keys (point, report, analytic), and figure words spelt the same in French (lot, correction, partition, date,
+# table, messages, archive, desk, puts).
+ALLOWED_BY_LANG["fr"] |= {
+    "duckdb", "polars", "sqlite", "pandas", "numpy", "sym", "ts", "bid", "ask", "instrument", "account", "id",
+    "point", "report", "analytic", "lot", "correction", "partition", "date", "table", "messages", "archive",
+    "desk", "puts",
+    "omDef", "omMeth", "omThm", "omProp",   # the series colour names in a \foreach list (case-sensitive)
+}
+
+# One Quant Book 16 (desk, French, 2026-11-12): figure nodes that read the same in French (pod, capital, options,
+# prime broker), the US registration categories kept in English (FCM, IB, CPO, CTA, swap dealer, commodity pool operator,
+# introducing broker), durations in tick labels (min, h), and due diligence.
+ALLOWED_BY_LANG["fr"] |= {"pod", "capital", "options", "prime", "broker", "fcm", "ib", "cpo", "cta", "swap", "dealer",
+                          "commodity", "pool", "operator", "introducing", "min", "h", "due", "diligence"}
+
+# One Quant Book 17 (industry), French pilot edition: firm, exchange and city names in figure nodes, legends and
+# \foreach lists, the internal node keys of Fig. 18.1, the job title "Trader" (ch. 16) and \text{base} in a formula.
+ALLOWED_BY_LANG["fr"] |= {"drw", "tower", "research", "jane", "street", "hudson", "river", "trading", "millennium",
+                          "management", "balyasny", "asset", "schonfeld", "strategic", "advisors", "exoduspoint",
+                          "hong", "kong", "zurich", "chicago", "new", "york", "infrastructure", "philadelphia", "stock",
+                          "exchange", "board", "optiver", "susquehanna", "group", "one", "san", "francisco",
+                          "belvedere", "amsterdam", "base", "trader", "ceo", "cro", "mkt", "mrm", "ra", "qa", "ld",
+                          "ds", "dv", "rd", "rv", "v1"}
 
 if __name__ == "__main__":
     sys.exit(main())

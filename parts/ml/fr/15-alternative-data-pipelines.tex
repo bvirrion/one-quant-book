@@ -1,0 +1,316 @@
+\chapter{Chaînes de traitement des données alternatives}\label{ch:ml:alternative-data-pipelines}
+
+Un panel de dépenses par carte réalise le nowcast de la croissance des ventes d'une année sur l'autre de cent détaillants, à 3.3 points de pourcentage près en moyenne
+pendant trois ans~; la quatrième année, l'écart atteint 22.5 points. Rien n'a changé chez les détaillants. Le fournisseur avait changé de banque partenaire,
+et les titulaires de carte du nouveau partenaire étaient plus âgés et vivaient ailleurs. Le livre~7 (chapitre~12) a appris à décider s'il faut acheter
+un jeu de données~; le livre~8 (chapitre~16) en a fait un outil de trading. Ce chapitre traite de la plomberie intermédiaire, là où se concentrent l'essentiel du travail et l'essentiel
+des pertes~: ingérer des livraisons parfois erronées, \omterm{def:ml:sequence-models-on-order-books:attention}{transformer} des libellés de commerçants en titres, corriger un panel
+qui ne représente pas la population, et distinguer une histoire que le fournisseur a vécue d'une histoire qu'il a reconstituée. Tous les chiffres
+proviennent d'un panel synthétique dont la vérité est connue, construit pour que chaque étape ait quelque chose à détecter.
+
+\section{Ingestion et validation}
+
+\begin{definition}[Chaîne d'ingestion, validation de schéma]\label{def:ml:alternative-data-pipelines:ingest}
+Une \emph{chaîne d'ingestion}\index{chaîne d'ingestion} (ingestion pipeline) est le code qui reçoit les livraisons du fournisseur, les contrôle, les rattache
+aux identifiants de la société et les stocke avec l'instant où chaque valeur est devenue connue. \emph{Validation de
+schéma}\index{validation de schéma} (schema validation) vérifie chaque enregistrement par rapport à un schéma déclaré~: chaque champ est présent, de son type et dans
+son intervalle admissible, et aucun enregistrement n'est dupliqué~; les enregistrements en échec sont rejetés avec un motif, jamais réparés en silence.
+\end{definition}
+
+L'univers du chapitre compte 100 détaillants sur 24 trimestres. Leurs ventes réelles proviennent des dépenses d'une population répartie en six cellules,
+trois tranches d'âge croisées avec deux régions, dont les parts sont connues~; chaque détaillant puise ses clients dans les cellules selon ses propres proportions,
+et les dépenses de chaque cellule croissent à leur propre rythme. Le panel du fournisseur compte 50\,000 titulaires de carte d'une même banque, biaisé vers les jeunes
+(45~\% dans la tranche la plus jeune contre 30~\% de la population) et dérive vers les plus jeunes d'un point par trimestre~; au trimestre 16, le
+fournisseur change de partenaire et le panel passe à 30\,000 titulaires de carte, dont la moitié dans la tranche la plus âgée et les trois quarts dans une seule région.
+Le fournisseur lance son service au trimestre 12~; il livre d'un seul coup les trimestres 0 à 11, puis les données de chaque trimestre un trimestre après sa clôture.
+
+Chaque livraison se présente sous forme de lignes donnant le trimestre, le libellé du commerçant, la tranche d'âge, la région, la dépense et l'effectif du panel, la dépense d'un détaillant dans une cellule
+répartie entre deux ou trois libellés au niveau des magasins~: 36\,766 lignes au total, avec des défauts introduits à dessein. La \omterm{def:ml:alternative-data-pipelines:ingest}{validation de schéma}
+(\cref{lst:ml:alt:validate}) rejette 121 lignes avec un champ manquant, 69 avec une dépense négative, 64 avec l'effectif du panel livré
+sous forme de texte, et 111 doublons, soit chaque défaut introduit et rien d'autre. Une ligne peut être valide et la
+livraison du trimestre 19 arrive en centimes. Un second contrôle compare le total de chaque livraison à celui de la précédente et la
+met en attente de revue lorsque le rapport sort de $[0.5, 2]$~; elle ne retient que cette livraison et aucune autre, et la revue la remet à l'échelle.
+Ce sont les contrôles portant sur la livraison, et pas seulement sur les lignes, qui détectent un changement d'unités chez le fournisseur, un fichier perdu ou un fichier envoyé deux fois.
+
+\section{Rattachement aux titres}
+
+\begin{definition}[Résolution d'entités, appariement d'enregistrements]\label{def:ml:alternative-data-pipelines:er}
+L'\emph{appariement d'enregistrements}\index{appariement d'enregistrements} (record linkage) détermine quels enregistrements de deux fichiers décrivent la même entité lorsque
+aucun identifiant commun n'existe, en comparant leurs attributs (Fellegi et Sunter, 1969).
+La \emph{résolution d'entités}\index{résolution d'entités} (entity resolution) est la tâche appliquée aux libellés d'entités d'un jeu de données (commerçants, émetteurs, applications, navires) face à une liste de référence,
+ici le référentiel des titres (security master, livre~7, chapitre~4)~: normaliser, comparer, puis décider d'associer, d'envoyer en revue ou de laisser
+sans correspondance.
+\end{definition}
+
+Un réseau de cartes affiche «~SQ *BOREALIS RET~», «~BOREALIS RETAIL \#4417~», «~BOREALI RETA STR 313~» ou «~BOREALIS 5120~», et
+le modèle a besoin de l'identifiant permanent de Borealis Retail, et non d'une chaîne de caractères. Le résolveur du \cref{lst:ml:alt:resolve}
+retire les préfixes des processeurs de paiement, les numéros de magasin et les mots vides, puis note chaque alias d'après ses jetons, en comptant
+un jeton trouvé comme préfixe d'au moins trois lettres (les réseaux de cartes tronquent) comme correspondance complète. Sur les 600 libellés des détaillants, la correspondance exacte
+sur le nom normalisé en trouve 300~; le résolveur en associe 500 automatiquement, toutes correctes, et envoie les 100 autres en revue~:
+les libellés qui ne donnent que le premier mot du nom, que trois détaillants au plus partagent (Borealis Retail, Borealis Stores,
+Borealis Outfitters). Sur dix libellés de commerçants sans rapport («~DELTA AIR LINES~», «~SUMMIT DENTAL CARE~»), aucun n'est associé,
+six partent en revue et quatre sont rejetés d'emblée. La file de revue est l'endroit où un humain gagne sa place dans la chaîne~:
+associer un magasin au mauvais détaillant contamine silencieusement ses ventes, alors qu'un libellé laissé en revue ne fait que retarder son traitement.
+
+\section{Biais de panel et repondération du panel}
+
+\begin{definition}[Biais de panel, repondération du panel]\label{def:ml:alternative-data-pipelines:panel}
+Le \emph{biais de panel}\index{biais de panel} (panel bias) est l'écart entre une statistique calculée sur le panel d'un fournisseur de données (titulaires de carte,
+appareils, utilisateurs) et la même statistique sur la population qu'elle représente, due à la composition du panel. \emph{Repondération
+du panel}\index{repondération du panel} (panel reweighting) attribue à chaque membre du panel un poids tel que le panel pondéré corresponde aux
+totaux connus de la population~; \emph{raking} (ajustement proportionnel itératif) le fait avec les seules marges, en ajustant les poids sur chaque marge
+à tour de rôle jusqu'à ce que toutes concordent (Deming et Stephan, 1940).
+\end{definition}
+
+Le nowcast brut divise la dépense du panel de chaque détaillant par le nombre de panélistes et en tire la croissance d'une année sur l'autre. Tant que
+le panel dérive lentement, l'erreur reste modeste (3.3 points en moyenne sur les trimestres 4 à 15)~: un détaillant dont les jeunes clients
+dépensent davantage chaque année paraît, dans un panel qui rajeunit, croître plus vite qu'il ne le fait en réalité. Pendant les quatre trimestres qui suivent le
+changement de partenaire, chaque comparaison d'une année sur l'autre oppose le nouveau panel à l'ancien, et l'erreur bondit à 22.5 points
+(\cref{fig:ml:alt:errors})~; elle revient à 2.7 dès que les deux termes de la comparaison proviennent du nouveau panel. Le raking des six cellules
+sur les marges d'âge et de région de la population (\cref{lst:ml:alt:rake}) supprime l'effet de composition~: 1.7 points avant le
+changement, 2.7 pendant l'année du changement, 2.6 après. Le résidu de cette année provient des petites cellules du nouveau panel (1\,125
+titulaires de carte dans la plus mince), dont le bruit d'échantillonnage aucune repondération ne supprime.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={trimestre},ylabel={erreur absolue moyenne (points)},
+  tick label style={font=\small},label style={font=\small},xmin=3.5,xmax=23.5,ymin=0,ymax=26,grid=major,
+  grid style={gray!25},legend cell align=left,legend style={font=\footnotesize,at={(0.02,0.97)},anchor=north west,fill=white,draw=none},
+  table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.6pt] table[x=quarter,y=raw]{figdata/ml/15-alternative-data-pipelines/errors.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.6pt] table[x=quarter,y=raked]{figdata/ml/15-alternative-data-pipelines/errors.csv};
+\addplot[black!60,dashed,ycomb,forget plot,mark=none] table[x=quarter,y expr=26]{figdata/ml/15-alternative-data-pipelines/events.csv};
+\legend{dépense par panéliste,calé sur les marges de la population}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Erreur absolue moyenne, sur 100 détaillants, de la croissance des ventes d'une année sur l'autre lue dans le panel. En pointillés~: le
+lancement du fournisseur (trimestre 12) et son changement de banque partenaire (trimestre 16). Données~: \texttt{ml\_altdata.errors}.}\label{fig:ml:alt:errors}
+\end{omfigure}
+
+Le raking suppose que les marges de la population soient connues et que le panel couvre chaque cellule~: une cellule que le panel n'atteint pas ne peut
+être repondérée à partir de rien. Il suppose aussi qu'au sein d'une cellule le panel dépense comme la population, l'hypothèse
+qu'un nouveau partenaire est le plus susceptible de mettre en défaut (ses titulaires peuvent être aussi plus aisés que plus âgés). La
+repondération propre au fournisseur, lorsqu'il en existe une, mérite le même examen que le panel brut~: il faut demander les marges retenues ainsi que la
+composition du panel trimestre par trimestre.
+
+\section{Détection de la rétropolation}
+
+\begin{definition}[Horodatage de première observation]\label{def:ml:alternative-data-pipelines:firstseen}
+L'\emph{horodatage de première observation}\index{horodatage de première observation} (first-seen timestamp) d'une valeur est le moment où l'entreprise la reçoit pour la première fois, enregistré par
+la société lors de l'ingestion, par opposition au temps de validité que lui attache le fournisseur. Une valeur dont l'horodatage de première observation est bien
+postérieur à son temps de validité a été rétropolée (livre~7, chapitre~3), et son historique ne peut être présumé identique à ce qu'un utilisateur
+en direct aurait vu.
+\end{definition}
+
+La chaîne stocke chaque valeur dans le magasin bitemporel du livre~7 (chapitre~3), avec le trimestre de livraison comme temps de connaissance,
+et le test de rétropolation tient en une requête~: les trimestres 0 à 10 ont été observés pour la première fois au trimestre 12, plus d'un trimestre après leur clôture.
+Ils comptent parce que le fournisseur les a construits au lancement avec le recul, en déplaçant ses estimations de panel aux trois quarts
+du chemin vers les ventes que les détaillants avaient déjà déclarées. (Le trimestre 11, livré au lancement un trimestre après sa clôture, ressemble
+à un trimestre en direct et n'a pas été ajusté~: ses ventes n'avaient pas encore été déclarées.)
+
+Pour évaluer le nowcast comme prédicteur, le rendement d'annonce de chaque détaillant est sa surprise de ventes, soit la croissance réelle moins un
+consensus qui se trompe de 3 points en moyenne, plus du bruit. Le coefficient d'information de rang entre la surprise du nowcast redressé
+et le rendement vaut 0.480 sur les trimestres rétropolés et 0.419 sur les trimestres en direct avant le changement de partenaire, 0.412
+après celui-ci (\cref{fig:ml:alt:ic}). Le coefficient d'information du nowcast brut passe de 0.391 en direct avant le changement à 0.264 après lui. Un essai
+qui évalue l'historique rétropolé, qui constitue l'essentiel de ce qu'un nouveau fournisseur peut offrir, perçoit un signal environ 15~\% plus fort que
+celui sur lequel il tradera.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,ybar,bar width=12pt,ymin=0,ymax=0.55,ylabel={coefficient d'information de rang moyen},area legend,
+  xtick={0,1,2},xticklabels={rétropolées,en direct avant\\le changement,en direct après\\le changement},tick label style={font=\small},
+  xticklabel style={align=center},
+  label style={font=\small},enlarge x limits=0.25,grid=major,grid style={gray!25},legend columns=2,
+  legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none},table/col sep=comma]
+\addplot[fill=omThm,draw=none] table[x=i,y=raw]{figdata/ml/15-alternative-data-pipelines/ic.csv};
+\addplot[fill=omDef,draw=none] table[x=i,y=raked]{figdata/ml/15-alternative-data-pipelines/ic.csv};
+\legend{dépense par membre du panel,redressé}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coefficient d'information de rang moyen de la surprise du nowcast avec le rendement d'annonce, par période. Données~:
+\texttt{ml\_altdata.ic\_summary}.}\label{fig:ml:alt:ic}
+\end{omfigure}
+
+\section{De la chaîne au prédicteur}
+
+Le nowcast devient un prédicteur grâce au harnais d'essai fournisseur du livre~7 (chapitre~12)~: couverture par trimestre, part de la rétropolation,
+un test de dérive du panel sur les résidus par rapport aux ventes déclarées, le coefficient d'information par année et le coefficient d'information marginal par rapport à ce que le desk
+possède déjà. Le rôle de la chaîne est de lui fournir des données dont le sens est fidèle à leur libellé. Froot, Kang, Ozik et Sadka (2017) ont construit
+des indicateurs de ventes en temps réel pour des détaillants à partir d'environ 50 millions d'appareils mobiles, et les ont mis en relation avec les surprises de résultats
+et les rendements d'annonce~; Katona, Painter, Patatoukas et Zeng (2024) ont exploité l'introduction de la couverture satellitaire des parkings des détaillants
+pour montrer que les investisseurs disposant de telles données ont tiré un profit des transactions réalisées avant les publications des détaillants, en particulier les mauvaises. Les deux
+reposent sur la plomberie que ce chapitre construit~: quels magasins appartiennent à quelle entreprise, qui figure dans le panel, et à quel moment chaque chiffre
+était connu.
+
+\begin{method}[Une chaîne de données alternatives]\label{met:ml:alt:method}
+\begin{enumerate}
+\item Valider chaque ligne par rapport à un schéma et chaque livraison par rapport à la précédente~; rejeter en motivant, retenir ce qui paraît erroné,
+ne jamais corriger en silence.
+\item Résoudre les entités en identifiants permanents avec un seuil de correspondance, une zone de revue et une personne dans la file~; mesurer
+la précision sur un échantillon étiqueté.
+\item Stocker chaque valeur avec son \omterm{def:ml:alternative-data-pipelines:firstseen}{horodatage de première observation}~; étiqueter la rétropolation~; évaluer les essais sur les seules données en direct.
+\item Obtenir la composition du panel par période et la redresser aux marges connues~; surveiller les ruptures de composition.
+\item Transmettre le résultat au harnais d'essai et, une fois en direct, à la surveillance (chapitre~27).
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: le panel qui a grandi}\label{tut:ml:alternative-data-pipelines:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Ingérer les livraisons d'un fournisseur, résoudre ses libellés de commerçants, redresser son panel et comparer les erreurs de nowcast et les coefficients d'information
+par période. \textbf{État final~:} \cref{fig:ml:alt:errors,fig:ml:alt:ic}.
+\begin{tutsteps}
+\item \textbf{\omterm{def:ml:alternative-data-pipelines:ingest}{Validation de schéma}.}
+\omcode{code/firm/altdata/firm_altdata.py}{37}{60}{Validation de chaque ligne par rapport à un schéma.}\label{lst:ml:alt:validate}
+\item \textbf{Libellés de commerçants vers identifiants.}
+\omcode{code/firm/altdata/firm_altdata.py}{77}{112}{Similarité de jetons et résolution avec une zone de revue.}\label{lst:ml:alt:resolve}
+\item \textbf{Redressement.}
+\omcode{code/firm/altdata/firm_altdata.py}{115}{126}{Ajustement proportionnel itératif à deux marges.}\label{lst:ml:alt:rake}
+\item \textbf{Exécuter} \texttt{ml\_altdata.ingest()}, \texttt{resolution\_quality()}, \texttt{error\_summary()},
+\texttt{ic\_summary()} et \texttt{fig\_altdata.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Attribuer aux porteurs de cartes du nouveau partenaire un niveau de dépense différent dans chaque cellule, et observer
+le redressement échouer~; abaisser le seuil de revue et compter les mauvaises correspondances.
+\end{tutorial}
+
+\section{Construction~: la chaîne de données alternatives}\label{bld:ml:alternative-data-pipelines:altdata}
+
+\begin{build}
+\bfield{Rôle} Livraisons du fournisseur transformées en données à la date, indexées par identifiant et repondérées, utilisables par un prédicteur.
+\bfield{Interface} \texttt{SCHEMA}, \texttt{validate(rows, schema)}, \texttt{delivery\_check(prev, new, lo, hi)}~;
+\texttt{normalise}, \texttt{similarity}, \texttt{resolve(strings, aliases, accept, review)}~;
+\texttt{rake(counts, row\_margin, col\_margin, iters)}~; \texttt{first\_seen(store, entity, field, valid)} sur \texttt{firm.pit}~;
+\texttt{card\_panel(n\_firms, quarters, launch, partner\_change, seed)}.
+\bfield{Règles} Les rejets portent leurs motifs~; rien n'est corrigé sans trace~; chaque valeur stockée a un temps de connaissance~;
+les correspondances sous le seuil attendent une personne.
+\bfield{Tests d'acceptation} \texttt{code/firm/altdata/tests/}~: chaque type de défaut est rejeté avec son motif et les lignes propres passent~;
+une livraison dupliquée est retenue~; les chaînes tronquées et préfixées se résolvent, les racines communes vont en revue, les commerçants sans rapport
+ne se correspondent pas~; le redressement respecte les deux marges et laisse sans pondération un panel déjà aux marges~; les \omterm{def:ml:alternative-data-pipelines:firstseen}{horodatages de première observation}
+séparent un historique rétropolé.
+\bfield{Pour aller plus loin} Poids de correspondance de Fellegi--Sunter appris sur les décisions de revue~; redressement à trois marges avec plafonnement des
+pondérations~; composition du panel surveillée pour détecter les ruptures.
+\end{build}
+
+\begin{omsources}
+\item I.~P.~Fellegi et A.~B.~Sunter, ``A theory for record linkage'', \emph{Journal of the American Statistical Association}
+64(328), 1969.
+\item W.~E.~Deming et F.~F.~Stephan, ``On a least squares adjustment of a sampled frequency table when the expected marginal
+totals are known'', \emph{Annals of Mathematical Statistics} 11(4), 1940.
+\item K.~A.~Froot, N.~Kang, G.~Ozik et R.~Sadka, ``What do measures of real-time corporate sales say about earnings
+surprises and post-announcement returns?'', \emph{Journal of Financial Economics} 125(1), 2017.
+\item Z.~Katona, M.~Painter, P.~N.~Patatoukas et J.~Zeng, ``On the capital market consequences of big data: evidence from
+outer space'', \emph{Journal of Financial and Quantitative Analysis}, 2024.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:1}
+Une livraison totalise 2.4~milliards~; la précédente en totalisait 23.9~millions. Expliquer ce que fait le contrôle de livraison et quelles sont les
+causes probables.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:2}
+Redresser le panel $2\times2$ d'effectifs $\begin{pmatrix}30 & 20\\ 10 & 40\end{pmatrix}$ aux marges de lignes et de colonnes égales. Donner les
+effectifs pondérés.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:alternative-data-pipelines:3}
+Pourquoi «~BOREALIS 5120~» part-il en revue alors que «~BOREALI RETA STR 313~» est apparié~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:4}
+Expliquer, à l'aide du monde du chapitre, pourquoi l'erreur du nowcast brut augmente pendant exactement quatre trimestres après le changement de partenaire.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:5}
+Pourquoi le test d'\omterm{def:ml:alternative-data-pipelines:firstseen}{horodatage de première observation} n'a-t-il pas pu signaler le trimestre 11, et pourquoi cela n'a-t-il pas eu d'importance ici~? Quand le pourrait-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:alternative-data-pipelines:6}
+\emph{Trouver la faille.} «~Nous avons corrigé les dépenses négatives du fournisseur en prenant leurs valeurs absolues et converti
+les effectifs du panel textuel en entiers, de sorte qu'aucune donnée n'a été perdue.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:alternative-data-pipelines:7}
+\emph{Programmation.} Exécuter le pipeline en laissant la file de revue non résolue (chaînes en revue supprimées). Que devient
+l'erreur du nowcast redressé, et pourquoi l'erreur est-elle plus grande pour certains détaillants que pour d'autres~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:alternative-data-pipelines:8}
+Montrer que, pour un panel dont les effectifs de cellules sont le produit d'une marge d'âge et d'une marge de région, le redressement
+aux marges de la population donne les pondérations de post-stratification (part de la population sur part du panel dans chaque cellule) lorsque les
+parts de cellules de la population sont aussi un produit. Que se passe-t-il lorsqu'elles ne le sont pas~?
+\end{exercise}
+
+\section{Problème~: Le panel qui a grandi}
+
+\begin{problem}[{Problème du week-end --- un panel n'est pas une population}]\label{pb:ml:alternative-data-pipelines:1}
+Le monde du chapitre~: 100 détaillants, 24 trimestres, un panel qui dérive, qui change de partenaire au trimestre 16 et qui
+est lancé au trimestre 12 avec un historique reconstitué a posteriori.
+
+\medskip\noindent\textbf{Partie I --- Ingestion.}
+\begin{enumerate}
+\item Quels défauts ont été introduits, et combien de lignes la validation rejette-t-elle~?
+\item Quel défaut la validation ligne par ligne manque-t-elle, et qu'est-ce qui le détecte~?
+\item Pourquoi rejeter plutôt que réparer~?
+\item Qu'est-ce que le pipeline stocke pour chaque valeur, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Résolution.}
+\begin{enumerate}[resume]
+\item Combien de chaînes la correspondance exacte résout-elle, et combien le résolveur~?
+\item Quelles chaînes partent en revue, et pourquoi la revue est-elle le bon endroit pour elles~?
+\item Que deviennent les marchands sans rapport~?
+\item Combien coûte une mauvaise correspondance, comparée à une chaîne laissée en revue~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Panel et reconstitution.}
+\begin{enumerate}[resume]
+\item Quelles sont les erreurs du nowcast brut et du nowcast redressé avant, pendant et après l'année du changement~?
+\item Que suppose le redressement, et quelle erreur résiduelle subsiste~?
+\item Quels trimestres sont reconstitués, et comment le pipeline le sait-il~?
+\item Quels sont les IC sur l'historique reconstitué et sur l'historique en production~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'erreur du nowcast avec et sans la \omterm{def:ml:alternative-data-pipelines:panel}{repondération du panel} après le changement de partenaire, et l'IC de
+l'historique reconstitué face à celui en production.
+\item Que faut-il demander à un fournisseur de panel de cartes avant un essai~?
+\item Comment détecter un changement de partenaire que le fournisseur n'a pas annoncé~?
+\item Que faut-il surveiller une fois les données en production~?
+\item Quelle part de l'IC reconstitué peut-on croire~?
+\item Où placer un humain dans ce pipeline, et pourquoi à cet endroit~?
+\item Qu'est-ce qui change pour un panel de satellites ou de téléchargements d'applications~?
+\item En une phrase~: quelle est l'hypothèse la plus coûteuse des données alternatives~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:alternative-data-pipelines:1}
+Qu'est-ce qu'un backfill dans un jeu de données du fournisseur, et comment le détectez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:alternative-data-pipelines:2}
+Concevez l'étape d'ingestion d'un fichier quotidien du fournisseur. Que vérifiez-vous, et que faites-vous lorsqu'un contrôle échoue~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:alternative-data-pipelines:3}
+Comment associeriez-vous à grande échelle les descripteurs de marchands à des sociétés cotées, et comment mesureriez-vous la qualité de cette correspondance~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:alternative-data-pipelines:4}
+Un panel de cartes sur-représente les jeunes clients. Comment corrigeriez-vous un nowcast des ventes pour cela, et qu'est-ce qui peut mal tourner~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:ml:alternative-data-pipelines:5}
+Un nowcast qui a suivi les ventes pendant trois ans se trompe lourdement pendant une année. Que vérifiez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur}]\label{iq:ml:alternative-data-pipelines:6}
+Le test d'un fournisseur donne un IC de 0.5 sur huit ans~; le jeu de données a été lancé il y a deux ans. Comment estimeriez-vous l'IC
+que vous devriez attendre en production~?
+\end{interviewq}

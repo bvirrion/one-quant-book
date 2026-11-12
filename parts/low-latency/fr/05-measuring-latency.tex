@@ -1,0 +1,366 @@
+\chapter{Mesurer la latence}\label{ch:ll:measuring-latency}
+
+Une équipe a modifié son service, relancé son test de charge et constaté une amélioration du 99\up{e}~centile. Le changement avait en fait allongé les
+blocages du service, et le test avait appris à mieux ne pas les voir~: il n'envoyait chaque requête qu'après la réponse précédente,
+si bien que pendant chaque blocage il cessait simplement de demander, et les requêtes qu'il aurait envoyées, celles qui auraient attendu,
+n'étaient jamais mesurées. Cet effet porte un nom, l'\omterm{def:ll:measuring-latency:co}{omission coordonnée}, ainsi qu'une correction, tous deux issus d'un exposé devenu
+incontournable pour quiconque publie un centile (Tene, 2015). La mesure est l'endroit où la plupart des travaux sur la latence échouent~:
+l'horloge coûte autant que le code, le benchmark observe une machine chaude, l'histogramme arrondit la queue de distribution, le testeur
+se coordonne avec le système qu'il teste. Ce chapitre construit l'outillage de mesure du livre et les règles
+d'usage associées.
+
+\section{Horloges}
+
+Le chapitre~2 a introduit le \omterm{def:ll:cpu-microarchitecture:tsc}{compteur d'horodatage}, un registre qui compte à cadence constante.
+
+\begin{definition}[Compteur d'horodatage invariant]\label{def:ll:measuring-latency:invtsc}
+Un \emph{compteur d'horodatage invariant}\index{compteur d'horodatage invariant} tourne à cadence constante dans tous les états de puissance et
+de fréquence du processeur, de sorte que les différences de ses lectures sont proportionnelles au temps écoulé sur chaque cœur.
+Le processeur signale la propriété par un bit de CPUID~; Linux l'affiche sous forme des indicateurs \texttt{constant\_tsc} et
+\texttt{nonstop\_tsc}.
+\end{definition}
+
+Avec un compteur invariant, une mesure de latence se réduit à deux lectures et une soustraction~; la conversion en nanosecondes est
+une multiplication unique, par une cadence calibrée une fois pour toutes sur l'horloge monotone du système d'exploitation. Les autres solutions passent par
+l'interface d'horloge du noyau, \texttt{clock\_gettime}, que Linux sert en espace utilisateur (le vDSO) lorsque sa source d'horloge
+est elle-même le TSC, et sinon par un appel système. La \Cref{fig:ll:measuring-latency:clocks} mesure le coût de chaque lecture sur
+ce portable~: environ \qty{6.5}{\nano\second} pour \texttt{rdtsc}, quelque \qty{11}{\nano\second} pour \texttt{rdtscp}, qui attend
+les instructions précédentes, et de 14 à \qty{16}{\nano\second} pour chaque horloge du noyau. La calibration demande de la prudence quant à l'horloge du noyau qu'elle retient. \texttt{CLOCK\_MONOTONIC}, derrière \texttt{std::chrono::steady\_clock},
+est discipliné par la synchronisation temporelle, qui l'accélère ou le ralentit pour converger vers l'heure exacte~;
+\texttt{CLOCK\_MONOTONIC\_RAW} ne l'est pas. Dix calibrations de 50 millisecondes sur l'horloge brute concordent à six chiffres près,
+soit 2.9952 ticks par nanoseconde, la fréquence nominale du processeur de 2.995~GHz~; sur l'horloge disciplinée, les mêmes intervalles donnent une
+cadence d'environ 2~\% supérieure le jour de la mesure, et l'écart varie à chaque ajustement de la synchronisation. Le banc d'essai calibre
+donc sur l'horloge brute.
+
+\begin{definition}[Surcoût de mesure]\label{def:ll:measuring-latency:overhead}
+Le \emph{surcoût de mesure}\index{surcoût de mesure} d'une région instrumentée est le temps que la mesure elle-même
+ajoute~: les lectures d'horloge, les barrières qui les encadrent et l'enregistrement du résultat. Il est inclus dans chaque valeur relevée et doit
+rester petit devant la grandeur mesurée, ou être retranché.
+\end{definition}
+
+Une étape de \qty{40}{\nano\second} mesurée avec une horloge de \qty{20}{\nano\second} est pour moitié de la mesure. Les chiffres par étape du chapitre~1
+comportaient environ \qty{15}{\nano\second} de surcoût chacun~; le chapitre~26 n'horodate que les frontières d'étapes de l'ensemble du chemin, avec le
+compteur, et enregistre les ticks bruts pour une conversion ultérieure.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.4cm,xbar,bar width=9pt,xmin=0,enlarge x limits={upper,value=0.18},
+  symbolic y coords={gettimeofday,CLOCK_REALTIME,CLOCK_MONOTONIC_RAW,CLOCK_MONOTONIC,steady_clock,rdtscp,rdtsc},
+  ytick=data,yticklabels={rdtsc,rdtscp,steady\_clock,CLOCK\_MONOTONIC,CLOCK\_MONOTONIC\_RAW,CLOCK\_REALTIME,gettimeofday},
+  enlarge y limits=0.12,y tick label style={font=\ttfamily\footnotesize},
+  xlabel={ns par appel},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=1},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[y=clock,x=ns_per_call]{figdata/low-latency/05-measuring-latency/measured_clocks.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coût d'une lecture de chaque horloge accessible à un programme Linux (meilleur de sept lots d'un million d'appels, épinglé
+sur un seul CPU, source d'horloge \texttt{tsc}, de sorte que chaque horloge du noyau est servie en espace utilisateur). Mesuré sur un portable (Intel Core
+Ultra 7 155H) sous WSL2, sans cœurs isolés. Données~: \texttt{bench\_clocks.py}.}\label{fig:ll:measuring-latency:clocks}
+\end{omfigure}
+
+\section{Horodatage au niveau du câble}
+
+L'horloge d'un programme ne peut dire quand le programme a vu un paquet, et non quand le paquet est arrivé.
+
+\begin{definition}[Horodatage matériel]\label{def:ll:measuring-latency:hwts}
+Un \emph{horodatage matériel}\index{horodatage matériel} est écrit par une carte réseau, un commutateur ou un dispositif de capture lorsque
+les bits d'un paquet franchissent son port, à partir d'une horloge propre à ce dispositif, et il est transmis avec le paquet (par la carte) ou enregistré avec
+une copie de celui-ci (par un dispositif de capture branché sur un tap ou un port miroir).
+\end{definition}
+
+L'horodatage de réception du livre~1, chapitre~28, se prend au mieux au niveau matériel~: le temps écoulé entre un \omterm{def:ll:measuring-latency:hwts}{horodatage matériel}
+et la première lecture du paquet par le programme est le chemin de réception (carte, bus, noyau ou bibliothèque de contournement) que ne voit pas
+un horodatage logiciel. La \omterm{def:ll:where-latency-comes-from:t2t}{latence wire-to-wire} (chapitre~1) exige deux \omterm{def:ll:measuring-latency:hwts}{horodatages matériels}, à l'entrée et à la sortie, issus d'horloges qui concordent~:
+soit le même dispositif (un appareil de capture observant les deux sens), soit des dispositifs synchronisés sur une référence commune
+(le protocole de temps de précision, livre~14, chapitre~4).
+
+\section{Histogrammes et centiles}
+
+\begin{definition}[Histogramme de latence]\label{def:ll:measuring-latency:hist}
+Un \emph{histogramme de latence}\index{histogramme de latence} compte les latences enregistrées dans des classes. Dans un histogramme log-linéaire, les
+classes sont exactes pour les petites valeurs et croissent en proportion de la valeur au-delà, de sorte que la largeur de chaque classe reste au plus une
+fraction fixe des valeurs qu'elle contient~; les centiles sont alors connus à cette précision relative sur tout l'intervalle, depuis
+une table de taille fixe et sans stocker d'échantillons.
+\end{definition}
+
+Conserver chaque échantillon d'une journée de messages est possible hors ligne, mais non sur le chemin critique (hot path)~; un histogramme de taille fixe, lui, convient.
+L'histogramme du livre, \texttt{firm.lathist}, conserve 256 classes exactes puis, pour chaque puissance de deux, 128 classes~: chaque classe
+a une largeur d'au plus $2^{-7}$ de ses valeurs, soit moins de 0.8~\%, depuis une nanoseconde jusqu'à la plus grande valeur sur 64~bits, dans 7\,424
+compteurs.
+
+\begin{proposition}[Précision relative des classes log-linéaires]\label{prop:ll:measuring-latency:precision}
+Avec $S$ bits de sous-classes, une valeur $v \ge 2^S$ tombe dans une classe de largeur $2^{b(v)-S}$, où $b(v)$ est sa longueur en bits, et
+la largeur est au plus $2^{-(S-1)}v$.
+\end{proposition}
+
+\begin{proof}
+Écrivons $v = m \cdot 2^{s} + r$ avec $s = b(v) - S$, $m = \lfloor v/2^s \rfloor$ et $0 \le r < 2^s$. La classe contient les valeurs de même $m$ et de même $s$,
+un intervalle de largeur $2^s$. Comme $v$ comporte $b(v)$ bits, $v \ge 2^{b(v)-1} = 2^{S-1}2^s$,
+donc $2^s \le 2^{-(S-1)}v$.
+\end{proof}
+
+Les centiles se lisent dans les effectifs par le rang le plus proche~: le $p$-quantile est la borne supérieure de la classe où
+l'effectif cumulé atteint pour la première fois $\lceil p\,n \rceil$ (plafonné par la plus grande valeur enregistrée). Des histogrammes issus de plusieurs
+fils, machines ou journées se fusionnent par addition des effectifs, ce que les quantiles d'échantillons stockés ne permettent pas sans ces échantillons.
+
+\section{Omission coordonnée}
+
+\begin{definition}[Omission coordonnée]\label{def:ll:measuring-latency:co}
+L'\emph{omission coordonnée}\index{omission coordonnée} est la perte des mesures les plus lentes lorsqu'un générateur de charge
+attend la réponse à chaque requête avant d'envoyer la suivante~: pendant que le système se bloque, le générateur n'envoie rien, si bien que les
+requêtes qui auraient attendu pendant le blocage ne sont jamais émises et jamais mesurées.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=1cm,y=1cm]
+\fill[omThm!10] (2,-2.3) rectangle (6,1.3);
+\node[omThm,anchor=south] at (4,1.3) {service figé};
+\draw[-Stealth] (0,-2.5) -- (10.4,-2.5) node[right]{temps (ms)};
+\foreach \x in {0,1,2,3,4,5,6,7,8,9} {\draw (\x,-2.58) -- (\x,-2.42) node[below=3pt]{\x}; \draw[gray!40,dotted] (\x,-2.4) -- (\x,1.2);}
+\node[anchor=east] at (-0.2,0.8) {boucle fermée};
+\foreach \a/\b in {0/0.3,1/1.3,7/7.3,8/8.3,9/9.3} {\draw[omDef,line width=3pt] (\a,0.8) -- (\b,0.8);}
+\draw[omDef,line width=3pt] (2,0.8) -- (6.1,0.8);
+\node[omDef,anchor=south west] at (6.2,0.8) {un échantillon lent~; 3 à 6 jamais envoyés};
+\node[anchor=east] at (-0.2,-0.4) {boucle ouverte};
+\foreach \a/\b/\y in {0/0.3/-0.4,1/1.3/-0.4,2/6.1/-0.4,3/6.2/-0.8,4/6.3/-1.2,5/6.4/-1.6,6/6.5/-2.0,7/7.3/-0.4,8/8.3/-0.4,9/9.3/-0.4} {\draw[omMeth,line width=3pt] (\a,\y) -- (\b,\y);}
+\node[omMeth,anchor=west] at (6.7,-1.6) {chaque requête planifiée mesurée};
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:measuring-latency:co}{Omission coordonnée}. Chaque barre va de l'instant d'envoi prévu d'une requête jusqu'à sa réponse. Le testeur en boucle fermée (en haut) envoie à 2,
+attend pendant le blocage, et n'enregistre qu'un seul échantillon lent~; les requêtes prévues à 3, 4, 5 et 6 ne sont jamais émises. Le
+testeur en boucle ouverte (en bas) envoie selon le calendrier et mesure chaque requête à partir de son instant d'envoi prévu, si bien que toute requête qui
+a attendu est comptée.}\label{fig:ll:measuring-latency:co-timeline}
+\end{omfigure}
+
+La correction, lorsque le rythme prévu est connu, consiste à ajouter les échantillons manquants~: une réponse ayant duré $v$ pour un intervalle prévu
+$\Delta$ tient lieu de requêtes qui auraient attendu $v-\Delta$, $v-2\Delta$, et ainsi de suite jusqu'à $\Delta$. Elle est
+exacte seulement si le service aurait répondu à chacune d'elles dès la fin du blocage~; une file qui se vide après le blocage
+rend les valeurs réelles encore plus grandes. Le remède consiste à ne pas avoir besoin de la correction~: générer la charge selon un calendrier, en boucle ouverte, et
+mesurer chaque requête à partir de l'instant où elle aurait dû être envoyée.
+
+\begin{example}[Un blocage par seconde]\label{ex:ll:measuring-latency:co}
+Un service répond en environ \qty{100}{\micro\second} et se fige pendant \qty{10}{\milli\second} au début de chaque seconde~;
+les testeurs prévoient une requête par milliseconde pendant 100 secondes (la \cref{fig:ll:measuring-latency:spectrum}). Le
+testeur en boucle fermée recueille 99\,000 échantillons et annonce un p99 de \qty{0.16}{\milli\second}~: le seul échantillon qu'il prélève à chaque blocage vaut 0.1~\%
+du total. Corrigé, il annonce \qty{1.06}{\milli\second}~; le testeur en boucle ouverte, qui voit aussi la file se vider après
+chaque blocage, \qty{1.87}{\milli\second}. Le service est lent pour 1~\% des requêtes que les utilisateurs envoient, et le test naïf
+le dément d'un ordre de grandeur.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ymode=log,xmin=0.3,xmax=4,ymin=0.05,ymax=20,
+  xtick={0.3010,1,2,3,4},xticklabels={50~\%,90~\%,99~\%,99.9~\%,99.99~\%},
+  ytick={0.1,1,10},yticklabels={0.1,1,10},xlabel={centile},ylabel={latence (ms, échelle logarithmique)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.2pt] table[x=nines,y=closed_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\addplot[omDef,thick,dashed,mark=square*,mark size=1.2pt] table[x=nines,y=corrected_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\addplot[omMeth,thick,mark=triangle*,mark size=1.4pt] table[x=nines,y=open_ms]{figdata/low-latency/05-measuring-latency/spectrum.csv};
+\legend{boucle fermée (brut),boucle fermée (corrigée),boucle ouverte}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Latence par centile d'un service qui se fige pendant \qty{10}{\milli\second} chaque seconde, mesurée par trois
+testeurs prévoyant une requête par milliseconde. Du 99\up{e} au 99.8\up{e}~centile, le testeur en boucle fermée
+se trompe d'un facteur de dix à cinquante. Données~: \texttt{ll\_measure.spectrum}, simulation déterministe de 100
+secondes.}\label{fig:ll:measuring-latency:spectrum}
+\end{omfigure}
+
+Dans un système de trading, le «~testeur~» est souvent le marché. Une stratégie qui mesure son propre temps de réaction uniquement sur les
+messages qu'elle parvient à traiter souffre du même biais~: pendant un blocage, les messages en attente derrière elle sont traités en retard,
+et une mesure qui horodate chaque message au moment où le programme le touche pour la première fois, plutôt qu'à l'arrivée du paquet,
+n'enregistre aucun de ce retard. L'horodatage de réception relève du support physique (un \omterm{def:ll:measuring-latency:hwts}{horodatage matériel}) ou, du moins, au
+moment où le paquet a quitté le noyau.
+
+\section{Profileurs et compteurs matériels}
+
+\begin{definition}[Profileur par échantillonnage, compteur de performance matériel]\label{def:ll:measuring-latency:prof}
+Un \emph{profileur par échantillonnage}\index{profileur par échantillonnage} interrompt un programme à intervalles réguliers (de temps ou
+d'événements matériels) et enregistre l'endroit où il se trouvait, en estimant la part du temps passée dans chaque fonction. Un \emph{compteur de performance
+matériel}\index{compteur de performance matériel} est un registre du processeur qui compte des événements (cycles, instructions
+retirées, \omterm{def:ll:memory-hierarchy-and-caches:miss}{défauts de cache}, \omterm{def:ll:cpu-microarchitecture:branch}{erreurs de prédiction de branchement}) pour le code exécuté sur un cœur~; sous Linux, elles se lisent à l'aide de
+\texttt{perf\_event\_open} et l'outil \texttt{perf}.
+\end{definition}
+
+Les deux répondent à la question «~où passe le temps en moyenne~», qui est la mauvaise question pour une queue de distribution. Un \omterm{def:ll:measuring-latency:prof}{profileur par échantillonnage} ne voit
+rien d'un événement qui survient une fois par minute~; les compteurs ne donnent que des totaux, sauf lus autour d'une région. Leur usage dans le travail sur la
+latence relève du diagnostic~: compter les \omterm{def:ll:memory-hierarchy-and-caches:miss}{défauts de cache} et les erreurs de prédiction dans la région que les horodatages signalent comme lente, sur une
+reproduction du cas lent. L'accès est souvent restreint~: le paramètre du noyau \texttt{perf\_event\_paranoid}, égal à 2 par défaut,
+n'autorise que les mesures en espace utilisateur, et les machines virtuelles, y compris l'ordinateur portable de ce livre, n'exposent en général
+pas du tout les compteurs. Les mesures de ce livre n'utilisent donc que l'horloge et ce qui peut être compté en logiciel.
+
+\begin{method}[Rapporter une mesure de latence]\label{met:ll:measuring-latency:report}
+\begin{enumerate}
+\item Nommer les deux instants et préciser qui a horodaté chacun (la \cref{def:ll:where-latency-comes-from:t2t} au chapitre~1).
+\item Piloter le système selon un calendrier (en boucle ouverte) à un rythme indiqué, ou corriger l'\omterm{def:ll:measuring-latency:co}{omission coordonnée} et le dire.
+\item Enregistrer chaque mesure dans un histogramme à erreur relative bornée~; annoncer le p50, le p99, le p99.9 et le maximum, avec le
+nombre de mesures.
+\item Indiquer la machine, le placement, le compilateur et ses options, l'horloge et son surcoût, l'échauffement, et les autres processus en cours d'exécution.
+\item Répéter la mesure, et annoncer la dispersion des centiles entre les exécutions avant de comparer deux versions (chapitre~25).
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: un histogramme et un générateur de charge}\label{tut:ll:measuring-latency:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire l'histogramme log-linéaire dans trois langages sur un même jeu de test, mesurer les horloges et reproduire
+l'\omterm{def:ll:measuring-latency:co}{omission coordonnée}. \textbf{État final~:} les \cref{fig:ll:measuring-latency:clocks,fig:ll:measuring-latency:spectrum}.
+\begin{tutsteps}
+\item \textbf{Indexer une valeur.} En dessous de $2^S$, la valeur est son propre indice~; au-dessus, ses $S$ bits de poids fort et sa longueur en bits choisissent la
+case.
+\omcode{code/firm/lathist/cpp/firm_lathist.hpp}{12}{18}{La case d'une valeur~: une longueur en bits et un décalage.}\label{lst:ll:measuring-latency:index}
+\item \textbf{Corriger l'omission.} L'enregistrement corrigé ajoute les échantillons que le blocage a masqués.
+\omcode{code/firm/lathist/cpp/firm_lathist.hpp}{39}{44}{Enregistrement avec l'intervalle attendu.}\label{lst:ll:measuring-latency:corrected}
+\item \textbf{Vérifier les jumeaux.} \texttt{make\_lathist\_fixture.py} écrit 20\,000 valeurs allant d'une nanoseconde à dix secondes,
+leurs cases non nulles et sept quantiles~; les tests Python, C++20 et Rust reproduisent les deux fichiers à l'identique.
+\item \textbf{Simuler les testeurs.} Le testeur en boucle fermée envoie dès l'arrivée de la réponse précédente~; celui en boucle ouverte, à la
+milliseconde. \texttt{fig\_measure.py} écrit le spectre.
+\omcode{code/low-latency/05-measuring-latency/python/ll_measure.py}{45}{53}{Un testeur en boucle fermée, source de l'omission coordonnée.}\label{lst:ll:measuring-latency:closed}
+\item \textbf{Mesurer les horloges} avec \texttt{python bench\_clocks.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Faire durer le blocage \qty{50}{\milli\second} une fois toutes les cinq secondes et comparer les trois
+p99~; ajouter un \texttt{record\_corrected} au banc d'essai du chapitre~1, avec l'intervalle d'un flux réel, et voir si quelque chose
+change.
+\end{tutorial}
+
+\section{Construction~: l'histogramme de latence}\label{bld:ll:measuring-latency:lathist}
+
+\begin{build}
+\bfield{Rôle} Le seul moyen dont dispose la firme pour enregistrer une distribution de latence, sur le chemin critique (hot path) comme en dehors de celui-ci, dans tous les langages, afin que
+les histogrammes issus du feed handler, du moteur de stratégie et de la passerelle puissent être fusionnés et comparés.
+\bfield{Interface} Python \texttt{LatHist(sub\_bits)} avec \texttt{record(v, n)},
+\texttt{record\_corrected(v, interval)}, \texttt{merge}, \texttt{quantile(p)}, \texttt{mean}, \texttt{nonzero}~; \texttt{index\_of}, \texttt{bucket\_range}.
+C++20 \texttt{firm::lathist::LatHist} et Rust \texttt{firm\_lathist::LatHist}~: les mêmes, avec les compteurs sous forme de
+vecteur de taille fixe.
+\bfield{Règles} Les valeurs sont des entiers non négatifs (nanosecondes, ou ticks convertis une seule fois)~; la largeur d'une case vaut au plus
+$2^{-(S-1)}$ de ses valeurs~; les quantiles se calculent par rang le plus proche à partir du bord supérieur de la case, plafonnés par le maximum~; l'enregistrement n'alloue jamais
+de mémoire~; les trois implémentations concordent exactement sur la fixture.
+\bfield{Tests d'acceptation} \texttt{code/firm/lathist/}~: les cases qui recouvrent la droite, la borne d'erreur relative, les quantiles et
+la fusion, la correction d'omission, et la fixture commune en Python, C++20 et Rust.
+\bfield{Pour aller plus loin} Sérialiser un histogramme de façon compacte pour la journalisation (longueurs de séries pour les cases nulles)~; un histogramme d'intervalle qui
+tourne chaque seconde sans interrompre l'enregistreur.
+\end{build}
+
+\begin{omsources}
+\item G.~Tene, ``How NOT to measure latency'', QCon San Francisco 2015.
+\item HdrHistogram, project documentation (``Corrected vs.\ raw value recording calls'').
+\item Intel, \emph{Intel 64 and IA-32 Architectures Software Developer's Manual}, vol.~3, ``Invariant TSC''.
+\item Linux man pages \texttt{clock\_gettime(2)}, \texttt{vdso(7)}, \texttt{perf\_event\_open(2)}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:1}
+Une région est chronométrée à 3\,020 ticks sur un compteur calibré à 3.02 ticks par nanoseconde, avec un surcoût de 45 ticks. Quelle
+est sa latence~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:2}
+Quelle case de \texttt{firm.lathist} (avec $S = 8$) contient \qty{1\,000}{\nano\second}, et quelle plage de valeurs
+couvre-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:measuring-latency:3}
+Combien de compteurs l'histogramme nécessite-t-il avec $S = 10$, et quelle est sa précision relative~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:4}
+Un testeur en boucle fermée qui vise une requête toutes les \qty{2}{\milli\second} enregistre une réponse de \qty{9}{\milli\second}. Quelles
+valeurs la correction ajoute-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:5}
+Pourquoi le testeur en boucle ouverte de l'\cref{ex:ll:measuring-latency:co} affiche-t-il un p99 plus élevé que le
+testeur en boucle fermée corrigé~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:measuring-latency:6}
+La durée de réaction d'une stratégie est mesurée à partir de l'instant où sa boucle d'événements lit chaque message. Pendant un
+blocage de \qty{2}{\milli\second}, 400 messages s'accumulent dans le socket. Qu'enregistre la mesure pour eux, et que devrait-elle enregistrer~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:measuring-latency:7}
+\emph{Programmation.} Exécuter \texttt{ll\_measure} avec un blocage de \qty{50}{\milli\second} toutes les cinq secondes. Quels sont les trois p99
+désormais, et pourquoi le chiffre en boucle fermée bouge-t-il à peine~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:measuring-latency:8}
+\emph{Trouver la faille.} «~Le p99.99 de notre service est de \qty{40}{\micro\second}~: nous avons chronométré un million de requêtes depuis un seul
+thread client, en envoyant chaque requête dès que la réponse précédente est arrivée, et nous avons conservé les échantillons dans un histogramme de 1\,000
+cases de \qty{100}{\nano\second}.~»
+\end{exercise}
+
+\section{Problème~: le banc d'essai qui mentait}
+
+\begin{problem}[{Problème du week-end --- un blocage par seconde}]\label{pb:ll:measuring-latency:1}
+Le service de l'\cref{ex:ll:measuring-latency:co} répond en environ \qty{100}{\micro\second} et se bloque pendant
+\qty{10}{\milli\second} au début de chaque seconde. Trois testeurs visent une requête par milliseconde pendant 100 secondes.
+
+\medskip\noindent\textbf{Partie I --- Comptage.}
+\begin{enumerate}
+\item Combien de requêtes les testeurs en boucle ouverte et en boucle fermée envoient-ils, et pourquoi ce nombre diffère-t-il~?
+\item Quelle part des échantillons en boucle fermée est lente~?
+\item Quelle part des requêtes envoyées par un client en boucle ouverte arrive pendant un blocage ou attend derrière un blocage~?
+\item Combien d'échantillons la correction ajoute-t-elle par blocage, et au total~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Centiles.}
+\begin{enumerate}[resume]
+\item Lire les trois p99 à partir de la \cref{fig:ll:measuring-latency:spectrum}.
+\item Pourquoi les trois testeurs concordent-ils à la médiane et au p99.9~?
+\item Pourquoi le chiffre corrigé se situe-t-il en dessous de celui en boucle ouverte~?
+\item Quel chiffre un utilisateur du service ressentirait-il~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'histogramme.}
+\begin{enumerate}[resume]
+\item Quelle est la précision relative de l'histogramme utilisé, et cela importe-t-il ici~?
+\item Combien de compteurs contient-il~?
+\item Les trois histogrammes des testeurs pourraient-ils être fusionnés, et que signifierait l'histogramme fusionné~?
+\item Que donnerait un histogramme à cases fixes de \qty{100}{\micro\second} jusqu'à \qty{10}{\milli\second}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le rapport.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le p99 rapporté par le testeur en boucle fermée, brut et corrigé, face à celui du
+testeur en boucle ouverte.
+\item Réécrire le rapport naïf sous la forme de la \cref{met:ll:measuring-latency:report}.
+\item Pourquoi «~un blocage par seconde~» est-il réaliste pour un service doté d'un ramasse-miettes ou d'une tâche périodique~?
+\item Comment détecter l'\omterm{def:ll:measuring-latency:co}{omission coordonnée} dans un rapport qu'on n'a pas produit~?
+\item Quel est l'analogue, sur le marché, d'un testeur en boucle fermée~?
+\item Pourquoi le surcoût de l'horloge doit-il être indiqué avec chaque chiffre~?
+\item Qu'apporte un \omterm{def:ll:measuring-latency:hwts}{horodatage matériel} à la mesure d'un feed handler~?
+\item En une phrase~: que dit un chiffre de latence honnête~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:measuring-latency:1}
+Comment lisez-vous l'heure avec le moindre surcoût sur x86 Linux, et que doit-il être vrai pour que la lecture ait un sens
+d'un cœur à l'autre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:measuring-latency:2}
+Qu'est-ce que l'\omterm{def:ll:measuring-latency:co}{omission coordonnée}, et comment concevriez-vous un test de charge qui l'évite~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:measuring-latency:3}
+Vous devez enregistrer le p99.9 d'un flux d'un million de latences par seconde à mémoire constante. Comment faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:measuring-latency:4}
+Pourquoi la latence moyenne est-elle un mauvais résumé, et que rapporteriez-vous à la place~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:measuring-latency:5}
+Quand un \omterm{def:ll:measuring-latency:prof}{profileur par échantillonnage} est-il utile pour le travail sur la latence, et quand est-il inutile~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:measuring-latency:6}
+Deux versions d'un moteur de trading diffèrent de 3~\% au p99 sur un seul essai chacune. De quoi avez-vous besoin avant d'y croire~?
+\end{interviewq}

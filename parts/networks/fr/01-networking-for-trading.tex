@@ -1,0 +1,520 @@
+\chapter{Réseaux pour le trading}\label{ch:nw:networking-for-trading}
+
+L'opérateur du flux consolidé des options américaines indique à ses abonnés quelle capacité réseau acheter, et il ne donne pas une moyenne.
+Pour juillet 2026, il projette 4.403 gigabits sur les 100 millisecondes les plus chargées et 0.501 gigabit sur les 10
+millisecondes les plus chargées, par copie du flux~: \qty{44}{\giga\bit\per\second} sur la fenêtre la plus longue, \qty{50}{\giga\bit\per\second}
+sur la plus courte, soit le double pour un abonné qui prend les deux copies redondantes. Ses propres statistiques disent la même chose vu de l'autre côté~: la
+milliseconde la plus chargée de juillet 2026 a transporté des messages à un débit cinq fois supérieur à celui de la seconde la plus chargée. Un réseau
+dimensionné pour la moyenne d'une journée de trading perd des paquets dans ses millisecondes les plus chargées, et ce sont ces millisecondes-là que
+une société de trading est payée pour voir.
+
+Ce chapitre ouvre la première partie du livre, consacrée au réseau entre une plateforme de négociation et les serveurs de la société. Il chiffre le coût d'un octet sur le fil,
+montre comment un paquet atteint de nombreux abonnés, explique pourquoi les données de marché circulent en datagrammes et les ordres en flux, et se termine
+là où naissent la plupart des pertes~: sur un port de commutateur qui reçoit davantage qu'il ne peut émettre.
+
+\section{La trame Ethernet et ce que coûte un octet sur le fil}
+
+\begin{definition}[Carte réseau, trame Ethernet]\label{def:nw:networking-for-trading:frame}
+Une \emph{carte réseau}\index{carte réseau} (NIC) est le dispositif qui relie un ordinateur à une liaison réseau~: 
+elle transforme les bits présents sur le fil en données dans la mémoire de l'hôte, et inversement. Une \emph{trame Ethernet}\index{trame Ethernet} est
+l'unité qu'une liaison Ethernet transporte~: une adresse de destination et une adresse source (6 octets chacune), un type (2 octets), une charge utile de 46 à 1\,500
+octets, une séquence de contrôle de trame (4 octets), soit de 64 à 1\,518 octets au total sans étiquette VLAN. Sur le fil, chaque trame est
+précédée de 8 octets de préambule et de délimiteur de début et suivie d'au moins 12 octets d'intervalle inter-trames inactif.
+\end{definition}
+
+\begin{definition}[Débit de ligne, délai de sérialisation, unité de transmission maximale]\label{def:nw:networking-for-trading:ser}
+Le \emph{débit de ligne}\index{débit de ligne} (line rate) $R_{\mathrm L}$ d'une liaison est le débit auquel elle cadence les bits sur le support (1, 10, 25
+ou \qty{100}{\giga\bit\per\second}). Le \emph{délai de sérialisation}\index{délai de sérialisation} d'une trame est le temps que met la liaison
+pour la placer sur le fil. L'\emph{unité de transmission maximale}\index{unité de transmission maximale} (MTU) est la charge utile la plus grande qu'une
+liaison transporte dans une seule trame, soit 1\,500 octets pour l'Ethernet standard.
+\end{definition}
+
+\begin{proposition}[Coût d'une trame]\label{prop:nw:networking-for-trading:ser}
+Une trame de $\ell_{\mathrm f}$ octets occupe $\ell_{\mathrm f} + 20$ octets de temps de ligne, si bien que son \omterm{def:nw:networking-for-trading:ser}{délai de sérialisation} vaut
+\[
+  t_{\mathrm{ser}} = \frac{8\,(\ell_{\mathrm f} + 20)}{R_{\mathrm L}},
+\]
+et une liaison transporte au plus $R_{\mathrm L} / (8(\ell_{\mathrm f}+20))$ trames par seconde. Tout dispositif qui doit recevoir une trame entière
+avant de la réémettre paie $t_{\mathrm{ser}}$ une fois de plus.
+\end{proposition}
+
+\begin{proof}
+Le préambule, le délimiteur de début et l'intervalle inter-trames représentent 20 octets de temps de ligne qui appartiennent à chaque trame et à aucune autre~;
+une liaison émet un bit toutes les $1/R_{\mathrm L}$. Un dispositif de type store-and-forward (chapitre~2) ne commence à émettre qu'une fois le dernier bit
+arrivé, soit un retard d'une sérialisation au débit entrant.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.95cm,minimum width=1.32cm,text width=1.2cm,
+  align=center,inner sep=1pt}]
+\foreach \i/\n/\b/\c in {0/{préam\-bule\\+ SFD}/8/gray!15, 1/en-tête\\Ethernet/14/omDef!15, 2/en-tête\\IPv4/20/omDef!15,
+  3/en-tête\\UDP/8/omDef!15, 4/{Mold-\\UDP64}/20/omMeth!18, 5/lon\-gueur/2/omMeth!18, 6/ajout\\d'ordre/36/omThm!25,
+  7/FCS/4/omDef!15, 8/{inter\-valle}/12/gray!15}
+  {\node[f,fill=\c,anchor=south west] at (1.35*\i,0) {\n}; \node[font=\scriptsize] at (1.35*\i+0.66,-0.25) {\b\ octets};}
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (1.35,-0.5) -- (10.8,-0.5)
+  node[midway,below=4pt,font=\scriptsize] {Trame Ethernet~: 104 octets (64 au minimum, 1\,518 au maximum)};
+\draw[decorate,decoration={brace,amplitude=4pt}] (0,1.05) -- (12.15,1.05)
+  node[midway,above=4pt,font=\scriptsize] {temps de ligne~: 124 octets $=$ \qty{99.2}{\nano\second} à \qty{10}{\giga\bit\per\second},
+  \qty{39.7}{\nano\second} à \qty{25}{\giga\bit\per\second}};
+\end{tikzpicture}
+
+\omcaption{Un message d'ajout d'ordre sur le fil, au format de flux du simulateur (un paquet MoldUDP64 dans un datagramme UDP dans une
+\omterm{def:nw:networking-for-trading:frame}{trame Ethernet}). Les 36 octets que lit la stratégie représentent 29~\% du temps de ligne qu'occupe la trame. Les cadres ne sont pas à l'échelle~; les nombres d'octets
+proviennent de la \cref{prop:nw:networking-for-trading:ser} et des en-têtes des formats.}\label{fig:nw:networking-for-trading:frame}
+\end{omfigure}
+
+\begin{example}[Un ajout d'ordre]\label{ex:nw:networking-for-trading:mold}
+Le simulateur de bourse du livre~10 publie son flux sous forme de paquets MoldUDP64~: un en-tête de 20 octets (session, numéro de
+séquence, nombre de messages), puis chaque message précédé d'une longueur de 2 octets. Un message d'ajout d'ordre fait 36 octets, si bien qu'un paquet qui en transporte un seul
+fait 58 octets de charge utile UDP~; avec 8 octets d'en-tête UDP, 20 d'en-tête IPv4 et 18 d'en-tête Ethernet et de séquence de contrôle, la trame
+fait 104 octets et occupe 124 octets de temps de ligne (\cref{fig:nw:networking-for-trading:frame})~: \qty{99.2}{\nano\second}
+à \qty{10}{\giga\bit\per\second}, \qty{39.7}{\nano\second} à 25. Une plateforme qui regroupe huit de ces messages dans un seul paquet
+ne paie les 66 octets de surcharge fixe qu'une fois pour huit messages, au lieu de huit fois.
+\end{example}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrrr}
+\toprule
+Trame (octets) & \qty{1}{\giga\bit\per\second} & \qty{10}{\giga\bit\per\second} & \qty{25}{\giga\bit\per\second} &
+\qty{100}{\giga\bit\per\second} \\
+\midrule
+64 & 672.0 & 67.2 & 26.9 & 6.7 \\
+128 & 1\,184.0 & 118.4 & 47.4 & 11.8 \\
+256 & 2\,208.0 & 220.8 & 88.3 & 22.1 \\
+512 & 4\,256.0 & 425.6 & 170.2 & 42.6 \\
+1\,024 & 8\,352.0 & 835.2 & 334.1 & 83.5 \\
+1\,518 & 12\,304.0 & 1\,230.4 & 492.2 & 123.0 \\
+\bottomrule
+\end{tabular}
+\caption{\omterm{def:nw:networking-for-trading:ser}{Délai de sérialisation} en nanosecondes selon la taille de la trame et le \omterm{def:nw:networking-for-trading:ser}{débit de ligne} (\cref{prop:nw:networking-for-trading:ser}, préambule
+et intervalle inter-trames inclus). Calculé par \texttt{nw\_wire.frame\_table}.}\label{tab:nw:networking-for-trading:ser}
+\end{table}
+
+Le \Cref{tab:nw:networking-for-trading:ser} est le premier tableau de latence de ce livre et celui que l'on oublie le plus souvent. Une
+trame de taille maximale à \qty{10}{\giga\bit\per\second} met \qty{1.23}{\micro\second} à se sérialiser, soit la moitié des
+\qty{2.5}{\micro\second} qu'un ingénieur d'un grand teneur de marché (market maker) a présentés lors d'une conférence publique comme un très bon temps de bout en bout pour un
+système de trading logiciel complet (livre~13, chapitre~1). Passer de 10 à \qty{25}{\giga\bit\per\second} fait gagner 60~\% sur
+chaque sérialisation, ce qui justifie d'acheter le port le plus rapide même lorsque le port plus lent suffirait à écouler le trafic.
+La sérialisation est aussi la raison pour laquelle les petites trames comptent~: un ordre dépasse rarement une centaine d'octets, et un commutateur qui le réémet
+seulement après l'avoir reçu en entier en paie chaque octet.
+
+\begin{remark}[Bits en vol]\label{rem:nw:networking-for-trading:flight}
+La lumière traverse une fibre monomode standard à raison d'un mètre en \qty{4.88}{\nano\second} environ (indice de groupe 1.462, chapitre~10).
+Une trame de 1\,518 octets à \qty{10}{\giga\bit\per\second} mesure donc 252~mètres dans la fibre, davantage que tout câble présent dans une
+salle de centre de données~: son premier bit atteint l'extrémité lointaine bien avant que son dernier bit n'ait quitté la source. La distance et la sérialisation sont deux
+termes distincts d'un budget de latence, et à l'échelle d'un bâtiment c'est généralement la sérialisation qui l'emporte.
+\end{remark}
+
+\omcode{code/firm/netsim/firm_netsim.py}{36}{50}{Calcul de la taille des trames dans \texttt{firm.netsim}~: la plus petite trame est complétée à 64
+octets, et chaque trame paie 20 octets de préambule et d'intervalle.}\label{lst:nw:networking-for-trading:frame}
+
+\section{Multicast IP~: groupes, appartenance et snooping}
+
+Une plateforme de négociation envoie les mêmes données de marché à des centaines d'abonnés. Envoyer une copie à chacun sur sa propre connexion ferait
+attendre le dernier abonné que tous les autres soient servis (le chapitre~12 étudie une plateforme qui a fait exactement cela)~; envoyer une seule copie que le réseau réplique
+les rend tous égaux, à la réplication près.
+
+\begin{definition}[Groupe multicast, IGMP]\label{def:nw:networking-for-trading:group}
+Un \emph{groupe multicast}\index{groupe multicast} est une adresse IPv4 comprise entre 224.0.0.0 et 239.255.255.255 qui désigne un ensemble
+de récepteurs plutôt qu'un seul hôte~: un datagramme qui lui est envoyé est remis à chacun de ses membres. L'\emph{Internet Group Management
+Protocol}\index{Internet Group Management Protocol} (IGMP) est le protocole par lequel un hôte indique à ses routeurs voisins
+les groupes qu'il souhaite recevoir et, dans la version~3, les sources dont il accepte les flux.
+\end{definition}
+
+Le flux d'une plateforme de négociation est en général réparti sur de nombreux groupes, un par canal ou par partition d'instruments,
+afin qu'un abonné ne reçoive que les groupes dont il a besoin (le chapitre~22 dimensionne ainsi les flux d'options). Un groupe doit aussi être livré sur le segment Ethernet,
+et les adresses Ethernet comptent 48 bits~: une adresse de groupe est associée à l'adresse Ethernet \texttt{01:00:5e} suivie des 23 bits de poids faible du groupe,
+si bien que les 5 bits de poids fort parmi les 28 bits qui distinguent les groupes sont perdus et que 32 groupes partagent chaque adresse Ethernet.
+Une carte qui filtre sur les adresses Ethernet peut donc laisser passer des groupes auxquels l'hôte ne s'est jamais joint,
+et le noyau les rejette après en avoir payé le coût.
+
+\begin{definition}[IGMP snooping]\label{def:nw:networking-for-trading:snooping}
+L'\emph{IGMP snooping}\index{IGMP snooping} est la pratique d'un commutateur qui lit les rapports d'appartenance IGMP qui le traversent et
+n'achemine le trafic de chaque groupe que vers les ports sur lesquels un membre s'est signalé, au lieu d'inonder
+chaque port de chaque trame multicast.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.65cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[b,fill=gray!10] (v) at (0,0) {flux de la plateforme\\ groupes A, B};
+\node[b,fill=omDef!15,minimum width=1.9cm,minimum height=3.6cm] (s) at (3.6,0) {commutateur\\ (IGMP\\ snooping)};
+\foreach \y/\t/\g in {1.35/{serveur 1~: abonné à A}/{A}, 0.45/{serveur 2~: abonné à A et B}/{A et B}, -0.45/{serveur 3~: abonné à B}/{B},
+  -1.35/{serveur 4~: abonné à rien}/{rien}}
+  {\node[b,minimum width=4.1cm,anchor=west] (h) at (7.4,\y) {\t};
+   \draw[->,thick] (s.east|-h.west) -- node[above,font=\scriptsize]{envoie \g} (h.west);}
+\draw[->,thick] (v) -- node[above,font=\scriptsize]{A et B} (s.west|-v.east);
+\end{tikzpicture}
+
+\omcaption{\omterm{def:nw:networking-for-trading:snooping}{IGMP snooping}. Le commutateur apprend, à partir des rapports d'appartenance des serveurs, quels ports veulent quel groupe, et réplique
+chaque groupe uniquement vers eux~; le serveur~4 ne reçoit rien. Sans snooping, les quatre ports transporteraient les deux groupes, et les serveurs qui ne sont abonnés à rien
+consacreraient tout de même du temps de leurs cartes et de leur noyau à les rejeter.}\label{fig:nw:networking-for-trading:snoop}
+\end{omfigure}
+
+\begin{example}[Deux groupes, une adresse Ethernet]\label{ex:nw:networking-for-trading:mac} \sloppy
+Le groupe 239.255.1.2 est associé à \texttt{01:00:5e:7f:01:02}~: les 23 bits de poids faible de 255.1.2 valent 127.1.2 une fois le bit de poids fort de 255 retiré. Le groupe 224.127.1.2 est associé à la même adresse.
+Un serveur qui ne s'est joint qu'au premier reçoit aussi, depuis tout commutateur ou toute carte qui filtre sur la seule adresse Ethernet,
+le trafic du second. Les plateformes attribuent leurs groupes en tenant compte de cela, et
+une société de trading qui exploite son propre multicast interne (le ticker plant du chapitre~27) devrait faire de même.
+\end{example}
+
+\section{Datagrammes contre flux}
+
+Deux protocoles de transport acheminent presque tout ce qui circule dans un réseau de trading. UDP envoie des datagrammes~: chacun est remis entier
+ou pas du tout, sans ordre ni retransmission, et un datagramme envoyé à un groupe atteint chacun de ses membres. TCP achemine un flux d'octets
+entre deux extrémités~: il numérote les octets, les acquitte, retransmet ceux qui sont perdus
+et livre le tout dans l'ordre.
+
+Les données de marché circulent en multidiffusion UDP parce que seul le multicast envoie une copie à tous, et parce qu'un flux ne doit pas ralentir
+pour son abonné le plus lent~: le contrôle de flux de TCP ferait exactement cela. Le prix à payer est que la perte devient le problème de l'application. La plateforme
+envoie chaque paquet sur deux lignes indépendantes (livre~10, chapitre~26), les numérote et exécute des services de retransmission
+et d'instantanés~; le feed handler de la société arbitre et récupère (livre~13, chapitres~16 et~18). Les ordres voyagent sur TCP parce qu'un ordre doit arriver
+exactement une fois, dans l'ordre par rapport aux autres ordres de la société, et parce que la plateforme doit savoir quelle connexion l'a envoyé~: la couche session
+du protocole de saisie des ordres repose sur ces garanties.
+
+\begin{definition}[Blocage en tête de file]\label{def:nw:networking-for-trading:hol}
+Le \emph{blocage en tête de file}\index{blocage en tête de file} est le retard imposé à chaque élément d'une file ordonnée par un élément en tête
+qui ne peut pas avancer. Dans TCP, un segment perdu retient chaque octet ultérieur du flux, déjà reçu ou non, jusqu'à
+l'arrivée de sa retransmission.
+\end{definition}
+
+Le \omterm{def:nw:networking-for-trading:hol}{blocage en tête de file} est le prix de l'ordre imposé par TCP. Une annulation envoyée une microseconde après un nouvel ordre perdu attend la retransmission
+de ce nouvel ordre, qui arrive au moins après un aller-retour et, en général, après une temporisation~: sur une liaison de colocation sans perte, la perte est rare,
+et lorsqu'elle survient, toute la session se bloque. L'ordre est aussi une qualité~: la plateforme ne doit jamais voir l'annulation avant
+l'ordre qu'elle annule.
+
+\begin{definition}[Algorithme de Nagle]\label{def:nw:networking-for-trading:nagle}
+L'\emph{algorithme de Nagle}\index{algorithme de Nagle} est la règle de TCP selon laquelle un émetteur retient de nouvelles données, au lieu de les envoyer
+dans un petit segment, tant que les données qu'il a déjà envoyées restent non acquittées. Il économise de la bande passante lorsqu'un programme écrit de nombreux petits morceaux,
+et il a été conçu pour les terminaux interactifs.
+\end{definition}
+
+\begin{proposition}[Nagle rencontre l'acquittement différé]\label{prop:nw:networking-for-trading:nagle}
+Supposons qu'un émetteur écrive un petit ordre puis, avant son acquittement, un second petit ordre, sur une connexion où l'\omterm{def:nw:networking-for-trading:nagle}{algorithme de Nagle} est activé,
+vers un récepteur qui retarde ses acquittements (TCP autorise jusqu'à une demi-seconde). Le second ordre ne part que lorsque le premier est acquitté~:
+après la temporisation d'acquittement différé du récepteur, ou après un aller-retour si le récepteur a lui-même des données à envoyer.
+Désactiver l'\omterm{def:nw:networking-for-trading:nagle}{algorithme de Nagle} (l'option de socket \texttt{TCP\_NODELAY}) supprime l'attente.
+\end{proposition}
+
+\begin{proof}
+Par la règle, la seconde écriture est retenue tant que le premier segment n'est pas acquitté. Le récepteur envoie son acquittement
+lorsque sa temporisation expire, lorsqu'il dispose d'un second segment complet à acquitter (ce n'est pas le cas~: un seul petit segment est arrivé), ou avec ses propres données.
+\end{proof}
+
+\begin{method}[Un socket de saisie des ordres]\label{met:nw:networking-for-trading:socket}
+\begin{enumerate}
+\item Activer \texttt{TCP\_NODELAY} sur chaque connexion de saisie des ordres et de drop copy.
+\item Écrire chaque message en un seul appel, de sorte qu'un message soit un seul segment et que rien n'attende une écriture ultérieure.
+\item Lorsque le protocole de session de la plateforme acquitte au niveau applicatif, acquitter aussi rapidement au niveau TCP
+  (l'option \texttt{TCP\_QUICKACK} de Linux n'est pas permanente et doit être réactivée après chaque lecture).
+\item Garder la connexion ouverte (les heartbeats de la couche session) et préchauffée~: une nouvelle connexion TCP coûte un aller-retour avant
+  son premier octet, et le chapitre~20 ajoute une poignée de main TLS (handshake) par-dessus pour les plateformes de crypto-actifs.
+\end{enumerate}
+\end{method}
+
+\section{Congestion~: files de sortie, incast et micro-rafales}
+
+Un commutateur achemine chaque trame vers un port de sortie. Si les trames destinées à un même port arrivent plus vite que le \omterm{def:nw:networking-for-trading:ser}{débit de ligne} de ce port,
+elles attendent.
+
+\begin{definition}[File de sortie, taux de sursouscription]\label{def:nw:networking-for-trading:egress}
+Une \emph{file de sortie}\index{file de sortie} est la mémoire tampon dans laquelle un commutateur retient les trames en attente d'émission sur un port de sortie~;
+lorsqu'elle est pleine, les trames qui arrivent sont rejetées (tail drop). Le \emph{taux de sursouscription}\index{taux de sursouscription} d'un port est la somme des \omterm{def:nw:networking-for-trading:ser}{débits de ligne} pouvant émettre vers lui,
+divisée par son propre \omterm{def:nw:networking-for-trading:ser}{débit de ligne}.
+\end{definition}
+
+\begin{definition}[Incast, micro-rafale]\label{def:nw:networking-for-trading:burst}
+L'\emph{incast}\index{incast} est la congestion qui survient lorsque de nombreux émetteurs transmettent simultanément vers un même récepteur. Un
+\emph{micro-rafale}\index{micro-rafale} (microburst) est une période de quelques microsecondes à quelques millisecondes pendant laquelle le trafic offert à un port
+dépasse son \omterm{def:nw:networking-for-trading:ser}{débit de ligne}, alors que sa moyenne sur n'importe quel intervalle qu'un outil de supervision rapporte (une seconde, une minute) reste bien en deçà
+de celui-ci.
+\end{definition}
+
+Un flux qui occupe en moyenne la moitié d'un port peut le saturer pendant une milliseconde, et un réseau de trading est conçu pour que cela
+se produise~: le flux de chaque plateforme, et chaque partition de chaque flux, réagit aux mêmes événements de marché au même moment.
+
+\begin{proposition}[La borne fluide]\label{prop:nw:networking-for-trading:fluid}
+Soient $n$ entrées qui émettent aux débits $r_1, \dots, r_n$ vers un port de \omterm{def:nw:networking-for-trading:ser}{débit de ligne} $R_{\mathrm L}$ pendant une rafale de durée $D$, à partir
+d'une file vide. À la fin de la rafale, la file contient
+\[
+  B = \Bigl(\textstyle\sum_i r_i - R_{\mathrm L}\Bigr)^{+} D / 8 \text{ octets},
+\]
+et le dernier octet de la rafale quitte le port $8B/R_{\mathrm L}$ après son arrivée. Le rejet en queue ne perd rien si et seulement si la mémoire
+disponible pour le port est au moins égale à $B$~; sinon il perd $B$ moins la mémoire, par trames entières.
+\end{proposition}
+
+\begin{proof}
+Pendant la rafale, la file croît au rythme de la différence des débits lorsque celle-ci est positive, et reste vide dans le cas contraire~; le port
+la vide ensuite à $R_{\mathrm L}$. La version discrète, trame par trame, est la boucle de la \cref{lst:nw:networking-for-trading:egress},
+qui se réduit à la formule fluide lorsque les trames sont petites devant $B$.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xmode=log,xmin=0.7,xmax=1400,ymin=0,ymax=380,
+  xtick={1,10,100,1000},xticklabels={1~ms,10~ms,100~ms,1~s},
+  xlabel={fenêtre de moyennage (échelle logarithmique)},ylabel={débit de crête (millions de messages / s)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omExo,very thick,mark=*,mark size=1.6pt] table[x=window_ms,y=2024_01]{figdata/networks/01-networking-for-trading/opra.csv};
+\addplot[omMeth,very thick,mark=square*,mark size=1.6pt] table[x=window_ms,y=2025_03]{figdata/networks/01-networking-for-trading/opra.csv};
+\addplot[omThm,very thick,mark=triangle*,mark size=2pt] table[x=window_ms,y=2026_07]{figdata/networks/01-networking-for-trading/opra.csv};
+\legend{janv. 2024,mars 2025,juil. 2026}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La fenêtre la plus chargée de chaque longueur pour le flux consolidé d'options américaines, exprimée en débit~: le nombre de pointes de messages en une
+seconde, 100~ms, 10~ms et 1~ms, divisé par la fenêtre. Plus la fenêtre est courte, plus le débit est élevé~; en juillet 2026, la milliseconde la plus chargée
+a atteint 5.5 fois la seconde la plus chargée. Données~: OPRA, \emph{Key Operating Metrics} (août 2026), transcrites dans
+\texttt{data/networks/opra\_metrics.csv}.}\label{fig:nw:networking-for-trading:opra}
+\end{omfigure}
+
+La \cref{fig:nw:networking-for-trading:opra} est la version publiée de la \omterm{def:nw:networking-for-trading:burst}{micro-rafale}~: le même flux, au même mois, représente 63.9 millions de messages par seconde
+ou 350 millions selon la fenêtre dans laquelle on le lit. L'avis de capacité de l'opérateur, que les abonnés utilisent pour dimensionner leurs liens, est
+rédigé en pointes de 10 millisecondes pour cette raison
+(\cref{dat:nw:networking-for-trading:opra})~; un port de commutateur ne moyenne pas sur 10 millisecondes, il met en file trame par trame.
+
+\begin{dated}{2026-09}{Combien de réseau le flux d'options demande}\label{dat:nw:networking-for-trading:opra}
+La projection de capacité de la SIAC pour OPRA en vigueur en juillet 2026 donne, pour une copie du flux, 13.575 millions de messages, 4.403
+gigabits et 1.564 million de paquets dans les 100 millisecondes les plus chargées, et 1.562 million de messages, 0.501 gigabit et 169\,000
+paquets dans les 10 millisecondes les plus chargées. Cela représente \qty{44.0}{\giga\bit\per\second} et \qty{50.1}{\giga\bit\per\second}~; environ 352
+octets et 8.7 messages par paquet sur la fenêtre de 100 millisecondes. Les abonnés qui prennent les deux copies redondantes doublent la
+bande passante, et l'avis demande 10~\% de plus pour les retransmissions. L'avis précise que l'intervalle de 10 millisecondes «~reflète le taux d'utilisation du système
+pendant les rafales de trafic~».
+\end{dated}
+
+Pour voir le mécanisme plutôt que son empreinte, le tutoriel du chapitre simule huit flux vers un seul port de
+\qty{10}{\giga\bit\per\second} avec \texttt{firm.netsim}. Chaque flux a une moyenne de 400\,000 paquets par seconde, en grappes (un événement de marché produit une suite de messages),
+d'un à trente messages d'ajout d'ordre par paquet~; les huit ensemble offrent environ
+\qty{5.2}{\giga\bit\per\second}, soit la moitié du port. Dans une première version, les grappes de chaque flux sont indépendantes. Dans l'autre, 30~\% des
+paquets de chaque flux arrivent en grappes déclenchées par des événements communs, 400 par seconde, qui touchent les huit flux à la fois, comme une publication
+macroéconomique ou une transaction importante sur un contrat à terme sur indice.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.7cm},width=6.6cm,height=5.2cm,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[xmode=log,ymode=log,xmin=0.7,xmax=14000,ymin=3,ymax=300,xlabel={fenêtre (\unit{\micro\second}, log)},
+  ylabel={débit de crête (\unit{\giga\bit\per\second}, log)},xtick={1,10,100,1000,10000},
+  xticklabels={1,10,100,1\,000,10\,000},ytick={5,10,20,50,100,200},yticklabels={5,10,20,50,100,200}]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=window_us,y=independent]{figdata/networks/01-networking-for-trading/peak.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=window_us,y=common]{figdata/networks/01-networking-for-trading/peak.csv};
+\addplot[gray,dashed,domain=0.7:14000] {10};
+\nextgroupplot[xmode=log,xmin=8,xmax=6000,ymin=0,ymax=26,xlabel={mémoire tampon de sortie (Ko, log)},ylabel={trames perdues (\%)},
+  xtick={10,100,1000},xticklabels={10,100,1\,000},
+  legend columns=2,legend style={font=\footnotesize,at={(-0.2,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omDef,thick,dashed,mark=o,mark size=1.4pt] table[x=buffer_kb,y=f4_independent]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omThm,thick,dashed,mark=square,mark size=1.4pt] table[x=buffer_kb,y=f4_common]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=buffer_kb,y=f8_independent]{figdata/networks/01-networking-for-trading/fanin.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=buffer_kb,y=f8_common]{figdata/networks/01-networking-for-trading/fanin.csv};
+\legend{4 flux indépendants,4 flux avec événements communs,8 flux indépendants,8 flux avec événements communs}
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Simulation~: flux vers un seul port de sortie de \qty{10}{\giga\bit\per\second}. À gauche~: la fenêtre la plus chargée de chaque longueur pour huit
+flux (en pointillés~: le \omterm{def:nw:networking-for-trading:ser}{débit de ligne})~; les rafales indépendantes restent en dessous à partir de 100~\unit{\micro\second}, alors que les événements communs
+le dépassent au-delà de \qty{60}{\giga\bit\per\second}. À droite~: trames perdues par rejet en queue selon la taille de la mémoire tampon, pour 50~ms de trafic.
+La même charge moyenne nécessite environ 30~Ko de mémoire tampon lorsque les rafales sont indépendantes et environ un mégaoctet lorsqu'elles sont communes. Données~:
+\texttt{fig\_bursts.py} sur \texttt{firm.netsim} (avec graine, déterministe).}\label{fig:nw:networking-for-trading:fanin}
+\end{omfigure}
+
+Les deux versions ont la même charge moyenne, et la différence tient tout entière à la corrélation
+(\cref{fig:nw:networking-for-trading:fanin}). Avec des rafales indépendantes, les 100 microsecondes les plus chargées transportent
+\qty{9.1}{\giga\bit\per\second}, et la mémoire tampon qui n'aurait rien perdu, soit le plus fort arriéré de la simulation, est de 21 à 31~Ko
+sur vingt graines. Avec des événements communs, les 100 microsecondes les plus chargées transportent \qty{68}{\giga\bit\per\second}, et cette mémoire tampon
+se situe entre 0.44 et 2.4~Mo sur les mêmes vingt graines, 1.1~Mo en moyenne. Retirer les événements communs constitue l'ablation~: le
+mégaoctet est dû à la corrélation, et non à la charge. Les statistiques de trafic d'un port, moyennées sur une seconde, affichent la moitié d'un lien dans
+les deux cas.
+
+\begin{dated}{2026-09}{La mémoire tampon d'un commutateur à faible latence}\label{dat:nw:networking-for-trading:buffer}
+La fiche technique de Cisco pour le Nexus 3548-X, un commutateur de 48 ports à \qty{10}{\giga\bit\per\second} vendu pour sa faible latence, indique sa
+mémoire tampon comme «~6 Mo partagés entre 16 ports~; 18 Mo au total~» et des latences «~aussi basses que~» \qty{250}{\nano\second} en mode normal et
+\qty{200}{\nano\second} en mode warp. Un port dont les quinze voisins sont également chargés peut compter sur environ un seizième de son bloc de
+6~Mo, soit 375~Ko.
+\end{dated}
+
+Lu à côté de la simulation, l'encadré dit qu'un port qui peut emprunter tout le bloc partagé survit aux rafales d'événements communs
+de la \cref{fig:nw:networking-for-trading:fanin}, et qu'un port qui n'obtient que son seizième n'y survit pas~: avec 500~Ko de mémoire tampon, les
+huit flux avec événements communs perdent encore 2.6~\% de leurs trames. Les événements qui saturent tous les ports à la fois sont ceux qui
+laissent à chaque port sa seule part. Les remèdes sont un port de sortie plus rapide (les rafales communes des huit flux atteignent
+\qty{16}{\giga\bit\per\second} pendant une milliseconde, à l'intérieur d'un port de \qty{25}{\giga\bit\per\second}), moins de flux par port, ou un commutateur dont la
+mémoire tampon est dédiée plutôt que partagée~; le chapitre~2 ajoute les équipements qui ne mettent rien en file d'attente.
+
+\section{Tutoriel~: les microrafales, des trames aux pertes}\label{tut:nw:networking-for-trading:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Chiffrer les trames sur le fil, lire la courbe publiée des rafales et simuler un port de convergence jusqu'à la perte de trames.
+\textbf{État final~:} le \cref{tab:nw:networking-for-trading:ser}, les \cref{fig:nw:networking-for-trading:opra,fig:nw:networking-for-trading:fanin},
+et les mémoires tampons sans perte citées dans le texte.
+\begin{tutsteps}
+\item \textbf{Trames.} \texttt{nw\_wire.frame\_table()} et \texttt{mold\_example()} reproduisent le tableau et
+  l'\cref{ex:nw:networking-for-trading:mold} à partir du \cref{lst:nw:networking-for-trading:frame}.
+\item \textbf{La courbe publiée.} \texttt{opra\_curve()} convertit les pics de messages de l'opérateur en débits~; \texttt{opra\_capacity()}
+  convertit l'avis de capacité en gigabits par seconde et en octets par paquet.
+\item \textbf{Trafic.} \texttt{feed()} tire les paquets d'un flux à partir de \texttt{firm.netsim.bursty\_arrivals}, et
+  \texttt{fanin\_traffic()} fusionne huit d'entre eux, avec ou sans événements communs (\cref{lst:nw:networking-for-trading:feed}).
+\item \textbf{Le port.} \texttt{firm.netsim.egress} exécute la file à rejet en queue (\cref{lst:nw:networking-for-trading:egress})~;
+  \texttt{fanin()} balaie la mémoire tampon, \texttt{zero\_loss\_buffer()} lance vingt graines avec une mémoire tampon non bornée et renvoie pour chaque
+  exécution son plus grand arriéré. \texttt{python fig\_bursts.py} écrit les données des graphiques.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Faites varier la part des paquets accompagnés d'événements communs de 0 à 0.5 et tracez la mémoire tampon sans perte
+en fonction de cette part~; remplacez le port de \qty{10}{\giga\bit\per\second} par un port de \qty{25}{\giga\bit\per\second} et trouvez la plus petite
+mémoire tampon qui ne perd rien.
+\end{tutorial}
+
+\omcode{code/networks/01-networking-for-trading/python/nw_wire.py}{62}{77}{Un flux et une convergence de huit flux~: les instants des événements communs sont tirés une fois et
+partagés par tous les flux.}\label{lst:nw:networking-for-trading:feed}
+
+\omcode{code/firm/netsim/firm_netsim.py}{119}{140}{La file de sortie~: l'arriéré se résorbe au débit de ligne entre deux arrivées, et une
+trame qui ne tient pas est rejetée entière.}\label{lst:nw:networking-for-trading:egress}
+
+\section{Construction~: le modèle de réseau}\label{bld:nw:networking-for-trading:netsim}
+
+\begin{build}
+\bfield{Rôle} Un modèle au niveau du paquet du réseau de la société, que chaque chapitre ultérieur des parties~I et~II utilise~: trames, liaisons,
+files, commutateurs et multicast, avec une comptabilité exacte des octets et un trafic amorcé.
+\bfield{Interface} \texttt{firm\_netsim}~: constantes pour chaque en-tête~; \texttt{frame\_bytes}, \texttt{mold\_payload},
+\texttt{wire\_bytes}, \texttt{ser\_ns}, \texttt{prop\_ns}~; \texttt{mcast\_mac}~; \texttt{peak\_rate(t, bytes, window)}~;
+\texttt{event\_times}, \texttt{bursty\_arrivals}~; \texttt{egress(t, frames, gbps, buffer)} qui renvoie les départs, les rejets et
+les arriérés~; \texttt{forward\_ns(frame, gbps, mode, fabric\_ns)} pour les équipements store-and-forward, cut-through et de couche~1~;
+\texttt{replicate(groups, members, ports, snooping)}~; \texttt{merge}. Jumeau C++20 de la \omterm{def:nw:networking-for-trading:egress}{file de sortie},
+\texttt{cpp/firm\_netsim.hpp}.
+\bfield{Règles} Nanosecondes et octets entiers~; chaque trame paie 20 octets de préambule et d'intervalle~; les trames de moins de 64 octets sont
+complétées~; le rejet en queue rejette les trames entières~; une file est FIFO~; chaque tirage aléatoire est amorcé~; la file C++ reproduit celle de Python à la
+nanoseconde près.
+\bfield{Tests d'acceptation} \texttt{code/firm/netsim/tests/}~: tailles de trames de paquets connus (64, 104, 1\,518 octets)~; correspondance d'adresses de la RFC~1112
+et son recouvrement de 32 vers 1~; la fenêtre de débit de crête sur un flux construit à la main~; ordre FIFO, conservation des trames et
+la borne de la mémoire tampon de la \omterm{def:nw:networking-for-trading:egress}{file de sortie}~; dix trames arrivant ensemble quittent après dix sérialisations~; l'échantillon partagé avec le
+test C++.
+\bfield{Pour aller plus loin} Files à priorité (priorité stricte aux ordres sur les données de marché sur une liaison montante partagée)~; un commutateur à mémoire partagée dans lequel
+les ports empruntent à un réservoir commun selon un seuil dynamique, pour reproduire l'arithmétique de l'\cref{dat:nw:networking-for-trading:buffer}
+en simulation.
+\end{build}
+
+\begin{omsources}
+\item OPRA, \emph{Key Operating Metrics of U.S. Options Securities Information Processor} (août 2026)~; SIAC, \emph{Revised
+OPRA Capacity Projections} (15 septembre 2025).
+\item G.~Fairhurst, «~Ethernet Frame Calculations~» (University of Aberdeen)~; UNH InterOperability Laboratory, \emph{10
+Gigabit Ethernet} tutoriel MAC.
+\item RFC~768 (UDP), RFC~791 (IPv4), RFC~9293 (TCP), RFC~896 (Nagle), RFC~1122 (exigences pour les hôtes), RFC~1112 et RFC~5771
+(adressage multicast), RFC~3376 (IGMPv3), RFC~4541 (snooping)~; Linux \texttt{tcp(7)}.
+\item Cisco, \emph{Nexus 3548-X, 3524-X, 3548-XL and 3524-XL Switches Data Sheet}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:1}
+Calculer le \omterm{def:nw:networking-for-trading:ser}{délai de sérialisation} d'une trame de 256 octets à \qty{25}{\giga\bit\per\second}, et le nombre de trames de 64 octets qu'une
+liaison de \qty{10}{\giga\bit\per\second} peut transporter en une seconde~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:2}
+À quelle adresse Ethernet le \omterm{def:nw:networking-for-trading:group}{groupe multicast} 233.54.12.111 est-il associé~? Donner un autre groupe de 224.0.0.0/4 qui partage cette adresse.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:networking-for-trading:3}
+D'après l'\cref{dat:nw:networking-for-trading:opra}, quel débit une société qui reçoit les deux copies du flux, avec la
+marge de retransmission, doit-elle prévoir pour la crête de 10 millisecondes, et combien de liaisons de \qty{25}{\giga\bit\per\second} cela représente-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:4}
+Une passerelle écrit un nouvel ordre puis, quarante microsecondes plus tard, une annulation d'un autre ordre sur la même connexion TCP, sans
+\texttt{TCP\_NODELAY}. La plateforme n'acquitte les données qu'avec ses propres messages ou à l'échéance de son minuteur d'acquittement différé. Que
+peut-il arriver à l'annulation, et pourquoi l'ordre des deux n'est-il jamais menacé~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:5}
+Quatre entrées émettent chacune à \qty{6}{\giga\bit\per\second} pendant 50 microsecondes vers un port de \qty{10}{\giga\bit\per\second} dont la
+file est vide. Combien d'octets sont en file à la fin de la rafale, et combien de temps attend le dernier octet~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:networking-for-trading:6}
+Dans la \cref{fig:nw:networking-for-trading:opra}, calculer, en janvier 2024 et en juillet 2026, le rapport entre le débit de la milliseconde la plus
+chargée et celui de la seconde la plus chargée. Qu'est-ce qui a changé, et qu'est-ce que cela implique pour une liaison dimensionnée en 2024~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:networking-for-trading:7}
+\emph{Programmation.} Avec \texttt{nw\_wire.zero\_loss\_buffer}, calculer la mémoire tampon sans perte moyenne sur vingt graines lorsque 10~\% des paquets
+arrivent avec des événements communs, puis lorsque 50~\% des paquets y arrivent. Comment la mémoire tampon évolue-t-elle avec cette part~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:networking-for-trading:8}
+\emph{Trouver la faille.} «~Notre port de données de marché moyenne \qty{3}{\giga\bit\per\second} sur une liaison de \qty{10}{\giga\bit\per\second} et
+son pic sur une minute est de \qty{4.2}{\giga\bit\per\second}. Plus de la moitié de la liaison nous reste disponible~; les pertes de paquets que signale notre handler
+doivent venir du serveur.~»
+\end{exercise}
+
+\section{Problème~: L'ouverture qui ne tenait pas}
+
+\begin{problem}[{Problème du week-end --- huit flux, un port et un tampon partagé}]\label{pb:nw:networking-for-trading:1}
+Le commutateur de données de marché d'une société envoie huit flux de plateformes vers un serveur de stratégie par un même port de \qty{10}{\giga\bit\per\second}. Chaque
+flux a un débit moyen de \qty{0.6}{\giga\bit\per\second}~; lors d'un événement touchant l'ensemble du marché, les huit flux émettent ensemble en rafale à \qty{2.5}{\giga\bit\per\second}
+chacun pendant une milliseconde. Les trames font en moyenne 200 octets. Le commutateur est celui de l'\cref{dat:nw:networking-for-trading:buffer}~; pendant
+un tel événement, chaque port du bloc est occupé, de sorte que le port dispose du seizième du tampon partagé de 6~Mo.
+
+\medskip\noindent\textbf{Partie I --- Moyennes.}
+\begin{enumerate}
+\item Quelle est la charge moyenne du port et son taux d'utilisation~?
+\item Combien de trames par seconde transporte-t-il en moyenne (préambule et intervalle inter-trames compris)~?
+\item Quel est le débit offert pendant l'événement, et le taux d'utilisation correspondant~?
+\item Pourquoi le compteur d'une minute du port ne fait-il jamais apparaître l'événement~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La file d'attente.}
+\begin{enumerate}[resume]
+\item Combien d'octets sont en attente en file à la fin de la rafale, avec un tampon illimité~?
+\item Combien de trames cela représente-t-il~?
+\item Combien de temps le dernier octet de la rafale attend-il dans la file~?
+\item Après la rafale, les flux reviennent à leurs moyennes. Combien de temps la file met-elle à se vider~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le tampon.}
+\begin{enumerate}[resume]
+\item Quel tampon ne perdrait rien~?
+\item Quel tampon le port obtient-il réellement pendant l'événement~?
+\item Combien d'octets et combien de trames sont écartés~?
+\item Quelle part des trames de la rafale cela représente-t-elle~?
+\item Le bloc entier de 6~Mo aurait-il suffi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le tampon minimal pour une perte nulle, et le nombre de trames écartées avec la part du port.
+\item Combien de temps la rafale devrait-elle durer pour que le bloc entier de 6~Mo déborde~?
+\item Un port de \qty{25}{\giga\bit\per\second} mettrait-il seulement des trames en file pendant l'événement~?
+\item La société prend les deux copies de chaque flux sur des ports distincts du même bloc. Cela aide-t-il~?
+\item Quel compteur du commutateur montre la perte, et quel compteur du gestionnaire~?
+\item Comment les chemins de reprise du gestionnaire (livre~13, chapitre~18) gèrent-ils la perte~?
+\item En une phrase~: pourquoi l'événement qui remplit un port est-il celui qui remplit tous les ports~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:networking-for-trading:1}
+Qu'est-ce que le \omterm{def:nw:networking-for-trading:ser}{délai de sérialisation}~? Pourquoi passer de 10 à \qty{25}{\giga\bit\per\second} compte-t-il pour un ordre qui tient dans une petite
+trame~?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, trader}]\label{iq:nw:networking-for-trading:2}
+Pourquoi les données de marché sont-elles envoyées en multicast UDP, et les ordres en TCP~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:networking-for-trading:3}
+Expliquez l'\omterm{def:nw:networking-for-trading:nagle}{algorithme de Nagle} et l'acquittement différé. Que configurez-vous sur une socket de saisie des ordres, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:networking-for-trading:4}
+Le feed handler signale des trous sur les deux lignes à l'ouverture, mais la carte du serveur n'affiche aucune perte. Où regardez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:networking-for-trading:5}
+Que fait \omterm{def:nw:networking-for-trading:snooping}{IGMP snooping}, et que se passe-t-il dans un réseau de trading qui en est dépourvu~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:networking-for-trading:6}
+Comment dimensionneriez-vous le tampon d'un port de commutateur qui reçoit plusieurs flux de données de marché~?
+\end{interviewq}

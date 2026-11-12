@@ -1,0 +1,333 @@
+\chapter{Serveur de signaux et gestion des paramètres}\label{ch:pl:signal-serving-and-parameter-management}
+
+Un paramètre de risque saisi comme 50 signifiait cinquante points de base pour la personne qui l'avait tapé et cinquante pour cent pour la stratégie qui le lisait. Rien
+ne vérifiait l'unité~; le changement partait vers toutes les stratégies à la fois~; le premier signe fut le taux d'exécution. Un paramètre est du code que personne ne compile~:
+il modifie le comportement autant qu'une mise en production, il est édité par davantage de personnes, et il n'a en général ni types, ni tests, ni historique. Ce
+chapitre donne aux paramètres et aux signaux de recherche le même outillage que le code possède déjà --- types, revue, historique, déploiement progressif --- et mesure,
+sur dix stratégies simulées, ce que chaque pièce de cet outillage fait gagner lorsque 50 veut dire la mauvaise chose.
+
+\section{Du signal de recherche à l'entrée de production}
+
+Un signal de recherche devient une entrée de production lorsqu'une stratégie le lit selon un calendrier et prend des positions sur cette base. Entre les deux se placent les questions
+qu'un carnet de recherche ne pose jamais~: quelle version est en service, depuis combien de temps la valeur peut être utilisée avant d'être écartée, ce que fait la stratégie lorsqu'elle manque
+et qui l'a modifiée. Le livre~12 (chapitres 24 et 25) y a répondu pour les variables et les modèles d'apprentissage automatique --- le feature store,
+la fraîcheur des variables, le registre de modèles et sa piste d'audit. Ce chapitre applique les mêmes réponses aux entrées plus simples que possède toute stratégie~:
+les signaux calculés par des tâches de recherche et les paramètres saisis par des personnes.
+
+\section{Le service de signaux}
+
+\begin{definition}[Service de signaux]\label{def:pl:signal-serving-and-parameter-management:service}
+Un \emph{service de signaux}\index{service de signaux} sert des signaux de recherche aux stratégies de production~: chaque valeur est servie avec sa version et son heure de publication
+uniquement tant qu'elle est plus récente qu'une borne énoncée, et remplacée par une valeur de repli déclarée lorsqu'elle est périmée ou absente, le statut
+étant communiqué au lecteur.
+\end{definition}
+
+Le repli fait partie du contrat du signal, choisi lors de la conception du signal et non par l'auteur de la stratégie à trois heures du matin~: pour
+un signal directionnel, en général zéro (pas d'opinion)~; pour une entrée de risque, en général la valeur la plus prudente.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{148}{165}{Le service de signaux~: la dernière valeur si elle est fraîche, sinon le repli déclaré,
+toujours avec la version et un statut.}\label{lst:pl:signal-serving-and-parameter-management:service}
+
+Avec une borne de fraîcheur de cinq minutes et un repli à zéro, un signal de momentum publié à l'instant 0 puis de nouveau à 60~secondes est servi
+comme 0.7 (version~3, frais) à 200~secondes, et comme 0 avec le statut «~stale-fallback~» à 600~secondes~; un signal qui n'a jamais été publié est servi comme
+repli avec le statut «~missing-fallback~». La stratégie sait laquelle des deux valeurs elle a reçue.
+
+\section{La configuration comme donnée}
+
+\begin{definition}[Magasin de paramètres, configuration comme donnée]\label{def:pl:signal-serving-and-parameter-management:store}
+Un \emph{magasin de paramètres}\index{magasin de paramètres} conserve chaque paramètre de production de chaque stratégie, chaque valeur étant accompagnée de la date à partir de laquelle
+elle s'applique et de la date à laquelle elle a été enregistrée, du changement qui l'a posée et de ses approbations. La \emph{configuration comme donnée}\index{configuration comme donnée} est
+la pratique qui consiste à conserver la configuration dans un tel magasin, sous forme d'enregistrements typés et versionnés que des outils peuvent valider, comparer et interroger, plutôt que
+sous forme de texte modifié sur place sur les machines de production.
+\end{definition}
+
+Les deux dates d'une valeur sont le temps de validité et le temps de connaissance du livre~7 (chapitre~3)~: la date à partir de laquelle elle s'applique et celle
+à laquelle le magasin en a eu connaissance. Elles permettent au magasin de répondre à la question que pose toute analyse post-mortem --- qu'est-ce qui était en service à 10~h~31 mardi dernier --- dans ses deux acceptions~: telle que la
+firme la connaissait à l'époque, et telle qu'elle est connue aujourd'hui, depuis qu'une correction a été enregistrée.
+
+\section{Schémas, approbations et historique}
+
+\begin{definition}[Schéma de configuration]\label{def:pl:signal-serving-and-parameter-management:schema}
+Un \emph{schéma de configuration}\index{schéma de configuration} déclare, pour chaque paramètre, son unité canonique et les unités dans lesquelles il peut être saisi,
+ses bornes, la variation maximale autorisée en une seule étape et l'ampleur de variation qui exige un second approbateur~; chaque valeur proposée est convertie
+et contrôlée à l'aide de ce schéma avant que quiconque ne l'approuve.
+\end{definition}
+
+Le paramètre de ce chapitre est une limite d'inventaire, exprimée en fraction du capital de la stratégie~: unité canonique une fraction, saisie en points de base,
+en pourcentage ou en fraction, bornée à 2~\%, modifiable d'au plus 50 points de base à la fois, et exigeant deux approbateurs pour toute modification supérieure à 20 points de base
+--- le principe des quatre yeux du livre~16 (chapitre~12) appliqué à un nombre.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{75}{96}{Une proposition~: convertie dans l'unité canonique, contrôlée au regard des bornes et de la
+limite de variation, signalant combien d'approbations elle exige~; toute proposition, refusée ou non, est versée à la piste d'audit.}\label{lst:pl:signal-serving-and-parameter-management:propose}
+
+Le cinquante du hook, saisi sans unité, est refusé~: une valeur sans unité n'est pas acceptée. Saisi comme «~50 percent~», il est refusé à double titre~: 0.5 est
+en dehors de $[0, 0.02]$, et un pas de 0.495 dépasse le pas autorisé de 0.005. Saisi comme «~50 bp~», il est accepté sous la forme 0.005. Une hausse à 75 points de base
+(un pas de 25) attend une première approbation, ne peut pas être approuvée par son auteur, et s'applique après la seconde. Chaque proposition, approbation et application
+est une ligne de la piste d'audit à chaînage de hachages du livre~12 (\texttt{firm.exptrack})~: modifier une ligne rompt la chaîne, et
+\texttt{verify} indique où.
+
+\omcode{code/firm/paramstore/firm_paramstore.py}{98}{120}{Approbation par une personne autre que l'auteur, autant que le changement en exige, et
+requête bitemporelle~: la valeur en vigueur à un temps de validité, telle que connue à un temps de connaissance.}\label{lst:pl:signal-serving-and-parameter-management:approve}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.9cm,minimum width=1.8cm,
+  fill=omDef!10},>=Stealth]
+\node[box] (p) at (0,0) {proposition\\ valeur + unité};
+\node[box] (s) at (2.45,0) {schéma\\ unités, bornes};
+\node[box] (a) at (4.9,0) {approbations\\ par d'autres};
+\node[box] (f) at (7.35,0) {indicateur\\ une stratégie};
+\node[box] (r) at (9.9,0) {déploiement\\ toutes les stratégies};
+\foreach \x/\y in {p/s,s/a,a/f,f/r} {\draw[->] (\x) -- (\y);}
+\node[box,fill=omThm!10,minimum width=10.3cm] (h) at (4.95,-1.5) {historique bitemporel (temps de validité et de connaissance) et piste d'audit à chaînage de hachages};
+\foreach \x in {p,s,a,f,r} {\draw[->,gray] (\x.south) -- (\x.south|-h.north);}
+\node[omThm,font=\scriptsize,anchor=south] at (2.45,0.55) {refusé~: 50 sans unité, 50 percent};
+\node[font=\scriptsize,anchor=south,align=center] at (8.6,0.55) {surveillance déclenchée~:\\indicateur coupé, valeur ramenée en arrière};
+\end{tikzpicture}
+
+\omcaption{Le cycle de vie d'une modification de paramètre dans le magasin~: saisie typée, contrôlée par le schéma, approuvée par d'autres, déployée derrière un indicateur
+vers une stratégie puis vers toutes, chaque étape étant enregistrée avec ses dates dans un historique qui ne peut pas être modifié
+sans que cela se remarque.}\label{fig:pl:signal-serving-and-parameter-management:life}
+\end{omfigure}
+
+\begin{example}[Ce qui était en service à 10~h~31 mardi dernier]\label{ex:pl:signal-serving-and-parameter-management:asof}
+La hausse à 75 points de base a été enregistrée le mardi à 9~h~43 et a pris effet à 10~h~00. Le jeudi, une correction a été enregistrée~: à partir du mardi
+à 10~h~30, la limite aurait dû être de 60. Interrogé le mercredi sur ce qui était en service le mardi à 10~h~31, le magasin répond 75 points de base~; interrogé aujourd'hui, il
+répond 60. Les deux réponses sont exactes, et une analyse post-mortem a besoin des deux~: ce que la stratégie a utilisé, et ce qu'elle aurait dû utiliser.
+\end{example}
+
+\section{Déployer une modification}
+
+\begin{definition}[Indicateur de fonctionnalité]\label{def:pl:signal-serving-and-parameter-management:flag}
+Un \emph{indicateur de fonctionnalité}\index{indicateur de fonctionnalité} (feature flag) est un commutateur nommé, placé dans la configuration, qui active un comportement ou une nouvelle valeur pour des stratégies,
+des utilisateurs ou une part du trafic choisis, sans nouvelle mise en production, de sorte qu'un changement puisse être déployé d'abord sur une seule stratégie et retiré en coupant l'indicateur.
+\end{definition}
+
+\begin{definition}[Dérive de configuration]\label{def:pl:signal-serving-and-parameter-management:drift}
+La \emph{dérive de configuration}\index{dérive de configuration} est un écart entre la configuration qu'un système est déclaré exécuter et celle
+qu'il exécute réellement~: un serveur non mis à jour, une valeur éditée sur place, un indicateur resté d'une ancienne version.
+\end{definition}
+
+Les indicateurs sont la manière dont le déploiement canari et le déploiement progressif du livre~7 (chapitre~21) s'appliquent aux paramètres~: la nouvelle valeur est placée derrière un indicateur activé
+pour une seule stratégie, surveillée, puis étendue. La dérive est ce que devient un indicateur laissé en place~: le \texttt{drift} du chapitre compare, stratégie par
+stratégie, la valeur déclarée à celle que chaque stratégie signale exécuter, et, sur la démonstration, trouve une seule stratégie qui exécute 0.5
+là où le magasin indique 0.005. Le cas le plus connu des deux est celui de Knight Capital~: le 1\up{er} août 2012, un indicateur utilisé autrefois pour une ancienne fonction a été
+réaffecté à du nouveau code~; ce nouveau code n'était pas parvenu sur l'un des huit serveurs, et les ordres portant l'indicateur y ont déclenché l'ancien code~; la
+perte a dépassé 460~millions de dollars (livre~7, chapitre~21, et livre~13, chapitre~22, le racontent en détail).
+
+\section{Cinquante de quoi~?}
+
+L'incident du chapitre fait tourner dix stratégies de cotation (le quoter du chapitre~11, un lot de chaque côté) pendant une heure chacune sur le simulateur du livre~10, chacune sur sa
+propre session \texttt{firm.tape}, avec 4~millions de dollars de capital chacune. La limite visée, 50 points de base de capital, correspond à deux lots à 100~\$~; lue comme
+50~pour cent, elle vaudrait deux cents. Le changement arrive dix minutes après le début de la session. Un moniteur compare les exécutions de chaque stratégie dans chaque fenêtre de cinq
+minutes, avec son nombre habituel pour cette fenêtre --- ici, la même session sans le changement, une référence meilleure que celle de n'importe quel moniteur réel --- et
+se déclenche au-delà de 1.3 fois ce nombre~; un déclenchement ramène le paramètre en arrière. L'exposition est l'inventaire au-delà de ce que la limite visée autorise (trois lots, avec
+un ordre en attente), en dollars.
+
+\omcode{code/platforms/16-signal-serving-and-parameter-management/python/pl_paramstore.py}{62}{68}{Le moniteur~: la fin de la première
+fenêtre de cinq minutes après le changement où les exécutions dépassent 1.3 fois le nombre habituel.}\label{lst:pl:signal-serving-and-parameter-management:monitor}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,xlabel={minutes après le changement},ylabel={inventaire excédentaire (milliers de \$)},xmin=-1,xmax=20,ymin=0,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=minutes,y=all_k]{figdata/platforms/16-signal-serving-and-parameter-management/timeline.csv};
+\addplot[color=omDef,thick,const plot] table[x=minutes,y=staged_k]{figdata/platforms/16-signal-serving-and-parameter-management/timeline.csv};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:5.4,380) {l'ensemble d'un coup~: détecté à 5 minutes};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:6,45) {progressif~: le canari seul, détecté à 15 minutes};
+\node[font=\scriptsize,anchor=east] at (axis cs:19.6,250) {contrôle de schéma~: refusé à l'entrée, rien};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Inventaire au-delà de la limite visée, sommé sur les stratégies qui ont reçu la mauvaise valeur, depuis le changement jusqu'à ce que le moniteur
+se déclenche et que la valeur soit ramenée en arrière, sur une grille de dix secondes. L'ensemble d'un coup, dix stratégies l'accumulent pendant cinq minutes~; progressivement, une seule stratégie pendant
+quinze~; avec un schéma, la valeur n'entre jamais. Données~: \texttt{fig\_paramstore.py}.}\label{fig:pl:signal-serving-and-parameter-management:timeline}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.0cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}@{}}
+\toprule
+politique & détection (minutes) & excédent maximal (\$k) & excédent \$-minutes (k) \\
+\midrule
+l'ensemble d'un coup & 5 & 410 & 1\,348 \\
+progressif (un canari pendant 30 min) & 15 & 30 & 53 \\
+contrôle de schéma & 0 (refusé) & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{L'erreur d'unités selon trois politiques~: minutes entre le changement et la détection, le maximum de l'inventaire excédentaire sommé sur les
+stratégies touchées, et son intégrale dans le temps.}\label{tab:pl:signal-serving-and-parameter-management:policies}
+\end{table}
+
+Le \Cref{tab:pl:signal-serving-and-parameter-management:policies} donne le résultat. L'ensemble d'un coup est détecté le plus tôt --- dix moniteurs surveillent au lieu
+d'un, et le premier se déclenche à cinq minutes --- et coûte le plus~: 410\,000~\$ d'inventaire excédentaire au maximum et 1.35 million de dollars-minute. Le
+moniteur propre au canari met quinze minutes à se déclencher (sa session est calme), mais seul le canari détient la mauvaise valeur~: 30\,000~\$ au maximum et
+53\,000 dollars-minute, soit 25 fois moins. Le contrôle de schéma ne coûte rien, car l'erreur ne devient jamais une valeur. Les stratégies diffèrent beaucoup
+quant au délai avec lequel leur taux d'exécution révèle l'erreur~: cinq sur dix après cinq minutes, trois après quinze, une après trente et une après cinquante.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,ybar,bar width=12pt,ylabel={minutes avant détection},ymin=0,ymax=58,
+  symbolic x coords={q01,q02,q03,q04,q05,q06,q07,q08,q09,q10},xtick=data,enlarge x limits=0.06,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  nodes near coords,nodes near coords style={font=\scriptsize}]
+\addplot[fill=omDef!45,draw=omDef] table[x=strategy,y=detect_min]{figdata/platforms/16-signal-serving-and-parameter-management/detection.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Minutes entre l'erreur d'unités et le premier déclenchement du moniteur de taux d'exécution, stratégie par stratégie, chacune sur sa propre session d'une heure. Le délai au bout duquel
+une erreur apparaît dépend du marché que la stratégie se trouve traiter~: cinq stratégies la révèlent dans la première fenêtre, une seule à la fin de
+l'heure. Le canari du déploiement progressif est q01. Données~: \texttt{fig\_paramstore.py}.}\label{fig:pl:signal-serving-and-parameter-management:detection}
+\end{omfigure}
+
+\begin{remark}[La détection n'est pas une protection]\label{rem:pl:signal-serving-and-parameter-management:detect}
+Une détection plus rapide n'a pas rendu l'ensemble d'un coup plus sûr~: il avait dix occasions de s'en apercevoir, et dix stratégies accumulaient de l'exposition pendant ce temps. Un
+déploiement progressif limite le dommage au canari quelle que soit la vitesse du moniteur~; un schéma empêche le dommage quel que soit le déploiement. Le moniteur présenté ici est
+optimiste --- il connaît le nombre contrefactuel d'exécutions de chaque stratégie --- et un moniteur réel serait plus lent, ce qui élargit chaque écart.
+\end{remark}
+
+\begin{dated}{2026-09}{Configuration à grande échelle}\label{dat:pl:signal-serving-and-parameter-management:scale}
+L'article de Facebook sur la gestion de configuration (Tang et autres, SOSP 2015) décrivait un système traitant plusieurs milliers de changements de configuration en ligne
+par jour et des billions de vérifications de configuration, utilisé pour les déploiements de produits, les expériences, la répartition de charge et le déploiement de modèles. L'ordonnance de la SEC sur
+Knight Capital (Release 34-70694, 2013) relève l'indicateur réaffecté, le serveur non mis à jour, environ 45~minutes d'ordres non voulus et une perte
+de plus de 460~millions de dollars.
+\end{dated}
+
+\section{Tutoriel~: une erreur d'unités, de trois façons}\label{tut:pl:signal-serving-and-parameter-management:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Servir un signal avec une borne de fraîcheur, placer un paramètre sous un schéma avec approbations et historique, et mesurer ce que coûte une erreur
+d'unités selon trois politiques. \textbf{État final~:} la \cref{fig:pl:signal-serving-and-parameter-management:timeline} et
+le \cref{tab:pl:signal-serving-and-parameter-management:policies}.
+\begin{tutsteps}
+\item \textbf{Signaux}~: \texttt{pl\_paramstore.signals()}.
+\item \textbf{Paramètres}~: \texttt{governance(dir)}~: les entrées refusées, les deux approbations, les réponses bitemporelles, les indicateurs, la dérive, la piste d'audit.
+\item \textbf{Incident}~: \texttt{incident()} fait tourner vingt heures de négociation simulée (dix stratégies, avec et sans l'erreur).
+\item \textbf{Politiques}~: lire les délais de détection et les expositions dans le résultat.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Abaisser le seuil du moniteur à 1.2 et compter ses fausses alarmes sur les exécutions inchangées~; étager le déploiement en trois
+étapes (une, trois, toutes) au lieu de deux.
+\end{tutorial}
+
+\section{Construction~: le magasin de paramètres}\label{bld:pl:signal-serving-and-parameter-management:paramstore}
+
+\begin{build}
+\bfield{Rôle} Chaque donnée de production qu'une stratégie lit --- signal ou paramètre --- typée, versionnée, approuvée, auditable et déployée
+progressivement.
+\bfield{Interface} \texttt{Schema}~; \texttt{ParamStore(root)} avec \texttt{register}, \texttt{propose}, \texttt{approve}, \texttt{as\_of},
+\texttt{history}, \texttt{audit}~; \texttt{Flags}~; \texttt{drift}~; \texttt{SignalService(max\_age, fallback)} avec \texttt{publish} et
+\texttt{get}.
+\bfield{Règles} Une valeur entre avec son unité ou pas du tout~; l'auteur n'approuve jamais~; les changements au-delà d'un seuil exigent deux approbateurs~; les
+valeurs portent un temps de validité et un temps de connaissance~; la piste d'audit est chaînée par hachage~; les signaux portent une version, une borne de fraîcheur et un repli déclaré.
+\bfield{Tests d'acceptation} \texttt{code/firm/paramstore/tests/}~: unités, bornes et pas~; approbations (auteur refusé, deux approbateurs distincts)~;
+requêtes bitemporelles et historique~; vérification de la piste d'audit et détection d'une ligne modifiée~; indicateurs, dérive et
+les trois statuts du \omterm{def:pl:signal-serving-and-parameter-management:service}{service de signaux}.
+\bfield{Pour aller plus loin} Déploiements en pourcentage par hachage du nom de la stratégie~; retour arrière automatique relié au moniteur~; contrôles de dérive contre le
+rapport propre de chaque stratégie au démarrage.
+\end{build}
+
+\begin{omsources}
+\item C.~Tang et al., ``Holistic configuration management at Facebook'', SOSP 2015.
+\item US Securities and Exchange Commission, \emph{In the Matter of Knight Capital Americas LLC}, Release No.\ 34-70694, 2013.
+\item One Quant Book~7, chapitres 3 et 21~; One Quant Book~12, chapitres 24 et 25~; One Quant Book~16, chapitre~12.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:1}
+Combien de lots représente une limite d'inventaire de 50 points de base de 4~millions de dollars à 100~\$ l'action, puis de 50~\%~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:2}
+Pourquoi la hausse de 50 à 75 points de base exige-t-elle deux approbateurs selon le schéma du chapitre, et la correction à 60 un seul~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:signal-serving-and-parameter-management:3}
+Que renvoie le \omterm{def:pl:signal-serving-and-parameter-management:service}{service de signaux} à 400 secondes dans l'exemple du chapitre, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:4}
+Pourquoi le déploiement simultané a-t-il été détecté plus tôt que le déploiement progressif, et pourquoi reste-t-il pire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:5}
+Une analyse post-mortem demande quelle limite une stratégie utilisait à 10~h~31 un mardi. Laquelle des deux réponses du magasin veut-elle, et quand veut-elle
+l'autre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:signal-serving-and-parameter-management:6}
+Lequel des contrôles du chapitre aurait arrêté l'incident Knight Capital tel que la SEC le décrit, et lequel ne l'aurait pas fait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:signal-serving-and-parameter-management:7}
+\emph{Programmation.} Relancer \texttt{incident} en choisissant comme canari la stratégie dont le moniteur se déclenche en dernier (q10).
+Que deviennent le temps de détection et l'exposition du déploiement progressif~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:signal-serving-and-parameter-management:8}
+\emph{Trouver la faille.} «~Nos paramètres sont dans un fichier YAML du dépôt, donc ils sont versionnés, relus et sûrs.~»
+\end{exercise}
+
+\section{Problème~: Cinquante de quoi~?}
+
+\begin{problem}[{Problème du week-end --- une erreur d'unités sous trois politiques}]\label{pb:pl:signal-serving-and-parameter-management:1}
+Les dix stratégies, le schéma et le moniteur du chapitre.
+
+\medskip\noindent\textbf{Partie I --- Le magasin.}
+\begin{enumerate}
+\item Que déclare le schéma de la limite d'inventaire~?
+\item Que se passe-t-il pour 50 saisi sans unité, comme pourcentage et comme points de base~?
+\item Qui peut approuver un changement, et combien d'approbations faut-il~?
+\item Quels sont les deux temps d'une valeur, et à quelle question répond chacun~?
+\item Que garantit la piste d'audit~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Signaux et indicateurs.}
+\begin{enumerate}[resume]
+\item Que renvoie le \omterm{def:pl:signal-serving-and-parameter-management:service}{service de signaux}, et avec quel statut, lorsqu'un signal est périmé~?
+\item Qui choisit le repli d'un signal, et quand~?
+\item À quoi sert un \omterm{def:pl:signal-serving-and-parameter-management:flag}{indicateur de fonctionnalité}, et que devient-il s'il est laissé en place~?
+\item Que trouve le contrôle de dérive dans la démonstration~?
+\item Que fit un indicateur réaffecté chez Knight Capital~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'incident.}
+\begin{enumerate}[resume]
+\item Que représentent 50 points de base et 50 pour cent en lots~?
+\item Comment le moniteur décide-t-il, et pourquoi est-il optimiste~?
+\item Quand se déclenche le moniteur de chaque stratégie~?
+\item Quelles sont l'exposition et le temps de détection, pris ensemble~?
+\item Et pour le déploiement progressif~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'exposition accumulée avant détection à cause de l'erreur d'unités sous un changement simultané, un déploiement progressif
+et une vérification du schéma, ainsi que les minutes avant détection dans chaque cas.
+\item Pourquoi la détection n'est-elle pas une protection~?
+\item Quel contrôle faudrait-il construire en premier~?
+\item Que faudrait-il ajouter pour attraper une erreur d'unités qui reste dans les bornes~?
+\item En une phrase~: qu'est-ce qu'un paramètre exige et qu'une variable n'exige pas~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:signal-serving-and-parameter-management:1}
+Comment empêchez-vous une erreur d'unités dans un paramètre de production~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:signal-serving-and-parameter-management:2}
+Un signal de recherche alimente des stratégies en production. Que se passe-t-il lorsque le travail qui le calcule échoue~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:signal-serving-and-parameter-management:3}
+Comment déploieriez-vous une modification d'une limite de risque sur une centaine de stratégies~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:signal-serving-and-parameter-management:4}
+Qu'est-ce que la \omterm{def:pl:signal-serving-and-parameter-management:drift}{dérive de configuration}, et comment la détecteriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:signal-serving-and-parameter-management:5}
+Concevez un système de gestion des paramètres pour une société de trading.
+\end{interviewq}

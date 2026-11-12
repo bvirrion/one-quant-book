@@ -1,0 +1,405 @@
+\chapter{Données de référence et services de symbologie}\label{ch:pl:reference-data-and-symbology-services}
+
+En janvier 2022, le ticker META appartenait à un fonds indiciel coté (ETF). À la fin de ce mois, le fonds a changé son ticker en
+METV, et le 9 juin 2022 une grande entreprise, négociée sous FB depuis dix ans, commença à l'être sous META, en gardant le même
+numéro d'identifiant pour ses actions. Un système qui indexait son historique par ticker détenait désormais, sous un seul symbole, six mois d'un fonds suivis de
+l'historique d'un autre émetteur, et rien ne l'a signalé~: les deux étaient des cours valides d'un titre réellement négocié sous META
+ces jours-là). Ce chapitre construit le service qui l'évite (\texttt{firm.refdata})~: il conserve chaque fait que chaque fournisseur a jamais livré
+sur un instrument, de façon bitemporelle~; il associe chaque symbole externe à un identifiant permanent, à une date donnée et tel qu'il était connu à un
+instant donné~; il assemble une \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} (golden copy) avec la provenance de chaque valeur~; il sert les opérations sur titres sous forme d'événements dont le sens peut changer
+avant qu'ils ne se produisent~; il tient de la même manière les contreparties de la société. Un univers synthétique, avec une réutilisation de tickers introduite à dessein, un fournisseur
+qui rate un renommage et une taille de lot mal saisie, mesure ce que vaut chaque élément.
+
+\section{Ce que sert le service de données de référence}
+
+Le livre~1 (chapitre~28) définissait les données de référence comme tout ce qui concerne un instrument et n'est pas un prix, et la symbologie comme
+l'ensemble des identifiants sous lesquels il est connu~; le livre~7 (chapitre~4) a construit un référentiel des titres (security master) fondé sur des identifiants permanents et des
+changements de ticker pour la recherche. La plateforme a besoin des mêmes faits sous forme de service, lu par chaque système de la carte du chapitre~1~: la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de
+ticks} pour nommer ses partitions, le trading pour connaître une taille de lot et un tick, le risque pour trouver le sous-jacent d'un instrument, le post-trade pour trouver
+son code ISIN et la devise de règlement-livraison.
+
+\begin{definition}[Service de données de référence]\label{def:pl:reference-data-and-symbology-services:service}
+Un \emph{service de données de référence}\index{service de données de référence} (reference-data service) est le \omterm{def:pl:the-platform-map:sor}{système de référence} (system of record) pour les instruments, les entités juridiques et
+opérations sur titres~: il ingère les faits livrés par les fournisseurs de données et les bourses, conserve chaque version de chacun avec l'instant où il
+était valide et l'instant où il est devenu connu, réconcilie les sources et répond aux questions de tout autre système à leur sujet à une
+date donnée et tel qu'il était connu à un instant donné.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box,fill=gray!12] (a) at (0,1.3) {fournisseur A};
+\node[box,fill=gray!12] (b) at (0,0.2) {fournisseur B};
+\node[box,fill=gray!12] (c) at (0,-0.9) {flux d'opérations\\sur titres};
+\node[box,fill=omMeth!15,text width=3.2cm] (st) at (3.8,0.2) {faits bitemporels\\clé $\to$ identifiant permanent};
+\node[box,fill=omThm!12,text width=2.3cm] (g) at (7.3,0.9) {copie de référence\\avec provenance};
+\node[box,fill=omThm!12,text width=2.3cm] (x) at (7.3,-0.5) {rapport de conflits\\(opérations)};
+\node[box,text width=2.9cm] (con) at (10.8,0.2) {base de ticks, trading,\\risque, post-trade,\\recherche};
+\draw[->] (a) -- (st); \draw[->] (b) -- (st); \draw[->] (c) -- (st);
+\draw[->] (st) -- (g); \draw[->] (st) -- (x);
+\draw[->] (g) -- (con);
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:pl:reference-data-and-symbology-services:service}{service de données de référence}~: les faits des fournisseurs et le flux des opérations sur titres sont conservés de façon bitemporelle sous des
+identifiants permanents~; une \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} est assemblée champ par champ, avec la source de chaque valeur, les désaccords sont envoyés à un rapport de conflits,
+et chaque consommateur interroge le service plutôt qu'une copie d'un fichier fournisseur.}\label{fig:pl:reference-data-and-symbology-services:arch}
+\end{omfigure}
+
+L'univers du chapitre compte 110 cotations sur 500 jours de négociation~: 100 au départ, 10 admises à la cote plus tard. Chaque cotation possède une clé externe
+permanente (son code ISIN dans les données synthétiques), un ticker, un nom, une taille de lot et un tick. Douze cotations changent de ticker~; cinq de leurs anciens
+tickers sont attribués plus tard à cinq des nouvelles cotations, comme META est passé d'un fonds à une entreprise. Vingt cotations subissent un split, chacun
+annoncé 10 à 30 jours avant que le split ne prenne effet~; un split annoncé a été annulé.
+
+\section{Fournisseurs, conflits et copie de référence}
+
+Aucune source n'a raison sur tout. Les fournisseurs diffèrent par leur couverture, leur rapidité et leur soin~: l'un reçoit directement les
+avis des bourses et met à jour les tickers le jour même, un autre est meilleur sur les noms et les détails juridiques~; chacun fait des erreurs que l'autre ne fait pas.
+Deux fournisseurs livrent les faits du chapitre. Le fournisseur A est rapide, mais il saisit mal la taille de lot d'une cotation (10 au lieu de 100) pendant six
+jours avant de la corriger. Le fournisseur B apprend avec deux jours de retard deux changements de ticker, et rate complètement un renommage jusqu'à trois jours
+après que son ancien ticker a été attribué à une nouvelle cotation~: pendant 146 jours, il associe ce ticker à la cotation qui ne l'utilise plus.
+
+\begin{definition}[Copie de référence]\label{def:pl:reference-data-and-symbology-services:golden}
+La \emph{copie de référence}\index{copie de référence} (golden copy) d'un instrument est l'enregistrement que le \omterm{def:pl:reference-data-and-symbology-services:service}{service de données de référence} assemble à partir de ses sources,
+champ par champ, selon des règles énoncées (une priorité entre sources par champ, une validation, des corrections manuelles), avec la source de chaque
+valeur conservée comme sa provenance~; elle est ce que lit chaque consommateur, tandis que les enregistrements propres aux fournisseurs sont conservés à côté.
+\end{definition}
+
+\omcode{code/firm/refdata/firm_refdata.py}{81}{97}{La copie de référence (la première source, dans la priorité du champ, qui a une
+valeur, avec son nom pour provenance) et le rapport de conflits (chaque instrument dont les sources divergent).}\label{lst:pl:reference-data-and-symbology-services:golden}
+
+Le \Cref{tab:pl:reference-data-and-symbology-services:quality} compte, sur les 52\,492 jours-instruments de l'univers et tels que connus
+chaque jour, combien de fois chaque source et la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} se trompent, et combien de fois le service signale un conflit. Avec le fournisseur A en tête
+pour les tickers, la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} ne se trompe jamais sur un ticker, et le rapport de conflits signale chaque jour où le fournisseur B s'est trompé, sauf les
+trois jours où il n'avait aucune valeur. La taille de lot montre l'autre versant~: le fournisseur A est aussi prioritaire pour les lots, de sorte que la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} recopie
+sa coquille pendant les six jours. La priorité détermine les erreurs dont la société hérite~; le rapport de conflits est ce qui les repère, puisque
+les deux sources avaient une valeur et divergeaient à chacun de ces jours-là.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+champ & fournisseur A erroné & fournisseur B erroné & \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} erronée & conflits signalés \\
+\midrule
+ticker (A en premier) & 0 & 153 & 0 & 150 \\
+taille de lot (A en premier) & 6 & 0 & 6 & 6 \\
+\bottomrule
+\end{tabular}
+\caption{Jours-instruments, sur 52\,492 et tels que connus chaque jour, où chaque source et la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} divergent de la
+vérité, et où le service signale un conflit entre les deux fournisseurs. Données~: \texttt{pl\_refdata.golden\_quality}.}\label{tab:pl:reference-data-and-symbology-services:quality}
+\end{table}
+
+La coquille sur la taille de lot montre aussi pourquoi le service est bitemporel plutôt qu'une table mise à jour. La coquille du fournisseur A est un fait valide
+à partir du jour 100, livré le jour 100~; sa correction est une autre version du même fait, toujours valide à partir du jour 100, livrée le
+jour 106 (la \cref{fig:pl:reference-data-and-symbology-services:bitemporal}). Interrogé sur le jour 103 tel que connu le jour 103, le service
+répond 10, la taille de lot qu'un système de trading a réellement utilisée ce jour-là~; interrogé sur le jour 103 tel que connu le jour 106 ou plus tard, il répond 100,
+la vérité. Une table mise à jour ne peut donner que la seconde réponse, et chaque ordre dimensionné avec 10 devient inexplicable.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,x=0.9cm,y=0.9cm]
+\draw[->] (0,0) -- (8.6,0) node[right]{date de validité};
+\draw[->] (0,0) -- (0,4.4) node[above]{temps de connaissance};
+\foreach \x/\l in {1/96,3/100,5/103,7/106} {\draw (\x,0.08) -- (\x,-0.08) node[below]{\l};}
+\foreach \y/\l in {1/96,2/100,3/103,4/106} {\draw (0.08,\y) -- (-0.08,\y) node[left]{\l};}
+\fill[omDef!15] (1,1) rectangle (3,4.2);
+\node at (2,2.6) {lot 100};
+\fill[omThm!20] (3,2) rectangle (8.3,4);
+\node at (5.6,2.5) {lot 10 (coquille de A)};
+\fill[omMeth!20] (3,4) rectangle (8.3,4.2);
+\draw[omMeth,thick] (3,4) -- (8.3,4);
+\node[anchor=south,omMeth] at (6.6,4.2) {lot 100 (correction)};
+\fill[omThm] (5,3) circle (2pt);
+\node[anchor=south west] at (5.05,3.0) {(103, 103): 10};
+\fill[omMeth] (5,4.1) circle (2pt);
+\end{tikzpicture}
+
+\omcaption{Taille de lot du fournisseur A pour la cotation 7, en bitemporel~: horizontalement la date de validité de la valeur, verticalement
+le moment où elle est connue. La coquille est valide à partir du jour 100 et connue dès le jour 100~; sa correction est valide à partir du même jour et connue à partir du jour 106.
+Une question désigne un point~: au jour 103, telle que connue le jour 103, la réponse est la coquille, 10, valeur qu'utilisent les systèmes ce jour-là~; telle que connue
+à partir du jour 106, la valeur corrigée, 100.}\label{fig:pl:reference-data-and-symbology-services:bitemporal}
+\end{omfigure}
+
+\begin{method}[Mise en œuvre d'une copie de référence]\label{met:pl:reference-data-and-symbology-services:golden}
+(1) Fixer un ordre de priorité des sources pour chaque champ, d'après leur exactitude et leur rapidité mesurées sur ce champ. (2) Conserver la valeur de chaque source,
+et non seulement le gagnant. (3) Signaler chaque divergence à une file d'attente des opérations le jour même, avec les valeurs et
+leurs sources, et la résoudre sur preuve (un avis de la bourse, l'émetteur). (4) Enregistrer une correction manuelle comme une source à part entière, avec
+son auteur et sa raison. (5) Mesurer chaque source par rapport à la vérité résolue, et réviser l'ordre de priorité.
+\end{method}
+
+\section{Résolution des symboles dans le temps}
+
+\begin{definition}[Résolution des symboles]\label{def:pl:reference-data-and-symbology-services:resolution}
+La \emph{résolution des symboles}\index{résolution des symboles} est la mise en correspondance d'un symbole externe (un ticker, un code de fournisseur) avec l'identifiant
+permanent de l'instrument qui le portait à une date donnée, telle que la firme la connaissait à un instant donné.
+\end{definition}
+
+Les deux instants comptent. La date de validité répond à «~quelle société était META le 3 janvier 2022~?~» --- un fonds. Le temps de connaissance répond à
+«~qu'est-ce que la firme croyait le matin où elle a négocié~?~» --- une réponse qui, pour un fournisseur ayant appris un changement tardivement, peut différer de la
+vérité. \texttt{resolve} prend les deux (\cref{lst:pl:reference-data-and-symbology-services:store}), et le service enregistre chaque fait
+dans le magasin bitemporel du livre~7, sous un index par date d'effet, de sorte que «~la valeur en vigueur à une date~» soit le dernier fait valide
+à cette date ou avant elle, dans la version connue au moment de la question.
+
+\omcode{code/firm/refdata/firm_refdata.py}{38}{58}{Faits datés par date d'effet dans un magasin bitemporel~: la valeur en vigueur à une date est
+celle de la plus récente date valide, antérieure ou égale à elle, dans la version connue au moment de la question.}\label{lst:pl:reference-data-and-symbology-services:store}
+
+\begin{proposition}[La correspondance du jour n'est pas un historique]\label{prop:pl:reference-data-and-symbology-services:today}
+Résoudre un symbole à chaque date passée avec la correspondance en vigueur aujourd'hui renvoie l'instrument qui porte aujourd'hui ce symbole. Elle
+diffère de la résolution à date exactement aux dates où le symbole appartenait à un autre instrument ou à aucun~: avant un
+changement de nom qui l'y amène, après un changement de nom qui l'en fait sortir, et avant une réutilisation.
+\end{proposition}
+
+\begin{proof}
+La correspondance du jour est une fonction constante de la date~; la résolution à date suit l'historique du symbole. Elles coïncident à une date donnée
+si et seulement si le détenteur du symbole à cette date est le détenteur du jour.
+\end{proof}
+
+Sur l'univers du chapitre, en échantillonnant tous les cinq jours, la résolution avec la correspondance du dernier jour désigne une cotation différente de
+la résolution à date sur 384 jours-ticker sur 10\,493, soit 3.7~\%. La \Cref{fig:pl:reference-data-and-symbology-services:t056} suit
+un ticker au fil de son existence~: il appartient à une cotation jusqu'au jour 33, à aucune jusqu'au jour 176, puis à la cotation
+qui l'a réutilisé.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5cm,xlabel={jour de négociation},ytick={0,1,2},
+  yticklabels={aucun,premier détenteur (cotation 56),réutilisateur (cotation 100)},ymin=-0.4,ymax=2.5,xmin=0,xmax=500,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.35)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[very thick,omDef,const plot] table[x=day,y=pit]{figdata/platforms/06-reference-data-and-symbology-services/t056.csv};
+\addplot[thick,omThm,dashed,const plot] table[x=day,y=today]{figdata/platforms/06-reference-data-and-symbology-services/t056.csv};
+\addplot[thick,omMeth,dotted,const plot,yshift=-2pt] table[x=day,y=vendor_b]{figdata/platforms/06-reference-data-and-symbology-services/t056.csv};
+\legend{à date (copie de référence),correspondance du jour,fournisseur B seul}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Ce que le ticker T056 désigne chaque jour~: à date par la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}, avec la correspondance du jour, et dans les seuls enregistrements du fournisseur
+B seuls. Le premier détenteur change de nom le jour 33, et une nouvelle cotation prend le ticker le jour 176~; la correspondance du jour attribue
+toute la période au réutilisateur, et le fournisseur B conserve le ticker sur le premier détenteur jusqu'au jour 179. Données~:
+\texttt{fig\_refdata.py}.}\label{fig:pl:reference-data-and-symbology-services:t056}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Un ticker passé de main en main}\label{dat:pl:reference-data-and-symbology-services:meta}
+Meta Platforms a annoncé le 31 mai 2022 que ses actions ordinaires de classe~A seraient négociées sur le Nasdaq sous le ticker META dès
+l'ouverture du 9 juin 2022, en remplacement de FB, avec un numéro CUSIP inchangé. Le ticker META avait appartenu au Roundhill Ball
+Metaverse ETF, qui a changé de ticker pour devenir METV à la fin de janvier 2022 (articles de presse, consultés en septembre 2026).
+\end{dated}
+
+\begin{remark}[Quel identifiant retenir comme clé]\label{rem:pl:reference-data-and-symbology-services:keys}
+Les tickers sont réutilisés~; les numéros de titres nationaux et internationaux (l'ISIN de l'ISO~6166) changent avec certaines opérations sur titres et
+sont partagés par les cotations d'un même instrument sur plusieurs plateformes~; le Financial Instrument Global Identifier est attribué une fois pour toutes, et il n'est jamais
+modifié ni réutilisé. La firme indexe tout par son propre identifiant permanent et enregistre chaque identifiant externe comme un attribut daté,
+comme le fait le référentiel des titres du livre~7.
+\end{remark}
+
+\section{Opérations sur titres comme service}
+
+Une opération sur titres est connue avant de se produire, et ce qui est connu peut changer~: un split est annoncé, confirmé, parfois modifié
+ou annulé. Un service qui n'enregistre que la version finale de chaque opération ne peut pas dire ce qu'une stratégie savait le jour où elle a négocié.
+
+\begin{definition}[Événement d'opération sur titres, événement de cycle de vie de l'instrument]\label{def:pl:reference-data-and-symbology-services:event}
+Un \emph{événement d'opération sur titres}\index{evenement@événement d'opération sur titres} est l'enregistrement de données de référence d'une opération sur titres~: sa nature
+(split, dividende, fusion, scission), ses conditions, sa date d'effet et son statut (annoncé, confirmé, modifié, annulé), chaque
+changement de statut constitue une nouvelle version, avec l'instant où il est devenu connu. Un \emph{événement de cycle de vie de l'instrument}\index{evenement@événement de cycle de vie de l'instrument}
+est tout changement daté des données de référence d'un instrument~: admission à la cote, changement de nom, changement de taille de lot ou de pas de cotation, opération sur titres, radiation,
+ou échéance.
+\end{definition}
+
+\omcode{code/firm/refdata/firm_refdata.py}{103}{128}{Opérations sur titres sous forme d'événements versionnés~: la dernière version connue au moment
+de la question tranche, et seuls les splits confirmés entrent dans le facteur d'ajustement.}\label{lst:pl:reference-data-and-symbology-services:actions}
+
+Dans le flux d'opérations sur titres du chapitre, chaque split est annoncé, confirmé trois jours plus tard, ou annulé. Le facteur d'ajustement
+entre deux dates est alors une question dotée d'un temps de connaissance~: pour le premier split (un quatre pour un, annoncé le jour 386, effectif
+le jour 412), le facteur sur les deux ans vaut 1 tel que connu le jour 385 ou 386, et 4 à partir du jour 389~; le split annulé n'y
+entre jamais. Un backtest qui demande le facteur avec le temps de connaissance de chaque décision est à date~; celui qui le demande avec la connaissance du jour
+ne l'est pas, pour tout signal qui utilise des niveaux de prix.
+
+\section{Contreparties, comptes et le reste}
+
+Les instruments constituent la moitié des données de référence. L'autre moitié est constituée des parties avec lesquelles la firme traite.
+
+\begin{definition}[Référentiel des contreparties]\label{def:pl:reference-data-and-symbology-services:cpty}
+Un \emph{référentiel des contreparties}\index{référentiel des contreparties} est l'enregistrement de données de référence des entités juridiques avec lesquelles la firme traite~:
+pour chacune, son identifiant d'entité juridique (LEI, livre~2, chapitre~28), ses dénominations, son entité mère, sa juridiction et les accords et
+les comptes qui lui sont rattachés, datés par date d'effet et bitemporels, comme les données des instruments.
+\end{definition}
+
+Son premier usage est l'agrégation~: les limites et les expositions sont fixées sur une mère ultime, donc la chaîne de mères doit être juste à la date
+de l'exposition et telle qu'elle était connue au moment où la limite a été vérifiée. Dans l'exemple du chapitre, un fonds est acquis par une filiale
+d'une banque le jour 250, et la firme l'apprend le jour 260~: interrogé le jour 255 sur le jour 255, la mère ultime du fonds est lui-même~; interrogé le jour 262,
+la société holding. Les deux réponses sont exactes, et un rapport de crédit produit le jour 255 doit pouvoir être reproduit avec la première
+(chapitre~25).
+
+\begin{example}[Le panier qui n'était pas détenu]\label{ex:pl:reference-data-and-symbology-services:basket}
+Une note de recherche retient 20 tickers le jour 0 (cinq d'entre eux seront renommés puis réutilisés, six subiront un split) et demande
+le rendement en conservation du panier sur les 500 jours. Calculé à chaque date avec les facteurs de split, le résultat est la vérité~: $+23.5~\%$. Avec le
+mapping de tickers d'aujourd'hui et des prix non ajustés, il vaut $-16.6~\%$, soit une erreur de 40.1 points~: les seuls splits non ajustés coûtent 45.8 points
+(les bonnes cotations, non ajustées, rapportent $-22.3~\%$), et le seul mapping d'aujourd'hui ajoute 5.7 (ajusté des splits, il rapporte $+29.2~\%$, les
+rendements des réutilisateurs remplaçant ceux des cotations visées).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xbar,bar width=9pt,xmin=-30,xmax=38,xlabel={rendement en conservation sur 500 jours (\%)},
+  ytick={0,1,2,3,4},yticklabels={vérité,à date,correspondance du jour~; ajusté,bons noms~; non ajusté,correspondance du jour~; non ajusté},
+  y dir=reverse,tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=ret,y=k]{figdata/platforms/06-reference-data-and-symbology-services/basket.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le rendement du même panier de 20 tickers calculé de cinq façons~: la vérité, à chaque date (égal à elle), le mapping d'aujourd'hui avec
+des prix ajustés des splits, les bonnes cotations avec des prix non ajustés, et le mapping d'aujourd'hui avec des prix non ajustés. Données~:
+\texttt{pl\_refdata.basket\_backtest}.}\label{fig:pl:reference-data-and-symbology-services:basket}
+\end{omfigure}
+
+\section{Tutoriel~: deux fournisseurs et un ticker réutilisé}\label{tut:pl:reference-data-and-symbology-services:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire le service à partir de deux fournisseurs imparfaits et d'un flux d'opérations sur titres, mesurer la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}, et montrer
+ce que vaut pour un backtest une résolution faite à chaque date. \textbf{État final~:} \cref{tab:pl:reference-data-and-symbology-services:quality},
+\cref{fig:pl:reference-data-and-symbology-services:t056,fig:pl:reference-data-and-symbology-services:basket}.
+\begin{tutsteps}
+\item \textbf{Univers}~: \texttt{pl\_refdata.universe()}~: cotations, renommages, réutilisations, splits et prix.
+\item \textbf{Livraison}~: \texttt{build()} alimente \texttt{firm.refdata} avec les faits du fournisseur A et du fournisseur B et le flux d'opérations sur titres,
+avec les défauts introduits volontairement.
+\item \textbf{\omterm{def:pl:reference-data-and-symbology-services:golden}{Copie de référence}}~: \texttt{golden\_quality(rd, u)} pour le ticker et la taille de lot~; \texttt{rd.conflicts} le jour de la
+première réutilisation.
+\item \textbf{Résolution}~: \texttt{mapping\_differs} et le cycle de vie du ticker T056.
+\item \textbf{Backtest}~: \texttt{basket\_backtest} de cinq façons.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Placer le fournisseur B en premier pour les tickers et compter les erreurs de la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}~; ajouter une correction manuelle qui corrige
+la coquille sur la taille de lot le deuxième jour, et vérifier que la provenance de la valeur est la correction manuelle et non le fournisseur A.
+\end{tutorial}
+
+\section{Construction~: le service de données de référence}\label{bld:pl:reference-data-and-symbology-services:refdata}
+
+\begin{build}
+\bfield{Rôle} Le \omterm{def:pl:the-platform-map:sor}{système de référence} pour les instruments, les opérations sur titres et les contreparties~: la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} y nomme ses partitions
+(chapitre~4), les règles de qualité des données le consultent pour leurs contrôles (chapitre~7), la saisie des transactions et le post-trade le lisent (chapitres~21--22).
+\bfield{Interface} \texttt{RefData(precedence)} avec \texttt{ingest(vendor, known, valid, key, field, value)}, \texttt{pid},
+\texttt{value}, \texttt{golden}, \texttt{conflicts}, \texttt{resolve(field, value, valid, known)}, \texttt{add\_action},
+\texttt{actions}, \texttt{factor(pid, start, end, known)}~; \texttt{CounterpartyMaster} avec \texttt{add}, \texttt{name},
+\texttt{ultimate\_parent}.
+\bfield{Règles} Chaque fait est conservé avec sa date de validité et son temps de connaissance, les corrections sont de nouvelles versions, jamais des modifications~; chaque
+clé externe correspond à un seul identifiant permanent, pour toujours~; la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} indique sa source pour chaque valeur~; chaque désaccord est
+signalé~; seules les opérations sur titres confirmées ajustent les prix, tels qu'ils étaient connus au moment de la demande.
+\bfield{Tests d'acceptation} \texttt{code/firm/refdata/tests/}~: identifiants permanents et valeurs effectives par fournisseur~; précédence,
+provenance et désaccords~; résolution à travers un renommage et une réutilisation, et historique demandé aujourd'hui~; une correction sous forme de version~; opérations
+annoncées, confirmées et annulées, et le facteur tel que connu~; une mère acquise et apprise plus tard.
+\bfield{Pour aller plus loin} Corrections manuelles comme source~; règles de validation (une taille de lot doit être un multiple d'un lot standard) qui mettent en quarantaine une
+valeur avant qu'elle n'atteigne la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}~; le référentiel des titres du livre~7 reconstruit à partir des faits du service.
+\end{build}
+
+\begin{omsources}
+\item Meta Platforms, ``Meta Platforms, Inc. to Change Ticker Symbol to `META' on June~9'', communiqué de presse, 31 mai 2022~; articles de presse
+sur le changement de ticker du Roundhill Ball Metaverse ETF, 2022.
+\item Object Management Group, Financial Instrument Global Identifier (FIGI), \texttt{openfigi.com}~; ISO~6166 (ISIN), décrite par
+l'Association of National Numbering Agencies.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:reference-data-and-symbology-services:1}
+Sur 10\,493 jours-tickers échantillonnés, 384 correspondent à une cotation différente avec le mapping d'aujourd'hui. Quelle est cette part, et sur quels types de
+dates cela se produit-il~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:reference-data-and-symbology-services:2}
+Le communiqué de presse de Meta indiquait que son numéro CUSIP ne changerait pas avec son ticker. Pourquoi cela compte-t-il pour les données de référence d'une firme, et
+pourquoi le CUSIP n'est-il toujours pas la clé de la firme~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:reference-data-and-symbology-services:3}
+Le premier split de l'univers (quatre pour un) est annoncé le jour 386, confirmé le jour 389 et effectif le jour 412. Quel est le facteur d'ajustement sur les deux années tel que connu
+les jours 385, 386, 389 et 412~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:reference-data-and-symbology-services:4}
+Le fournisseur A est le premier pour les tailles de lot et se trompe pendant six jours. Que sert la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} pendant ces jours, qu'est-ce qui détecte
+l'erreur, et quelle règle aurait empêché qu'elle atteigne la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:reference-data-and-symbology-services:5}
+Un fonds a été acquis le jour 250 et la firme l'a appris le jour 260. Quelle est sa mère ultime pour le jour 255 telle que connue le jour 255, et
+telle que connue le jour 262~? Quelle réponse un rapport de crédit imprimé le jour 255 doit-il afficher lorsqu'on le reproduit un mois plus tard~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:reference-data-and-symbology-services:6}
+Expliquer les deux parties de l'erreur de 40.1 points du panier de l'\cref{ex:pl:reference-data-and-symbology-services:basket}, et pourquoi elles ne
+se cumulent pas.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:reference-data-and-symbology-services:7}
+\emph{Programmation.} Placer le fournisseur B en premier dans la précédence du ticker et relancer \texttt{golden\_quality}. Combien de jours-instruments la
+\omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} est-elle fausse, et pourquoi pas 153~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:reference-data-and-symbology-services:8}
+\emph{Trouver la faille.} «~Nos backtests utilisent des prix ajustés avec les facteurs d'opérations sur titres du jour. C'est sans risque~: une division ne
+modifie pas la valeur d'une entreprise, donc ajuster l'historique pour elle ne peut pas faire fuiter d'information.~»
+\end{exercise}
+
+\section{Problème~: le ticker qui a changé de mains}
+
+\begin{problem}[{Problème du week-end --- deux fournisseurs et un panier}]\label{pb:pl:reference-data-and-symbology-services:1}
+L'univers du chapitre, soit 110 cotations sur 500 jours, ses deux fournisseurs, le flux d'opérations sur titres et le panier de 20 tickers.
+
+\medskip\noindent\textbf{Partie I --- Les faits.}
+\begin{enumerate}
+\item Combien de changements de nom, de réutilisations et de divisions l'univers contient-il, et combien de divisions sont annulées~?
+\item Quels deux instants chaque fait porte-t-il, et pourquoi les deux~?
+\item Sur quels points le fournisseur B se trompe-t-il, et pendant combien de temps au pire~?
+\item Sur quels points le fournisseur A se trompe-t-il~?
+\item Pourquoi le service conserve-t-il les valeurs des deux fournisseurs plutôt que la seule \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}.}
+\begin{enumerate}[resume]
+\item Sur combien de jours-instruments chaque fournisseur se trompe-t-il sur le ticker, ainsi que la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}~?
+\item Pourquoi la \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence} se trompe-t-elle sur la taille de lot pendant six jours~?
+\item Combien de conflits le service signale-t-il pour chaque champ~?
+\item Quelles deux cotations sont en conflit le jour 176, et pourquoi~?
+\item Quelle modification apporter à la précédence, et sur quels éléments la fonder~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Résolution et opérations.}
+\begin{enumerate}[resume]
+\item Sur quelle part des jours-tickers le référentiel du jour désigne-t-il la mauvaise cotation~?
+\item Suivre le ticker T056 sur les 500 jours.
+\item Quel facteur d'ajustement la première division donne-t-elle, tel qu'il est connu avant puis après sa confirmation~?
+\item Que devient la division annulée~?
+\item Quelle est la société mère ultime du fonds pour le jour 255, telle qu'elle est connue le jour 255 et le jour 262~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le rendement du panier à chaque instant, avec le référentiel du jour et les prix non ajustés, ainsi que les
+deux composantes de l'erreur.
+\item Laquelle des deux erreurs un chercheur remarquerait-il en premier, et laquelle est la plus dangereuse~?
+\item Que doit demander un backtest au \omterm{def:pl:reference-data-and-symbology-services:service}{service de données de référence}, et avec quels instants~?
+\item Que doit faire le responsable du rapport de conflits face au désaccord de 146 jours~?
+\item En une phrase~: pourquoi les données de référence doivent-elles être bitemporelles~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:reference-data-and-symbology-services:1}
+Pourquoi une société ne devrait-elle jamais indexer ses données par ticker~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:reference-data-and-symbology-services:2}
+Deux fournisseurs de données sont en désaccord sur la taille de lot d'un instrument. Comment le \omterm{def:pl:reference-data-and-symbology-services:service}{service de données de référence} doit-il trancher, et que doit-il conserver~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:reference-data-and-symbology-services:3}
+Comment les opérations sur titres créent-elles du biais d'anticipation dans un backtest, et comment l'évitez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:pl:reference-data-and-symbology-services:4}
+Pourquoi un \omterm{def:pl:reference-data-and-symbology-services:cpty}{référentiel des contreparties} doit-il être bitemporel~? Donnez un exemple impliquant des limites.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:reference-data-and-symbology-services:5}
+Concevez un \omterm{def:pl:reference-data-and-symbology-services:service}{service de données de référence} pour une société qui négocie des actions, des contrats à terme et des options dans plusieurs pays~: sources, identifiants,
+stockage, \omterm{def:pl:reference-data-and-symbology-services:golden}{copie de référence}, et la manière dont les consommateurs l'interrogent.
+\end{interviewq}

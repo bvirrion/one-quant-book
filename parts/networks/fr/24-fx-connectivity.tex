@@ -1,0 +1,344 @@
+\chapter{Connectivité FX}\label{ch:nw:fx-connectivity}
+
+Sur EBS, chaque paire de devises est désormais appariée en un seul lieu, New York ou Londres, et un trader à Tokyo l'atteint par une passerelle
+qui transmet l'ordre à travers un océan ou un continent. Un fournisseur de liquidité à Londres qui diffuse ses prix vers Tokyo cote sur
+une information déjà vieille de deux traversées eurasiennes au moment où un preneur de liquidité de Tokyo la voit~: 141~millisecondes
+au \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} d'un spécialiste. Pourtant, le contrôle de prix du fournisseur n'a besoin d'aucun temps de rétention pour attraper un preneur de Tokyo qui a eu la nouvelle en premier, tant que le fournisseur
+apprend la nouvelle aussi vite que la requête du preneur voyage. Lorsqu'il l'apprend plus lentement, le temps de rétention qui comblerait l'écart est un délai
+que le code de bonne conduite du marché n'autorise pas.
+
+Le livre~2 a décrit la structure du marché FX~: plateformes principales, ECN, plateformes mono-dealer, prime brokerage, cotations en streaming,
+last look et temps de rétention. Le livre~10 a introduit l'agrégateur de liquidité et le livre~13 la session FIX. Ce chapitre les place sur la
+carte des chapitres~10 à~12~: là où l'appariement FX a lieu, là où le crédit est vérifié, comment les flux d'un fournisseur de liquidité atteignent
+les sites, et ce que voient les agrégateurs. Les sites des plateformes sont des lignes datées~; le modèle de péremption est signalé comme tel.
+
+\section{Les sites d'appariement}
+
+\begin{definition}[Appariement multisite]\label{def:nw:fx-connectivity:multisite}
+L'\emph{appariement multisite}\index{appariement multisite} est une conception de plateforme dans laquelle des moteurs d'appariement tournent dans plusieurs centres de données,
+chaque instrument est apparié dans exactement l'un d'eux, et les passerelles des autres sites transmettent les ordres au moteur de l'instrument
+plutôt que de les apparier localement.
+\end{definition}
+
+\begin{dated}{2026-09}{Où les plateformes FX apparient et diffusent, d'après leurs documents de connectivité}\label{dat:nw:fx-connectivity:sites}
+\begin{itemize}
+\item EBS Market sur CME Globex~: chaque produit se négocie en un seul lieu. Le spot FX et les métaux de New York sont hébergés chez Equinix Secaucus NY5
+  (secours à Slough LD4.2)~; le spot FX et les NDF de Londres sont en LD4.2 (secours à NY5). TY3 à Tokyo n'a qu'une passerelle de commodité, qui achemine les ordres
+  vers New York ou Londres, et des données de marché conflatées filtrées par crédit~; un ordre envoyé à une passerelle de segment pour un instrument
+  qui n'y est pas apparié est rejeté. Les services partagés, dont les limites de crédit globales, sont à Chicago DC3.
+\item LSEG FX (guide de juin 2026)~: appariement spot et à terme à Londres LD4 (reprise à NY6)~; les flux PriceStream et
+  l'agrégation à New Jersey NY6, à Londres LD4 et à Tokyo TY3~; appariement des NDF à Singapour SG3 (reprise à LD4)~; \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation}
+  \omterm{def:nw:colocation-products-and-how-they-are-sold:mmr}{interconnexions} (cross-connects) de \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation} à LD4, TY3, NY4/NY5 et SG1, avec des longueurs de câble égales dans les bâtiments principaux.
+\end{itemize}
+\end{dated}
+
+Le change n'a pas de bourse unique par paire~: la même paire est cotée sur plusieurs plateformes, chacune avec ses propres sites, et toute
+plateforme qui apparie une paire l'apparie en un seul lieu. La carte est donc courte~: Slough, Secaucus, Tokyo et Singapour
+(\cref{tab:nw:fx-connectivity:floors}). Londres LD4 est là où se trouvent les moteurs londoniens et où siègent les fournisseurs
+de liquidité londoniens~; le campus de Secaucus héberge le moteur new-yorkais d'EBS et les flux de LSEG à New Jersey~; TY3 est un site d'accès et de diffusion sans
+appariement EBS~; SG1 et SG3 servent les NDF de LSEG.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Depuis Londres LD4 vers & Plancher de fibre, sens unique (ms) & À 1.5 (ms) & Aller-retour à 1.5 (ms) \\
+\midrule
+Secaucus NY5 et NY6 & 27.07 & 40.6 & 81.2 \\
+Tokyo TY3 & 46.85 & 70.3 & 140.5 \\
+Singapour SG1 & 53.10 & 79.7 & 159.3 \\
+\bottomrule
+\end{tabular}
+\caption{Planchers de fibre à sens unique depuis Londres LD4 vers les autres sites FX (géodésique et \omterm{def:nw:the-north-american-map:floor}{indice de groupe} du chapitre~10, coordonnées des sites dans
+\texttt{data/networks/sites.csv}), et au \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} de 1.5 du spécialiste du chapitre~19. Données~: \texttt{firm\_fxlinks.one\_way\_ms}.}\label{tab:nw:fx-connectivity:floors}
+\end{table}
+
+L'ordre d'un trader de Tokyo vers les moteurs d'EBS traverse la passerelle de Tokyo et le réseau~: au \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} de 1.5 et avec
+\qty{40}{\micro\second} pour les étapes de passerelle, de contrôle de crédit et d'appariement (hypothèses), il faut \qty{79.5}{\milli\second} pour atteindre New York et
+\qty{70.3}{\milli\second} pour Londres, dans un sens.
+
+\section{Contrôles de crédit dans le chemin de l'ordre}
+
+\begin{definition}[Filtre de crédit bilatéral]\label{def:nw:fx-connectivity:credit}
+Un \emph{filtre de crédit bilatéral}\index{filtre de crédit bilatéral} est un filtre de plateforme qui permet à deux participants de négocier
+et ne montre à chacun que les prix de l'autre lorsque chacun a accordé du crédit à l'autre~; il s'applique aux données de marché
+que reçoit un participant et à l'appariement de ses ordres.
+\end{definition}
+
+Les plateformes FX sont pour la plupart bilatérales en profondeur~: une transaction est un contrat entre deux firmes nommées, réglé entre
+elles ou par leurs prime brokers, de sorte que chacune doit avoir accordé du crédit à l'autre. EBS montre à chaque firme un carnet filtré par crédit, les niveaux de prix
+qu'elle peut réellement négocier, à côté d'un «~market best~» qui ignore le crédit, et prévient que la quantité filtrée peut dépasser ce qui est négociable.
+Le contrôle de crédit intervient donc à deux endroits du chemin~: dans les données (ce que la firme voit) et dans l'appariement (ce qu'elle peut
+négocier), et le meilleur prix apparent d'une firme n'est pas forcément son meilleur prix négociable.
+
+Pour un fournisseur de liquidité, le crédit est aussi la première moitié du last look. Le principe~17 du FX Global Code en retient deux~: la validité
+y compris «~un crédit disponible suffisant~», et le prix~; et le rapport 2021 du Global Foreign Exchange Committee ajoute que «~tout délai
+supplémentaire à ce qui est nécessaire pour achever le contrôle de prix et de validité est considéré comme contraire au principe~17~»
+(\cref{dat:nw:fx-connectivity:lastlook}).
+
+\begin{dated}{2026-09}{Last look, d'après le FX Global Code et son comité}\label{dat:nw:fx-connectivity:lastlook}
+Principe~17~: le last look est un contrôle de risque destiné à vérifier la validité (détails opérationnels et crédit disponible suffisant) et le prix (si le prix demandé
+«~reste cohérent avec le prix courant qui serait disponible pour le client~»). Rapport du GFXC sur le last look
+(août 2021)~: un délai supplémentaire au-delà des contrôles est contraire au principe~17~; les fournisseurs de liquidité doivent publier la
+durée maximale et minimale de leur fenêtre de last look.
+\end{dated}
+
+\section{Intégrer le rôle de fournisseur de liquidité}
+
+Un fournisseur de liquidité à Londres apprend un mouvement de prix à son origine, le valorise et diffuse la nouvelle cotation vers chaque site de plateforme. Un preneur
+de liquidité sur un site de plateforme apprend le même mouvement par son propre chemin. La péremption de la cotation sur le site correspond au retard du fournisseur moins celui du preneur~;
+un preneur qui frappe la cotation périmée envoie une requête au fournisseur, qui contrôle le prix à l'arrivée de la requête,
+ou après un temps de rétention.
+
+\omcode{code/firm/fxlinks/firm_fxlinks.py}{72}{82}{Péremption sur un site de plateforme, et temps de rétention avant le contrôle de prix qui permettrait au fournisseur de savoir ce que le preneur savait.}\label{lst:nw:fx-connectivity:stale}
+
+\begin{proposition}[Quand aucun temps de rétention n'est nécessaire]\label{prop:nw:fx-connectivity:hold}
+Si le chemin d'information du fournisseur depuis l'origine n'est pas plus lent que le chemin du preneur depuis l'origine, suivi du chemin de la requête
+vers le fournisseur, le contrôle de prix du fournisseur à l'arrivée reflète déjà tout mouvement que le preneur pouvait avoir vu~; le temps de rétention qui comble l'écart
+vaut le retard du fournisseur moins cette somme, et zéro sinon.
+\end{proposition}
+
+\begin{proof}
+Un mouvement à l'instant $\tau$ atteint le preneur en $\tau + d_T$ et, par la requête, le fournisseur au plus tôt en $\tau + d_T + d_R$~;
+le fournisseur le connaît en $\tau + d_I + p$. Le contrôle à l'arrivée plus un temps de rétention $h$ reflète le mouvement si et seulement si
+$d_I + p \le d_T + d_R + h$.
+\end{proof}
+
+Avec tous les chemins à un \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} de 1.5, l'inégalité triangulaire réduit le temps de rétention au seul traitement du fournisseur, quelle que soit
+la péremption. Pour un mouvement à Tokyo, la cotation du fournisseur de Londres atteint le site de Tokyo \qty{140.6}{\milli\second} après que le preneur de Tokyo
+en a eu connaissance~; la requête du preneur remonte ensuite à Londres en \qty{70.3}{\milli\second}, où le fournisseur avait appris le mouvement
+\qty{70.3}{\milli\second} après qu'il s'est produit. Le contrôle de prix à l'arrivée le détecte (avec la gigue (jitter) du modèle de
+\qty{0.5}{\milli\second} par tronçon, 70~\% immédiatement et 99.4~\% après un temps de rétention de deux millisecondes). Si en revanche le fournisseur apprend les mouvements de Tokyo
+par un backbone à 2.46 fois le plancher, sa cotation est périmée de \qty{185.6}{\milli\second} sur le site de Tokyo et le temps de rétention qui comblerait
+l'écart est \qty{45.1}{\milli\second}~: la différence entre les deux \omterm{def:nw:the-north-american-map:factor}{facteurs de tracé}, multipliée par le plancher.
+
+\omcode{code/networks/24-fx-connectivity/python/nw_fx.py}{33}{38}{Les chiffres du problème du week-end~: un mouvement à Tokyo, le site de Tokyo, un fournisseur de Londres.}\label{lst:nw:fx-connectivity:tokyo}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[ybar,width=11.5cm,height=5.8cm,bar width=9pt,ymin=0,ymax=160,xtick=data,
+  xticklabels from table={figdata/networks/24-fx-connectivity/staleness.csv}{site},
+  ylabel={péremption sur le site (ms)},xlabel={site de la plateforme},
+  nodes near coords={\pgfmathprintnumber[fixed,precision=0]{\pgfplotspointmeta}},
+  every node near coord/.append style={font=\scriptsize},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=x,y=ny]{figdata/networks/24-fx-connectivity/staleness.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=x,y=tokyo]{figdata/networks/24-fx-connectivity/staleness.csv};
+\legend{mouvement à New York,mouvement à Tokyo}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Modèle~: péremption de la cotation d'un fournisseur de liquidité de Londres sur chaque site de change (Londres LD4, Secaucus NY5 et NY6, Tokyo TY3, Singapour SG1), après un mouvement à New York ou à Tokyo, tous les chemins à
+1.5 fois le plancher de la fibre et \qty{0.1}{\milli\second} de valorisation. Un mouvement à Londres laisse chaque site
+périmé de \qty{0.1}{\milli\second}. Données~: \texttt{fig\_fx.py}, \texttt{nw\_fx.staleness\_table()}.}\label{fig:nw:fx-connectivity:staleness}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmin=0,xmax=60,ymin=0,ymax=1.05,xlabel={temps de rétention avant le contrôle de prix (ms)},
+  ylabel={requêtes de preneurs informés détectées},tick label style={font=\footnotesize},label style={font=\small},grid=major,
+  grid style={gray!25},legend pos=south east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick] table[x=hold,y=equal]{figdata/networks/24-fx-connectivity/caught.csv};
+\addplot[omThm,thick] table[x=hold,y=backbone]{figdata/networks/24-fx-connectivity/caught.csv};
+\legend{chemin d'information à 1.5,chemin d'information à 2.46}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Modèle~: part des requêtes de transaction d'un preneur de Tokyo ayant vu en premier un mouvement à Tokyo que le contrôle de prix du fournisseur de Londres
+intercepte, en fonction du temps de rétention avant le contrôle, avec une gigue (jitter) exponentielle de \qty{0.5}{\milli\second} par tronçon. Avec un chemin d'information
+aussi rapide que celui de la requête, un temps de rétention de deux millisecondes en intercepte 99.4~\%~; avec un backbone, 47 millisecondes sont nécessaires. Données~:
+\texttt{fig\_fx.py}, \texttt{nw\_fx.caught\_curves()}.}\label{fig:nw:fx-connectivity:caught}
+\end{omfigure}
+
+Le FX Global Code tranche quel correctif est admis. Un temps de rétention au-delà de ce qu'exigent les contrôles va à l'encontre du principe 17, donc le fournisseur ne peut pas compenser
+un chemin d'information lent par une fenêtre de last look plus longue~; il doit le rendre plus rapide, ou valoriser les mouvements de Tokyo à Tokyo, ce que
+permettent des sites de streaming comme le PriceStream de LSEG à TY3. La péremption elle-même n'est pas du ressort du fournisseur~: une cotation établie
+à Londres est périmée d'un aller-retour à Tokyo, et le seul remède pour un preneur qui veut des prix londoniens frais à Tokyo est un fournisseur qui cote
+depuis Tokyo.
+
+\section{Agrégateurs de liquidité}
+
+Un agrégateur de liquidité combine les flux de plusieurs fournisseurs et affiche le meilleur. Après un mouvement, les fournisseurs dont les cotations arrivent en dernier sont les
+dont les prix n'ont pas bougé, et leurs prix périmés sont les meilleurs du côté que le marché a délaissé~: l'agrégateur sélectionne
+la cotation la plus périmée précisément lorsqu'elle l'est. Chez un agrégateur de Tokyo, après un mouvement à Tokyo, la cotation d'un fournisseur de Tokyo est fraîche, celle d'un fournisseur de Londres
+reste périmée pendant \qty{140.5}{\milli\second}, et celle d'un fournisseur du New Jersey pendant \qty{158.9}{\milli\second}
+(\texttt{firm\_fxlinks.stale\_window\_ms}). C'est le côté fournisseur des courses du chapitre~19~: un fournisseur
+subit une sélection adverse proportionnelle à sa distance aux mouvements des paires qu'il cote, et un agrégateur rend cette
+sélection systématique. Les défenses du fournisseur sont celles évoquées plus haut~: un chemin d'information rapide, une valorisation proche de l'origine et un contrôle de prix sans délai
+supplémentaire.
+
+\begin{method}[Se connecter comme fournisseur de liquidité FX]\label{met:nw:fx-connectivity:lp}
+\begin{enumerate}
+\item Lister les plateformes et leurs sites pour chaque paire~: où elle apparie, où elle diffuse en streaming, où se trouvent les passerelles.
+\item Pour chaque paire, repérer l'origine de ses mouvements et comparer le chemin d'information du fournisseur aux chemins des preneurs et au
+  chemin de retour de la requête (\cref{prop:nw:fx-connectivity:hold}).
+\item Lorsque le chemin d'information du fournisseur est plus lent, le raccourcir ou valoriser à partir d'un site proche de l'origine~; ne jamais allonger la
+  fenêtre de last look pour compenser.
+\item Veiller à la cohérence du crédit entre les plateformes et dans le contrôle de validité, et mesurer les rejets par motif.
+\item Mesurer la péremption sur chaque site à partir des horodatages du fournisseur lui-même, ainsi que les exécutions qui suivent des mouvements non encore vus.
+\end{enumerate}
+\end{method}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  site/.style={draw=omDef,fill=omDef!10,rounded corners,align=center,minimum height=10mm,inner sep=3pt},
+  lp/.style={draw=omThm,fill=omThm!12,rounded corners,align=center,minimum height=10mm,inner sep=3pt}]
+\node[lp] (ld) at (0,0) {Londres LD4\\fournisseur~; moteurs};
+\node[site] (ny) at (-4.2,-2.2) {Secaucus NY5 et NY6\\moteur~; flux};
+\node[site] (ty) at (4.2,-2.2) {Tokyo TY3\\passerelle~; flux};
+\node[site] (sg) at (4.2,1.6) {Singapour SG1 et SG3\\moteur NDF};
+\draw[->,omThm,thick] (ld) -- node[above,sloped,font=\footnotesize] {40.6 ms} (ny);
+\draw[->,omThm,thick] (ld) -- node[above,sloped,font=\footnotesize] {70.3 ms} (ty);
+\draw[->,omThm,thick] (ld) -- node[above,sloped,font=\footnotesize] {79.7 ms} (sg);
+\draw[->,omDef,dashed] (ty) -- node[below,font=\footnotesize] {ordres vers New York ou Londres} (ny);
+\end{tikzpicture}
+
+\omcaption{Flux d'un fournisseur de Londres vers les sites de change, dans un sens, à 1.5 fois le plancher de la fibre, et la passerelle de Tokyo qui transmet
+les ordres aux moteurs. Schéma indicatif~; distances comme dans le \cref{tab:nw:fx-connectivity:floors}.}\label{fig:nw:fx-connectivity:fanout}
+\end{omfigure}
+
+\section{Tutoriel~: péremption sur chaque site}\label{tut:nw:fx-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Calculer la péremption des cotations d'un fournisseur de Londres sur les sites de change, et ce que son contrôle de prix doit intercepter pour attraper les preneurs
+qui ont vu le mouvement en premier. \textbf{État final~:} les \cref{fig:nw:fx-connectivity:staleness,fig:nw:fx-connectivity:caught}.
+\begin{tutsteps}
+\item \textbf{Sites.} \texttt{firm\_fxlinks.load\_venues} et \texttt{sites} lisent les lignes datées des plateformes et les coordonnées.
+\item \textbf{Péremption.} \texttt{staleness\_ms} et \texttt{hold\_ms} (\cref{lst:nw:fx-connectivity:stale}) pour chaque origine et
+  site, avec \texttt{Paths} pour les \omterm{def:nw:the-north-american-map:factor}{facteurs de tracé}.
+\item \textbf{Contrôles.} \texttt{caught} ajoute la gigue (jitter) et compte les requêtes de preneurs informés interceptées après chaque temps de rétention~; \texttt{nw\_fx.tokyo}
+  (\cref{lst:nw:fx-connectivity:tokyo}) donne les chiffres du problème du week-end.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Doter chaque preneur d'un chemin par faisceau hertzien là où il en existe (chapitre~14) et voir quels sites voient leurs temps de rétention bondir~; ajouter un
+deuxième fournisseur à Tokyo et mesurer ce qu'un agrégateur y sélectionne.
+\end{tutorial}
+
+\section{Construction~: le modèle de connectivité FX}\label{bld:nw:fx-connectivity:fxlinks}
+
+\begin{build}
+\bfield{Rôle} Où les plateformes FX apparient et diffusent, et ce que voient les flux d'un fournisseur et ses contrôles de prix sur chaque site~: les lignes FX du
+plan du chapitre~29.
+\bfield{Interface} \texttt{firm\_fxlinks}~: \texttt{Venue}, \texttt{load\_venues}, \texttt{sites}, \texttt{one\_way\_ms},
+\texttt{Paths}, \texttt{staleness\_ms}, \texttt{hold\_ms}, \texttt{caught}, \texttt{stale\_window\_ms}, \texttt{order\_path\_ms}.
+\bfield{Règles} Les sites des plateformes sont des lignes datées avec leurs sources~; les chemins sont des planchers de fibre multipliés par les \omterm{def:nw:the-north-american-map:factor}{facteurs de tracé} annoncés~; la gigue (jitter) et le traitement sont des
+hypothèses déclarées~; les résultats sont un modèle.
+\bfield{Tests d'acceptation} \texttt{code/firm/fxlinks/tests/}~: la table des plateformes, aucun temps de rétention lorsque les chemins sont égaux pour chaque origine et chaque site, le
+temps de rétention égal à l'écart des \omterm{def:nw:the-north-american-map:factor}{facteurs de tracé}, et les fenêtres de péremption et le chemin de l'ordre.
+\bfield{Pour aller plus loin} Chemins par faisceau hertzien pour les preneurs~; plusieurs fournisseurs sur plusieurs sites~; limites de crédit par contrepartie dans le chemin de l'ordre.
+\end{build}
+
+\begin{omsources}
+\item CME Group Client Systems Wiki~: EBS Market on CME Globex Market Functionality~; iLink Binary Order Entry for EBS~; données de marché filtrées par crédit
+  pour EBS.
+\item LSEG, FX Venues Colo Connectivity Technical Deployment Guide, version 2.6 (juin 2026).
+\item Global Foreign Exchange Committee, Report on Last Look (août 2021), et le FX Global Code, Principle 17.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:fx-connectivity:1}
+Déterminer où EBS apparie le spot FX de New York, et où il apparie le spot FX de Londres et les NDF.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:fx-connectivity:2}
+Déterminer ce que montre à une firme un carnet filtré par crédit, et pourquoi sa quantité peut tromper.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:fx-connectivity:3}
+Calculer le plancher de fibre à sens unique de LD4 vers TY3, et l'aller-retour à un \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} de 1.5~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fx-connectivity:4}
+En utilisant la \cref{prop:nw:fx-connectivity:hold}, expliquer pourquoi un mouvement à Londres ne laisse les cotations du fournisseur de Londres
+périmées que de \qty{0.1}{\milli\second} sur chaque site~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fx-connectivity:5}
+Un trader de Tokyo envoie un ordre pour une paire appariée à New York par la passerelle de Tokyo. Calculer le temps nécessaire pour atteindre le moteur dans le
+modèle, et ce que gagnerait un serveur de New York.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:fx-connectivity:6}
+Expliquer pourquoi un agrégateur de liquidité a tendance à afficher la cotation la plus périmée après un mouvement.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:fx-connectivity:7}
+\emph{Programmation.} Avec \texttt{firm\_fxlinks.caught}, déterminer quel temps de rétention intercepte 99~\% des demandes informées lorsque le chemin d'information du fournisseur
+est de 2.46, la gigue du modèle étant de \qty{0.5}{\milli\second}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:fx-connectivity:8}
+\emph{Trouver la faille.} «~Nos exécutions à Tokyo sont toxiques parce que nos cotations y sont périmées de 140 millisecondes~; une fenêtre de last look
+de 150 millisecondes suffira à corriger cela.~»
+\end{exercise}
+
+\section{Problème~: USDJPY sur trois sites}
+
+\begin{problem}[{Problème du week-end --- les cotations d'un fournisseur de Londres sur le site de Tokyo}]\label{pb:nw:fx-connectivity:1}
+Un fournisseur de liquidité à Londres, LD4, diffuse l'USDJPY en streaming vers les plateformes de Londres, de Secaucus et de Tokyo. Supposons que la nouvelle qui fait bouger l'USDJPY
+éclate à Tokyo. Utiliser le modèle du chapitre~: chaque chemin à 1.5 fois le plancher de fibre sauf indication contraire, \qty{0.1}{\milli\second} de valorisation, et
+une gigue de \qty{0.5}{\milli\second} par tronçon lorsque cela est demandé.
+
+\medskip\noindent\textbf{Partie I --- Distances.}
+\begin{enumerate}
+\item Calculer les planchers de fibre à sens unique de LD4 vers NY5 et vers TY3.
+\item Les calculer pour un \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} de 1.5.
+\item Déterminer le degré de péremption de la cotation du fournisseur sur chaque site après un mouvement à Tokyo.
+\item Même question après un mouvement à New York.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le contrôle de prix.}
+\begin{enumerate}[resume]
+\item Avec tous les chemins à 1.5, déterminer le temps de rétention que le contrôle de prix doit avoir pour intercepter un preneur de liquidité de Tokyo ayant vu un mouvement à Tokyo.
+\item Déterminer la part que le contrôle intercepte immédiatement, puis après deux millisecondes, en tenant compte de la gigue.
+\item Si le fournisseur apprend les mouvements de Tokyo par un backbone à 2.46, déterminer la péremption et le temps de rétention.
+\item Déterminer alors le temps de rétention qui intercepte 99~\%.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les règles.}
+\begin{enumerate}[resume]
+\item Indiquer à quoi servent, selon le Principle 17, les contrôles.
+\item Déterminer si le fournisseur peut allonger sa fenêtre jusqu'à \qty{45}{\milli\second}.
+\item Indiquer les recours autorisés.
+\item Préciser où se placerait un moteur de valorisation à Tokyo, et ce qu'il changerait pour le site de Tokyo.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la péremption de la cotation sur le site de Tokyo d'un fournisseur hébergé à Londres, et le temps de rétention qui
+  la neutraliserait.
+\item Indiquer quels chiffres sont publiés et lesquels sont supposés.
+\item Indiquer ce que voit un agrégateur de liquidité à Tokyo après un mouvement à Tokyo.
+\item Indiquer comment le fournisseur devrait mesurer sa péremption en production.
+\item Expliquer ce que signifie la passerelle de Tokyo pour un preneur de Tokyo sur EBS.
+\item Indiquer comment des chemins par faisceau hertzien pour les preneurs modifieraient le résultat.
+\item Indiquer où cela se place dans le plan du chapitre~29.
+\item En une phrase, préciser ce qui détermine si le last look peut protéger un fournisseur éloigné.
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:fx-connectivity:1}
+Où placeriez-vous les serveurs pour négocier le spot FX sur les principales plateformes, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:fx-connectivity:2}
+À quoi sert le last look, et à quoi ne sert-il pas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:fx-connectivity:3}
+Comment mesureriez-vous la péremption de vos cotations sur chaque plateforme~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:fx-connectivity:4}
+Vos exécutions sur une plateforme sont devenues toxiques depuis un changement de réseau. Que regardez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:nw:fx-connectivity:5}
+Pourquoi le meilleur prix d'un agrégateur de liquidité peut-il être moins bon qu'il n'y paraît~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:fx-connectivity:6}
+Concevez l'infrastructure de valorisation et de cotation en streaming d'un fournisseur de liquidité cotant les paires de devises G10 auprès de clients à Londres, New York et Tokyo.
+\end{interviewq}

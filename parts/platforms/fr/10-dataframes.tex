@@ -1,0 +1,390 @@
+\chapter{Dataframes}\label{ch:pl:dataframes}
+
+Deux chercheurs calculent des barres de cinq minutes à partir des mêmes transactions et obtiennent des volumes différents. Une bibliothèque nomme une barre par son left
+edge et place une transaction horodatée exactement sur une borne dans la barre qui commence à cette borne~; l'autre la nomme par son right edge et
+place la même transaction dans la barre qui se termine à cette borne~; l'un des deux supprime les minutes pendant lesquelles rien n'a été échangé, l'autre non.
+Les deux sont justes selon leurs propres conventions, et un signal qui compare les deux ensembles de barres trouve une régularité qui n'est rien d'autre que la
+convention. Le \omterm{def:pl:dataframes:dataframe}{dataframe} est le langage de travail de la plateforme de recherche~; ses idiomes --- barres, jointures as-of, fenêtres glissantes,
+rangs cross-sectionnels, pivots --- c'est là que se cachent ses bugs silencieux, et ses moteurs diffèrent énormément par leur coût. Ce chapitre
+formule une fois pour toutes ces idiomes avec des conventions explicites pour trois moteurs (\texttt{firm.marketdf}), vérifie que les moteurs concordent, et
+exécute sur un mois de cotations et de transactions un même pipeline de recherche, en \omterm{def:pl:dataframes:eager}{évaluation immédiate}, en \omterm{def:pl:dataframes:eager}{évaluation paresseuse} et en \omterm{def:pl:dataframes:outofcore}{traitement hors mémoire}.
+
+\section{Le modèle du dataframe}
+
+\begin{definition}[Dataframe]\label{def:pl:dataframes:dataframe}
+Un \emph{dataframe}\index{dataframe} est une table de colonnes nommées et typées, de même longueur, munie d'opérations qui agissent sur des colonnes entières
+et sur des \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes}~: sélection, filtrage, colonnes calculées, regroupement et agrégation, jointures, tri, fenêtres et remodelage.
+\end{definition}
+
+Les trois moteurs du chapitre mettent en œuvre le même modèle de façon différente. pandas conserve chaque colonne sous forme de tableau numpy (ou
+tableau Arrow) muni d'un index de lignes, et exécute chaque opération dès qu'elle est appelée. Polars conserve les colonnes dans la disposition mémoire d'Arrow,
+n'a pas d'index de lignes, et peut soit exécuter chaque opération, soit construire un plan et l'exécuter plus tard. DuckDB est un moteur SQL~: une requête
+est un plan, exécuté lorsque son résultat est demandé (chapitre~5). La \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes} du chapitre~3 sous-tend les trois.
+
+\begin{definition}[Format long, format large]\label{def:pl:dataframes:shape}
+Une table en \emph{format long}\index{format long} a une ligne par observation et une colonne pour chaque variable, y compris les clés
+(symbole, temps, valeur). Les mêmes données en \emph{format large}\index{format large} ont une ligne par valeur d'une clé et une colonne par
+valeur de l'autre (une ligne par minute, une colonne par symbole).
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,cell/.style={draw,minimum width=1.05cm,minimum height=0.42cm,inner sep=1pt}]
+\foreach \r/\t/\s/\v in {0/09:31/AAA/10.1,1/09:31/BBB/20.4,2/09:32/AAA/10.2,3/09:32/BBB/20.3} {
+  \node[cell] at (0,-\r*0.42) {\t}; \node[cell] at (1.05,-\r*0.42) {\s}; \node[cell] at (2.1,-\r*0.42) {\v};}
+\foreach \x/\h in {0/heure,1.05/symbole,2.1/clôture} {\node[cell,fill=omDef!15,font=\tiny] at (\x,0.42) {\h};}
+\node[font=\scriptsize\itshape] at (1.05,1.05) {long~: une ligne par observation};
+\draw[->,thick] (3.1,-0.4) -- node[above]{pivot} (4.6,-0.4);
+\draw[<-,thick] (3.1,-0.9) -- node[below]{dépivoter} (4.6,-0.9);
+\foreach \r/\t/\a/\b in {0/09:31/10.1/20.4,1/09:32/10.2/20.3} {
+  \node[cell] at (5.6,-\r*0.42) {\t}; \node[cell] at (6.65,-\r*0.42) {\a}; \node[cell] at (7.7,-\r*0.42) {\b};}
+\foreach \x/\h in {5.6/heure,6.65/AAA,7.7/BBB} {\node[cell,fill=omMeth!15] at (\x,0.42) {\h};}
+\node[font=\scriptsize\itshape,align=center] at (6.65,1.2) {large~: une ligne par minute,\\une colonne par symbole};
+\end{tikzpicture}
+
+\omcaption{Les mêmes cours de clôture en \omterm{def:pl:dataframes:shape}{format long} (clés en colonnes) et en \omterm{def:pl:dataframes:shape}{format large} (une clé en lignes, l'autre en colonnes).
+Le code de recherche passe de l'un à l'autre~: le \omterm{def:pl:dataframes:shape}{format long} pour le stockage, les jointures et les regroupements~; le \omterm{def:pl:dataframes:shape}{format large} pour l'arithmétique cross-sectionnelle et
+les matrices.}\label{fig:pl:dataframes:shape}
+\end{omfigure}
+
+Les données de marché sont stockées au \omterm{def:pl:dataframes:shape}{format long} (les partitions du chapitre~4 sont des tables longues), et la plupart des transformations sont plus claires sous cette forme~: une fenêtre glissante
+est une fenêtre sur les lignes d'un même symbole, un rang cross-sectionnel est un rang sur les lignes d'une même minute. Le \omterm{def:pl:dataframes:shape}{format large} sert aux
+opérations matricielles de la construction de portefeuille (livre~7, chapitres~24--26), et le pivot entre les deux est l'endroit où
+apparaissent les valeurs manquantes~: une minute où un symbole n'a pas été échangé est une cellule vide du tableau large, jamais une ligne du tableau long.
+
+\section{Évaluation immédiate et évaluation paresseuse}
+
+\begin{definition}[Évaluation immédiate, évaluation paresseuse]\label{def:pl:dataframes:eager}
+Un moteur à \emph{évaluation immédiate}\index{évaluation immédiate} (eager evaluation) exécute chaque opération dès qu'elle est appelée et matérialise l'intégralité
+de son résultat. Un moteur à \emph{évaluation paresseuse}\index{évaluation paresseuse} (lazy evaluation) enregistre les opérations sous forme de plan et n'exécute ce plan que
+lorsqu'un résultat est demandé, ce qui lui permet de voir l'ensemble du calcul avant d'en exécuter la moindre partie.
+\end{definition}
+
+L'\omterm{def:pl:dataframes:eager}{évaluation immédiate} est facile à raisonner et à déboguer pas à pas~; chaque table intermédiaire existe, et chaque table intermédiaire
+coûte de la mémoire. L'\omterm{def:pl:dataframes:eager}{évaluation paresseuse} donne au moteur l'ensemble du pipeline, ce qui rend l'optimisation possible.
+
+\section{Plans de requête et optimisation}
+
+\begin{definition}[Optimiseur de requêtes]\label{def:pl:dataframes:optimiser}
+Un \emph{optimiseur de requêtes}\index{optimiseur de requêtes} (query optimiser) réécrit un plan en un plan équivalent et moins coûteux avant de l'exécuter~: il reporte les filtres
+et les projections vers les lectures (pour que moins de lignes et de colonnes soient lues, chapitre~3), supprime les colonnes et les opérations inutiles, réordonne les
+jointures et les agrégations, et choisit les algorithmes.
+\end{definition}
+
+Une requête en \omterm{def:pl:dataframes:eager}{évaluation paresseuse} sur les cours d'un symbole pour un jour donné, écrite comme un parcours de chaque fichier de transactions suivi d'un filtre et d'une sélection, est
+optimisée par Polars en un plan qui ne lit qu'une partition et quatre des six colonnes, et applique le filtre pendant le parcours
+(la \cref{fig:pl:dataframes:plan}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,op/.style={draw,rounded corners=2pt,align=center,minimum width=4.4cm,minimum height=0.62cm,
+  inner sep=2pt},>=Stealth]
+\node[font=\small\bfseries] at (0,0.75) {tel qu'écrit};
+\node[op,fill=omMeth!12] (a1) at (0,0) {sélection \texttt{ts}, \texttt{price}};
+\node[op,fill=omMeth!12] (a2) at (0,-1.0) {filtre symbole $=$ S007, date $=5$};
+\node[op,fill=omThm!12] (a3) at (0,-2.0) {parcours des 20 partitions par date\\ les 6 colonnes};
+\draw[->] (a3) -- (a2); \draw[->] (a2) -- (a1);
+\draw[->,very thick,gray] (2.6,-1.0) -- node[above,black]{optimiseur} (4.2,-1.0);
+\node[font=\small\bfseries] at (6.8,0.75) {tel qu'exécuté};
+\node[op,fill=omMeth!12] (b1) at (6.8,0) {sélection \texttt{ts}, \texttt{price} (2 sur 2)};
+\node[op,fill=omDef!12,minimum height=1.62cm] (b2) at (6.8,-1.5) {parcours de \texttt{date=5} seulement\\ projection de 4 colonnes sur 6\\ filtre symbole $=$ S007\\
+  pendant le parcours};
+\draw[->] (b2) -- (b1);
+\node[anchor=north,align=center,text width=4.6cm] at (6.8,-2.45) {élagage des partitions, report des projections et report des prédicats};
+\end{tikzpicture}
+
+\omcaption{Une requête restreinte telle qu'écrite et telle que Polars l'exécute (d'après le plan qu'il affiche). Le filtre sur la colonne de partition supprime 19 partitions sur
+20 avant qu'aucun fichier ne soit ouvert~; la projection conserve les deux colonnes renvoyées et les deux que lit le filtre~; le filtre sur le
+symbole s'exécute à l'intérieur du parcours.}\label{fig:pl:dataframes:plan}
+\end{omfigure}
+
+L'élagage des partitions (seule \texttt{date=5} est parcourue), le \omterm{def:pl:columnar-formats:pushdown}{report des projections} (quatre colonnes~: les deux demandées et les deux dont le filtre
+a besoin) et le \omterm{def:pl:columnar-formats:pushdown}{report des prédicats} du chapitre~3 sont tous du ressort de l'optimiseur~; une version en \omterm{def:pl:dataframes:eager}{évaluation immédiate} du même code lirait le mois entier et
+le filtrerait en mémoire.
+
+\section{Traitement hors mémoire et exécution en flux}
+
+\begin{definition}[Traitement hors mémoire, exécution en flux]\label{def:pl:dataframes:outofcore}
+Le \emph{traitement hors mémoire}\index{traitement hors mémoire} (out-of-core processing) calcule un résultat sur des données plus grandes que la mémoire en les lisant par morceaux
+depuis le stockage. L'\emph{exécution en flux}\index{exécution en flux} (streaming execution) en est la forme au niveau du moteur~: les opérateurs du plan se transmettent des lots
+au fur et à mesure de leur production, de sorte qu'un parcours, un filtre et une agrégation ne retiennent qu'un lot à la fois, tandis que les opérateurs qui ont besoin
+de la totalité de leur entrée (un tri global, certaines jointures) la mettent en tampon.
+\end{definition}
+
+Le chapitre~8 écrivait à la main des boucles de \omterm{def:pl:dataframes:outofcore}{traitement hors mémoire}~; un moteur à \omterm{def:pl:dataframes:eager}{évaluation paresseuse} (lazy) doté d'un exécuteur en flux fait de même pour un plan entier. Il ne peut pas le faire
+pour tous les opérateurs~: une jointure as-of exige que ses deux côtés soient triés, et un tri a besoin de toute son entrée, si bien qu'un plan qui en contient met en tampon à ces
+points. Le pipeline ci-dessous en contient les deux, ce qui explique que l'\omterm{def:pl:dataframes:outofcore}{exécution en flux} économise ici de la mémoire sans pour autant la rendre constante.
+
+\section{Idiomes pour les données de marché}
+
+\begin{definition}[Fonction de fenêtre]\label{def:pl:dataframes:window}
+Une \emph{fonction de fenêtre}\index{fonction de fenêtre} calcule, pour chaque ligne, une valeur sur un ensemble de lignes apparentées --- les lignes d'un même
+groupe, ordonnées, éventuellement limitées à un cadre comme les $n$ dernières lignes --- sans réduire les lignes comme le fait une agrégation~:
+une moyenne glissante par symbole, un rang au sein d'une minute, la valeur de la ligne précédente (un décalage).
+\end{definition}
+
+Cinq idiomes couvrent l'essentiel de la recherche sur les données de marché, et chacun repose sur une convention qu'il faut énoncer explicitement plutôt que de la reprendre telle quelle.
+
+\begin{method}[Idiomes des données de marché et leurs conventions]\label{met:pl:dataframes:idioms}
+\textbf{Barres}~: indiquer la largeur, l'étiquette (bord gauche ou droit), le côté fermé, et si les barres vides sont supprimées ou comblées (avec
+le cours de clôture précédent et un volume nul). \textbf{Jointures as-of}~: indiquer la clé (le temps ou le numéro de séquence, chapitre~4), le groupe et si
+une égalité de temps correspond. \textbf{Fenêtres glissantes}~: indiquer le cadre (lignes ou temps), le groupe et le nombre minimal d'observations.
+\textbf{Rangs en coupe transversale}~: indiquer la règle de départage. \textbf{Tableaux croisés}~: indiquer ce que signifie une cellule manquante.
+\end{method}
+
+\omcode{code/firm/marketdf/firm_marketdf.py}{54}{88}{Barres avec conventions explicites dans trois moteurs~: l'indice de barre, déduit du
+côté fermé par division plancher (quel que soit le comportement de la division entière du moteur sur les nombres négatifs), l'étiquette déduite du bord, puis la même
+agrégation.}\label{lst:pl:dataframes:bars}
+
+Le \Cref{lst:pl:dataframes:bars} illustre l'idiome des barres dans les trois moteurs. Deux détails sont de ceux qui rompent l'équivalence en silence~: le
+premier et dernier cours d'une barre doivent être pris dans l'ordre temporel avec un départageur (le numéro de séquence du flux), et l'indice d'une
+barre fermée à droite est $\lceil t/w \rceil - 1 = \lfloor (t-1)/w \rfloor$ pour des temps entiers, et chaque moteur doit le calculer par division plancher
+--- la division entière de DuckDB tronque vers zéro, et la version SQL calcule le plancher explicitement. Les tests d'acceptation
+comparent les trois moteurs sur des transactions horodatées à la seconde, de sorte que les bornes et les égalités apparaissent.
+
+\begin{example}[Deux jeux de barres]\label{ex:pl:dataframes:bars}
+Sur la journée d'un même symbole de transactions synthétiques (375 transactions, horodatées à la seconde comme certains fournisseurs les livrent), des barres de cinq minutes étiquetées
+et fermées à gauche ou à droite diffèrent en volume dans 4 des 74 intervalles~: deux transactions tombent exactement sur une borne de cinq minutes,
+et chacune déplace son volume, soit 600 actions au total, d'une barre à la suivante. Les deux jeux portent aussi des étiquettes distantes de cinq minutes pour le même
+intervalle. Combler les barres vides ajoute 4 barres aux 74, et les rendements par barre de la journée passent à 77 au lieu de 73~: un rendement calculé à cheval sur une
+barre supprimée couvre dix minutes et se compare, dans une fenêtre glissante, à des rendements de cinq minutes.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (11.2,0) node[right]{temps};
+\foreach \x/\l in {0.5/10:00,5.5/10:05,10.5/10:10} {\draw (\x,0.1) -- (\x,-0.1) node[below]{\l};}
+\fill[omThm] (5.5,0) circle (2.5pt);
+\node[omThm,above] at (5.5,0.1) {transaction à 10:05:00};
+\draw[omDef,thick] (0.5,0.9) -- (5.4,0.9); \draw[omDef,line width=2pt] (5.6,0.9) -- (10.5,0.9);
+\fill[omDef] (0.5,0.9) circle (2pt); \draw[omDef,fill=white] (5.4,0.9) circle (2pt);
+\fill[omDef] (5.6,0.9) circle (2pt); \draw[omDef,fill=white] (10.5,0.9) circle (2pt);
+\node[omDef,above] at (3,0.95) {barre étiquetée 10:00}; \node[omDef,above,align=center] at (8,0.95) {barre étiquetée 10:05\\(qui contient la transaction)};
+\node[omDef,anchor=east,font=\scriptsize\bfseries] at (0.3,0.9) {gauche/gauche};
+\draw[omMeth,line width=2pt] (0.5,-0.9) -- (5.4,-0.9); \draw[omMeth,thick] (5.6,-0.9) -- (10.5,-0.9);
+\draw[omMeth,fill=white] (0.5,-0.9) circle (2pt); \fill[omMeth] (5.4,-0.9) circle (2pt);
+\draw[omMeth,fill=white] (5.6,-0.9) circle (2pt); \fill[omMeth] (10.5,-0.9) circle (2pt);
+\node[omMeth,below,align=center] at (3,-0.95) {barre étiquetée 10:05\\(qui contient la transaction)}; \node[omMeth,below] at (8,-0.95) {barre étiquetée 10:10};
+\node[omMeth,anchor=east,font=\scriptsize\bfseries] at (0.3,-0.9) {droite/droite};
+\end{tikzpicture}
+
+\omcaption{Une transaction horodatée exactement à 10:05:00 selon deux conventions de barres. Fermée à gauche, elle appartient à la barre $[10\!:\!05,
+10\!:\!10)$, étiquetée 10:05~; fermée à droite, elle appartient à la barre $(10\!:\!00, 10\!:\!05]$, également étiquetée 10:05 parce que cette convention nomme les barres par
+leur bord droit. Les points pleins marquent les extrémités fermées, les points vides les extrémités ouvertes~; la barre épaisse contient la transaction. La même étiquette désigne deux
+intervalles différents, et le volume de la transaction change d'intervalle.}\label{fig:pl:dataframes:edge}
+\end{omfigure}
+
+\section{Jointures, fenêtres et rangs~: là où se cachent les égalités}
+
+Les barres sont la convention la plus visible~; trois autres se cachent dans les jointures et les fenêtres. Une jointure as-of sur l'horodatage associe chaque transaction
+à la dernière cotation à cet instant ou avant~: lorsqu'une transaction et la cotation qu'elle a modifiée partagent un horodatage, la jointure inclusive renvoie
+la cotation postérieure à la transaction. Le chapitre~4 l'a relevé sur 223 des 17\,281 transactions et a rendu la jointure stricte sur le numéro de séquence du flux~;
+\texttt{firm\_marketdf.asof} prend \texttt{strict} comme argument dans les trois moteurs (pandas \texttt{allow\_exact\_matches}, Polars
+de même, DuckDB l'inégalité \texttt{>} au lieu de \texttt{>=}).
+
+Une fenêtre glissante a un cadre en lignes ou en temps, et un nombre minimal d'observations en deçà duquel elle ne renvoie rien ou une
+valeur partielle~: la moyenne glissante de cet idiome porte sur toutes les lignes existantes, soit une seule au début de chaque symbole, ce qui doit être connu du code qui
+l'utilise. Un rang en coupe transversale a une règle de départage, et les moteurs diffèrent par défaut.
+
+\begin{example}[Rendements à égalité]\label{ex:pl:dataframes:ties}
+Sur une minute, quatre symboles ont des rendements de $0.1$, $0.2$, $0.2$ et $0.3$ (en points de base). La règle de la moyenne donne les rangs 1,
+2.5, 2.5 et 4, la somme des rangs $10 = 4\cdot5/2$ quelles que soient les égalités. Le \texttt{rank()} de SQL donne 1, 2, 2, 4 (la règle du minimum), ce qui abaisse
+le rang moyen des symboles à égalité~; avec $c$ lignes à égalité pour \texttt{rank()} $= r$, le rang moyen vaut $(2r + c - 1)/2 = (4 + 2 - 1)/2 = 2.5$,
+l'expression qu'utilise le SQL du \cref{lst:pl:dataframes:sql}. Les rendements de cours sur une grille de pas de cotation présentent souvent des égalités~: dans le mois le plus court des
+tests, 10.8~\% des 222\,621 rendements à une minute sont exactement nuls, et 6\,467 groupes de rendements à égalité apparaissent dans 7\,808 minutes.
+\end{example}
+
+\section{Un seul pipeline, cinq modes}
+
+Le pipeline de recherche du chapitre s'exécute sur le mois de cotations du chapitre~3 (désormais 3 millions, soit trois mille par symbole et par jour) et
+un mois de 1.2 million de transactions, stocké en partitions par date au format Parquet~: des barres à une minute, leurs rendements logarithmiques, le rang en coupe transversale de
+chaque rendement au sein de sa minute, le rang moyen de chaque symbole sur le mois~; et, en parallèle, chaque transaction rattachée par jointure as-of à sa
+cotation en vigueur, et la fourchette effective moyenne de chaque symbole, en points de base. Le \Cref{lst:pl:dataframes:lazy} est la version Polars, un plan en
+\omterm{def:pl:dataframes:eager}{évaluation paresseuse} que partagent les trois modes Polars.
+
+\omcode{code/platforms/10-dataframes/python/pl_dataframes.py}{111}{124}{Le pipeline sous forme d'un seul plan Polars~: barres, rendements et rangs par
+expressions de fenêtre, la jointure as-of et la fourchette effective~; le même plan est collecté en évaluation immédiate (eager), en évaluation paresseuse ou par le
+moteur en flux.}\label{lst:pl:dataframes:lazy}
+
+\omcode{code/platforms/10-dataframes/python/pl_dataframes.py}{140}{161}{Le même pipeline en SQL de DuckDB, sur les fichiers Parquet~:
+barres par agrégat ordonné, rendements par décalage, rangs par une fenêtre dont la règle de départage est explicitée, et la
+jointure as-of.}\label{lst:pl:dataframes:sql}
+
+Les cinq modes renvoient les mêmes cinquante rangs moyens et cinquante fourchettes moyennes, à neuf décimales près. La \Cref{fig:pl:dataframes:engines} les mesure
+chacun dans son propre processus, avec un seul thread, la mémoire étant comptée comme le high-water mark du processus moins celui d'un processus qui ne fait que
+importer les bibliothèques (155~Mo). pandas, en \omterm{def:pl:dataframes:eager}{évaluation immédiate} et avec un index de lignes, lit tout le mois en mémoire et conserve chaque table intermédiaire~:
+il a besoin de 895~Mo de plus que l'import des bibliothèques et de 1.3~s. Polars en \omterm{def:pl:dataframes:eager}{évaluation immédiate} conserve les mêmes tables sous forme Arrow~: 769~Mo. En \omterm{def:pl:dataframes:eager}{évaluation paresseuse}, il lui faut 654~Mo, et
+avec le moteur en flux 614~Mo~; la jointure as-of et les tris limitent le gain à un niveau modeste. DuckDB, qui exécute le SQL sur les fichiers avec ses
+propres opérateurs en flux, a besoin de 317~Mo, soit un tiers de pandas.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=10pt,ymin=0,ymax=1000,ylabel={mémoire supplémentaire (Mo)},
+  xtick={0,1,2,3,4},xticklabels from table={figdata/platforms/10-dataframes/measured_engines.csv}{engine},
+  tick label style={font=\small},xticklabel style={text width=1.7cm,align=center},label style={font=\small},grid=major,grid style={gray!20},enlarge x limits=0.15,
+  nodes near coords,point meta=explicit symbolic,nodes near coords style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x expr=\coordindex,y=extra_mb,meta=seconds]{figdata/platforms/10-dataframes/measured_engines.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Mémoire au-delà des imports (barres) et temps réel en secondes (étiquettes) du même pipeline de recherche sur un mois de cotations et
+de transactions, dans cinq modes de moteur, chacun exécuté dans son propre processus avec un seul fil. Les cinq donnent des réponses identiques. Mesuré sur un ordinateur portable (Intel
+Core Ultra 7 155H) sous WSL2, machine par ailleurs inactive. Données~: \texttt{bench\_dataframes.py}.}\label{fig:pl:dataframes:engines}
+\end{omfigure}
+
+\begin{remark}[Mesurer la mémoire d'un processus fils]\label{rem:pl:dataframes:rss}
+La première version de la mesure lisait le pic de l'ensemble résident du fils dans \texttt{getrusage}, et chaque moteur semblait demander à peu près
+la même mémoire~: sous Linux, les statistiques d'utilisation sont conservées à travers \texttt{exec}, si bien que le chiffre peut inclure la mémoire du processus à partir duquel le fils a été
+lancé. La high-water mark de
+\texttt{/proc/self/status} appartient à l'espace d'adressage propre du processus~; c'est elle que le chapitre rapporte.
+\end{remark}
+
+\begin{dated}{2026-09}{Versions des moteurs}\label{dat:pl:dataframes:versions}
+Les mesures et les plans du chapitre utilisent pandas 2.3.3, Polars 1.44.2, DuckDB 1.5.5 et PyArrow 25.0.1, les versions figées dans les
+prérequis de la série. Les plans, les valeurs par défaut et l'usage mémoire changent d'une version à l'autre~: le plan de la \cref{fig:pl:dataframes:plan} est celui qu'affiche cette
+version de Polars, et Polars se replie sur son moteur en mémoire pour les opérations pas encore implémentées en flux.
+\end{dated}
+
+\section{Tutoriel~: barres, conventions et cinq moteurs}\label{tut:pl:dataframes:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Calculer des barres selon des conventions énoncées dans trois moteurs, observer ce que changent les conventions, et exécuter un pipeline dans cinq
+modes avec des réponses identiques. \textbf{État final~:} l'\cref{ex:pl:dataframes:bars}, la \cref{fig:pl:dataframes:engines} et le plan optimisé
+du chapitre.
+\begin{tutsteps}
+\item \textbf{Idiomes}~: \texttt{firm\_marketdf.bars}, \texttt{asof}, \texttt{rolling\_mean}, \texttt{xs\_rank}, \texttt{to\_wide},
+\texttt{to\_long}~; les tests d'acceptation vérifient que les trois moteurs concordent.
+\item \textbf{Conventions}~: \texttt{pl\_dataframes.conventions()} pour la journée d'un symbole de l'\cref{ex:pl:dataframes:bars}.
+\item \textbf{Plan}~: \texttt{plan\_text()} affiche le plan paresseux optimisé d'une requête étroite.
+\item \textbf{Pipeline}~: \texttt{write\_month(**BIG)}, puis \texttt{bench\_dataframes.py} exécute les cinq modes, chacun dans son propre processus,
+vérifie les réponses et enregistre le temps et la mémoire.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer la jointure as-of du plan Polars par une jointure sur la seconde précédente et observer ce que le moteur en flux
+économise alors~; ajouter une option de barres remplies au pipeline et mesurer comment les rangs moyens changent.
+\end{tutorial}
+
+\section{Construction~: idiomes des données de marché}\label{bld:pl:dataframes:marketdf}
+
+\begin{build}
+\bfield{Rôle} L'implémentation partagée par la plateforme des idiomes que chaque chercheur réécrit~: un seul contrat, trois moteurs, les
+conventions en arguments, l'équivalence en tests. Le moteur de backtest du chapitre~11 et le code de variables de l'environnement de recherche
+(chapitre~15) l'utilisent.
+\bfield{Interface} \texttt{ENGINES}~; \texttt{bars(ticks, width, label, closed, fill, engine)}~;
+\texttt{asof(left, right, by, on, engine, strict)}~; \texttt{rolling\_mean(df, by, order, column, window, engine)}~; \texttt{xs\_rank(df, time, column, engine)}~;
+\texttt{to\_wide}, \texttt{to\_long}.
+\bfield{Règles} Les conventions sont des arguments sans valeur par défaut cachée au-delà de celle qui est documentée~; chaque idiome donne le même résultat dans
+chaque moteur, ligne pour ligne~; les égalités sont départagées par le numéro de séquence~; les temps entiers sont regroupés par division entière arrondie vers le bas dans chaque moteur.
+\bfield{Tests d'acceptation} \texttt{code/firm/marketdf/tests/}~: barres selon quatre conventions égales entre moteurs sur des transactions datées à la seconde,
+avec volume conservé~; les conventions vérifiées à la main sur quatre transactions~; les jointures as-of (inclusives et strictes), moyennes mobiles et rangs égaux
+entre moteurs~; un aller-retour de pivot.
+\bfield{Pour aller plus loin} Fenêtres glissantes en temps~; barres à prix pondérés par le volume~; les idiomes pour les tables Arrow sans pandas.
+\end{build}
+
+\begin{omsources}
+\item H.~Wickham, ``Tidy data'', \emph{Journal of Statistical Software} 59(10), 2014.
+\item Documentation de pandas, \texttt{DataFrame.resample}~; guide utilisateur de Polars, ``Streaming''~; documentation de DuckDB, ``AsOf join''.
+\item Pages de manuel Linux, \texttt{getrusage(2)}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:1}
+Une transaction est horodatée à 10:05:00 exactement. Dans quelle barre de cinq minutes, et sous quelle étiquette, tombe-t-elle selon chacune des deux conventions
+de la \cref{fig:pl:dataframes:edge}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:2}
+Convertir en \omterm{def:pl:dataframes:shape}{format large} le tableau au \omterm{def:pl:dataframes:shape}{format long} de la \cref{fig:pl:dataframes:shape}, puis revenir en arrière. Que contient le \omterm{def:pl:dataframes:shape}{format large} pour une minute où BBB
+n'a pas été échangé~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:dataframes:3}
+Quelles colonnes et quelles partitions le plan optimisé de la requête étroite lit-il, et pourquoi quatre colonnes plutôt que deux~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:4}
+Pourquoi l'indice d'une barre fermée à droite est-il $\lfloor (t-1)/w \rfloor$ pour un temps entier $t$, et que se passe-t-il dans un moteur dont la division entière
+tronque vers zéro, pour des temps négatifs~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:5}
+Dans l'\cref{ex:pl:dataframes:bars}, supprimer les barres vides donne 73 rendements et les remplir en donne 77. Quels rendements diffèrent, et que surestime une
+volatilité glissante sur 20 barres de la série où les barres vides ont été supprimées~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:dataframes:6}
+Pourquoi l'\omterm{def:pl:dataframes:outofcore}{exécution en flux} économise-t-elle moins de mémoire sur le pipeline du chapitre que sur un pipeline de parcours, de filtres et d'agrégations~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:dataframes:7}
+\emph{Programmation.} Avec \texttt{firm\_marketdf.bars}, calculer les barres d'une minute du mois du chapitre pour un symbole dans les trois moteurs et
+selon les quatre conventions des tests d'acceptation. Les moteurs concordent-ils, et le volume total dépend-il de la convention~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:dataframes:8}
+\emph{Trouver la faille.} «~Nous rééchantillonnons les transactions en barres avec la valeur par défaut de la bibliothèque, calculons les rendements avec \texttt{pct\_change} sur la table de barres
+triée par temps, puis classons-les entre symboles à chaque minute.~»
+\end{exercise}
+
+\section{Problème~: deux jeux de barres}
+
+\begin{problem}[{Problème du week-end --- un mois à travers cinq moteurs}]\label{pb:pl:dataframes:1}
+Le mois de cotations et de transactions du chapitre, ses conventions de barres et les cinq modes de moteur de la \cref{fig:pl:dataframes:engines}.
+
+\medskip\noindent\textbf{Partie I --- Conventions.}
+\begin{enumerate}
+\item Combien de transactions de la journée d'un symbole tombent exactement sur une frontière de cinq minutes, et pourquoi cela peut-il arriver~?
+\item Combien des 74 intervalles diffèrent en volume entre les deux conventions, et combien d'actions se déplacent~?
+\item À quelle distance sont les étiquettes d'un même intervalle selon les deux conventions~?
+\item Combien de barres et de rendements compte la journée lorsque les barres vides sont supprimées, et combien lorsqu'elles sont remplies~?
+\item Quelle convention retenir pour un entrepôt de recherche, et que faut-il consigner~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Plans.}
+\begin{enumerate}[resume]
+\item Que matérialise un moteur à \omterm{def:pl:dataframes:eager}{évaluation immédiate} qu'un moteur à \omterm{def:pl:dataframes:eager}{évaluation paresseuse} n'a pas besoin de matérialiser~?
+\item Quelles sont les trois optimisations que révèle le plan de la requête restreinte~?
+\item Pourquoi un plan à \omterm{def:pl:dataframes:eager}{évaluation paresseuse} est-il plus facile à optimiser qu'un code à \omterm{def:pl:dataframes:eager}{évaluation immédiate}~?
+\item Quels opérateurs du pipeline ne peuvent pas s'exécuter en flux, et pourquoi~?
+\item Pourquoi le SQL doit-il calculer explicitement la division à l'arrondi inférieur~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les cinq modes.}
+\begin{enumerate}[resume]
+\item Que calcule le pipeline, et comment compare-t-on les cinq résultats~?
+\item De combien de mémoire, en plus des imports, chaque mode a-t-il besoin~?
+\item Quel mode est le plus rapide, et lequel utilise le moins de mémoire~?
+\item Pourquoi pandas est-il le plus coûteux en mémoire~?
+\item Pourquoi une première mesure donnait-elle à peu près la même mémoire pour tous les moteurs~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les écarts de volume et de rendement entre les conventions, ainsi que le temps et la mémoire du pipeline dans
+les cinq modes.
+\item Quel moteur retenir pour un mois, et lequel pour cinq ans des mêmes données~?
+\item Que standardiser dans une équipe de recherche pour que les barres de deux chercheurs concordent~?
+\item Contre quoi un test d'équivalence entre moteurs protège-t-il~?
+\item En une phrase~: qu'est-ce qui rend un pipeline de \omterm{def:pl:dataframes:dataframe}{dataframes} fiable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur}]\label{iq:pl:dataframes:1}
+Vos barres de cinq minutes ne concordent pas avec celles d'un collègue. Que vérifiez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, développeur}]\label{iq:pl:dataframes:2}
+Quelle est la différence entre l'\omterm{def:pl:dataframes:eager}{évaluation immédiate} et l'\omterm{def:pl:dataframes:eager}{évaluation paresseuse} des \omterm{def:pl:dataframes:dataframe}{dataframes}, et dans quels cas cela importe-t-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:dataframes:3}
+Comment calculeriez-vous un rang en coupe transversale des rendements à une minute sur 3\,000 symboles pendant un an~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:dataframes:4}
+Votre tâche pandas manque de mémoire sur un mois de transactions. Que modifiez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:dataframes:5}
+Concevez une bibliothèque partagée de transformations de données de marché pour une équipe de recherche utilisant plusieurs moteurs de \omterm{def:pl:dataframes:dataframe}{dataframes}.
+\end{interviewq}

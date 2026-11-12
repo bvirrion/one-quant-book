@@ -1,0 +1,424 @@
+\chapter{Bases de données de séries temporelles et leurs alternatives}\label{ch:pl:time-series-databases-and-the-alternatives}
+
+Cinq moteurs ont répondu aux mêmes cinq questions sur le même mois de cotations, et chaque réponse a été vérifiée contre les quatre autres
+avant toute mesure de temps. Le magasin par lignes muni d'un index a trouvé la dernière cotation d'un symbole avant midi en moins d'un dixième
+de milliseconde, près de quatre-vingts fois plus vite que le moteur colonnaire, et il a mis plus de trois cents millisecondes pour calculer la
+moyenne de la fourchette de chaque symbole sur le mois, plus de quarante fois plus lentement que le moteur colonnaire. Aucun de ces deux résultats n'est une propriété du produit~; les deux sont
+des propriétés de la question. Ce chapitre examine ce que promettent les bases de données vendues pour les séries temporelles, classe les requêtes sur données de marché
+en quelques formes, explique pourquoi un moteur est rapide sur certaines formes et lent sur d'autres, et construit le banc d'essai
+(\texttt{firm.tsbench}) qu'une entreprise doit exécuter sur ses propres données avant de choisir.
+
+\section{Ce que promet une base de données de séries temporelles}
+
+\begin{definition}[Base de données de séries temporelles]\label{def:pl:time-series-databases-and-the-alternatives:tsdb}
+Une \emph{base de données de séries temporelles}\index{base de données de séries temporelles} (time-series database) est une base de données conçue pour des enregistrements indexés par le temps, qui arrivent pour l'essentiel
+dans l'ordre chronologique et sont pour l'essentiel lus par plages temporelles~: elle les stocke partitionnés et ordonnés par temps, ajoute rapidement des données et offre des
+opérations propres au temps (agrégation en \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{intervalles de temps}, jointures as-of, rétention par âge).
+\end{definition}
+
+La \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} du chapitre~4 possède toutes ces propriétés et n'est pas un produit de base de données~: ce sont des fichiers, un moteur embarqué et
+quelques conventions. C'est la première chose à comprendre à propos de cette catégorie. Ce qu'une \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{base de données de séries temporelles} ajoute, c'est un conditionnement ---
+un serveur qui ingère, compacte, conserve et répond aux requêtes sans que l'entreprise écrive elle-même les pièces --- et, dans les meilleures,
+une ingénierie de ces mêmes idées~: stockage colonnaire, partitions temporelles, \omterm{def:pl:columnar-formats:pushdown}{cartes de zones}, exécution vectorisée. Les opérations qu'elle nomme sont
+celles dont tout magasin de données de marché a besoin.
+
+\begin{definition}[Intervalle de temps, sous-échantillonnage]\label{def:pl:time-series-databases-and-the-alternatives:bucket}
+Un \emph{intervalle de temps}\index{intervalle de temps} (time bucket) est l'un des intervalles égaux et alignés en lesquels un axe temporel est découpé (les minutes d'une
+journée)~; le regroupement en intervalles affecte chaque enregistrement à son intervalle. Le \emph{sous-échantillonnage}\index{sous-échantillonnage} (downsampling) remplace les enregistrements de chaque intervalle
+par un résumé (la dernière valeur, le nombre, une barre ouverture-plus haut-plus bas-clôture), et stocke ou renvoie une ligne par intervalle.
+\end{definition}
+
+Les barres d'une minute sont l'exemple standard~: les barres temporelles du livre~7 (chapitre~2) sont des ticks sous-échantillonnés. Un magasin
+qui conserve l'historique des ticks pendant des mois et les barres d'une minute pendant des années effectue un \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{sous-échantillonnage} dans le cadre de sa \omterm{def:pl:capturing-and-storing-tick-data:tier}{politique de rétention} (chapitre~2)~: les ticks bruts
+vieillissent et disparaissent, les intervalles restent.
+
+\section{Formes de requêtes sur données de marché}
+
+Presque chaque requête qu'une plateforme de recherche ou de trading adresse à ses données de marché relève de quelques formes, et chaque forme
+demande quelque chose de différent au stockage (\cref{fig:pl:time-series-databases-and-the-alternatives:shapes}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\draw[->] (0,0) -- (10.6,0) node[below left]{temps (un mois)};
+\draw[->] (0,0) -- (0,4.1) node[left,align=right]{symboles};
+\fill[gray!10] (0.05,0.1) rectangle (10.25,3.8);
+\draw[gray!60,dashed] (0.05,0.1) rectangle (10.25,3.8);
+\foreach \y in {0.5,1.0,...,3.5} {\draw[gray!25] (0,\y) -- (10.3,\y);}
+\fill[omThm!70] (5.02,1.95) circle (2.2pt);
+\node[omThm,anchor=south] at (4.55,2.25) {ponctuelle};
+\fill[omDef!40] (5.3,1.9) rectangle (5.9,2.1);
+\node[omDef,anchor=south west] at (5.35,2.12) {plage};
+\fill[omMeth!40] (6.5,1.4) rectangle (7.2,1.6);
+\foreach \x in {6.6,6.7,6.8,6.9,7.0,7.1} {\draw[omMeth] (\x,1.4) -- (\x,1.6);}
+\node[omMeth,anchor=north] at (6.85,1.38) {barres (intervalles)};
+\fill[omProp!35] (3.2,0.2) rectangle (3.6,3.7);
+\node[omProp,anchor=south] at (3.4,3.72) {jointure as-of (un jour, tous les symboles)};
+\node[anchor=south east,fill=gray!10,inner sep=1pt] at (10.2,0.15) {section transversale~: chaque ligne (boîte en pointillés)};
+\end{tikzpicture}
+
+\omcaption{Cinq formes de requêtes sur un mois de cotations (symboles par temps)~: une recherche ponctuelle (la dernière cotation d'un symbole avant un
+instant donné), un parcours par plage (un symbole, une heure), des \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{intervalles de temps} (un symbole, un jour, une ligne par minute), une jointure as-of (chaque transaction d'un
+jour avec la cotation de son symbole), et une section transversale (chaque ligne du mois, un nombre par symbole). Chacune touche une
+région différente, et une disposition différente sert chacune.}\label{fig:pl:time-series-databases-and-the-alternatives:shapes}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}p{5.6cm}@{}}
+\toprule
+forme & lignes touchées & ce qui la rend rapide & exemple \\
+\midrule
+ponctuelle & une & un index ou une clé triée & dernière cotation avant un ordre \\
+plage & une tranche contiguë & ordre de tri, \omterm{def:pl:columnar-formats:pushdown}{cartes de zones} & l'heure d'un symbole \\
+barres & une tranche, résumée & ordre de tri, agrégation vectorisée & barres d'une minute pour un graphique \\
+jointure as-of & deux tranches, fusionnées & toutes deux triées par temps dans chaque symbole & transactions avec cotations \\
+section transversale & toutes & colonnes, parcours vectorisés & fourchette moyenne par symbole \\
+\bottomrule
+\end{tabular}
+\caption{Les cinq formes de requêtes, les lignes que chacune touche, et ce dont un moteur a besoin pour y répondre rapidement.}\label{tab:pl:time-series-databases-and-the-alternatives:shapes}
+\end{table}
+
+\section{Moteurs embarqués contre serveurs}
+
+Une base de données était autrefois un serveur~: un processus séparé, souvent sur une machine distincte, auquel les clients envoyaient des requêtes par le réseau.
+Les moteurs analytiques que les plateformes de recherche utilisent aujourd'hui ne le sont pas.
+
+\begin{definition}[Base de données embarquée]\label{def:pl:time-series-databases-and-the-alternatives:embedded}
+Une \emph{base de données embarquée}\index{base de données embarquée} (embedded database) s'exécute à l'intérieur du processus qui l'interroge, sous forme de bibliothèque~: ni serveur, ni
+réseau, ni sérialisation des résultats, et données partagées avec la mémoire du programme hôte lorsque les formats le permettent.
+\end{definition}
+
+SQLite, la base de données la plus déployée qui existe, est embarquée et orientée lignes~; DuckDB est embarqué et colonnaire~; Polars est une bibliothèque de
+dataframes dotée d'un optimiseur de requêtes, ce qui en fait aussi un moteur embarqué. Un moteur embarqué renonce à ce que procure un serveur ---
+les écritures concurrentes, le contrôle d'accès, une seule copie des données pour de nombreux utilisateurs --- et gagne les allers-retours et les conversions
+qu'il ne fait pas (\cref{fig:pl:time-series-databases-and-the-alternatives:embedded}). Pour les requêtes d'un chercheur sur des fichiers d'une
+\omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}, c'est le bon compromis~; pour un service auquel de nombreuses équipes écrivent, ce ne l'est pas (chapitre~25).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,inner sep=3pt,align=center}]
+\draw[rounded corners=3pt,gray] (-0.3,-0.9) rectangle (4.1,1.0);
+\node[font=\scriptsize\itshape,anchor=south west] at (-0.3,1.0) {un processus};
+\node[box,fill=omDef!12] (a) at (0.9,0) {code de\\recherche};
+\node[box,fill=omMeth!15] (e) at (3.1,0) {moteur\\(bibliothèque)};
+\draw[<->] (a) -- (e);
+\node[box,fill=gray!10] (f) at (3.1,-1.9) {fichiers colonnaires};
+\draw[->] (f) -- (e);
+\draw[rounded corners=3pt,gray] (5.0,-0.9) rectangle (7.0,1.0);
+\draw[rounded corners=3pt,gray] (9.6,-0.9) rectangle (12.0,1.0);
+\node[font=\scriptsize\itshape,anchor=south west] at (5.0,1.0) {client};
+\node[font=\scriptsize\itshape,anchor=south west] at (9.6,1.0) {serveur};
+\node[box,fill=omDef!12] (c) at (6.0,0) {code de\\recherche};
+\node[box,fill=omMeth!15] (s) at (10.8,0) {serveur de\\base de données};
+\draw[->] (c.north east) to[bend left=15] node[above]{requête} (s.north west);
+\draw[->] (s.south west) to[bend left=15] node[below,align=center]{lignes,\\ sérialisées} (c.south east);
+\node[box,fill=gray!10] (d) at (10.8,-1.9) {son propre stockage};
+\draw[->] (d) -- (s);
+\end{tikzpicture}
+
+\omcaption{Un moteur embarqué (à gauche) s'exécute à l'intérieur du programme qui l'interroge et lit directement les fichiers~; un serveur de base de données
+(à droite) est un autre processus, joint par une connexion, qui renvoie ses résultats sérialisés. Le serveur peut servir de nombreux utilisateurs
+et rédacteurs~; le moteur embarqué évite l'aller-retour et la conversion.}\label{fig:pl:time-series-databases-and-the-alternatives:embedded}
+\end{omfigure}
+
+L'autre différence entre les moteurs tient à la manière dont ils exécutent un plan. Un moteur classique fait passer une ligne à la fois d'un opérateur à
+l'autre, en appelant une fonction par ligne et par opérateur. Un moteur en colonnes fait passer des lots de valeurs d'une même colonne.
+
+\begin{definition}[Exécution vectorisée des requêtes, matérialisation tardive]\label{def:pl:time-series-databases-and-the-alternatives:vectorised}
+L'\emph{exécution vectorisée des requêtes}\index{exécution vectorisée des requêtes} exécute chaque opérateur d'un plan de requête sur un lot de valeurs
+d'une colonne à la fois (un vecteur de quelques milliers), de sorte que le surcoût par appel ne soit payé qu'une fois par lot et que les boucles internes soient des boucles serrées
+sur des tableaux. La \emph{matérialisation tardive}\index{matérialisation tardive} retarde l'assemblage des lignes de résultat à partir des colonnes
+jusqu'après les filtres~: les opérateurs font passer les positions des lignes qualifiées, et seules les autres colonnes des lignes survivantes ne sont jamais lues.
+\end{definition}
+
+Ces deux idées viennent de la lignée de recherche du moteur MonetDB/X100 (2005) et des magasins en colonnes qui l'ont suivi~; elles expliquent pourquoi un
+moteur en colonnes parcourt un million de lignes en quelques millisecondes. Elles expliquent aussi pourquoi il est plus lent qu'un index pour une recherche ponctuelle~: un
+parcours vectorisé d'un fichier trié ouvre encore un fichier, lit un pied de page et décode au moins un bloc, alors qu'un B-tree parcourt trois
+pages pour atteindre une seule ligne.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,op/.style={draw,rounded corners=2pt,minimum width=1.9cm,minimum height=0.6cm,fill=omDef!10}]
+\node[op] (s1) at (0,2.4) {parcours};
+\node[op] (f1) at (0,1.2) {filtre};
+\node[op] (g1) at (0,0) {agrégation};
+\draw[->] (s1) -- node[right]{une ligne} (f1);
+\draw[->] (f1) -- node[right]{une ligne} (g1);
+\node[font=\scriptsize\itshape] at (0,3.1) {ligne par ligne};
+\node[op,fill=omMeth!15] (s2) at (5.0,2.4) {parcours};
+\node[op,fill=omMeth!15] (f2) at (5.0,1.2) {filtre};
+\node[op,fill=omMeth!15] (g2) at (5.0,0) {agrégation};
+\draw[->] (s2) -- node[right]{2\,048 valeurs d'une colonne} (f2);
+\draw[->] (f2) -- node[right]{positions des lignes retenues} (g2);
+\node[font=\scriptsize\itshape] at (5.0,3.1) {vectorisée};
+\end{tikzpicture}
+
+\omcaption{Exécution ligne par ligne et exécution vectorisée du même plan. Le moteur vectorisé appelle chaque opérateur une seule fois par lot
+d'une colonne et fait passer des positions au lieu de lignes (\omterm{def:pl:time-series-databases-and-the-alternatives:vectorised}{matérialisation tardive}), de sorte que les autres colonnes des lignes qui échouent au filtre ne sont jamais
+lues.}\label{fig:pl:time-series-databases-and-the-alternatives:vector}
+\end{omfigure}
+
+\begin{proposition}[Aucun moteur ne gagne sur toutes les formes]\label{prop:pl:time-series-databases-and-the-alternatives:shapes}
+Soit un moteur qui répond à une requête en un temps $c_0 + c_r\,r$, où $r$ est le nombre de lignes qu'il doit parcourir et $c_0$ le coût fixe du
+démarrage (ouverture des fichiers, planification, lecture des métadonnées). Un magasin de lignes indexé a un $c_0$ faible et un $c_r$ élevé~; un moteur en colonnes vectorisé
+a un $c_0$ plus élevé et un $c_r$ beaucoup plus faible. Le magasin de lignes est plus rapide en dessous de $r^\star = (c_0^{\mathrm{col}} -
+c_0^{\mathrm{row}})/(c_r^{\mathrm{row}} - c_r^{\mathrm{col}})$ lignes parcourues, le moteur en colonnes au-dessus.
+\end{proposition}
+
+\begin{proof}
+Égaler les deux coûts affines et résoudre en $r$~; en dessous du point d'intersection, l'ordonnée à l'origine la plus petite l'emporte, au-dessus la pente la plus petite.
+\end{proof}
+
+Le modèle est grossier --- le coût d'un moteur réel dépend de la disposition des données, de la sélectivité et du cache --- mais sa prédiction est ce que le banc d'essai
+retrouve~: recherches ponctuelles et courtes plages d'un côté, coupes transversales de l'autre.
+
+\section{Un banc d'essai qui a du sens}
+
+\begin{method}[Banc d'essai des moteurs sur données de marché]\label{met:pl:time-series-databases-and-the-alternatives:bench}
+(1) Utiliser les données et les formes de requêtes propres à la société, et non une démonstration du fournisseur. (2) Vérifier que chaque moteur renvoie la même réponse
+à chaque requête avant de chronométrer l'un d'eux~: un résultat rapide mais faux est l'erreur la plus fréquente d'un banc d'essai. (3) Exécuter les moteurs entrelacés,
+chaque moteur une fois par tour, de sorte qu'une dérive de la machine affecte tous les moteurs de la même façon. (4) Présenter la première exécution sur un moteur neuf (à froid)
+séparément de la médiane des autres (à chaud), ainsi que l'étalement. (5) Indiquer la machine, la charge et ce qui se trouvait dans le cache de pages.
+\end{method}
+
+\texttt{firm.tsbench} met en œuvre la méthode pour cinq moteurs~: DuckDB sur les fichiers Parquet du mois, partitionnés par date et
+triés par symbole et par temps~; Polars, qui parcourt les mêmes fichiers de façon paresseuse~; SQLite, embarqué et orienté lignes, avec un index sur le symbole et
+le temps~; pandas, en mode eager et en mémoire~; et un moteur numpy écrit à la main sur les tableaux triés par symbole et par temps, avec un
+index de décalage par symbole. Le \Cref{lst:pl:time-series-databases-and-the-alternatives:duck} présente les cinq requêtes de l'un de ces moteurs.
+
+\omcode{code/firm/tsbench/firm_tsbench.py}{76}{101}{Les cinq formes de requêtes telles que DuckDB y répond~: une recherche triée, une plage, des intervalles de temps
+avec le dernier mid de chaque minute, une jointure as-of et une moyenne transversale.}\label{lst:pl:time-series-databases-and-the-alternatives:duck}
+
+Les données sont le mois de cotations du chapitre~3 (un million de lignes, cinquante symboles, vingt jours) et 40\,000 transactions tirées de ce mois, chacune
+à une nanoseconde après une cotation. Les cinq moteurs s'accordent sur les cinq réponses~: 1 ligne pour la recherche ponctuelle, 153 pour l'heure de S007,
+359 barres d'une minute pour sa journée, 2\,000 transactions jointes, 50 fourchettes moyennes.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6.4cm,ybar,bar width=5pt,ymode=log,log origin=infty,ymin=0.03,ymax=1000,
+  ylabel={temps médian (ms, échelle log)},xtick={0,1,2,3,4},
+  xticklabels={ponctuelle,plage,barres,as-of,{coupe\\transversale}},xticklabel style={align=center},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},enlarge x limits=0.15,
+  legend columns=5,legend style={font=\footnotesize,at={(0.5,-0.26)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=6pt}},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=duckdb]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omMeth!55,draw=omMeth] table[x=k,y=polars]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omThm!55,draw=omThm] table[x=k,y=sqlite]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=omProp!55,draw=omProp] table[x=k,y=pandas]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\addplot[fill=gray!55,draw=gray] table[x=k,y=numpy]{figdata/platforms/05-time-series-databases-and-the-alternatives/measured_tsbench_wide.csv};
+\legend{DuckDB,Polars,SQLite,pandas,numpy}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Temps médian à chaud de chaque forme de requête sur chaque moteur, sept tours entrelacés, réponses vérifiées égales au préalable. Mesuré
+sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution, fichiers dans le cache de pages, machine par ailleurs inactive. Données~:
+\texttt{bench\_tsbench.py}.}\label{fig:pl:time-series-databases-and-the-alternatives:times}
+\end{omfigure}
+
+La \Cref{fig:pl:time-series-databases-and-the-alternatives:times} présente le résultat, et la prédiction de la proposition se vérifie. L'index de SQLite
+répond à la recherche ponctuelle en 0.05~ms et à l'heure en 0.3~ms, tandis que DuckDB met 3.8 et 2.2~ms pour ces deux requêtes, un temps dominé par
+l'ouverture et la planification~; sur la coupe transversale, l'ordre s'inverse~: SQLite a besoin de 313~ms pour lire un million de lignes une à une, contre
+7~ms pour DuckDB. Polars se place près de DuckDB, plus lent sur les formes agrégées~; pandas paie le parcours de toute la table en mémoire avec un
+masque booléen à chaque requête et est le plus lent sur quatre formes sur cinq. Le moteur numpy écrit à la main est le plus rapide sur la
+plage, les barres et la coupe transversale, et proche du plus rapide sur les deux autres~: connaître la disposition des données (triées, avec un décalage par
+symbole) bat tout moteur général, au prix d'une écriture et d'une maintenance pour chaque requête.
+
+\omcode{code/firm/tsbench/firm_tsbench.py}{255}{274}{Temps à froid et à chaud~: la première exécution de chaque requête sur un moteur neuf est la
+mesure à froid~; les exécutions à chaud sont entrelacées, chaque moteur une fois par requête et par tour.}\label{lst:pl:time-series-databases-and-the-alternatives:bench}
+
+\begin{example}[Le mélange des requêtes décide]\label{ex:pl:time-series-databases-and-the-alternatives:mix}
+Une charge de recherches ponctuelles et de coupes transversales, dont une fraction $f$ sont des coupes, coûte $(1-f)\,t_{\mathrm{point}} +
+f\,t_{\mathrm{xsec}}$ par requête sur chaque moteur. Avec les médianes ci-dessus, DuckDB et SQLite coûtent la même chose pour $f = 1.2~\%$~: dès que
+une requête sur cent environ est une coupe transversale, le moteur en colonnes est plus rapide sur l'ensemble de la charge, bien que
+il perde près de quatre-vingts contre un sur les recherches ponctuelles.
+\end{example}
+
+\section{Panorama du domaine}
+
+\begin{dated}{2026-09}{Moteurs de séries temporelles et moteurs analytiques utilisés pour les données de marché}\label{dat:pl:time-series-databases-and-the-alternatives:survey}
+Selon leur propre documentation et leurs fichiers de licence (consultés en septembre 2026)~: \textbf{kdb+} (KX) est «~une base de données historique en colonnes
+multiplateforme à haute performance pour séries temporelles~», un moteur de calcul en mémoire et un processeur de flux temps réel doté de son
+propre langage, q~; toute utilisation requiert une licence (commerciale, ou une édition communautaire gratuite de son successeur, KDB-X, avec des
+restrictions d'usage). \textbf{ClickHouse} est un serveur de base de données en colonnes, libre, destiné aux rapports analytiques temps réel (Apache
+2.0). \textbf{QuestDB} est une base de données libre pour séries temporelles, avec SQL sur des colonnes mappées en mémoire et partitionnées par temps, ainsi que Parquet
+(Apache 2.0). \textbf{TimescaleDB} est une extension de PostgreSQL destinée à l'analyse de séries temporelles, avec un columnstore (Apache 2.0 hors
+parties soumises à la Timescale Licence). \textbf{InfluxDB~3} est une base de données libre pour séries temporelles, construite sur Arrow, DataFusion et
+Parquet (MIT ou Apache 2.0). \textbf{ArcticDB} (Man Group) est une base de dataframes sans serveur, en Python, qui écrit sur un stockage objet
+ou sur LMDB (Business Source Licence 1.1, chaque version passant à Apache 2.0 au plus tard quatre ans après sa publication). \textbf{DuckDB}
+et \textbf{Polars} sont embarqués, sous licence MIT.
+\end{dated}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lp{2.7cm}p{3.3cm}p{4.3cm}}
+\toprule
+moteur & déploiement & stockage & force sur les données de marché \\
+\midrule
+kdb+ & serveur, en mémoire & en colonnes, partitionné par temps & capture des ticks et requêtes dans un seul système \\
+ClickHouse & serveur & en colonnes & grands balayages et agrégations \\
+QuestDB & serveur & en colonnes, partitionné par temps & ingestion et requêtes SQL sur \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{intervalles de temps} \\
+TimescaleDB & extension de PostgreSQL & lignes et columnstore & données relationnelles à côté des séries temporelles \\
+InfluxDB 3 & serveur & Arrow et Parquet & métriques de type supervision \\
+ArcticDB & bibliothèque, stockage objet & dataframes versionnés & historique de recherche sur dataframes \\
+DuckDB, Polars & bibliothèque & fichiers (Parquet, Arrow) & recherche sur une \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} \\
+SQLite & bibliothèque & lignes, B-tree & petites tables de référence, recherches ponctuelles \\
+\bottomrule
+\end{tabular}
+\caption{Les moteurs de l'encadré daté, par déploiement et stockage, et la part de la charge de données de marché pour laquelle chacun est conçu~;
+la dernière colonne traduit la lecture que fait ce livre de leur conception, et non un benchmark.}\label{tab:pl:time-series-databases-and-the-alternatives:survey}
+\end{table}
+
+Le choix découle du mélange des requêtes et de qui écrit. Une société dont les requêtes sur données de marché sont des balayages de recherche sur l'historique,
+écrits une fois par jour par un job de compaction, se contente de fichiers et d'un moteur embarqué~; une société qui a besoin de nombreux écrivains et lecteurs simultanés de données en direct, avec contrôle d'accès,
+achète ou construit un serveur~; une société dont les chercheurs travaillent en dataframes et veulent des jeux de données versionnés regarde du côté d'un magasin de dataframes.
+Quel que soit le choix, le benchmark de ce chapitre, sur les formes de requêtes propres à la société,
+tranche entre les candidats.
+
+\section{Tutoriel~: cinq moteurs, une seule réponse}\label{tut:pl:time-series-databases-and-the-alternatives:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Charger un jeu de données dans cinq moteurs, prouver qu'ils concordent et les chronométrer correctement. \textbf{État final~:}
+\cref{fig:pl:time-series-databases-and-the-alternatives:times} et le mélange-seuil de
+l'\cref{ex:pl:time-series-databases-and-the-alternatives:mix}.
+\begin{tutsteps}
+\item \textbf{Données}~: \texttt{pl\_tsbench.dataset()}~: le mois de cotations du chapitre~3 et 40\,000 transactions~; \texttt{prepare()} les écrit
+en Parquet, partitionnées par date et triées par symbole puis par temps.
+\item \textbf{Accord}~: \texttt{answers()} construit les cinq moteurs et vérifie les cinq formes de requêtes~; chaque contrôle doit être vrai.
+\item \textbf{Chronométrage}~: \texttt{bench\_tsbench.py} exécute \texttt{firm\_tsbench.bench}
+(\cref{lst:pl:time-series-databases-and-the-alternatives:bench})~: d'abord les exécutions à froid, puis sept tours entrelacés.
+\item \textbf{Décision}~: calculer la part-seuil des coupes transversales entre le moteur le plus rapide pour les recherches ponctuelles et le moteur le plus
+rapide pour les balayages.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Supprimer l'index de SQLite et relancer la recherche ponctuelle~; ajouter une sixième forme de requête (le prix
+pondéré par le volume des transactions de chaque symbole sur une journée) à chaque moteur et vérifier qu'ils concordent avant de la chronométrer.
+\end{tutorial}
+
+\section{Construction~: le benchmark des moteurs}\label{bld:pl:time-series-databases-and-the-alternatives:tsbench}
+
+\begin{build}
+\bfield{Rôle} Le benchmark permanent de la société pour tout moteur proposé pour les données de marché~: mêmes données, mêmes formes de requêtes, réponses vérifiées,
+temps entrelacés.
+\bfield{Interface} \texttt{QUERIES}, \texttt{ENGINES}, \texttt{Params(symbol, date, t0, t1, point\_t)}~;
+\texttt{write\_dataset(quotes, trades, root)}~; \texttt{make\_engine(name, quotes, trades, root)} avec \texttt{run(query, params)}
+renvoyant des lignes triées et arrondies~; \texttt{check(engines, params)}~; \texttt{bench(factory, params, rounds)} renvoyant le temps à froid et la médiane
+et la dispersion par moteur et par requête.
+\bfield{Règles} Aucun chronométrage avant que tous les moteurs concordent sur chaque forme de requête~; les tours entrelacent les moteurs~; les exécutions à froid se font sur des instances neuves~;
+les résultats sont comparés après tri et arrondi à six décimales, jamais à l'œil.
+\bfield{Tests d'acceptation} \texttt{code/firm/tsbench/tests/}~: les cinq moteurs concordent sur chaque forme de requête sur un petit jeu de données~; un moteur erroné
+introduit exprès est détecté par le contrôle~; la jointure as-of renvoie la cotation une nanoseconde avant chaque transaction~; le benchmark renvoie
+un temps à froid et un temps à chaud pour chaque moteur et chaque forme de requête.
+\bfield{Pour aller plus loin} Un moteur serveur derrière la même interface~; la mémoire autant que le temps~; le benchmark à plusieurs tailles de données,
+pour estimer les $c_0$ et $c_r$ de chaque moteur.
+\end{build}
+
+\begin{omsources}
+\item P.~Boncz, M.~Zukowski et N.~Nes, « MonetDB/X100~: hyper-pipelining query execution », \emph{CIDR}, 2005.
+\item D.~J.~Abadi, D.~S.~Myers, D.~J.~DeWitt et S.~R.~Madden, « Materialization strategies in a column-oriented DBMS »,
+\emph{ICDE}, 2007.
+\item M.~Raasveldt et H.~Mühleisen, « DuckDB~: an embeddable analytical database », \emph{SIGMOD}, 2019.
+\item La documentation et les fichiers de licence des moteurs de l'encadré daté.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:1}
+À partir de la \cref{fig:pl:time-series-databases-and-the-alternatives:times}, de quel facteur SQLite est-il plus rapide que DuckDB sur la recherche
+ponctuelle, et de quel facteur plus lent sur la coupe transversale~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:2}
+Pourquoi un index sur (symbol, time) rend-il la recherche ponctuelle presque gratuite, et pourquoi n'aide-t-il pas la coupe transversale~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:time-series-databases-and-the-alternatives:3}
+Une session de 6.5 heures compte combien d'intervalles d'une minute~? La requête sur les barres a renvoyé 359 lignes pour la journée de S007~: qu'est-il advenu
+des autres~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:4}
+Pourquoi les moteurs sont-ils entrelacés à l'intérieur de chaque tour plutôt que d'exécuter chacun sept fois de suite~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:5}
+Expliquer, avec la \cref{prop:pl:time-series-databases-and-the-alternatives:shapes}, pourquoi la recherche ponctuelle de DuckDB (3.8~ms) est plus lente que
+sa requête d'intervalle (2.2~ms), alors que l'intervalle renvoie 153 lignes.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:6}
+Dérivez la part de seuil de rentabilité de la \cref{ex:pl:time-series-databases-and-the-alternatives:mix} à partir des
+médianes mesurées.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:7}
+\emph{Programmation.} Vérifier les cinq moteurs sur le symbole S023, jour 12 (les mêmes fenêtres, décalées à ce jour). Concordent-ils, et combien
+de lignes chaque forme renvoie-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:time-series-databases-and-the-alternatives:8}
+\emph{Trouver la faille.} «~Nous avons comparé la \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{base de données de séries temporelles} du fournisseur avec DuckDB sur la requête de démonstration du fournisseur~: une exécution de
+chaque, la nôtre en premier. Celle du fournisseur était trois fois plus rapide, nous allons donc l'acheter.~»
+\end{exercise}
+
+\section{Problème~: le bon outil pour chaque question}
+
+\begin{problem}[{Problème du week-end --- choisir un moteur pour la plateforme de recherche}]\label{pb:pl:time-series-databases-and-the-alternatives:1}
+La matière du mois de cotations et de transactions du chapitre, les cinq moteurs de \texttt{firm.tsbench} et les médianes mesurées de
+la \cref{fig:pl:time-series-databases-and-the-alternatives:times}.
+
+\medskip\noindent\textbf{Partie I --- Formes.}
+\begin{enumerate}
+\item Nommer les cinq formes de requêtes et donner une question de données de marché pour chacune.
+\item Quelles formes touchent peu de lignes, et lesquelles en touchent beaucoup~?
+\item Quelle disposition sert la forme d'intervalle et la forme des barres~?
+\item Qu'est-ce qu'une \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{base de données de séries temporelles} ajoute au magasin de ticks du chapitre~4~?
+\item Qu'est-ce que le \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{sous-échantillonnage}, et où se place-t-il dans une \omterm{def:pl:capturing-and-storing-tick-data:tier}{politique de rétention}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Moteurs.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qui distingue un moteur embarqué d'un serveur, et que sacrifie chacun~?
+\item Qu'est-ce que l'exécution vectorisée, et pourquoi rend-elle les parcours rapides~?
+\item Qu'est-ce que la \omterm{def:pl:time-series-databases-and-the-alternatives:vectorised}{matérialisation tardive}~?
+\item Pourquoi une recherche dans un B-tree est-elle plus rapide qu'un parcours vectorisé d'un fichier trié pour une seule ligne~?
+\item Quel moteur est le plus rapide sur chaque forme ici, et lequel est le plus lent~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Mesure.}
+\begin{enumerate}[resume]
+\item Combien de lignes chaque forme renvoie-t-elle, et pourquoi les vérifier avant de chronométrer~?
+\item Quelles sont les médianes de SQLite et de DuckDB pour la recherche ponctuelle et la tranche transversale~?
+\item Pourquoi le moteur numpy écrit à la main est-il le plus rapide sur quatre formes, et pourquoi ce n'est-il pas la réponse~?
+\item Que mesure l'exécution à froid que la médiane à chaud ne mesure pas~?
+\item Que faut-il énoncer avec les chiffres pour qu'ils aient un sens~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le moteur le plus rapide pour chaque forme, et le mélange de requêtes à partir duquel le moteur en colonnes devance
+le magasin en lignes.
+\item La charge d'une équipe de recherche se compose à 95~\% de tranches transversales et de barres, et à 5~\% de recherches ponctuelles~: quel moteur choisir~?
+\item Un service qui répond aux demandes du dernier cours pour un routeur d'ordres~: quel moteur, et pourquoi pas celui de la recherche~?
+\item Quand un serveur de \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{base de données de séries temporelles} est-il le bon achat~?
+\item En une phrase~: qu'est-ce qui détermine le moteur le plus rapide~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:time-series-databases-and-the-alternatives:1}
+Qu'est-ce qu'une \omterm{def:pl:time-series-databases-and-the-alternatives:tsdb}{base de données de séries temporelles}, et en avez-vous besoin pour les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:time-series-databases-and-the-alternatives:2}
+Pourquoi un moteur en colonnes est-il rapide pour les agrégations et lent pour les recherches d'une seule ligne~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:time-series-databases-and-the-alternatives:3}
+Comment évalueriez-vous deux bases de données sur vos données de marché de sorte que le résultat ait un sens~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:time-series-databases-and-the-alternatives:4}
+Quand utiliseriez-vous un moteur embarqué comme DuckDB plutôt qu'un serveur de base de données~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:time-series-databases-and-the-alternatives:5}
+Votre société doit remplacer sa \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} propriétaire. Comment décidez-vous par quoi la remplacer~?
+\end{interviewq}

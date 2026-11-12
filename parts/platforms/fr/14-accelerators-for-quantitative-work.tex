@@ -1,0 +1,347 @@
+\chapter{Accélérateurs pour le travail quantitatif}\label{ch:pl:accelerators-for-quantitative-work}
+
+Une banque a transféré sa simulation de Monte Carlo du risque de contrepartie, exécutée chaque nuit, sur des processeurs graphiques, et elle a gagné un facteur de plusieurs fois. La même banque a essayé les
+mêmes dispositifs pour le pricing intrajournalier de transactions isolées, et rien n'a bougé~: chaque requête passait plus de temps à traverser le lien vers le dispositif et à en revenir
+qu'à calculer sur celui-ci. Les deux résultats étaient prévisibles à partir de trois nombres par charge de travail~--- le volume d'arithmétique effectué, le nombre d'octets
+déplacés, et le nombre d'octets devant traverser le lien vers le dispositif~--- et deux nombres par machine. Ce chapitre mesure ces nombres sur le processeur du portable
+et reprend celui d'un dispositif de centre de calcul depuis sa fiche produit, et prédit les deux issues avant que quiconque n'achète quoi que ce soit.
+
+\section{Ce que fait bien un processeur graphique}
+
+Un processeur graphique (un accélérateur au sens du livre~12, chapitre~23) dispose de milliers d'unités arithmétiques simples, qui exécutent la même
+instruction sur des données différentes, et d'une mémoire qui lui est attachée, plusieurs fois plus rapide que celle d'un serveur. Il excelle dans ce que font déjà les
+instructions SIMD d'un CPU (livre~13, chapitre~14), mais à une échelle bien plus grande~: une longue boucle d'opérations arithmétiques identiques et indépendantes sur des
+tableaux déjà présents dans sa mémoire. Il est en revanche mal adapté à trois choses que le code quantitatif fait souvent.
+
+\begin{definition}[Transfert hôte--périphérique]\label{def:pl:accelerators-for-quantitative-work:transfer}
+Un \emph{transfert hôte--périphérique}\index{transfert hôte--périphérique} déplace des données entre la mémoire du CPU (l'hôte) et celle d'un accélérateur
+(le périphérique) par un lien tel que PCI Express~; chaque entrée lue par un calcul sur le périphérique et chaque résultat qu'il renvoie traverse ce lien, à
+une bande passante très inférieure à celle de l'une ou l'autre mémoire, et avec un coût fixe à chaque traversée.
+\end{definition}
+
+\begin{definition}[Divergence des threads]\label{def:pl:accelerators-for-quantitative-work:divergence}
+La \emph{divergence des threads}\index{divergence des threads} se produit lorsque des threads qui s'exécutent en pas de deux prennent des branches différentes~: le groupe exécute
+chaque branche à tour de rôle, les threads qui ne s'y trouvent pas restant inactifs, si bien qu'un code à branches dépendant des données (exercice anticipé, contrôles de barrière, gains dépendant du
+chemin avec de nombreux cas) tourne à une fraction du débit du périphérique.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.8cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!15,minimum width=2.6cm] (cpu) at (0,0) {cœurs CPU};
+\node[box,fill=gray!10,minimum width=2.6cm] (hm) at (0,-1.6) {mémoire hôte};
+\node[box,fill=omDef!15,minimum width=3.2cm] (gpu) at (9.0,0) {périphérique~: des milliers\\ d'unités arithmétiques};
+\node[box,fill=gray!10,minimum width=3.2cm] (dm) at (9.0,-1.6) {mémoire du périphérique};
+\draw[<->,thick] (cpu) -- node[left]{24.0~Go/s, un cœur} (hm);
+\draw[<->,very thick] (gpu) -- node[right]{3.35~To/s} (dm);
+\draw[<->,thick,omThm] (hm.east) -- node[above]{PCIe Gen5~: 128~Go/s} node[below,align=center]{chaque entrée et\\chaque résultat traverse} (dm.west);
+\draw[->,dashed] (cpu.east) -- node[above=2pt,align=center]{lancement et synchronisation~:\\$L$ par requête} (gpu.west);
+\end{tikzpicture}
+
+\omcaption{Où passe le temps lorsque le travail migre vers un périphérique. La mémoire du périphérique est 140 fois plus rapide que ce qu'atteint un cœur du portable,
+mais les entrées et les résultats traversent un lien plus lent que l'une ou l'autre mémoire, et chaque requête paie un coût fixe de lancement et de synchronisation $L$
+(le chapitre suppose 10~microsecondes).}\label{fig:pl:accelerators-for-quantitative-work:path}
+\end{omfigure}
+
+Le troisième est la taille. Un calcul qui prend une microseconde sur un CPU ne peut pas être plus rapide sur un périphérique dont le seul lancement et la seule synchronisation
+prennent plusieurs microsecondes~: un petit travail, comme le prix d'une transaction isolée, supporte un coût fixe que les gros travaux amortissent.
+
+\section{Le modèle roofline}
+
+\begin{definition}[Intensité arithmétique]\label{def:pl:accelerators-for-quantitative-work:intensity}
+L'\emph{intensité arithmétique}\index{intensité arithmétique} d'un noyau de calcul est le nombre d'opérations en virgule flottante qu'il effectue par octet
+qu'il déplace entre la mémoire et le processeur.
+\end{definition}
+
+\begin{definition}[Modèle roofline]\label{def:pl:accelerators-for-quantitative-work:roofline}
+Le \emph{modèle roofline}\index{modèle roofline} (Williams, Waterman et Patterson, 2009) borne le débit arithmétique qu'un noyau d'intensité
+$I$ peut atteindre sur une machine de débit crête $P$ et de bande passante mémoire $B$ par $\min(P,\ I B)$. Tracé en axes logarithmiques, c'est une droite
+oblique (la bande passante) rencontrant un palier horizontal (le débit crête) au point de jonction $I^* = P/B$.
+\end{definition}
+
+\begin{definition}[Noyau limité par la mémoire, noyau limité par le calcul]\label{def:pl:accelerators-for-quantitative-work:bound}
+Un noyau dont l'intensité est inférieure au point de jonction de la machine est \emph{limité par la mémoire}\index{noyau limité par la mémoire} (memory-bound)~: son débit
+est limité par la bande passante, et ajouter des unités arithmétiques ne l'aide pas. Un noyau situé au-dessus de la jonction est \emph{limité par le calcul}\index{noyau limité par le calcul} (compute-bound).
+\end{definition}
+
+Le roofline transforme une question sur le matériel en deux nombres sur le code. Le modèle du chapitre (\texttt{firm.roofline}) ajoute le transfert
+et le coût fixe~: sur un périphérique, un noyau prend au moins $L + X/\ell + \max(F/P, M/B)$ secondes, avec $F$ ses opérations, $M$ ses octets
+en mémoire, $X$ les octets qui traversent un lien de bande passante $\ell$, et $L$ la latence de lancement et de synchronisation d'une requête.
+
+\omcode{code/firm/roofline/firm_roofline.py}{55}{75}{Un toit et le temps de bout en bout d'un noyau sur celui-ci~: la borne roofline, plus une
+latence de lancement et un transfert par le lien hôte pour un périphérique.}\label{lst:pl:accelerators-for-quantitative-work:roof}
+
+\section{Mesurer le toit du portable}
+
+Un cœur de ce portable (un Intel Core Ultra 7 155H, sous WSL2) a été mesuré~: le débit crête par un produit de matrices $2000\times2000$ en double précision
+sur un thread BLAS, la bande passante par un triad de type STREAM $a_i = b_i + s c_i$ en C++20 sur des tableaux de 128~Mo, en comptant 24 octets
+par élément. Le cœur atteint 66.9~GFLOP/s et 24.0~Go/s~: son point de jonction se situe à 2.79 opérations par octet.
+
+\omcode{code/firm/roofline/cpp/firm_roofline_triad.cpp}{11}{22}{La mesure de bande passante~: le triad, chronométré au meilleur de dix essais.}\label{lst:pl:accelerators-for-quantitative-work:triad}
+
+Quatre noyaux de référence ont été chronométrés sur le même cœur (\cref{tab:pl:accelerators-for-quantitative-work:kernels})~: un pas de
+mouvement brownien géométrique sur $2^{23}$ trajectoires ($S \mathrel{*}= e^{a + bZ}$), un gain de panier sur 500\,000 trajectoires de 20 actifs, l'agrégation d'un
+cube de valeurs de transactions (2\,000 trajectoires, 50 dates, 200 transactions) en un profil d'exposition positive attendue, et le produit de matrices. Les
+opérations sont comptées selon la convention de \texttt{firm.roofline}~: additions et multiplications comptent pour un, de même qu'un appel à \texttt{exp},
+bien qu'il coûte de nombreux cycles.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+noyau & intensité (flop/octet) & atteint (GFLOP/s) & toit (GFLOP/s) & part du toit \\
+\midrule
+pas de trajectoire & 0.17 & 0.65 & 3.99 & 16~\% \\
+gain de panier & 0.25 & 4.82 & 5.99 & 81~\% \\
+agrégation des expositions & 0.13 & 2.63 & 3.03 & 87~\% \\
+produit de matrices & 166.7 & 64.2 & 66.9 & 96~\% \\
+\bottomrule
+\end{tabular}
+\caption{Quatre noyaux sur un cœur du portable~: intensité selon la convention de comptage du chapitre, débit atteint (meilleur de cinq exécutions),
+toit à cette intensité et part atteinte. Données~: \texttt{bench\_roofline.py}.}
+\label{tab:pl:accelerators-for-quantitative-work:kernels}
+\end{table}
+
+Trois des quatre sont \omterm{def:pl:accelerators-for-quantitative-work:bound}{limités par la mémoire}, et les deux boucles simples atteignent 81 et 87~\% du toit de bande passante~: elles sont achevées, et seule
+une bande passante supérieure les accélérerait. Le pas de trajectoire reste très en deçà de son toit parce que le roofline compte des opérations et que \texttt{exp} est une seule
+opération qui prend de nombreux cycles~; sa vraie limite est le débit de l'exponentielle. Le produit de matrices, seul \omterm{def:pl:accelerators-for-quantitative-work:bound}{noyau limité par le calcul}, définit
+le débit crête~: il atteint ici 96~\% de celui-ci seulement parce que le débit crête est son meilleur résultat sur davantage d'exécutions que les cinq du tableau.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=12cm,height=6.4cm,xlabel={intensité arithmétique (flop par octet, échelle log)},ylabel={GFLOP/s (échelle log)},xmin=0.01,xmax=1000,
+  ymin=0.1,ymax=100000,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[omThm,very thick] table[x=intensity,y=cpu_gflops]{figdata/platforms/14-accelerators-for-quantitative-work/roofline.csv};
+\addplot[omDef,very thick,dashed] table[x=intensity,y=device_gflops]{figdata/platforms/14-accelerators-for-quantitative-work/roofline.csv};
+\addplot[only marks,mark=*,mark size=2pt,black]
+  table[x=intensity,y=gflops]{figdata/platforms/14-accelerators-for-quantitative-work/measured_kernels.csv};
+\node[font=\scriptsize,anchor=west] at (axis cs:0.18,0.65) {pas de trajectoire};
+\node[font=\scriptsize,anchor=west] at (axis cs:0.29,4.8) {gain de panier};
+\node[font=\scriptsize,anchor=south east,align=right,inner sep=1pt] at (axis cs:0.12,2.9) {agrégation\\des expositions};
+\node[font=\scriptsize,anchor=south east] at (axis cs:167,64) {produit de matrices};
+\node[omThm,font=\scriptsize,anchor=north] at (axis cs:30,50) {un cœur du portable};
+\node[omDef,font=\scriptsize,anchor=north,align=center] at (axis cs:100,30000) {périphérique de centre\\de calcul (FP64)};
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Deux rooflines~: un cœur du portable (mesuré) et un processeur graphique de centre de calcul en double précision (d'après sa fiche
+produit), avec les quatre noyaux tels que mesurés sur le cœur. Le ridge du cœur est à 2.8 opérations par octet, celui du périphérique à 10.1~: les
+noyaux \omterm{def:pl:accelerators-for-quantitative-work:bound}{limités par la mémoire} (memory-bound) sur le cœur le sont encore davantage sur le périphérique. Données~: \texttt{bench\_roofline.py}, \texttt{fig\_roofline.py}.}
+\label{fig:pl:accelerators-for-quantitative-work:roofline}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Un périphérique de centre de calcul}\label{dat:pl:accelerators-for-quantitative-work:h100}
+La fiche produit de NVIDIA indique, pour le H100 dans sa forme SXM~: 34 téraFLOPS en double précision (67 sur ses cœurs tensoriels), 67 en simple
+précision, 80~Go de mémoire à 3.35~To/s, une interconnexion NVLink à 900~Go/s, 128~Go/s par PCIe Gen5, et jusqu'à 700~W. Face à un cœur du portable, il offre 508
+fois le pic en double précision et 140 fois la bande passante. Le chapitre prend ces chiffres comme le toit du périphérique et son
+chiffre PCIe comme liaison avec l'hôte, la lecture la plus favorable de celui-ci.
+\end{dated}
+
+\section{Monte Carlo et risque sur un périphérique}
+
+La charge de nuit est une simulation Monte Carlo d'expositions pour un ensemble de compensation (netting set)~: 10\,000 trajectoires de 50 facteurs de risque à
+120 dates mensuelles, 5\,000 transactions valorisées sur chaque trajectoire et chaque date (dix opérations chacune~: une transaction linéaire sur un
+facteur, actualisée), et les valeurs agrégées en un profil d'exposition attendue (livre~6, chapitres 17 et~18). Elle effectue 66~milliards d'opérations et déplace 98~Go en mémoire~: limitée par la mémoire sur les
+deux machines. Seules les descriptions des transactions partent vers le périphérique (100 octets chacune) et seul le profil revient~; les trajectoires sont engendrées là où
+elles servent, avec un générateur à compteur (livre~4, chapitre~26), de sorte que les trajectoires du périphérique sont celles du CPU.
+
+\omcode{code/platforms/14-accelerators-for-quantitative-work/python/pl_roofline.py}{43}{65}{Les deux charges du modèle~: la tâche d'exposition
+ses trois noyaux, son temps de bout en bout sur le périphérique, et une requête de valorisation de $n$ transactions.}\label{lst:pl:accelerators-for-quantitative-work:model}
+
+Sur le cœur, à son toit, la tâche prend 4.09~secondes~; sur le périphérique, 29.3~millisecondes, lancements et transferts compris~: 140 fois plus
+vite, soit le rapport des bandes passantes, car la tâche est limitée par la mémoire. Si 95~\% du traitement de nuit relève de ce type de calcul et que
+le reste (lecture des positions, écriture des rapports) reste sur l'hôte, la loi d'Amdahl plafonne le gain de l'ensemble à $1/(0.05 + 0.95/140) = 17.6$ fois.
+Face à un socket serveur à nombreux cœurs, le facteur par cœur se réduit~: un calcul \omterm{def:pl:accelerators-for-quantitative-work:bound}{limité par la mémoire} gagne le rapport de la bande passante du
+périphérique à celle du socket, et non à celle d'un seul cœur.
+
+\section{Entraînement, et ce que le livre d'apprentissage automatique disait déjà}
+
+Le livre~12 (chapitre~23) a couvert le terrain propre de l'accélérateur~: l'entraînement des réseaux de neurones est dominé par les produits de matrices, \omterm{def:pl:accelerators-for-quantitative-work:bound}{limités par le calcul} (compute-bound), à
+forte intensité, exécutés en précision mixte sur les unités tensorielles et répartis entre périphériques par parallélisme de données. Le même roofline l'explique~: un
+produit de matrices de taille $n$ a une intensité de $n/12$, bien au-dessus de tout ridge, et le pic en précision réduite d'un périphérique est plusieurs fois son
+pic en double précision. Le Monte Carlo de la finance quantitative est d'ordinaire l'autre type de noyau --- faible intensité, double précision --- et
+il gagne le rapport des bandes passantes, non celui des pics.
+
+\section{Décider avec un modèle de coût}
+
+Une seule demande de prix intrajournalière est petite~: dix mille opérations (cent flux sur une courbe interpolée) et un kilo-octet traversant la
+liaison (la transaction et son résultat). Sur le cœur, elle prend 0.33~microseconde~; sur le périphérique, 10.0 --- presque tout étant le lancement et
+la latence de synchronisation, que le chapitre fixe à 10~microsecondes (une hypothèse, non un chiffre de fiche technique). Le périphérique
+est 30 fois plus lent. Regroupées, les demandes partagent le coût fixe (\cref{fig:pl:accelerators-for-quantitative-work:batch})~: le périphérique atteint le seuil de rentabilité à 31 transactions par requête
+et approche, pour de très grands lots, 32.7 fois le cœur --- un plafond imposé par la liaison, car chaque kilo-octet de transaction la traverse encore.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=11.5cm,height=5.8cm,xlabel={transactions par requête (échelle log)},ylabel={accélération du périphérique (échelle log)},
+  xmin=1,xmax=1000000,ymin=0.02,ymax=100,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},
+  table/col sep=comma]
+\addplot[omDef,very thick] table[x=n,y=speedup]{figdata/platforms/14-accelerators-for-quantitative-work/batch.csv};
+\draw[black,dashed] (axis cs:1,1) -- (axis cs:1000000,1);
+\draw[omThm,thick] (axis cs:31,0.02) -- (axis cs:31,100) node[pos=0.12,right,font=\scriptsize]{seuil de rentabilité~: 31 transactions};
+\node[font=\scriptsize,anchor=north east] at (axis cs:900000,28) {plafond imposé par la liaison 32.7};
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Accélération de bout en bout prédite du périphérique par rapport à un cœur du portable pour une requête valorisant $n$ transactions, avec une latence de lancement et
+de synchronisation de 10~microsecondes et le débit PCIe de la fiche produit. Une seule transaction est 30 fois plus lente sur le périphérique~; le périphérique
+l'emporte à partir de 31 transactions, et aucun lot ne le porte au-delà du plafond de la liaison. Données~: \texttt{fig\_roofline.py}.}
+\label{fig:pl:accelerators-for-quantitative-work:batch}
+\end{omfigure}
+
+\begin{example}[Plus rapide la nuit, non en journée]\label{ex:pl:accelerators-for-quantitative-work:verdict}
+Le même périphérique, le même style de code, deux verdicts. La tâche d'exposition est grande et limitée par la mémoire, elle déplace peu à travers la liaison et tourne 140
+fois plus vite que sur un cœur (17.6 fois pour l'ensemble du traitement selon la loi d'Amdahl). La demande de prix est
+minuscule, et la latence d'un lancement représente trente fois son coût total sur le CPU. Le lot de rentabilité dépend de la latence supposée~: 4 transactions à 1~microseconde, 16 à 5, 31 à 10,
+155 à 50. Un service de valorisation capable de regrouper ses demandes à plusieurs centaines par appel gagnerait~; un service qui répond à chaque demande dès son arrivée ne le peut pas.
+\end{example}
+
+\begin{remark}[Ce que le modèle laisse de côté]\label{rem:pl:accelerators-for-quantitative-work:limits}
+Le modèle est une borne~: les noyaux réels atteignent une fraction de l'un ou l'autre toit, comme le montre le tableau pour le cœur. Il ignore la \omterm{def:pl:accelerators-for-quantitative-work:divergence}{divergence des threads}, le coût de
+portage et de la maintenance d'une seconde implémentation, le prix et la consommation du périphérique, et la mise en file d'attente des requêtes sur un périphérique partagé. Il suffit
+à écarter un accélérateur, ou à dire que le mesurer vaut l'effort.
+\end{remark}
+
+\begin{dated}{2026-09}{Un indice de référence pour le matériel de valorisation et de risque}\label{dat:pl:accelerators-for-quantitative-work:stac}
+STAC Research décrit sa suite de tests STAC-A2 comme «~la référence du secteur pour tester les piles technologiques utilisées pour les charges de calcul intensif
+analytiques liées à la valorisation et à la gestion des risques~». Les fournisseurs publient des résultats sur celle-ci pour les CPU et les accélérateurs~; le
+roofline du chapitre est l'estimation au dos d'enveloppe de la même question.
+\end{dated}
+
+\section{Tutoriel~: deux rooflines et une décision}\label{tut:pl:accelerators-for-quantitative-work:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Mesurer le toit d'un cœur et quatre noyaux sur celui-ci, les placer à côté du toit d'un périphérique cité, et prédire deux charges de
+bout en bout. \textbf{État final~:} \cref{fig:pl:accelerators-for-quantitative-work:roofline,fig:pl:accelerators-for-quantitative-work:batch}.
+\begin{tutsteps}
+\item \textbf{Mesurer}~: \texttt{bench\_roofline.py} avec un seul thread BLAS~: le pic, la bande passante du triad, les quatre noyaux.
+\item \textbf{Placer}~: \texttt{Kernel.intensity} et \texttt{Roof.attainable} pour chaque noyau sur les deux toits.
+\item \textbf{Prédire}~: \texttt{overnight(cpu\_roof())}, \texttt{request(cpu\_roof(), n)}, \texttt{break\_even}.
+\item \textbf{Éprouver l'hypothèse}~: \texttt{launch\_sensitivity}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Mettre les chiffres en simple précision du périphérique dans le toit et voir quelles charges il modifie~; garder les données de marché
+sur le périphérique entre les requêtes et n'envoyer que la transaction.
+\end{tutorial}
+
+\section{Construction~: le modèle roofline}\label{bld:pl:accelerators-for-quantitative-work:roofline}
+
+\begin{build}
+\bfield{Rôle} Un modèle de coût qui indique à la plateforme, avant tout achat ou portage, quelles charges un accélérateur accélérerait et de
+combien, à partir de chiffres mesurés et cités.
+\bfield{Interface} \texttt{Kernel(name, flops, bytes, transfer)}~; \texttt{Roof(name, peak, bandwidth, link, launch, source)} avec
+\texttt{attainable}, \texttt{time}, \texttt{end\_to\_end}, \texttt{ridge}~; \texttt{DEVICES}~; \texttt{measure\_peak},
+\texttt{measure\_bandwidth}~; les noyaux de référence et leurs descripteurs~; \texttt{amdahl}~; \texttt{break\_even}.
+\bfield{Règles} Les chiffres des périphériques sont des données avec une source~; les chiffres du CPU sont mesurés sur un cœur avec un seul thread~; une convention de comptage
+des opérations énoncée~; les hypothèses (la latence de lancement) signalées et balayées.
+\bfield{Tests d'acceptation} \texttt{code/firm/roofline/tests/}~: l'arithmétique du toit~; chaque noyau de référence contre un calcul direct et son
+intensité comptée~; la loi d'Amdahl~; la recherche du seuil de rentabilité, y compris un périphérique qui ne l'atteint jamais~; les données du périphérique et le triad.
+\bfield{Pour aller plus loin} Un toit mesuré de tout le socket~; un toit de périphérique issu d'un benchmark plutôt que d'une fiche technique~; le coût par résultat en argent
+à partir des prix de location.
+\end{build}
+
+\begin{omsources}
+\item S.~Williams, A.~Waterman et D.~Patterson, ``Roofline: an insightful visual performance model for multicore architectures'',
+\emph{Communications of the ACM} 52(4), 2009.
+\item G.~M. Amdahl, ``Validity of the single processor approach to achieving large scale computing capabilities'', AFIPS Spring Joint
+Computer Conference, 1967.
+\item NVIDIA, page produit du H100~; STAC Research, page de l'indice de référence STAC-A2.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:1}
+Quelle est l'intensité d'un produit matriciel de taille $n$ selon la convention du chapitre, et à partir de quel $n$ est-il \omterm{def:pl:accelerators-for-quantitative-work:bound}{limité par le calcul} (compute-bound) sur le cœur et
+sur le périphérique~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:2}
+Pourquoi l'accélération du travail d'exposition est-elle proche du rapport des bandes passantes et non du rapport des crêtes~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:accelerators-for-quantitative-work:3}
+Avec 95~\% d'un processus accéléré 140 fois, quel est le gain du processus entier, et quel serait-il avec 99~\%~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:4}
+Pourquoi l'étape de chemin n'atteint-elle que 16~\% de son toit, et qu'est-ce qui le rapprocherait de celui-ci~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:5}
+D'où vient le plafond de 32.7 pour les grands lots de requêtes de prix~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:accelerators-for-quantitative-work:6}
+Quelles parties d'une simulation de Monte Carlo d'option américaine avec une régression à chaque date souffriraient de la \omterm{def:pl:accelerators-for-quantitative-work:divergence}{divergence des threads}, et lesquelles non~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:accelerators-for-quantitative-work:7}
+\emph{Programmation.} Avec \texttt{firm.roofline}, recalculer le lot de seuil de rentabilité si les données de marché (1~Mo) doivent être envoyées avec chaque requête au lieu
+de rester sur le périphérique.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:accelerators-for-quantitative-work:8}
+\emph{Trouver la faille.} «~Le périphérique a 508 fois la crête de notre cœur, donc notre calcul de risque, qui prend dix heures sur un cœur, prendra une minute.~»
+\end{exercise}
+
+\section{Problème~: Plus rapide la nuit, pas en cours de journée}
+
+\begin{problem}[{Problème du week-end --- deux charges de travail, un périphérique}]\label{pb:pl:accelerators-for-quantitative-work:1}
+Un cœur de portable tel que mesuré, le périphérique de l'\cref{dat:pl:accelerators-for-quantitative-work:h100}, les deux charges de travail du chapitre.
+
+\medskip\noindent\textbf{Partie I --- Toits.}
+\begin{enumerate}
+\item Quelles sont la crête, la bande passante et le point de bascule du cœur~?
+\item Quelles sont celles du périphérique, et leurs rapports au cœur~?
+\item Lesquels des quatre noyaux sont \omterm{def:pl:accelerators-for-quantitative-work:bound}{limités par la mémoire} (memory-bound) sur le cœur, et sur le périphérique~?
+\item Pourquoi l'étape de chemin se situe-t-elle sous son toit~?
+\item Que ne capture pas un roofline~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le travail de nuit.}
+\begin{enumerate}[resume]
+\item Combien d'opérations et d'octets le travail d'exposition comporte-t-il, et qu'est-ce qui traverse la liaison~?
+\item Quels sont ses temps sur le cœur et sur le périphérique~?
+\item Pourquoi l'accélération est-elle ce qu'elle est~?
+\item Que donne la loi d'Amdahl pour le processus entier~?
+\item Comment la comparaison changerait-elle face à un serveur à nombreux cœurs~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La requête.}
+\begin{enumerate}[resume]
+\item Quels sont les temps d'une requête unique sur le cœur et sur le périphérique~?
+\item À quel lot le périphérique atteint-il le seuil de rentabilité~?
+\item Comment le seuil de rentabilité se déplace-t-il avec la latence de lancement~?
+\item Qu'est-ce qui borne l'accélération des très grands lots~?
+\item Que devrait changer un service de tarification pour en bénéficier~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'accélération de bout en bout prédite de la simulation de Monte Carlo d'exposition et d'une requête de prix portant sur une seule transaction, et
+la taille du lot à partir de laquelle le périphérique atteint le seuil de rentabilité.
+\item Quelles charges de travail de la plateforme faudrait-il déplacer d'abord vers un périphérique~?
+\item Que faudrait-il mesurer avant d'en acheter un~?
+\item Pourquoi utiliser la double précision dans le modèle~?
+\item En une phrase~: quand un accélérateur est-il rentable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:accelerators-for-quantitative-work:1}
+Qu'est-ce que l'\omterm{def:pl:accelerators-for-quantitative-work:intensity}{intensité arithmétique}, et pourquoi compte-t-elle pour choisir le matériel~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:accelerators-for-quantitative-work:2}
+Votre simulation de Monte Carlo a été 30 fois plus rapide sur un processeur graphique, votre service de tarification a ralenti. Expliquez.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:accelerators-for-quantitative-work:3}
+Comment estimeriez-vous, sans le matériel, ce qu'un périphérique ferait pour une charge de travail~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:accelerators-for-quantitative-work:4}
+Pouvez-vous exécuter une simulation de Monte Carlo sur un périphérique et obtenir exactement les nombres du CPU~? Comment procéder~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:accelerators-for-quantitative-work:5}
+Concevez le processus de décision pour déplacer des parties d'une plateforme de risque vers des accélérateurs.
+\end{interviewq}

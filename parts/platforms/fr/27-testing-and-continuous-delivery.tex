@@ -1,0 +1,384 @@
+\chapter{Tests et livraison continue}\label{ch:pl:testing-and-continuous-delivery}
+
+Lors des derniers jours de juillet 2012, un broker-dealer a déployé par étapes un nouveau code de routage d'ordres sur ses huit serveurs de routage. Le nouveau code réutilisait un
+indicateur qui avait jadis activé une fonction retirée des années plus tôt et jamais supprimée. Un technicien n'a pas copié le nouveau code sur l'un des huit
+serveurs~; aucune seconde personne n'a relu le déploiement, et aucune procédure écrite n'en exigeait une. Le 1\up{er} août, les ordres portant l'indicateur réutilisé atteignirent
+le huitième serveur, réveillèrent la fonction retirée, et en quarante-cinq minutes la société envoya des millions d'ordres et perdit plus de 460~millions de dollars. Le livre~11
+étudie l'épisode sous l'angle des limites de risque manquantes~; ce chapitre le lit sous l'angle de son déploiement. Chacun de ses éléments --- le vieux code non testé,
+l'indicateur réutilisé, le déploiement partiel, le contrôle absent --- est précisément ce qu'une chaîne de tests et une procédure de déploiement existent pour détecter.
+
+\section{La pyramide des tests pour le code de trading}
+
+\begin{definition}[Tests unitaires, d'intégration et de bout en bout]\label{def:pl:testing-and-continuous-delivery:tests}
+Un \emph{test unitaire}\index{test unitaire} vérifie une fonction ou une classe isolément, en millisecondes. Un
+\emph{test d'intégration}\index{test d'intégration} vérifie plusieurs composants travaillant ensemble --- un pricer avec ses données de marché, une stratégie avec le simulateur --- en quelques secondes. Un
+\emph{test de bout en bout}\index{test de bout en bout} exécute un flux complet comme le ferait la production --- des ordres émis par une stratégie, passant par la passerelle, jusqu'à
+une plateforme de négociation simulée, puis retour vers le \omterm{def:pl:position-and-pnl-services:service}{service de positions} --- en quelques minutes.
+\end{definition}
+
+\begin{definition}[Pyramide des tests]\label{def:pl:testing-and-continuous-delivery:pyramid}
+La \emph{pyramide des tests}\index{pyramide des tests} est la règle selon laquelle une base de code doit comporter beaucoup de \omterm{def:pl:testing-and-continuous-delivery:tests}{tests unitaires}, moins de \omterm{def:pl:testing-and-continuous-delivery:tests}{tests d'intégration} et peu
+de \omterm{def:pl:testing-and-continuous-delivery:tests}{tests de bout en bout}, car chaque niveau supérieur est plus lent, plus fragile et moins précis sur ce qui a cassé~; elle s'est largement diffusée grâce au livre de Mike Cohn
+paru en 2009, \emph{Succeeding with Agile}.
+\end{definition}
+
+Le code de trading ajoute ses propres niveaux. Le livre~13, chapitre~25, décrit les tests fondés sur des propriétés, les tests différentiels et les tests de fuzz, ainsi que les barrières de régression de performance
+et la certification par la bourse pour le chemin à faible latence. Le \omterm{def:pl:simulation-production-parity:harness}{harnais de parité} du chapitre~\ref{ch:pl:simulation-production-parity} est un \omterm{def:pl:testing-and-continuous-delivery:tests}{test d'intégration}
+entre le simulateur et l'adaptateur de production~; la validation des modèles du livre~6 est une revue, et non un test, mais elle produit les valeurs de référence que les tests
+utilisent. Ce chapitre ajoute le test dont une bibliothèque de pricing a le plus besoin, ainsi que les contrôles qui décident de ce qui atteint la production.
+
+\section{Fichiers de référence pour les pricers}
+
+\begin{definition}[Test sur fichier de référence]\label{def:pl:testing-and-continuous-delivery:golden}
+Un \emph{test sur fichier de référence}\index{test sur fichier de référence} (golden file) compare les sorties d'un programme à des valeurs relues et conservées avec le code --- le
+fichier de référence, chacune assortie d'une tolérance et de la provenance de la valeur~; tout écart au-delà de la tolérance fait échouer le test, et modifier une valeur de référence
+est elle-même un changement soumis à relecture.
+\end{definition}
+
+Les sorties d'une bibliothèque de pricing sont des nombres sans oracle indépendant pour la plupart des produits~: une forme fermée couvre les plus simples, et les
+pricers de référence du livre~5 en couvrent quelques autres. Ce qu'apporte un fichier de référence, c'est une mémoire~: la valeur donnée par la bibliothèque la veille, relue à l'époque, à laquelle
+on compare la version du jour. Le rapport du groupe de travail de JPMorgan sur les pertes de 2012 au sein du Chief Investment Office a constaté que le nouveau modèle de VaR reposait
+sur des tableurs remplis par copier-coller, et que l'un d'eux divisait par la somme de deux taux au lieu de leur moyenne, ce qui
+a vraisemblablement atténué la volatilité d'un facteur deux. Une valeur de référence pour la VaR d'un portefeuille de référence, relue une fois, aurait bougé lorsque le
+modèle a changé.
+
+Le portefeuille du chapitre compte soixante instruments valorisés par la bibliothèque du livre~5~: vingt options européennes (moteur analytique), dix puts américains
+(différences finies), vingt calls asiatiques (Monte Carlo, 20\,000 trajectoires) et dix calls down-and-out (forme fermée). La tolérance est l'erreur propre au moteur
+multipliée par un facteur $k$~: une tolérance relative de $10^{-10}$ pour les formes fermées, $k$ fois l'écart entre la grille à 200 points et celle à 400 points pour
+l'EDP, $k$ fois l'erreur type Monte Carlo --- estimée à partir de huit graines indépendantes --- pour Monte Carlo.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=4.6cm,xbar,bar width=10pt,xmin=1e-10,xmax=30,xtick={1e-10,1e-8,1e-6,1e-4,1e-2,1},y dir=reverse,
+  ytick=data,yticklabels={européennes (analytique),américaines (EDP),asiatiques (Monte Carlo),down-and-out (forme fermée)},
+  xlabel={unité d'erreur moyenne par instrument (unités de prix, échelle logarithmique)},grid=major,grid style={gray!20},tick label style={font=\small},
+  label style={font=\small},table/col sep=comma,log origin=infty,nodes near coords,point meta=rawx,
+  every node near coord/.append style={font=\scriptsize,anchor=west,/pgf/number format/sci,/pgf/number format/precision=2}]
+\addplot[fill=omDef!40,draw=omDef] table[y expr=\coordindex,x=mean_error_unit]
+  {figdata/platforms/27-testing-and-continuous-delivery/errors.csv};
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Unité d'erreur de chaque valeur de référence, moyennée par produit~: une tolérance relative de $10^{-10}$ sur des prix proches de 12--15 pour les formes fermées, un
+écart de 0.0019 entre deux grilles EDP pour les puts américains proches de 11, et l'erreur type Monte Carlo de 0.053 pour les calls asiatiques proches de 8. La tolérance vaut
+$k$ fois cette unité, si bien qu'un même $k$ couvre huit ordres de grandeur d'un produit à l'autre. Données~: \texttt{fig\_goldtest.py}.}
+\label{fig:pl:testing-and-continuous-delivery:errors}
+\end{omfigure}
+
+\omcode{code/platforms/27-testing-and-continuous-delivery/python/pl_goldtest.py}{74}{82}{Tolérance de chaque valeur de référence, déduite de l'erreur propre à son
+moteur~: dispersion Monte Carlo selon les graines, convergence de grille pour l'EDP, un epsilon relatif pour les formes fermées.}
+\label{lst:pl:testing-and-continuous-delivery:tol}
+
+\omcode{code/firm/goldtest/firm_goldtest.py}{80}{93}{Comparaison~: chaque résultat confronté à sa valeur de référence et à sa tolérance, une valeur manquante
+d'un côté ou de l'autre valant échec, et les échecs décomptés par produit.}\label{lst:pl:testing-and-continuous-delivery:compare}
+
+Cinq constructions sont ensuite comparées au fichier de référence. Chacune introduit un seul changement dans le comportement de la bibliothèque.
+
+\omcode{code/platforms/27-testing-and-continuous-delivery/python/pl_goldtest.py}{103}{118}{Les cinq constructions aux changements introduits volontairement~: une nouvelle graine Monte Carlo, une
+convention de décompte ACT/360, une erreur de signe sur le taux des puts, une moyenne asiatique qui omet son dernier fixing, et une grille EDP plus fine.}
+\label{lst:pl:testing-and-continuous-delivery:builds}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={facteur de tolérance $k$ (erreurs types Monte Carlo)},ylabel={part},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0.8,xmax=6.2,ymin=0,ymax=1.08,xtick={1,2,3,4,5,6}]
+\addplot[omThm,thick,mark=*] table[x=k,y=asian_fix]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[black,thick,mark=square*] table[x=k,y=noise_run]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[omDef,thick,dashed,mark=triangle*] table[x=k,y=noise_instrument]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+\addplot[gray,thin] table[x=k,y=noise_theory]{figdata/platforms/27-testing-and-continuous-delivery/tolerance.csv};
+  \node[omThm,font=\scriptsize,anchor=south east] at (axis cs:6.1,0.62) {bogue de fixing asiatique détecté};
+  \node[font=\scriptsize,anchor=north west] at (axis cs:1.05,0.8) {$\blacksquare$ échecs (bruit)};
+  \node[omDef,font=\scriptsize,anchor=north west,align=left] at (axis cs:1.05,0.68) {$\blacktriangle$ calls asiatiques\\signalés};
+  \node[gray,font=\scriptsize,anchor=north east] at (axis cs:2.3,0.12) {théorie};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le compromis de tolérance Monte Carlo. La graine pouvant changer, le bruit seul signale chaque call asiatique avec la probabilité que deux
+estimations diffèrent de plus de $k$ erreurs types (théorie en gris), et fait échouer chaque exécution pour $k\le 2$~; le bug de fixing asiatique, que seuls voient les instruments Monte
+Carlo, est détecté sur les vingt à $k\le2$, mais sur 9 sur 20 à $k=5$, où le bruit fait encore échouer 2.5~\% des exécutions. Données~:
+\texttt{fig\_goldtest.py}.}\label{fig:pl:testing-and-continuous-delivery:tolerance}
+\end{omfigure}
+
+Les deux régressions importantes sont détectées à toutes les tolérances~: l'erreur de signe modifie les vingt puts de centaines d'unités d'erreur et davantage, et la convention de
+décompte modifie chaque prix européen, américain et à barrière d'un montant bien supérieur à sa tolérance. Le problème vient de Monte Carlo
+(la \cref{fig:pl:testing-and-continuous-delivery:tolerance}). La graine pouvant changer, le test de référence se trouve face à deux estimations du même prix
+et doit tolérer leur écart. Avec $k=2$, le bruit seul signale 18~\% des calls asiatiques et fait échouer chacune des quarante exécutions~; avec $k=5$, il fait échouer 2.5~\%
+des exécutions, mais le bug de fixing asiatique --- une petite modification, de deux à dix erreurs types --- n'est détecté que sur 9 des 20 calls asiatiques, et l'effet de la
+convention de décompte sur eux, jamais plus de deux erreurs types, n'est détecté sur aucun. Une fausse alerte coûtant 1\,000~\$ d'investigation, et une régression
+non détectée sur un seul produit coûtant 500\,000~\$ --- les hypothèses du modèle --- la tolérance la moins coûteuse est $k\le2$, un test qui échoue à chaque exécution. Aucune tolérance ne fonctionne.
+
+La correction n'est pas une tolérance mais une graine. Le moteur Monte Carlo du livre~5 tire ses nombres aléatoires d'une graine fixée pour chaque instrument~; si la construction
+la fige, le prix Monte Carlo du jour devient une fonction déterministe du code, les mêmes nombres aléatoires donnent le même prix au dernier chiffre près,
+et les instruments Monte Carlo peuvent être comparés avec la tolérance d'une formule fermée. Figée, le test de référence détecte le bug de fixing asiatique sur les 20
+instruments et l'effet de la convention de décompte sur les 60. Une nouvelle graine fait alors échouer le test comme tout autre changement --- ce qu'elle est --- et est livrée comme une
+mise à jour approuvée des valeurs de référence. Il en va de même pour la grille EDP plus fine~: elle déplace chaque put américain d'exactement une unité d'erreur, passe
+pour tout $k\ge1$, et doit arriver en production comme une mise à jour de référence relue, avec la nouvelle grille dans sa provenance, et non comme un passage silencieux.
+
+\section{Intégration continue}
+
+\begin{definition}[Intégration continue, chaîne de déploiement]\label{def:pl:testing-and-continuous-delivery:ci}
+L'\emph{intégration continue}\index{intégration continue} fusionne chaque modification dans la branche principale au moins une fois par jour, et construit et teste le
+code fusionné automatiquement à chaque fusion. Une \emph{chaîne de déploiement}\index{chaîne de déploiement} (pipeline) est la séquence automatisée d'étapes ---
+construction, \omterm{def:pl:testing-and-continuous-delivery:tests}{tests unitaires}, \omterm{def:pl:testing-and-continuous-delivery:tests}{tests d'intégration} et \omterm{def:pl:testing-and-continuous-delivery:golden}{tests sur fichiers de référence}, \omterm{def:pl:testing-and-continuous-delivery:tests}{tests de bout en bout}, déploiement --- par laquelle passe chaque modification, dans l'ordre, en s'arrêtant à la
+première défaillance.
+\end{definition}
+
+\begin{definition}[Livraison continue]\label{def:pl:testing-and-continuous-delivery:cd}
+La \emph{livraison continue}\index{livraison continue} maintient la branche principale livrable à tout moment, de sorte que toute modification qui passe la
+\omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} puisse être mise en production par une décision plutôt que par un projet.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=5mm,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=11mm,text width=19mm},
+  gate/.style={draw=omThm,fill=omThm!8,rounded corners=2pt,align=center,minimum height=11mm,text width=19mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[st] (b) {construction};
+\node[st,right=of b] (u) {tests unitaires\\0.02~s};
+\node[st,right=of u] (g) {tests sur fichiers de référence\\0.33~s};
+\node[st,right=of g] (e) {bout en bout\\1.62~s};
+\node[gate,right=of e] (c) {tous les hôtes cohérents~?};
+\node[st,right=of c] (sw) {bascule\\du trafic};
+\foreach \a/\b in {b/u,u/g,g/e,e/c,c/sw} \draw[arr] (\a) -- (\b);
+\draw[arr,omThm] (c.south) -- ++(0,-6mm) -| node[pos=0.25,below,font=\scriptsize]{non~: refus, rester sur le bleu} (b.south);
+\end{tikzpicture}
+
+\omcaption{La \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} du chapitre, avec la durée mesurée de chaque niveau de tests sur le portefeuille de soixante instruments (machine inactive par ailleurs~;
+\texttt{bench\_goldtest.py}). Chaque étape ne s'exécute que si la précédente a réussi~; le dernier contrôle avant le basculement du trafic est la cohérence
+de chaque hôte avec la version publiée.}\label{fig:pl:testing-and-continuous-delivery:pipeline}
+\end{omfigure}
+
+L'ordre de la \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} est celui de la pyramide~: les tests peu coûteux d'abord, afin que la plupart des défaillances soient trouvées en quelques secondes. Sur le portefeuille du chapitre, le niveau unitaire
+(parité call-put sur mille options) prend 0.02~seconde, le niveau de référence (les soixante instruments face à leurs valeurs figées) 0.33 et le
+niveau de bout en bout (le portefeuille réévalué dans cinq scénarios) 1.62, mesurés sur une machine inactive par ailleurs. Le fichier de référence est assez petit pour être exécuté à chaque
+fusion~; celui d'une société réelle, avec des milliers d'instruments, est exécuté dans la construction d'intégration nocturne et à chaque modification de la bibliothèque.
+
+\section{Trains de livraisons et contrôle des changements}
+
+\begin{definition}[Train de livraisons]\label{def:pl:testing-and-continuous-delivery:train}
+Un \emph{train de livraisons}\index{train de livraisons} (release train) déploie, à heures fixes, tout ce qui a passé la \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} depuis le départ précédent~; une
+modification qui manque un train attend le suivant.
+\end{definition}
+
+\begin{definition}[Contrôle des changements]\label{def:pl:testing-and-continuous-delivery:change}
+Le \emph{contrôle des changements}\index{contrôle des changements} est la procédure que suit toute modification en production --- enregistrée, relue, approuvée par
+une personne autre que son auteur, déployée selon une méthode énoncée, vérifiée --- de sorte que la société puisse dire, pour toute modification, qui l'a faite, qui l'a approuvée
+et quand.
+\end{definition}
+
+La cadence du train fixe un compromis (\cref{tab:pl:testing-and-continuous-delivery:trains}). Sur une année de modèle de 533 modifications, déployer chaque
+modification dès qu'elle passe la \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} ne donne aucune attente et une seule modification par déploiement~; un train quotidien fait attendre les modifications une demi-journée en moyenne et en livre
+1.8 à la fois~; un train hebdomadaire, 3.5 jours et 10.3 modifications~; un train bihebdomadaire, 7 jours et 20.5. Le lot compte lorsqu'un déploiement tourne mal~:
+trouver la mauvaise modification parmi dix en demande environ quatre étapes de dichotomie, parmi vingt environ cinq, et chaque étape est un \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{retour arrière}, un redéploiement et une
+attente du symptôme. Les sociétés de trading se situent en général entre les deux~: de petites modifications fréquentes pour la recherche et l'analytique, des trains avec une
+fenêtre de changement pour la voie d'ordres, où le RTS~6 exige une méthodologie clairement délimitée pour développer et tester un système avant son déploiement ou
+sa mise à jour substantielle, dans un environnement séparé de la production.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.4cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{3.2cm}@{}}
+\toprule
+cadence & attente moyenne (jours) & modifications par déploiement & étapes de dichotomie\\
+\midrule
+chaque modification aussitôt & 0.00 & 1.00 & 0.00\\
+train quotidien & 0.51 & 1.83 & 1.16\\
+train hebdomadaire & 3.46 & 10.25 & 3.93\\
+train bihebdomadaire & 6.99 & 20.50 & 4.86\\
+\bottomrule
+\end{tabular}
+\caption{Une année de modèle de 533 modifications (dix par semaine) sous quatre cadences de livraison~: l'attente moyenne entre le passage de la \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement} et la mise en production, le
+nombre de modifications par déploiement, et les étapes de dichotomie nécessaires, en moyenne par modification, pour trouver une mauvaise modification dans son déploiement.}
+\label{tab:pl:testing-and-continuous-delivery:trains}
+\end{table}
+
+\section{Déployer et revenir en arrière}
+
+\begin{definition}[Déploiement bleu--vert, retour arrière]\label{def:pl:testing-and-continuous-delivery:bluegreen}
+Un \emph{déploiement bleu--vert}\index{déploiement bleu--vert} installe une version sur un second ensemble d'hôtes inactifs (vert) pendant que l'ensemble actuel
+(bleu) sert le trafic, puis bascule immédiatement le trafic vers le vert~; revenir en arrière est le \emph{retour arrière}\index{retour arrière} (rollback), c'est-à-dire le retour à la version précédente,
+ce qu'un déploiement bleu--vert transforme en simple bascule plutôt qu'en réinstallation.
+\end{definition}
+
+Le déploiement du hook a échoué à l'étape située entre l'installation et la bascule~: sept hôtes faisaient tourner la nouvelle version, un seul l'ancienne, et rien ne
+les comparait. Un contrôle de déploiement est simple à écrire. Chaque hôte signale l'empreinte de la construction qu'il exécute et celle de sa configuration, et la version
+est refusée --- la bascule du trafic n'a pas lieu --- sauf si chaque hôte signale les empreintes de la version. Exécuté sur les huit serveurs du hook, il désigne
+le huitième avant l'ouverture du marché.
+
+\omcode{code/firm/goldtest/firm_goldtest.py}{137}{145}{Contrôle de cohérence du déploiement~: les empreintes de construction et de configuration de chaque hôte, comparées à celles
+de la version publiée~; tout écart fait refuser la mise en production.}\label{lst:pl:testing-and-continuous-delivery:check}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  host/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum width=13mm,minimum height=9mm,align=center,font=\scriptsize},
+  bad/.style={draw=omThm,fill=omThm!15,rounded corners=2pt,minimum width=13mm,minimum height=9mm,align=center,font=\scriptsize},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\foreach \i in {1,...,7} \node[host] (h\i) at (1.55*\i-1.55,0) {router\i\\8430046e};
+\node[bad] (h8) at (1.55*7,0) {router8\\0290313a};
+\node[draw=black,rounded corners=2pt,align=center,text width=44mm] (c) at (5.4,-2.1) {version 8430046e~: vérifier chaque hôte};
+\foreach \i in {1,...,8} \draw[arr,gray] (h\i.south) -- (c.north);
+\node[omThm,font=\scriptsize,align=left,anchor=west] at (8.3,-2.1) {refusé~: router8 exécute\\une autre construction};
+\node[font=\scriptsize,anchor=south] at (5.4,0.6) {empreintes de construction signalées par les huit hôtes (les 8 premiers caractères)};
+\end{tikzpicture}
+
+\omcaption{Le contrôle de cohérence du déploiement du hook, rejoué~: sept routeurs signalent l'empreinte de la nouvelle construction, le huitième celle de l'ancienne, et
+la version est refusée avant qu'aucun ordre n'atteigne le huitième. Le même contrôle sur les empreintes de configuration détecte la \omterm{def:pl:signal-serving-and-parameter-management:drift}{dérive de
+configuration} (chapitre~\ref{ch:pl:signal-serving-and-parameter-management}).}\label{fig:pl:testing-and-continuous-delivery:hosts}
+\end{omfigure}
+
+L'ordonnance recense aussi ce qui manquait~: le code retiré était encore présent et appelable, et l'indicateur qu'il avait autrefois utilisé a reçu un
+nouveau sens. Les deux sont des défaillances de test au sens de ce chapitre. Le code mort doit être supprimé, non laissé derrière un indicateur~; un indicateur ne doit jamais
+être réutilisé, car un ancien hôte ou un ancien message lui donnera encore l'ancien sens~; et un \omterm{def:pl:signal-serving-and-parameter-management:flag}{indicateur de fonctionnalité}
+(chapitre~\ref{ch:pl:signal-serving-and-parameter-management}) activé par une version est un déploiement à part entière, avec son propre
+déploiement progressif et son propre contrôle pour vérifier que chaque hôte s'accorde sur sa signification.
+
+\begin{dated}{2026-09}{Les règles sur les tests et le déploiement}\label{dat:pl:testing-and-continuous-delivery:rules}
+L'ordonnance de la SEC du 16 octobre 2013 dans l'affaire Knight Capital Americas LLC (Release 34-70694) constate que le nouveau code a détourné un indicateur qui
+avait activé une fonction retirée encore présente sur les serveurs~; qu'un technicien n'a pas copié le nouveau code sur l'un des huit
+serveurs~; qu'aucun second technicien n'a relu le déploiement et qu'aucune procédure écrite ne l'exigeait~; et que les ordres routés pendant quarante-cinq minutes le 1\up{er} août
+2012 ont coûté à la société plus de 460~millions de dollars. Dans l'Union européenne, la Commission Delegated Regulation (EU) 2017/589 (RTS~6) impose à une
+entreprise d'investissement de définir des méthodologies clairement délimitées pour développer et tester un système de trading algorithmique avant son déploiement ou
+toute mise à jour substantielle, en veillant notamment à ce qu'il ne se comporte pas de manière non intentionnelle, et de tester dans un environnement séparé
+de la production (articles 5 et 7).
+\end{dated}
+
+\section{Tutoriel~: sept serveurs sur huit}\label{tut:pl:testing-and-continuous-delivery:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Figer les valeurs de référence d'une bibliothèque de pricing, mesurer ce que détecte chaque tolérance et ce qu'elle signale à tort, et refuser un
+déploiement partiel. \textbf{État final~:} les \cref{fig:pl:testing-and-continuous-delivery:tolerance,tab:pl:testing-and-continuous-delivery:trains}.
+\begin{tutsteps}
+\item \textbf{Portefeuille}~: \texttt{pl\_goldtest.portfolio()}~; l'unité d'erreur de chaque instrument avec \texttt{errors}.
+\item \textbf{Constructions}~: \texttt{experiment()}, les cinq constructions à défaut inséré et quarante constructions de bruit.
+\item \textbf{Tolérance}~: \texttt{rates(ex, k)} pour chaque $k$, puis avec \texttt{pinned=True}~; \texttt{expected\_cost(ex, k)}.
+\item \textbf{\omterm{def:pl:testing-and-continuous-delivery:ci}{Chaîne de déploiement}}~: \texttt{bench\_goldtest.py} pour les durées de chaque étape~; \texttt{trains()} pour les cadences.
+\item \textbf{Déploiement}~: \texttt{eight\_servers()} et \texttt{firm\_goldtest.consistency}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Stocker le fichier de référence sur disque avec \texttt{GoldenStore.save} et exiger une approbation pour le raffinement
+de la grille~; ajouter un contrôle vérifiant que deux versions ne donnent jamais deux sens à un même indicateur.
+\end{tutorial}
+
+\section{Construction~: tests sur fichier de référence et contrôles de déploiement}\label{bld:pl:testing-and-continuous-delivery:goldtest}
+
+\begin{build}
+\bfield{Rôle} Savoir, pour chaque construction de la bibliothèque de pricing, quelles valeurs ont varié et de combien, et ne jamais laisser une version atteindre un
+ensemble d'hôtes qui ne l'exécutent pas tous.
+\bfield{Interface} \texttt{Golden}, \texttt{GoldenStore} (\texttt{put}, \texttt{get}, \texttt{propose}, \texttt{approve}, \texttt{save},
+\texttt{load}), \texttt{compare}, \texttt{run\_tiers}, \texttt{release\_train}, \texttt{host\_state}, \texttt{consistency}.
+\bfield{Règles} Tolérances dérivées de l'erreur du moteur, non choisies~; graines Monte Carlo figées dans la construction~; mises à jour du fichier de référence proposées avec une justification
+et approuvées par une autre personne~; niveaux dans l'ordre de la \omterm{def:pl:testing-and-continuous-delivery:pyramid}{pyramide des tests}, arrêt au premier échec~; aucune version n'est activée tant que chaque hôte ne lui correspond pas.
+\bfield{Tests d'acceptation} \texttt{code/firm/goldtest/tests/}~: comparaison avec un échec, une valeur manquante et un succès~; approbation par une autre
+personne et persistance~; niveaux qui s'arrêtent à un échec~; attentes, lots et dichotomie du \omterm{def:pl:testing-and-continuous-delivery:train}{train de livraisons}~; cohérence avec une construction périmée et une
+configuration dérivée.
+\bfield{Pour aller plus loin} Un rapport d'impact des changements par facteur de risque~; valeurs de référence du risque (grecques, VaR) en plus des prix~; bascule bleu--vert dans le
+simulateur.
+\end{build}
+
+\begin{omsources}
+\item US Securities and Exchange Commission, \emph{In the Matter of Knight Capital Americas LLC}, Release No.~34-70694, 16 octobre 2013.
+\item \emph{Report of JPMorgan Chase \& Co.\ Management Task Force Regarding 2012 CIO Losses}, 16 janvier 2013.
+\item M.~Fowler, \emph{TestPyramid}, 2012 (d'après M.~Cohn, \emph{Succeeding with Agile}, 2009).
+\item Commission Delegated Regulation (EU) 2017/589 (RTS~6), articles 5 et 7.
+\item One Quant Book~5, chapitre~28 (pricers de référence)~; livre~11, chapitre~27 (contrôles de risque)~; livre~13, chapitre~25 (tests du code à faible latence).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:1}
+Pourquoi la tolérance d'un prix en forme fermée est-elle une tolérance relative de $10^{-10}$ et non nulle~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:2}
+Avec la graine libre, quelle part des options d'achat asiatiques le seul bruit signale-t-il à $k=3$, et que prédit la théorie~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:testing-and-continuous-delivery:3}
+Un \omterm{def:pl:testing-and-continuous-delivery:train}{train de livraisons} hebdomadaire regroupe dix modifications dont une est mauvaise. Environ combien d'étapes de dichotomie faut-il pour la trouver~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:4}
+Pourquoi la grille EDP plus fine passe-t-elle le \omterm{def:pl:testing-and-continuous-delivery:golden}{test sur fichier de référence} pour tout $k\ge1$, et pourquoi doit-elle malgré tout être approuvée~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:5}
+Pourquoi l'effet de la convention de décompte sur les options d'achat asiatiques n'est-il pas visible avec la graine libre, et comment devient-il visible avec la graine figée~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:testing-and-continuous-delivery:6}
+Qu'aurait changé un \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{déploiement bleu--vert} le matin du hook, et qu'est-ce qu'il n'aurait pas changé~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:testing-and-continuous-delivery:7}
+\emph{Programmation.} Doubler le nombre de trajectoires Monte Carlo du portefeuille et relancer \texttt{rates(ex, 5)}. Que devient la détection du fixing asiatique et
+pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:testing-and-continuous-delivery:8}
+\emph{Trouver la faille.} «~Le \omterm{def:pl:testing-and-continuous-delivery:golden}{test sur fichier de référence} a encore échoué à cause du bruit Monte Carlo, alors nous avons élargi chaque tolérance à dix
+erreurs types.~»
+\end{exercise}
+
+\section{Problème~: sept serveurs sur huit}
+
+\begin{problem}[{Problème du week-end --- sept serveurs sur huit}]\label{pb:pl:testing-and-continuous-delivery:1}
+Le portefeuille du chapitre, ses constructions, sa \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement}, ses \omterm{def:pl:testing-and-continuous-delivery:train}{trains de livraisons} et ses huit routeurs.
+
+\medskip\noindent\textbf{Partie I --- Tests.}
+\begin{enumerate}
+\item Que vérifie chaque niveau de la \omterm{def:pl:testing-and-continuous-delivery:pyramid}{pyramide des tests}, et pourquoi y a-t-il moins de tests à chaque niveau supérieur~?
+\item Que contient un fichier de référence pour chaque valeur~?
+\item Comment la tolérance de chaque moteur est-elle dérivée~?
+\item Qu'a relevé le rapport du groupe de travail de JPMorgan sur les feuilles de calcul VaR~?
+\item Quelles constructions modifient quels instruments~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Tolérance.}
+\begin{enumerate}[resume]
+\item Quelles régressions sont détectées à chaque tolérance, et pourquoi~?
+\item Que produit le seul bruit pour $k=2$ et pour $k=5$~?
+\item Quelle part du bogue du fixing asiatique est détectée à chaque $k$~?
+\item Quel $k$ minimise le coût attendu du modèle, et qu'est-ce qui ne va pas avec ce choix~?
+\item Que change le fait de figer la graine~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Livraison.}
+\begin{enumerate}[resume]
+\item Combien de temps prend chaque palier de la \omterm{def:pl:testing-and-continuous-delivery:ci}{chaîne de déploiement}~?
+\item Que donnent les quatre cadences de livraison~?
+\item Qu'enregistre le \omterm{def:pl:testing-and-continuous-delivery:change}{contrôle des changements}~?
+\item Qu'exige la RTS~6 avant qu'un algorithme de trading soit déployé~?
+\item Qu'est-ce qu'un \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{retour arrière} dans un \omterm{def:pl:testing-and-continuous-delivery:bluegreen}{déploiement bleu--vert}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le taux de détection de chaque régression introduite et le taux de fausses alertes du bruit de Monte Carlo à chaque
+tolérance, la tolérance qui minimise le coût attendu, et le contrôle de cohérence qui aurait refusé le déploiement partiel.
+\item Quelles sont les quatre erreurs survenues lors du déploiement du crochet, dans les termes de ce chapitre~?
+\item Laquelle le contrôle de cohérence aurait-il détectée, et laquelle les tests auraient-ils détectée~?
+\item Quelles exigences faudrait-il poser à chaque version du chemin d'ordres~?
+\item En une phrase~: qu'est-ce qu'un déploiement~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:testing-and-continuous-delivery:1}
+Qu'est-ce que la \omterm{def:pl:testing-and-continuous-delivery:pyramid}{pyramide des tests}, et pourquoi s'appelle-t-elle une pyramide~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:testing-and-continuous-delivery:2}
+Comment faites-vous des tests de non-régression sur un pricer Monte Carlo~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:testing-and-continuous-delivery:3}
+Une version a atteint sept serveurs sur huit. Comment votre processus de déploiement l'aurait-il arrêtée~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:testing-and-continuous-delivery:4}
+Déployez-vous le code de trading en continu ou par \omterm{def:pl:testing-and-continuous-delivery:train}{train de livraisons}~? Pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:testing-and-continuous-delivery:5}
+Concevez le processus de test et de livraison de la bibliothèque de pricing et du chemin d'ordres d'une société.
+\end{interviewq}

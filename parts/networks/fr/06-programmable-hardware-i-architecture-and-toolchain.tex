@@ -1,0 +1,358 @@
+\chapter{Matériel programmable I~: architecture et chaîne d'outils}\label{ch:nw:programmable-hardware-i-architecture-and-toolchain}
+
+Une liaison Ethernet à \qty{10}{\giga\bit\per\second} livre à un circuit ses octets au rythme de dix milliards de bits par seconde~; un circuit qui les prend
+64 bits à la fois doit accepter un mot toutes les \qty{6.4}{\nano\second}, à 156.25~MHz. Un circuit construit de registres et de logique entre eux
+met un nombre fixe de ces cycles pour décider, et il met ce même nombre à chaque fois~: aucun défaut de cache (cache miss), aucune interruption, aucun ordonnanceur, aucun
+ramasse-miettes (garbage collector) ne s'intercale entre le dernier octet d'un cours et la décision. Le déterminisme, plutôt que la vitesse brute, est ce que le matériel programmable
+vend à une société de trading, et il s'achète par une manière différente d'écrire des programmes.
+
+Ce chapitre présente les dispositifs, les langages et les outils, et écrit un premier circuit~: un extracteur de champ qui prélève un cours
+dans une trame pendant que la trame arrive encore, simulé cycle par cycle dans deux simulateurs indépendants et vérifié contre un
+modèle Python. Le chapitre~7 construit les circuits de trading par-dessus celui-ci.
+
+\section{Le tissu~: blocs logiques, mémoires, émetteurs-récepteurs et horloges}
+
+\begin{definition}[Circuit logique programmable, bloc logique configurable]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}
+Un \emph{circuit logique programmable}\index{circuit logique programmable} (FPGA) est une puce dont la logique et le câblage sont configurés
+après la fabrication par le chargement d'un fichier de configuration~: un réseau de petits éléments logiques programmables, de mémoires, de blocs arithmétiques et
+d'émetteurs-récepteurs série, reliés par un routage programmable. Un \emph{bloc logique configurable}\index{bloc logique configurable} est l'élément logique répété du réseau~:
+un groupe de tables de correspondance, dont chacune calcule n'importe quelle fonction booléenne de quelques entrées en la lisant
+dans une petite mémoire, avec des bascules pour enregistrer leurs sorties et une chaîne de retenue pour l'arithmétique.
+\end{definition}
+
+\begin{definition}[Block RAM]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}
+Une \emph{block RAM}\index{block RAM} est une mémoire dédiée embarquée sur la puce, d'une capacité de quelques dizaines de kilobits, dont un FPGA compte des centaines ou
+des milliers, chacune lisible et inscriptible en un cycle d'horloge, typiquement par deux ports indépendants.
+\end{definition}
+
+Les ressources sont concrètes. Dans la famille UltraScale d'AMD, chaque \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}{bloc logique configurable} contient huit tables de correspondance à 6~entrées et seize
+bascules, avec une chaîne de retenue de 8~bits, et chaque \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAM} contient 36 kilobits, utilisables comme une mémoire ou comme deux moitiés indépendantes. Une table de correspondance à 6~entrées
+calcule n'importe quelle fonction de six bits en un niveau de logique~; une fonction de davantage de bits demande plusieurs tables sur plusieurs niveaux,
+et la profondeur de cet arbre de niveaux, avec le câblage entre les tables, fixe la fréquence à laquelle le circuit peut être cadencé. À côté de la logique
+se trouvent les émetteurs-récepteurs série, qui transforment le flux de bits du module optique en mots parallèles, et les ressources d'horloge, qui
+distribuent les horloges et permettent à des parties du circuit de fonctionner à des cadences différentes.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt}]
+\foreach \i in {0,...,5} {\foreach \j in {0,1,2} {\node[b,fill=omDef!12,minimum width=0.9cm] at (1.1*\i,0.9*\j) {CLB};}}
+\foreach \j in {0,1,2} {\node[b,fill=omMeth!20,minimum width=0.9cm] at (6.9,0.9*\j) {BRAM};}
+\foreach \j in {0,1,2} {\node[b,fill=omThm!15,minimum width=0.9cm] at (8.25,0.9*\j) {DSP};}
+\node[b,fill=gray!15,minimum height=2.5cm,minimum width=1.1cm] at (-1.5,0.9) {émetteurs-\\ récepteurs\\ série};
+\node[b,fill=gray!8,minimum width=9.6cm] at (3.25,-0.95) {horloge et routage entre tous les blocs};
+\node[b,fill=white,align=left,anchor=west] at (9.2,0.9) {un CLB~: 8 tables\\ de correspondance à 6 entrées,\\ 16 bascules,\\ une chaîne de retenue};
+\end{tikzpicture}
+
+\omcaption{Le tissu d'un FPGA, schématiquement~: des colonnes de \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:clb}{blocs logiques configurables}, de \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:bram}{block RAM} et de blocs arithmétiques (DSP), des
+émetteurs-récepteurs série en bordure qui transforment le flux optique en mots, et l'horloge et le routage qui les relient. Les circuits réels
+comptent des centaines de milliers de tables de correspondance~; le contenu des CLB est celui de la famille UltraScale d'AMD.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:fabric}
+\end{omfigure}
+
+\section{Décrire le matériel~: niveau transfert de registres et synthèse de haut niveau}
+
+\begin{definition}[Niveau transfert de registres, langage de description de matériel]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:rtl}
+Un circuit écrit au \emph{niveau transfert de registres}\index{niveau transfert de registres} (RTL) décrit, pour chaque cycle d'horloge, comment les valeurs
+contenues dans les registres sont calculées à partir des valeurs précédentes des registres et des entrées, par une logique combinatoire. Un \emph{langage de
+description de matériel}\index{langage de description de matériel} (Verilog, SystemVerilog, VHDL) est un langage dans lequel de tels circuits sont écrits~:
+ses instructions décrivent des circuits qui fonctionnent tous à la fois, et non des instructions exécutées l'une après l'autre.
+\end{definition}
+
+\begin{definition}[Synthèse logique, placement-routage]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:synth}
+La \emph{synthèse logique}\index{synthèse logique} traduit une description RTL en un réseau de primitives du dispositif (tables de correspondance,
+bascules, mémoires). Le \emph{placement-routage}\index{placement-routage} (place and route) affecte chaque primitive à un emplacement de la puce et choisit les
+fils programmables qui les relient~; son résultat est le fichier de configuration chargé dans le dispositif.
+\end{definition}
+
+\begin{definition}[Synthèse de haut niveau]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:hls}
+La \emph{synthèse de haut niveau}\index{synthèse de haut niveau} (HLS) compile une fonction écrite en C ou en C++ en un circuit RTL, en choisissant
+ses registres et son ordonnancement~; le concepteur la guide par des directives, telles que l'intervalle d'initiation du pipeline, c'est-à-dire le nombre de cycles entre
+deux entrées successives (un intervalle de un accepte une nouvelle entrée à chaque cycle).
+\end{definition}
+
+La différence de raisonnement est la première leçon du chapitre. Une boucle C++ sur les huit octets d'un mot s'exécute huit fois, l'une après
+l'autre~; la même boucle en SystemVerilog décrit huit copies de son corps, qui existent toutes et calculent toutes au même cycle.
+Le \Cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field} est le cœur combinatoire de l'extracteur de champ~: pour chacun des
+huit voies d'octets du battement, il demande si cet octet appartient au champ et, dans ce cas, le décale dans la valeur, le tout en un cycle. Ce qui serait
+un branchement conditionnel dépendant des données dans un logiciel devient un ensemble de multiplexeurs dont le délai ne dépend pas des données.
+
+\omcode{code/firm/hdlkit/hdl/hdk_field.sv}{19}{29}{Logique combinatoire de l'extracteur de champ en SystemVerilog~: huit voies d'octets examinées
+dans le même cycle~; la boucle décrit huit copies du matériel, et non huit itérations.}\label{lst:nw:programmable-hardware-i-architecture-and-toolchain:field}
+
+\section{Fermeture temporelle~: périodes d'horloge, chemins critiques et pipelinage}
+
+\begin{definition}[Chemin critique, fermeture temporelle]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}
+Le \emph{chemin critique}\index{chemin critique} d'un circuit synchrone est son chemin le plus lent d'un registre au suivant~: le délai
+de sa logique et de son câblage, auquel s'ajoute la surcharge propre des registres, ce qui fixe la période d'horloge la plus courte que le circuit supporte. La \emph{fermeture
+temporelle}\index{fermeture temporelle} (timing closure) est le travail qui consiste à faire tenir chaque chemin entre registres dans la période d'horloge visée.
+\end{definition}
+
+\begin{definition}[Franchissement de domaine d'horloge]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}
+Un \emph{franchissement de domaine d'horloge}\index{franchissement de domaine d'horloge} est un signal qui passe entre des parties d'un circuit cadencées par des horloges sans lien entre elles~;
+il doit passer par un synchroniseur ou une FIFO asynchrone, sinon il sera parfois échantillonné pendant qu'il change.
+\end{definition}
+
+\begin{proposition}[Ce que le pipelinage apporte]\label{prop:nw:programmable-hardware-i-architecture-and-toolchain:pipe}
+Supposons qu'une décision demande $L$ niveaux de logique, de délai $t_{\mathrm{lvl}}$ chacun, et qu'un registre ajoute $t_{\mathrm{reg}}$. Découpé en $s$
+étages enregistrés comportant chacun au plus $\lceil L/s\rceil$ niveaux, le circuit a pour période d'horloge $T_{\mathrm{clk}} = \lceil L/s\rceil\,t_{\mathrm{lvl}}
++ t_{\mathrm{reg}}$ et pour latence $s\,T_{\mathrm{clk}}$. Le pipelinage élève la fréquence d'horloge maximale $f_{\mathrm{clk}} = 1/T_{\mathrm{clk}}$
+et ne réduit jamais la latence~: $s\,T_{\mathrm{clk}} \ge L\,t_{\mathrm{lvl}} + s\,t_{\mathrm{reg}}$.
+\end{proposition}
+
+\begin{proof}
+Chaque étage est un chemin registre à registre comportant au plus $\lceil L/s\rceil$ niveaux, donc la période est son délai. La décision traverse $s$
+étages, une période chacun, et $s\lceil L/s\rceil \ge L$.
+\end{proof}
+
+La proposition explique un choix de conception qui paraît à rebours~: un circuit de trading ajoute des registres, donc des cycles, pour aller plus vite. La liaison fixe
+l'horloge. Une liaison à \qty{10}{\giga\bit\per\second} prise 64 bits à la fois demande 156.25~MHz~; une liaison à \qty{25}{\giga\bit\per\second} à la
+même largeur demande 390.625~MHz. Une décision qui tient en un cycle à la première horloge peut en demander trois à la seconde, et sa latence en nanosecondes
+augmente alors un peu, tandis que le circuit suit une liaison deux fois et demie plus rapide. La \Cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}
+illustre le compromis avec des délais de modèle de \qty{0.5}{\nano\second} par niveau et \qty{0.4}{\nano\second} par registre, présentés comme des valeurs de modèle~:
+les délais d'un dispositif réel proviennent de ses rapports de temporisation.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,xmin=0.5,xmax=6.5,
+  xtick={1,2,3,4,5,6},xlabel={étages registrés},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},table/col sep=comma]
+\nextgroupplot[ymin=0,ymax=800,ylabel={horloge maximale (MHz)}]
+\addplot[omDef,very thick,mark=*,mark size=1.5pt] table[x=stages,y=fmax_mhz]{figdata/networks/06-programmable-hardware-i-architecture-and-toolchain/pipeline.csv};
+\addplot[gray,dashed,domain=0.5:6.5] {156.25};
+\addplot[omThm,dashed,domain=0.5:6.5] {390.625};
+\node[font=\scriptsize,anchor=south west] at (axis cs:3.6,160) {10G à 64 bits};
+\node[font=\scriptsize,anchor=north west,omThm] at (axis cs:4.1,385) {25G à 64 bits};
+\nextgroupplot[ymin=0,ymax=10,ylabel={latence à sa propre horloge (ns)}]
+\addplot[omMeth,very thick,mark=square*,mark size=1.5pt] table[x=stages,y=latency_ns]{figdata/networks/06-programmable-hardware-i-architecture-and-toolchain/pipeline.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Modèle~: une décision de 12 niveaux de logique découpée en étages registrés (\qty{0.5}{\nano\second} par niveau,
+\qty{0.4}{\nano\second} par registre, valeurs de modèle). À gauche~: l'horloge maximale, à comparer aux horloges qu'exigent les \omterm{def:nw:networking-for-trading:ser}{débits de ligne}~; à droite~: la latence
+à cette horloge. Cinq étages ne font pas mieux que quatre, car $\lceil 12/5\rceil = \lceil 12/4\rceil = 3$. Données~:
+\texttt{fig\_fpga.py}.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}
+\end{omfigure}
+
+\omcode{code/firm/hdlkit/hdl/hdk_cmp.sv}{13}{32}{Une comparaison en un étage et en deux~: la version à deux étages compare quatre tranches
+de 16 bits, enregistre les résultats, puis les combine, un cycle plus tard.}\label{lst:nw:programmable-hardware-i-architecture-and-toolchain:cmp}
+
+\section{Simulation et vérification}
+
+\begin{definition}[Banc de test, modèle au cycle près]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}
+Un \emph{banc de test}\index{banc de test} (testbench) est le code qui pilote les entrées d'une conception en simulation et vérifie ses sorties. Un \emph{modèle au cycle
+près}\index{modèle au cycle près} (cycle-accurate model) est un modèle logiciel d'une conception qui reproduit ses sorties cycle par cycle, utilisé comme référence
+à laquelle le matériel est vérifié, et comme substitut rapide de celui-ci.
+\end{definition}
+
+Une conception est vérifiée bien avant d'être synthétisée, car une conception synthétisée est lente à construire et difficile à observer. Ce livre
+simule chaque conception avec deux outils indépendants. Verilator compile le SystemVerilog en un modèle C++ piloté par un \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{banc de test} en C++~: c'est
+un compilateur plutôt qu'un simulateur traditionnel, et il est rapide. Icarus Verilog interprète la même source avec un \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{banc de test} SystemVerilog. Les
+deux \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{bancs de test} lisent le même stimulus et impriment les mêmes lignes d'événements, et le test les compare cycle par cycle et à un modèle de référence en Python~;
+un désaccord entre les simulateurs est un bogue de la conception (le plus souvent une ambiguïté que le langage autorise) avant d'être un bogue
+de l'un des outils. Les conceptions sont écrites pour les versions installées ici (Verilator 4.038, Icarus Verilog 11) et pour leurs versions plus récentes,
+et les tests échouent, au lieu d'être ignorés, lorsqu'un simulateur manque.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rll}
+\toprule
+Cycle & Entrée acceptée & Sorties enregistrées à la fin du cycle \\
+\midrule
+0 & mot 0~: octets \texttt{10}--\texttt{17} & --- \\
+1 & mot 1~: octets \texttt{18}--\texttt{1f}, dernier & --- \\
+2 & --- & champ \texttt{16171819}~; CRC-32 \texttt{f4a7fd67} \\
+3 & --- & comparaison (un étage)~: au plus le seuil \\
+4 & --- & comparaison (deux étages)~: au plus le seuil \\
+\bottomrule
+\end{tabular}
+\caption{La première trame passant par \texttt{hdk\_top} dans Verilator, sans contre-pression~: une trame de 16 octets, allant des octets \texttt{10} à \texttt{1f}, le
+champ aux octets 6 à 9, le seuil égal au champ. Le tampon de débordement (skid buffer) enregistre chaque beat accepté~; le champ et le CRC sont enregistrés
+au cycle qui suit le beat qui les complète. Icarus affiche les mêmes cycles. Données~: \texttt{nw\_fpga.first\_frame}.}\label{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=omDef!8] (hls) at (-3.4,0) {C++ avec\\ directives HLS};
+\node[b,fill=omDef!15] (rtl) at (0,0) {RTL\\ (SystemVerilog)};
+\node[b,fill=omMeth!18] (syn) at (2.8,0) {synthèse};
+\node[b,fill=omMeth!18] (par) at (5.1,0) {placement-\\ routage};
+\node[b,fill=omMeth!18] (sta) at (7.5,0) {analyse\\ temporelle};
+\node[b,fill=gray!12] (bit) at (10.2,0) {fichier de\\ configuration};
+\node[b,fill=omThm!12] (sim) at (4.6,-1.7) {simulation~: Verilator, Icarus, face à un modèle de référence};
+\draw[->] (hls) -- node[above,font=\scriptsize]{HLS} (rtl);
+\draw[->] (rtl) -- (syn);
+\draw[->] (syn) -- (par);
+\draw[->] (par) -- (sta);
+\draw[->] (sta) -- node[above,font=\scriptsize]{tenue} (bit);
+\draw[->,omThm] (sta.north) -- ++(0,0.5) -| node[pos=0.25,above,font=\scriptsize]{temporisation non atteinte~: restructurer, pipeliner} (rtl.north);
+\draw[<->,omThm] (rtl.south) |- (sim.west);
+\end{tikzpicture}
+
+\omcaption{La chaîne d'outils. La conception est simulée face à son modèle de référence avant la synthèse~; la synthèse, le placement et le routage produisent une
+conception dont la temporisation est analysée~; un chemin qui n'atteint pas l'horloge renvoie le concepteur au RTL.}\label{fig:nw:programmable-hardware-i-architecture-and-toolchain:flow}
+\end{omfigure}
+
+\section{Cartes réseau intelligentes}
+
+\begin{definition}[SmartNIC]\label{def:nw:programmable-hardware-i-architecture-and-toolchain:smartnic}
+Une \emph{SmartNIC}\index{SmartNIC} est une \omterm{def:nw:networking-for-trading:frame}{carte réseau} (NIC) dotée de son propre traitement programmable (un FPGA, ou des processeurs) entre les
+ports réseau et l'hôte, de sorte que les paquets puissent être analysés, filtrés, horodatés, acquittés ou générés sur la carte sans atteindre
+l'hôte.
+\end{definition}
+
+Pour une société de trading, la carte FPGA est le point où le matériel rejoint le reste du système~: ses émetteurs-récepteurs terminent les liaisons de la bourse, sa
+logique décode et décide, et son bus la relie aux logiciels de l'hôte, qui la configurent et reçoivent ce qu'elle a vu. Une conception
+sur une telle carte lit la trame à mesure qu'elle arrive, avant que le dernier octet ne soit reçu, ce que le tableau de ce chapitre montre à petite échelle~:
+le champ est connu au cycle qui suit le beat qui le complète, alors que le reste de la trame est encore à venir. Le chapitre~7 décide à partir de lui.
+
+\section{Tutoriel~: un extracteur de champ dans deux simulateurs}\label{tut:nw:programmable-hardware-i-architecture-and-toolchain:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Simuler la première conception cycle par cycle dans Verilator et Icarus, vérifier les deux face à un modèle Python sous une
+contre-pression aléatoire, et modéliser le coût du pipeline. \textbf{État final~:} \cref{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles},
+\cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline} et les tests au vert de \texttt{firm.hdlkit}.
+\begin{tutsteps}
+\item \textbf{Lire la conception.} \texttt{hdl/hdk\_top.sv} enchaîne un tampon de débordement, l'extracteur de champ
+  (\cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field}), une unité CRC-32 et le comparateur
+  (\cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:cmp}).
+\item \textbf{Construire les deux.} \texttt{firm\_hdlkit.build\_verilator} lance \texttt{verilator --cc --exe --build} avec le \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{banc de test} en C++~;
+  \texttt{build\_icarus} lance \texttt{iverilog -g2012} avec celui en SystemVerilog.
+\item \textbf{Exécuter et comparer.} \texttt{write\_stim} transforme les trames en beats de 8 octets, \texttt{write\_ready} fournit la
+  contre-pression de l'aval~; les deux simulateurs impriment les mêmes lignes d'événements, et \texttt{golden} calcule les champs, les CRC et les comparaisons en Python.
+\item \textbf{Cycles et horloges.} \texttt{nw\_fpga.first\_frame} fournit le tableau~; \texttt{timing} et \texttt{depth\_for} évaluent
+  la \cref{prop:nw:programmable-hardware-i-architecture-and-toolchain:pipe}, et \texttt{python fig\_fpga.py} écrit les données du graphique.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Déplacer le champ aux octets 60 à 63 et relever le cycle où il apparaît~; fixer le signal ready de l'aval à 50~\% et compter
+les cycles que met l'ensemble du flux.
+\end{tutorial}
+
+\section{Construction~: la boîte à outils matérielle}\label{bld:nw:programmable-hardware-i-architecture-and-toolchain:hdlkit}
+
+\begin{build}
+\bfield{Rôle} Les primitives et le banc de vérification que chaque conception matérielle de ce livre utilise.
+\bfield{Interface} modules SystemVerilog \texttt{hdk\_skid} (tampon skid, paramètre \texttt{W}), \texttt{hdk\_field} (\texttt{OFF},
+\texttt{LEN}), \texttt{hdk\_crc32}, \texttt{hdk\_cmp} (\texttt{PIPE}) et \texttt{hdk\_top}~; \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:tb}{bancs de test} \texttt{tb/hdk\_tb.cpp} (Verilator)
+et \texttt{tb/hdk\_tb.sv} (Icarus) qui impriment les mêmes lignes d'événements. Python \texttt{firm\_hdlkit}~: \texttt{require}, \texttt{beats},
+\texttt{write\_stim}, \texttt{write\_ready}, \texttt{build\_verilator}, \texttt{build\_icarus}, \texttt{run\_verilator},
+\texttt{run\_icarus}, \texttt{events}, \texttt{golden}, \texttt{CycleModel}.
+\bfield{Règles} Beats de 8 octets, l'octet~0 dans la voie de poids fort~; chaque sortie enregistrée~; le HDL est accepté par Verilator 4.038 avec
+\texttt{-Wall} et par Icarus 11 avec \texttt{-g2012}, sans avertissement~; une simulateur absent lève \texttt{ToolMissing}.
+\bfield{Tests d'acceptation} \texttt{code/firm/hdlkit/tests/}~: les deux simulateurs identiques cycle par cycle et égaux au modèle de référence sur des
+trames aléatoires avec contre-pression aléatoire, pour des comparateurs à un et deux étages~; chaque beat accepté une seule fois~; les latences en
+cycles~; les fonctions beat et golden vérifiées à la main.
+\bfield{Pour aller plus loin} Un FIFO asynchrone pour un \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{franchissement de domaine d'horloge} et un test qui l'échantillonne à des horloges sans lien~; un beat plus large (512 bits).
+\end{build}
+
+\begin{omsources}
+\item AMD, \emph{UltraScale Architecture Configurable Logic Block User Guide} (UG574) et \emph{Memory Resources} (UG573)~; AMD, \emph{Vitis
+High-Level Synthesis User Guide} (UG1399).
+\item Verilator documentation~; Icarus Verilog documentation~; IEEE~1800 (SystemVerilog).
+\item J.~W. Lockwood et coauteurs, ``A Low-Latency Library in FPGA Hardware for High-Frequency Trading (HFT)'', \emph{IEEE Symposium on
+High-Performance Interconnects} (2012).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:1}
+Quelle horloge une conception doit-elle atteindre pour traiter une liaison de \qty{25}{\giga\bit\per\second} 32 bits à la fois, puis 128 bits à la fois~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:2}
+Avec les délais du modèle, quelle est l'horloge maximale d'une décision de 12 niveaux en un seul étage, et sa latence~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:3}
+Dans la \cref{tab:nw:programmable-hardware-i-architecture-and-toolchain:cycles}, à quel cycle le champ apparaîtrait-il s'il occupait les octets 12 à
+15~? Et les octets 14 à 17 d'une trame de 24 octets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:4}
+Pourquoi la boucle du \cref{lst:nw:programmable-hardware-i-architecture-and-toolchain:field} prend-elle un cycle quelles que soient les données, alors que la
+même boucle en C++ peut ne pas le faire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:5}
+Dans la \cref{fig:nw:programmable-hardware-i-architecture-and-toolchain:pipeline}, pourquoi six étages sont-ils plus rapides que cinq~? Qu'est-ce que cela dit
+du décompte des niveaux~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:6}
+Que fait le tampon skid qu'un registre unique ne peut pas faire, et que se passerait-il pour le flux sans lui lorsque l'aval se bloque~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:7}
+\emph{Programmation.} Construire \texttt{hdk\_top} avec le champ au décalage 10 et de longueur 8 dans les deux simulateurs, exécuter les trames aléatoires du test et
+vérifier les deux contre le modèle de référence. Combien de cycles après le beat qui complète la trame le champ apparaît-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:programmable-hardware-i-architecture-and-toolchain:8}
+\emph{Trouver la faille.} «~La conception passe dans Verilator, elle fonctionnera donc sur la carte~; lancer un second simulateur est redondant.~»
+\end{exercise}
+
+\section{Problème~: huit cycles}
+
+\begin{problem}[{Problème du week-end --- une décision face à l'horloge d'une liaison}]\label{pb:nw:programmable-hardware-i-architecture-and-toolchain:1}
+La décision matérielle d'une société de trading (extraire un champ, le comparer à un seuil, vérifier une limite) demande 12 niveaux de logique. Utiliser le modèle du chapitre~:
+\qty{0.5}{\nano\second} par niveau, \qty{0.4}{\nano\second} par registre. La conception traite la liaison à 64 bits par cycle.
+
+\medskip\noindent\textbf{Partie I --- Les horloges.}
+\begin{enumerate}
+\item Quelle horloge une liaison de \qty{10}{\giga\bit\per\second} exige-t-elle à 64 bits par cycle~? Et une liaison de \qty{25}{\giga\bit\per\second}~?
+\item Quelle est l'horloge maximale de la décision en un seul étage~?
+\item Respecte-t-elle l'horloge de l'une ou l'autre liaison~?
+\item Combien de temps une trame de 128 octets met-elle à arriver à l'horloge de chaque liaison, en cycles puis en nanosecondes~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Pipeline.}
+\begin{enumerate}[resume]
+\item Combien d'étages la liaison de \qty{25}{\giga\bit\per\second} exige-t-elle~?
+\item Quelle est l'horloge maximale avec ce nombre d'étages~?
+\item Quelle est la latence de la décision lorsque la conception fonctionne à l'horloge de la liaison~?
+\item Quelle est la latence à l'horloge maximale propre à la conception~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Où passe le temps.}
+\begin{enumerate}[resume]
+\item Si le champ se termine à l'octet 40 d'une trame de 128 octets, combien de beats doivent être arrivés pour que le champ soit complet~?
+\item Ajouter la décision à l'horloge de \qty{25}{\giga\bit\per\second}~: à quel moment la décision est-elle prise, compté depuis le premier bit de la trame~?
+\item Quelle part de la trame arrive encore à cet instant~?
+\item Pourquoi a-t-on intérêt à décider avant l'arrivée de la séquence de contrôle de la trame, et quel en est le risque~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la profondeur de pipeline qui respecte l'horloge de \qty{25}{\giga\bit\per\second} et la latence de la décision, face
+  à la conception sans pipeline à sa propre horloge.
+\item Un chemin de données de 128 bits changerait-il la réponse~?
+\item Que remplacerait un rapport de temporisation réel dans ce modèle~?
+\item Pourquoi le pipeline ne réduit-il jamais la latence~?
+\item Pourquoi le teneur de marché accepterait-il une latence de décision plus longue pour une liaison plus rapide~?
+\item Comment vérifieriez-vous la conception pipelinée face à la conception sans pipeline~?
+\item Qu'ajoute un \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{franchissement de domaine d'horloge} si la décision s'exécute à une horloge autre que celle de la liaison~?
+\item En une phrase~: que décide le débit de la liaison sur la conception~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:1}
+Qu'est-ce qu'un FPGA, et pourquoi les sociétés de trading en utilisent-elles~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:2}
+Qu'est-ce que la \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:timing}{fermeture temporelle}~(timing closure)~? Que faites-vous lorsqu'un chemin échoue à la temporisation~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:3}
+Le pipeline ajoute des cycles. Comment peut-il rendre une conception plus rapide~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:4}
+RTL ou \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:hls}{synthèse de haut niveau} pour une conception de trading~? Argumentez les deux positions.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:5}
+Comment vérifieriez-vous un analyseur de flux matériel avant qu'il ne fonctionne face à une bourse en direct~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:programmable-hardware-i-architecture-and-toolchain:6}
+Qu'est-ce qu'un \omterm{def:nw:programmable-hardware-i-architecture-and-toolchain:cdc}{franchissement de domaine d'horloge}, et qu'est-ce qui va de travers s'il n'est pas géré~?
+\end{interviewq}

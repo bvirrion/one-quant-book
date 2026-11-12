@@ -1,0 +1,333 @@
+\chapter{Connectivité aux contrats à terme}\label{ch:nw:futures-connectivity}
+
+En janvier 2018, un ordre passé sur Eurex entrait dans la bourse par l'une des seize passerelles à haute fréquence, et le chemin
+sur lequel les ordres concurrents se disputaient mesurait 22 microsecondes, «~avec une variance de plusieurs µs~». Chaque passerelle avait sa propre file et sa
+propre gigue (jitter), si bien qu'une firme qui ouvrait des sessions sur plusieurs passerelles et en envoyait une copie par chacune pouvait devancer une firme plus rapide qui n'en utilisait qu'une. Le
+compte rendu de la bourse est sans détour~: «~La gigue de latence sur les chemins d'entrée parallèles a incité à la multiplicité pour réduire la latence.~»
+Sa réponse fut de changer les passerelles, et en septembre 2018 le chemin concurrentiel était passé sous les deux microsecondes, avec
+une variance en nanosecondes. L'histoire de ces changements est celle de ce que «~équitable~» signifie à la microseconde.
+
+Le livre~1 a présenté les futures commission merchants (FCM) et les membres compensateurs, le livre~10 la session de saisie des ordres, le livre~11 le kill switch
+et le contrôle pré-trade, le livre~13 le drop copy et les données de marché binaires. Ce chapitre porte sur la manière dont une firme se connecte
+à une bourse de contrats à terme~: les sessions et les passerelles qui les portent, les dispositifs d'équité adoptés par les bourses, les contrôles
+du membre compensateur sur le chemin d'ordres, et les canaux de données de marché. La compétition entre modèles de passerelles est une simulation étiquetée
+construite à partir des chiffres publiés par les bourses.
+
+\section{Sessions de saisie des ordres et passerelles de segment de marché}
+
+\begin{definition}[Passerelle de segment de marché]\label{def:nw:futures-connectivity:msgw}
+Une \emph{passerelle de segment de marché}\index{passerelle de segment de marché} est la passerelle de saisie des ordres d'une bourse dédiée à un
+segment de marché, soit un groupe de produits appariés sur une même instance de moteur, de sorte que chaque ordre portant sur ces produits
+entre par la même passerelle et dans une seule séquence, plutôt que par l'une de plusieurs passerelles générales qui acheminent vers tous les segments.
+\end{definition}
+
+CME Group propose les deux modèles. Une Convenience Gateway accepte les ordres de tous les segments de marché et les achemine~; une Market Segment
+Gateway se connecte à un seul segment, et la firme se connecte à chaque segment où elle opère, avec une seule identité de session partagée par
+  tous, et des adresses principale et de secours distinctes pour chacun (voir l'\cref{dat:nw:futures-connectivity:gateways}). Le T7 de Deutsche Börse
+a la même répartition~: des passerelles propres à une partition, réservées aux sessions à haute fréquence, n'en atteignent qu'une~; les passerelles à basse fréquence
+atteignent toutes les partitions par leur intermédiaire, 43 microsecondes plus lentes à la médiane~; les passerelles FIX passent par les passerelles à basse fréquence.
+
+Une session est donc un ensemble de choix~: quel type de passerelle, quels segments ou quelles partitions, quelle limitation de débit et combien. Sur
+T7, une session à haute fréquence est limitée à 150 transactions par seconde («~Full~») ou à 250 («~Ultra~»), et un participant peut ouvrir jusqu'à
+80 sessions, et la grille tarifaire facture plus cher la septième session Full que la sixième
+(voir l'\cref{dat:nw:futures-connectivity:sessions}).
+
+\begin{dated}{2026-09}{Types de sessions à haute fréquence et frais sur Eurex, d'après la grille tarifaire de juin 2023}\label{dat:nw:futures-connectivity:sessions}
+Session ETI High Frequency Full, au plus 150 transactions par seconde~: 260~EUR par mois pour chacune des six premières sessions
+d'un membre de négociation, 520~EUR à partir de la septième. Session Ultra, au plus 250 transactions par seconde~: 780~EUR par mois. Jusqu'à 80 sessions peuvent être
+souscrites (Deutsche Börse, 2021).
+\end{dated}
+
+Un planificateur de sessions transforme un débit de transactions en la combinaison la moins chère~: \texttt{firm\_gwmodel.plan\_sessions} gère 3\,000
+transactions par seconde sur une partition, avec cinq sessions Full et neuf Ultra, pour 8\,320~EUR par mois, moins cher que vingt
+sessions Full (8\,840~EUR), car le prix de Full double à partir de la septième.
+
+\section{Équité des passerelles et son histoire}
+
+\begin{definition}[Équité des passerelles]\label{def:nw:futures-connectivity:fairness}
+L'\emph{équité des passerelles}\index{equite@équité des passerelles} est la propriété du \omterm{def:nw:api-engineering-for-crypto-venues:path}{chemin de saisie d'ordres} d'une bourse, selon laquelle les messages concurrents atteignent
+le moteur d'appariement (matching engine) dans l'ordre où ils sont parvenus au réseau de la bourse, avec une variance faible
+au regard des écarts que la bourse entend récompenser, de sorte qu'aucun participant ne gagne à envoyer le même ordre par plusieurs chemins.
+\end{definition}
+
+\begin{dated}{2026-09}{Conceptions de passerelles et leur équité, d'après la documentation des bourses}\label{dat:nw:futures-connectivity:gateways}
+\begin{itemize}
+\item Eurex T7~: janvier 2018, 16 passerelles à haute fréquence, chemin concurrentiel de 22 µs «~avec une variance de plusieurs µs~»~; septembre
+  2018, des passerelles propres à chaque partition comme point d'entrée unique, «~moins de 2 µs avec une variance de l'ordre de la nanoseconde~». Depuis 2021~: FIFO
+  «~garantie de la \omterm{def:nw:networking-for-trading:frame}{carte réseau} jusqu'au moteur d'appariement~»~; connexions de \omterm{def:nw:colocation-products-and-how-they-are-sold:colo}{colocation} de même longueur à ±2.5~ns près.
+\item CME Globex~: «~Le MSGW garantit que les messages sont traités dans l'ordre où ils arrivent à la passerelle~»~; 17 segments
+  de marché. Garde-fous~: un message découpé entre plusieurs paquets, ou reçu hors d'ordre, coûte à sa session au moins
+  \qty{3}{\micro\second} de traitement supplémentaire, pendant lequel le message complet d'une autre session peut la devancer.
+\end{itemize}
+\end{dated}
+
+Le modèle reproduit cette incitation. Dix firmes réagissent au même événement au même instant. Avec le dispositif parallèle, chaque
+copie d'un ordre traverse le réseau jusqu'à une passerelle (\qty{20}{\micro\second}, gigue de \qty{1}{\micro\second}), attend derrière la file de cette passerelle
+(deux messages déjà présents en moyenne, et les copies de la course arrivées en premier,
+\qty{1.5}{\micro\second} chacune), et la première copie de la firme à être traitée compte. Avec le dispositif de segment, chaque copie entre dans une
+même passerelle, dont l'ordre est fixé à la \omterm{def:nw:networking-for-trading:frame}{carte réseau}, sur des connexions égales à ±2.5~ns près. Tous les paramètres sont des hypothèses situées dans la
+fourchette que décrivent les bourses.
+
+\omcode{code/firm/gwmodel/firm_gwmodel.py}{46}{65}{Une course sous chaque dispositif~: le dispositif de segment ordonne selon l'arrivée à la carte réseau, le dispositif parallèle selon les files.}\label{lst:nw:futures-connectivity:race}
+
+\begin{proposition}[Copies sous les deux dispositifs]\label{prop:nw:futures-connectivity:copies}
+Dans un dispositif où chaque copie de l'ordre d'une firme atteint une même file FIFO au même instant, des copies supplémentaires ne peuvent
+changer la firme qui arrive en tête. Avec des files parallèles à délais indépendants, l'arrivée de la firme est le minimum des délais de ses copies,
+minimum qui diminue à chaque copie, si bien que la chance de gagner de la firme augmente tandis que les autres gardent une seule session.
+\end{proposition}
+
+\begin{proof}
+Dans une seule file, les copies d'un ordre arrivent ensemble et la première n'est pas servie plus tôt qu'une copie seule ne le serait~; les autres
+ne font que s'aligner derrière elle. Avec des chemins indépendants, le minimum de $k+1$ délais est au plus égal au minimum de $k$, et strictement inférieur
+avec une probabilité positive lorsque les délais sont continus.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmin=0.5,xmax=12.5,ymin=0,ymax=0.65,xtick={1,2,3,4,5,6,7,8,9,10,11,12},
+  xlabel={les sessions de la firme (une copie chacune)},ylabel={probabilité de gagner la course},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend style={font=\footnotesize,at={(0.5,-0.25)},anchor=north,legend columns=3},table/col sep=comma]
+\addplot[omThm,thick,mark=*,mark size=1.4pt] table[x=k,y=solo]{figdata/networks/23-futures-connectivity/wins.csv};
+\addplot[omMeth,thick,mark=square*,mark size=1.4pt] table[x=k,y=everyone]{figdata/networks/23-futures-connectivity/wins.csv};
+\addplot[omDef,thick,dashed,mark=triangle*,mark size=1.8pt] table[x=k,y=segment]{figdata/networks/23-futures-connectivity/wins.csv};
+\legend{parallèle~: la firme seule,parallèle~: tout le monde,passerelle de segment}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: la probabilité qu'une firme gagne une course à dix firmes en fonction du nombre de sessions par lesquelles elle envoie une copie. Avec
+des passerelles parallèles et les autres sur une seule session, douze sessions la font passer de 10.0~\% à 59.7~\%~; si tout le monde fait de même, elle revient
+à un sur dix~; avec une passerelle de segment, un sur dix quoi qu'elle fasse. Données~: \texttt{fig\_futures.py},
+\texttt{nw\_futures.curves()}.}\label{fig:nw:futures-connectivity:wins}
+\end{omfigure}
+
+Seule à le faire, une firme qui disperse ses copies sur douze passerelles remporte 59.7~\% des courses, au lieu de 10.0~\%. Quand tout le monde le fait, le taux de victoire
+retombe à un sur dix, et ce qui subsiste, c'est la charge~: un message extérieur à la course atteignant une passerelle quelconque juste après la
+course prend \qty{25.4}{\micro\second} lorsque chaque firme envoie une copie et \qty{35.8}{\micro\second} lorsque chaque firme en envoie douze, les
+«~latences plus élevées et moins prévisibles~» du compte rendu de la bourse. Avec le dispositif de segment, la firme gagne 9.8~\% des courses avec
+une seule session ou douze~: l'ordre se décide à quelques nanosecondes de câble près, et les copies ne font qu'alourdir la passerelle.
+
+L'histoire se lit comme une suite de telles réparations. Les passerelles parallèles, à files indépendantes, récompensaient la multiplicité~; la file FIFO au sein d'une
+passerelle et des réseaux déterministes ont réduit la variance~; un point d'entrée unique par partition a supprimé les chemins parallèles~; des
+câbles de même longueur ont reporté le départage à la nanoseconde. Chaque réparation ferme une stratégie et expose la marge suivante. Les garde-fous de CME, que sa documentation qualifie de contrôle
+d'intégrité du marché, visent les messages découpés en paquets~: envoyer le début d'un message avant
+que sa fin soit prête est un moyen d'arriver le premier, et une session qui le fait attend désormais au moins trois microsecondes.
+
+\section{Drop copy et couches de risque du membre compensateur}
+
+\begin{definition}[Contrôle de crédit du membre compensateur]\label{def:nw:futures-connectivity:credit}
+Un \emph{contrôle de crédit du membre compensateur}\index{contrôle de crédit du membre compensateur} est une limite que fixe un membre compensateur, auprès de la bourse
+ou dans son propre système, sur l'exposition d'une firme d'exécution qu'il garantit, assortie d'actions que la bourse engage lorsque la limite est
+franchie, comme le blocage des nouveaux ordres ou l'annulation des ordres en cours.
+\end{definition}
+
+Une firme de contrats à terme opère sous la garantie d'un membre compensateur, qui la contrôle à la bourse. Le dispositif de CME,
+Globex Credit Controls, permet aux administrateurs des risques du membre compensateur de fixer des limites d'exposition et des tailles maximales d'ordre par firme d'exécution, et de choisir
+ce qui se passe en cas de dépassement~: un courriel, des ordres bloqués, des ordres annulés~; pour les cotations de masse, le contrôle ne s'applique qu'après l'exécution.
+Contrairement à la couche du courtier du chapitre~22, ce contrôle se situe dans la bourse~: il n'ajoute rien au chemin de la firme~; son coût
+est la limite elle-même, qui peut arrêter une stratégie au milieu d'une journée chargée.
+
+Le drop copy est le relevé indépendant, tenu par la firme, de chaque exécution et de chaque annulation, transmis par la bourse. Avec plusieurs sessions, il
+couvre toutes les sessions, et le rapprochement doit se faire session par session~: un identifiant d'ordre est unique au sein de sa session, et non d'une session à l'autre.
+\texttt{firm.gwmodel} répartit le drop copy par session et lance sur chacune le réconciliateur du livre~13.
+
+\omcode{code/firm/gwmodel/firm_gwmodel.py}{118}{126}{Rapprochement d'une firme multi-session~: le réconciliateur du livre~13 par session, et les sessions que la firme ne connaît pas.}\label{lst:nw:futures-connectivity:reconcile}
+
+La multiplicité a aussi un coût ici. Douze copies d'un ordre exécuter-ou-annuler produisent jusqu'à douze exécutions et annulations
+à rapprocher, et plusieurs copies peuvent donner lieu à une exécution~: une firme qui disperse ses ordres doit dimensionner chaque copie comme si toutes pouvaient s'exécuter, ce qui revient à
+la comptabilisation au pire cas de la passerelle du livre~13.
+
+\section{Données de marché~: canaux, reprise et bande passante}
+
+CME diffuse les données de marché par canal, un canal par groupe de produits (les contrats à terme E-mini S\&P~500 sur le canal 310, leurs options
+sur le 311, les contrats à terme sur taux sur le 312, les contrats à terme NYMEX sur pétrole brut et produits raffinés sur le 382, entre autres), chacun sur deux flux UDP, A et B,
+que la bourse recommande vivement de traiter les deux. Un trou dans les numéros de séquence des paquets signifie que chaque carnet du
+canal peut être faux~; la reprise se fait à partir de boucles d'instantanés, d'un rejeu TCP des paquets manqués ou d'une boucle d'instruments. Le fichier de configuration
+fait foi pour les adresses, et non le guide des canaux, et les deux changent.
+
+Deux flux ne protègent que si leurs pertes sont indépendantes. Avec une probabilité de perte de $10^{-5}$ par paquet sur chacun, des pertes indépendantes
+font perdre un paquet sur les deux une fois sur $10^{10}$~; avec une corrélation de 0.5 entre les pertes des deux flux (un commutateur partagé, un
+tampon partagé), une fois sur 200\,000 (\texttt{firm\_gwmodel.both\_lost}). Les deux flux doivent atteindre la firme par des chemins séparés, vers
+des ports de commutateur distincts, faute de quoi le second reproduit surtout les défaillances du premier.
+
+\section{Budget des sessions}
+
+Une firme peut calculer ce que vaut une session supplémentaire. Avec 20\,000 courses par mois et 0.50~EUR par course gagnée (hypothèses), la
+deuxième session vaut 840~EUR par mois dans le dispositif parallèle, et la douzième 180.5~EUR~; face aux frais d'Eurex, la dernière
+session qui se rentabilise est la sixième, là où le prix par session double.
+
+\omcode{code/networks/23-futures-connectivity/python/nw_futures.py}{34}{51}{La valeur de la k-ième session et la dernière dont la valeur couvre ses frais.}\label{lst:nw:futures-connectivity:marginal}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[ybar,width=11cm,height=5.6cm,bar width=8pt,xmin=1.4,xmax=12.6,ymin=0,ymax=950,xtick={2,3,4,5,6,7,8,9,10,11,12},
+  xlabel={la k-ième session de la firme},ylabel={EUR par mois},
+  tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,legend columns=2},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=k,y=value]{figdata/networks/23-futures-connectivity/marginal.csv};
+\addplot[fill=omDef!55,draw=omDef] table[x=k,y=fee]{figdata/networks/23-futures-connectivity/marginal.csv};
+\legend{valeur des gains supplémentaires (simulation),frais de session (grille datée)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La valeur mensuelle de chaque session supplémentaire dans le dispositif parallèle, 20\,000 courses par mois à 0.50~EUR par course gagnée
+(simulation et hypothèses), face aux frais de la session Full~: 260~EUR jusqu'à la sixième, 520~EUR à partir de la septième. La sixième est la dernière
+qui se rentabilise. Données~: \texttt{fig\_futures.py}, \texttt{nw\_futures.marginal()}.}\label{fig:nw:futures-connectivity:marginal}
+\end{omfigure}
+
+La grille tarifaire fait partie du dispositif d'équité~: un prix qui double à partir de la septième session rend la copie marginale plus coûteuse
+que ce qu'elle rapporte, précisément là où la courbe s'aplatit. Avec une passerelle de segment, le calcul est plus simple~: la deuxième session ne rapporte rien,
+et les sessions ne s'achètent que pour le débit, les segments et la redondance.
+
+\begin{method}[Planifier la saisie des ordres sur contrats à terme]\label{met:nw:futures-connectivity:plan}
+\begin{enumerate}
+\item Lister les segments de marché ou les partitions sur lesquels les stratégies opèrent~; lire le modèle de passerelle de la bourse et son dispositif d'équité.
+\item Dimensionner les sessions pour le débit et la bascule~: transactions par seconde et par segment face aux limitations de débit, avec des adresses de secours
+  testées dans les fenêtres de bascule de la bourse.
+\item Si le dispositif est équitable, ne pas acheter de copies~; s'il ne l'est pas, évaluer chaque session supplémentaire au regard de ses frais et de la charge
+  qu'elle ajoute, et prévoir que la bourse modifie le dispositif.
+\item Intégrer au plan les limites du membre compensateur et le drop copy~; rapprocher session par session.
+\item Prendre les deux flux de données de marché par des chemins séparés, et certifier la reprise avant de trader.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: courses à travers les passerelles}\label{tut:nw:futures-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Simuler une course sous des passerelles parallèles et de segment, et chiffrer les sessions qu'une firme achèterait.
+\textbf{État final~:} les \cref{fig:nw:futures-connectivity:wins,fig:nw:futures-connectivity:marginal}.
+\begin{tutsteps}
+\item \textbf{Dispositifs.} \texttt{firm\_gwmodel.Design} avec les paramètres énoncés~; \texttt{race}
+  (le \cref{lst:nw:futures-connectivity:race}) lance un événement.
+\item \textbf{Taux de victoire.} \texttt{win\_rate} sur 20\,000 événements pour chaque nombre de sessions, la firme seule ou tout le monde.
+\item \textbf{Budget.} \texttt{nw\_futures.marginal} et \texttt{last\_paying} (le \cref{lst:nw:futures-connectivity:marginal})
+  face à la grille datée des frais~; \texttt{plan\_sessions} pour le débit.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Faire varier le temps de réaction de chaque firme, de sorte que la firme la plus rapide remporte la plupart des courses dans un dispositif équitable, et
+mesurer la multiplicité dont une firme plus lente a besoin pour rattraper son retard dans le dispositif parallèle.
+\end{tutorial}
+
+\section{Construction~: le modèle de passerelles et de sessions}\label{bld:nw:futures-connectivity:gwmodel}
+
+\begin{build}
+\bfield{Rôle} Passerelles, sessions et leurs prix pour un desk de trading sur contrats à terme~: les lignes consacrées aux contrats à terme du plan du chapitre~29.
+\bfield{Interface} \texttt{firm\_gwmodel}~: \texttt{Design}, \texttt{race}, \texttt{win\_rate}, \texttt{SessionType},
+\texttt{load\_sessions}, \texttt{session\_cost}, \texttt{plan\_sessions}, \texttt{both\_lost}, \texttt{reconcile\_sessions}.
+\bfield{Règles} Les frais et les limites sont des lignes datées assorties de leurs sources~; la course est une simulation étiquetée, aux paramètres énoncés~; le
+\texttt{firm.ordergw} du livre~13 est enveloppé, sans être modifié.
+\bfield{Tests d'acceptation} \texttt{code/firm/gwmodel/tests/}~: équité du dispositif de segment, gain apporté par les copies dans le dispositif parallèle
+et la charge qu'elles ajoutent, une file vérifiée à la main, la grille des frais et le planificateur, et le rapprochement de deux sessions.
+\bfield{Pour aller plus loin} Écarts de temps de réaction entre firmes~; limitations de débit sur les copies imposées par la bourse~; passerelles d'ICE.
+\end{build}
+
+\begin{omsources}
+\item Deutsche Börse, \emph{T7 infrastructure and latency}, Open Day 2018~; \emph{Insights into Trading System Dynamics}, 2021.
+\item CME Group Client Systems Wiki~: iLink Architecture, Market Segment Gateway Safeguards, CME Globex Credit Controls, MDP 3.0
+  Recovery Services and Channel Guide.
+\item Eurex Circular 029/23 et sa pièce jointe sur la grille tarifaire.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:1}
+À quoi une Convenience Gateway et une Market Segment Gateway relient-elles chacune une session CME~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:2}
+Combien coûtent dix sessions Full par mois selon la grille d'Eurex de juin 2023, et que transportent-elles~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:futures-connectivity:3}
+Pourquoi la bourse recommande-t-elle de traiter à la fois les flux A et les flux B~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:4}
+En utilisant la \cref{prop:nw:futures-connectivity:copies}, expliquer pourquoi le taux de victoire du dispositif de segment reste à un sur dix.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:5}
+Pourquoi CME pénalise-t-elle un message réparti sur deux paquets, et qui bénéficie de ce message~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:futures-connectivity:6}
+Une firme envoie chaque IOC par quatre sessions. Que doit supposer son système de risque, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:futures-connectivity:7}
+\emph{Programmation.} Avec \texttt{firm\_gwmodel.plan\_sessions}, quel est le mélange le moins cher pour 3\,000 transactions par seconde, et
+de combien le coût augmenterait-il si l'on n'utilisait que des sessions Full~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:futures-connectivity:8}
+\emph{Trouver la faille.} «~Nos douze sessions nous font gagner six courses sur dix~; si les autres firmes nous copient, nous en ajouterons davantage.~»
+\end{exercise}
+
+\section{Problème~: Douze sessions pour un seul ordre}
+
+\begin{problem}[{Problème du week-end --- la valeur de la multiplicité selon deux dispositifs de passerelles}]\label{pb:nw:futures-connectivity:1}
+Une firme fait partie de dix firmes qui se disputent les mêmes événements sur une bourse de contrats à terme. Elle peut envoyer une copie de chaque ordre
+par douze sessions au plus. Utiliser le modèle du chapitre et les frais datés.
+
+\medskip\noindent\textbf{Partie I --- Le dispositif parallèle.}
+\begin{enumerate}
+\item Quelle est la chance de la firme de gagner avec une seule session, et avec douze~?
+\item Qu'apporte la deuxième session, et la douzième~?
+\item Quelle est la proposition derrière la courbe croissante~?
+\item Quelles hypothèses du modèle déterminent l'ampleur du gain~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Tout le monde copie.}
+\begin{enumerate}[resume]
+\item Que devient la chance de la firme lorsque les dix firmes envoient chacune douze copies~?
+\item Que devient la latence d'un tiers~?
+\item Pourquoi la bourse s'en est-elle préoccupée~?
+\item Qu'a-t-elle modifié, et dans quel ordre~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le dispositif de segment.}
+\begin{enumerate}[resume]
+\item Quelle est la chance de la firme avec une seule session et avec douze~?
+\item Qu'est-ce qui décide désormais de l'ordre d'arrivée~?
+\item Quelle marge reste-t-il pour se disputer~?
+\item Pourquoi les garde-fous de CME existent-ils~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la probabilité de gagner avec $k$ sessions sous des passerelles à gigue, face à une passerelle de segment,
+  et les frais de session au-delà desquels les sessions supplémentaires ne rapportent plus.
+\item Que dit la valeur de la douzième session sur les frais d'Eurex à partir de la septième~?
+\item Lesquels des chiffres du chapitre sont publiés et lesquels sont supposés~?
+\item Que achèterait la firme dans chaque dispositif~?
+\item Comment vérifierait-elle le dispositif auquel elle a affaire~?
+\item Que coûte la multiplicité en rapprochement et en risque~?
+\item Où cela s'inscrit-il dans le plan du chapitre~29~?
+\item En une phrase~: que signifie «~équitable~» à la microseconde~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:futures-connectivity:1}
+Qu'est-ce qu'une market segment gateway, et pourquoi une bourse en proposerait-elle une~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:futures-connectivity:2}
+Pourquoi envoyer le même ordre par plusieurs sessions pourrait-il faire gagner davantage de courses, et à partir de quand cela cesse-t-il de fonctionner~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:futures-connectivity:3}
+Comment mesureriez-vous si les passerelles d'une bourse sont équitables~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:futures-connectivity:4}
+Vous avez perdu des paquets sur les flux A et B au même instant. Que soupçonnez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:futures-connectivity:5}
+Le contrôle de crédit de votre membre compensateur a bloqué vos ordres en milieu de journée. Que faites-vous maintenant, et que changez-vous pour demain~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:futures-connectivity:6}
+Concevez la saisie des ordres pour une firme qui négocie cinq segments de marché sur une même bourse~: sessions, passerelles, bascule (failover), risque et rapprochement.
+\end{interviewq}

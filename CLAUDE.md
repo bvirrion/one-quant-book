@@ -8,8 +8,8 @@ Guidance for Claude Code when working in this repository.
 twenty LaTeX books, written in English, covering quantitative finance end to end
 (markets, methods, derivatives, risk, research, strategies, microstructure,
 HFT, machine learning, low-latency software, networks, platforms, the firm,
-the industry, interviews). **Books 1–10 also ship in French** (pilot tier, below); the
-other ten are English-only.
+the industry, interviews). **All twenty also ship in French** (pilot tier, below; Books 16–20 since
+2026-11-12, session 2 of the 11–20 run).
 
 **Status (2026-11-03): all twenty books are written.** Books 18, 19 and 20 are the interview books, written 2026-11-02/03
 in one parallel batch of three (one Opus 5.5 agent per book), which replaced the old 220-page Book 18: 1,789 new questions, long
@@ -115,6 +115,30 @@ Book 6 343 pp, Book 7 370, Book 8 356, Book 9 356, Book 10 327; all 0/0/0 under 
 `typo_apply.py`, `iqroles_fr.py`, `wkend_labels.py`, `quotes_fr.py`, `numfile.py`, `index_join.py`, …). Books 1–5 still
 carry two defect classes this run found and fixed only in Books 6–10: weekend-problem part labels in six forms, and the
 mid price as *point médian* / *cours médian*. Not done: the HTML reader for the French books.
+
+**French pilot editions of Books 11–15 (2026-11-11/12), session 1 of the Books 11–20 run.** Same method and shape as
+Books 6–10 (one coordinator, the main session; no subagents; Haiku at most three books at once), with ten books split
+over two sessions in a row, at most five closed in each (user rule). Session 1 did steps 1–3 for all ten books (entry
+files, the part titles of Books 11–20 in `styles/lang/{en,fr}.tex`, `ivbook.sty` strings by language, the interview
+prefaces, tracks and generated drill files, ten glossaries) and closed Books 11–15, self-scored 88 each from a
+20-passage sample: Book 11 353 pp, Book 12 370, Book 13 332, Book 14 372, Book 15 395; 1,553 Haiku calls, $12.1 at list
+price; the weekly plan went from 78 % to 81 %; all 0/0/0 under TeX Live 2026 and `check_translation.sh` green. Run file `sources/TRANSLATION_BOOKS_11-20_FR.md`
+(with the hand-over to session 2), one per book `sources/TRANSLATION_BOOK_N_FR.md`. New series-wide sweeps, run back over
+every French book and collected in `draft/pilot-quant-fr/sweeps_all.sh <slug>`: ordinals before *centile*, stray `=`
+lines in displays, clock times, byte units (*Mo*, *Go*), imperative exercise items, missing elision at a line break.
+Books 16–20: Haiku step 4 queued; steps 5–9 in session 2.
+
+**French pilot editions of Books 16–20 (2026-11-12), session 2 of the Books 11–20 run.** Same method and shape (one
+coordinator, the main session; no subagents), from step 5 on. Self-scored 88 each from a 20-passage sample: Book 16
+373 pp, Book 17 361, Book 18 423, Book 19 383, Book 20 421; 1,222 Haiku calls, $10.3 at list price; the weekly plan went
+from 82 % to 84 %; all 0/0/0 under TeX Live 2026, `check_translation.sh` green, and for 18–20
+`check_interview_book.py --final` and `--cross` green. The session's close rebuilt all twenty French books into
+`build/`. **English-canon fixes on the way:** `\euro` in math printed **£** in Books 9 and 17 (now `\text{\euro}`), and
+Books 18 and 19 wrote thousands with a comma (531 tokens, now `\,`, as `sources/INTERVIEW_BOOKS.md` asks). New
+series-wide sweeps in `sweeps_all.sh`: currency after the amount for `\$` too, tilde thousands, imperatives in answers
+(`answer_imperative.py`, `vous_imperative.py`), English `\index` entries, translated command names (`cmd_twin.py`
+report), and the interview tracks table made again after the fixers. Per-book run files
+`sources/TRANSLATION_BOOK_{16..20}_FR.md`. Not done: the HTML reader for the French books.
 
 ## Commands
 

@@ -1,0 +1,304 @@
+\chapter{Risque en temps réel}\label{ch:pl:real-time-risk}
+
+Chacun des deux desks est resté dans sa limite tout l'après-midi. Ensemble, ils se sont retrouvés vendeurs à près du double de l'appétit de risque de la société sur le même indice, et
+personne ne le voit avant le \omterm{def:pl:the-platform-map:batch}{batch de fin de journée}, parce que rien n'additionne les desks pendant qu'ils négocient. Le système de chaque desk répond à la question
+qui lui est posée --- suis-je dans ma limite~? --- et la question que personne n'a posée à aucun système est celle qui compte. Ce chapitre construit
+l'agrégateur qui la pose à chaque exécution et à chaque mouvement de marché~: les expositions sont additionnées le long de la hiérarchie de risque de manière incrémentale, les sensibilités sont mises en cache et
+rafraîchies lorsque le marché bouge, les limites contrôlées dans la boucle, et un \omterm{def:pl:real-time-risk:whatif}{contrôle what-if} avant l'envoi d'un ordre.
+
+\section{Ce que signifie le temps réel pour le risque}
+
+\begin{definition}[Système de risque en temps réel]\label{def:pl:real-time-risk:system}
+Un \emph{système de risque en temps réel}\index{système de risque en temps réel} calcule en continu les expositions de la société et l'utilisation de ses limites à partir des
+exécutions du \omterm{def:pl:position-and-pnl-services:service}{service de positions} et des mouvements du marché, assez vite pour qu'un dépassement soit repéré pendant que les opérations de trading qui le causent peuvent encore être arrêtées, et
+les restitue avec leurs horodatages.
+\end{definition}
+
+Le moteur de risque de fin de journée du livre~6 (chapitre~29) réévalue chaque position selon des centaines de scénarios une fois par nuit~; la passerelle pré-trade
+du livre~13 (chapitre~22) contrôle un ordre en microsecondes par rapport aux limites qu'elle tient en mémoire. Le risque en temps réel se situe entre les deux~: la durée se mesure en secondes, pas en
+nanosecondes ni en heures, et englobe toute la société, et non un seul ordre. Ses chiffres sont moins fins que ceux du moteur nocturne (sensibilités, et non
+réévaluation complète) et son périmètre plus large que celui de la passerelle (chaque desk à la fois). La rapidité de mise à disposition des données de risque est l'un des principes du BCBS~239
+(livre~6, chapitre~29)~: un chiffre disponible le lendemain matin décrit un risque déjà pris.
+
+\section{Agrégation le long de la hiérarchie}
+
+\begin{definition}[Agrégation des expositions]\label{def:pl:real-time-risk:aggregation}
+L'\emph{agrégation des expositions}\index{agrégation des expositions} additionne les expositions de chaque transaction --- ici des dollars de delta sur l'indice --- le long de la
+hiérarchie de risque (transaction, book, desk, société) de sorte que chaque nœud porte la somme de ses descendants et puisse être comparé à sa propre limite.
+\end{definition}
+
+La limite d'un desk et celle de la société ne forment pas une partition~: l'appétit de la société est en général inférieur à la somme des limites de ses desks, parce que ceux-ci
+ne sont pas censés utiliser leurs limites au même moment et dans le même sens. C'est exactement ce qu'ils font parfois. La hiérarchie du chapitre
+compte une société, deux desks et un book chacun~; l'appétit de la société et la limite de chaque desk valent 50~millions de dollars de delta sur l'indice, ce que
+la règle de \texttt{firm.riskctl} autorise (la limite d'un desk ne dépasse jamais celle de la société).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum width=3.4cm,minimum height=0.9cm},>=Stealth]
+\node[box,fill=omThm!15] (f) at (0,0) {société~: limite 50~M\$\\ clôture $-\$90.8$~M\$ (limite dépassée)};
+\node[box,fill=omDef!12] (a) at (-3,-1.5) {desk A~: limite 50~M\$\\ clôture $-\$47.6$~M\$};
+\node[box,fill=omDef!12] (b) at (3,-1.5) {desk B~: limite 50~M\$\\ clôture $-\$43.2$~M\$};
+\node[box,fill=gray!10] (a1) at (-3,-3) {book~: puts sur l'indice\\ 21\,000 unités, six lignes};
+\node[box,fill=gray!10] (b1) at (3,-3) {book~: future sur l'indice\\ 8\,800 à découvert};
+\draw[->] (a1) -- (a); \draw[->] (b1) -- (b); \draw[->] (a) -- (f); \draw[->] (b) -- (f);
+\node[font=\scriptsize\itshape,align=left,anchor=west] at (5.0,-2.2) {chaque exécution et chaque tick remonte\\ sa variation vers le haut};
+\end{tikzpicture}
+
+\omcaption{La hiérarchie de risque du chapitre à la clôture, avec la limite et le delta de chaque nœud. Chaque nœud est dans sa limite, sauf celui
+qu'aucun système de desk ne calcule.}\label{fig:pl:real-time-risk:hierarchy}
+\end{omfigure}
+
+\section{Mises à jour incrémentales}
+
+\begin{definition}[Agrégation incrémentale]\label{def:pl:real-time-risk:incremental}
+L'\emph{agrégation incrémentale}\index{agrégation incrémentale} met à jour les agrégats en n'ajoutant que la variation provoquée par chaque événement --- l'exposition d'une exécution,
+la variation d'une transaction après un mouvement de marché --- au nœud et à ses ascendants, au lieu de recalculer l'arbre à partir de toutes les transactions.
+\end{definition}
+
+\begin{definition}[Cache de sensibilités]\label{def:pl:real-time-risk:cache}
+Un \emph{cache de sensibilités}\index{cache de sensibilités} conserve les sensibilités de chaque transaction (delta, gamma, vega) calculées par la bibliothèque de pricing à
+un même état du marché, s'en sert pour reporter les expositions au fil des mouvements du marché, et les recalcule lorsque le marché a bougé de plus d'un
+seuil depuis ce calcul.
+\end{definition}
+
+L'agrégateur du chapitre (\texttt{firm.rtrisk}) conserve, pour chaque transaction, les dollars de delta qu'elle apporte actuellement. Une exécution ajoute la nouvelle
+contribution moins l'ancienne au book de la transaction et à chaque ascendant. Un tick de marché fait avancer chaque delta en cache avec son gamma, $(\Delta +
+\Gamma\,\mathrm{d}S)\,q\,S$, et applique les écarts~; lorsque le spot a bougé de plus de 0.5~\% depuis le remplissage du cache, chaque
+instrument est réévalué par la bibliothèque du livre~5 (\texttt{firm.pricing}, bump-and-reprice), puis les écarts sont de nouveau appliqués. Les agrégats ne
+sont jamais reconstruits~; les tests vérifient qu'ils égalent toujours une reconstruction complète.
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{50}{76}{Le cache de sensibilités~: grecques issues de la bibliothèque de pricing à un spot, périmées au-delà
+d'un seuil.}\label{lst:pl:real-time-risk:cache}
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{99}{134}{Agrégation incrémentale~: la contribution d'une transaction, sa variation ajoutée à chaque ascendant, et
+limites contrôlées à chaque exécution et à chaque tick.}\label{lst:pl:real-time-risk:aggregator}
+
+\begin{definition}[Instantané de risque]\label{def:pl:real-time-risk:snapshot}
+Un \emph{instantané de risque}\index{instantané de risque} est l'état de l'agrégateur à un instant donné~: l'exposition de chaque nœud, l'heure de marché qu'il reflète, le
+moment et le spot des sensibilités utilisées, leur ancienneté et les limites dépassées.
+\end{definition}
+
+Un \omterm{def:pl:real-time-risk:snapshot}{instantané de risque} qui ne dit pas depuis quand ses sensibilités ont été calculées ne peut pas être tenu pour fiable~; un instantané qui le dit peut servir avec discernement. À la clôture de
+l'après-midi du chapitre, le cache avait été rafraîchi pour la dernière fois 65 minutes plus tôt (3\,890~secondes)~: le spot n'avait pas bougé de 0.5~\% depuis, de sorte que les
+deltas reportés restaient dans la précision du seuil.
+
+\section{Sensibilités, réévaluation complète et écart}
+
+Reporter les expositions à partir de sensibilités en cache est rapide et approximatif~; la réévaluation complète est exacte et lente. L'écart se mesure en valorisant
+les options du desk A à la clôture selon les deux méthodes, pour des mouvements allant de $-10\%$ à $+10\%$ (la \cref{fig:pl:real-time-risk:gap})~: le P\&L delta-gamma issu de
+sensibilités calculées à la clôture face à la variation de la valeur complète des options.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={mouvement de l'indice (\%)},ylabel={erreur du P\&L delta-gamma (\% de la valeur complète)},xmin=-10,xmax=10,
+  ymin=0,ymax=25,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omDef,very thick] table[x=move_pct,y=error_pct]{figdata/platforms/18-real-time-risk/approximation.csv};
+\draw[omThm,dashed] (axis cs:-10,1) -- (axis cs:10,1) node[pos=0.5,above,font=\scriptsize]{1~\%};
+\draw[black,dotted] (axis cs:3.5,0) -- (axis cs:3.5,25) node[pos=0.8,right,font=\scriptsize]{$+3.5~\%$};
+\draw[black,dotted] (axis cs:-6.75,0) -- (axis cs:-6.75,25) node[pos=0.8,left,font=\scriptsize]{$-6.75~\%$};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'erreur du P\&L calculé à partir du delta et du gamma en cache, en proportion de celui de la réévaluation complète, pour les 21\,000 puts sur l'indice
+du desk A à la clôture, selon l'ampleur du mouvement de l'indice. Elle est nulle en $\pm1~\%$ (là où portaient les bumps des grecques), inférieure à 1~\% entre $-6.75~\%$ et $+3.5~\%$,
+et croît vite à la hausse, là où la convexité des puts change le plus. Données~: \texttt{fig\_rtrisk.py}.}\label{fig:pl:real-time-risk:gap}
+\end{omfigure}
+
+Dans la plage de mouvements qu'un système en temps réel rencontre en une journée, l'approximation est excellente~: l'erreur est exactement nulle en $\pm 1~\%$, parce que la bibliothèque
+a calculé le delta et le gamma à partir de bumps de $\pm 1~\%$ et la formule quadratique passe par eux, et reste sous 1~\% de la réévaluation complète entre
+$-6.75~\%$ et $+3.5~\%$. Au-delà, elle se dégrade vite --- 3.1~\% à $+5~\%$, 23.6~\% à $+10~\%$ --- ce qui explique que le cache soit rafraîchi pour des mouvements bien
+plus petits que ceux-là, et pourquoi les chiffres de stress viennent de la réévaluation complète (livre~6, chapitre~29), et non des sensibilités.
+
+\section{Limites dans la boucle}
+
+\begin{definition}[Contrôle what-if]\label{def:pl:real-time-risk:whatif}
+Un \emph{contrôle what-if}\index{contrôle what-if} calcule ce qu'une transaction proposée ferait à l'exposition de chaque nœud au-dessus de son livre,
+ainsi que les limites qu'elle franchirait, avant l'envoi de la transaction, sans modifier l'état de l'agrégateur.
+\end{definition}
+
+\omcode{code/firm/rtrisk/firm_rtrisk.py}{144}{148}{Le contrôle what-if~: la contribution de la transaction, ajoutée à ses ascendants sur une copie, et les
+limites qu'elle franchirait.}\label{lst:pl:real-time-risk:whatif}
+
+Un \omterm{def:pl:real-time-risk:whatif}{contrôle what-if} est la contribution du système en temps réel au contrôle pré-trade~: le filtre du livre~13 vérifie un ordre face aux limites en
+microsecondes, le what-if lui indique si la limite au niveau de la société a encore de la marge. À la clôture de l'après-midi du chapitre, le desk~B qui demande à vendre 400
+contrats à terme supplémentaires serait informé que son desk reste à $-45.2$~millions de dollars, dans sa limite, et que la société passe à $-92.8$~millions de dollars, très au-delà.
+
+\section{Deux desks, un seul indice}
+
+L'après-midi du chapitre court de 13~h~00 à 17~h~30 sur un indice qui part de 5\,000, avec des mouvements simulés à graine fixée (volatilité annuelle de 20~\% et dérive de
+$-1.5~\%$ sur l'après-midi~; il clôt à 4\,908.5). Le desk~A achète des puts sur indice --- six lignes cotées, trois strikes et deux échéances, 1\,000 unités
+par lot --- et le desk~B vend des contrats à terme sur indice, 400 par lot, chacun à des moments aléatoires, environ toutes les cinq minutes. Avant chaque transaction, le desk
+vérifie sa propre exposition et ne négocie que s'il reste sous 90~\% de sa limite. Les exécutions passent par le \omterm{def:pl:position-and-pnl-services:service}{service de positions} du chapitre~17~;
+l'agrégateur de la société additionne tout.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xlabel={heure de la journée (heures)},ylabel={delta (millions de \$)},xmin=13,xmax=17.5,ymin=-100,ymax=5,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=3}]
+\addplot[color=omThm,very thick,const plot] table[x=hour,y=firm_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{société}
+\addplot[color=omDef,thick,const plot] table[x=hour,y=desk_a_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{desk A (puts)}
+\addplot[color=omMeth,thick,dashed,const plot] table[x=hour,y=desk_b_m]{figdata/platforms/18-real-time-risk/exposure.csv};
+\addlegendentry{desk B (contrats à terme)}
+\draw[black,thick] (axis cs:13,-50) -- (axis cs:17.5,-50) node[pos=0.72,below,font=\scriptsize]{chaque limite~: $-50$~millions de dollars};
+\draw[omThm,dotted,thick] (axis cs:14.397,-100) -- (axis cs:14.397,5) node[pos=0.93,right,font=\scriptsize]{dépassement société 14:23:50};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Delta de l'indice pour la société et pour chaque desk tout au long de l'après-midi, dans l'agrégateur. Aucun des deux desks ne dépasse sa limite --- la plus forte exposition du desk~A
+est de $-49.3$~millions de dollars, celle du desk~B de $-43.6$~millions de dollars --- alors que la société franchit la sienne à 14:23:50 et termine à $-90.8$~millions de dollars.
+Données~: \texttt{fig\_rtrisk.py}.}\label{fig:pl:real-time-risk:exposure}
+\end{omfigure}
+
+\begin{example}[Deux desks, un seul indice]\label{ex:pl:real-time-risk:desks}
+Les deux desks ont fait ce que leurs systèmes permettaient~: le desk~A a réalisé 21 transactions et détient 21\,000 puts, le desk~B en a réalisé 22 et est vendeur de 8\,800 contrats à terme~; aucun des deux
+n'a dépassé sa limite à aucun moment. La limite de la société a été franchie à 14:23:50, seule alerte de l'agrégateur de l'après-midi~; à la clôture, la
+société affiche $-90.8$~millions de dollars de delta, soit 1.82 fois son appétit pour le risque (desk~A $-47.6$~millions de dollars, desk~B $-43.2$~millions de dollars). Sans l'agrégateur, le
+\omterm{def:pl:the-platform-map:batch}{batch de fin de journée} l'aurait détecté trois heures après le franchissement. Le cache a été rafraîchi six fois~; l'agrégateur a effectué 10\,570 mises à jour.
+\end{example}
+
+\begin{remark}[Qui agit sur l'alerte]\label{rem:pl:real-time-risk:who}
+Un franchissement au niveau de la société n'appartient à aucun desk. L'alerte de l'agrégateur doit atteindre quelqu'un qui a autorité sur les deux --- le responsable des risques qui peut
+bloquer les nouveaux ordres qui augmentent le risque via le filtre, ou réduire sur-le-champ la limite d'un desk (le \omterm{def:pl:signal-serving-and-parameter-management:store}{magasin de paramètres} du chapitre~16, avec ses approbations) ---
+et le cadre des limites doit dire à l'avance dont le risque sera réduit en premier. Un chiffre en temps réel que personne ne peut exploiter n'est qu'un rapport plus rapide.
+\end{remark}
+
+\section{Tutoriel~: deux desks et un agrégateur}\label{tut:pl:real-time-risk:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Agréger incrémentalement les expositions des deux desks, repérer le franchissement au niveau de la société que les desks ne pouvaient pas voir, et mesurer l'erreur d'approximation du
+\omterm{def:pl:real-time-risk:cache}{cache de sensibilités}. \textbf{État final~:} \cref{fig:pl:real-time-risk:exposure,fig:pl:real-time-risk:gap}.
+\begin{tutsteps}
+\item \textbf{L'après-midi}~: \texttt{pl\_rtrisk.afternoon()}~: la trajectoire de l'indice, les transactions des desks, les alertes de l'agrégateur.
+\item \textbf{Instantanés}~: \texttt{agg.snapshot(t)} à tout moment~: expositions, âge du cache, franchissements.
+\item \textbf{\omterm{def:pl:real-time-risk:whatif}{Contrôle what-if}}~: \texttt{what\_if\_at\_close(r)}.
+\item \textbf{L'écart}~: \texttt{approximation\_error(r)} et \texttt{one\_percent\_move}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Abaisser le seuil de rafraîchissement à 0.1~\% et compter les réévaluations~; donner au desk~A des calls au lieu de puts et voir si
+la société franchit encore sa limite.
+\end{tutorial}
+
+\section{Construction~: l'agrégateur en temps réel}\label{bld:pl:real-time-risk:rtrisk}
+
+\begin{build}
+\bfield{Rôle} Les expositions de la société et la consommation des limites, chaque nœud de la hiérarchie, mises à jour à chaque exécution et à chaque tick, avec les réponses what-if pour
+les transactions proposées.
+\bfield{Interface} \texttt{Hierarchy}~; \texttt{SensitivityCache(md, underlying, threshold)}~;
+\texttt{Aggregator(hierarchy, cache, limits)} avec \texttt{on\_fill}, \texttt{on\_tick}, \texttt{exposure}, \texttt{snapshot}, \texttt{what\_if}, \texttt{alerts}~;
+\texttt{Future}~; \texttt{delta\_gamma\_pnl}, \texttt{full\_pnl}.
+\bfield{Règles} Les agrégats sont mis à jour par différences, jamais reconstruits~; les sensibilités viennent de la bibliothèque de valorisation et sont rafraîchies au-delà
+d'un seuil~; chaque instantané porte l'âge de ses sensibilités~; les limites sont vérifiées à chaque mise à jour~; un what-if ne modifie jamais l'état.
+\bfield{Tests d'acceptation} \texttt{code/firm/rtrisk/tests/}~: la hiérarchie et les sommes incrémentales face à une reconstruction complète~; les ticks dans le
+seuil (porté avec le gamma) et au-delà (réévalué)~; limites, alertes et what-if~; le P\&L delta-gamma face à la réévaluation complète pour un petit
+mouvement.
+\bfield{Pour aller plus loin} Expositions au vega et aux taux sur la même hiérarchie~; de nombreux sous-jacents avec un chiffre consolidé de la société tenant compte des corrélations~; l'agrégateur alimenté
+à partir du journal d'événements du chapitre~24.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~5, chapitres 4 et 28 (grecques, bibliothèque de valorisation)~; One Quant Book~6, chapitres 21 et 29 (sensibilités, le moteur de
+risque et sa hiérarchie, BCBS~239)~; One Quant Book~11, chapitre~27, et livre~13, chapitre~22 (limites et filtre pré-trade).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:1}
+Pour un put de delta $-0.4$ sur 1\,000 unités d'un indice à 5\,000, calculer son delta en dollars et déterminer combien de transactions de ce type tiennent sous 90~\% de la
+limite de 50~millions de dollars~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:2}
+Expliquer pourquoi l'erreur d'approximation est exactement nulle en $\pm 1\%$ dans la \cref{fig:pl:real-time-risk:gap}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:real-time-risk:3}
+Dire ce que le \omterm{def:pl:real-time-risk:whatif}{contrôle what-if} indique au desk~B à la clôture, et expliquer pourquoi le système propre au desk~B ne peut pas le lui dire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:4}
+Expliquer pourquoi l'erreur croît plus vite à la hausse qu'à la baisse pour un livre de puts longs~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:5}
+L'instantané de la clôture utilisait des sensibilités vieilles de 65 minutes. Quand cela est-il acceptable, et qu'est-ce qui le rendrait inacceptable~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:real-time-risk:6}
+Pourquoi l'\omterm{def:pl:real-time-risk:incremental}{agrégation incrémentale} est-elle vérifiée contre une reconstruction dans les tests, et quel défaut le contrôle permettrait-il de détecter~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:real-time-risk:7}
+\emph{Programmation.} Exécuter \texttt{afternoon} avec un seuil de rafraîchissement de 0.1~\% puis de 2~\%. Combien de
+réévaluations chaque seuil entraîne-t-il, et l'exposition de la société à la clôture change-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:real-time-risk:8}
+\emph{Trouver la faille.} «~Chaque desk dispose d'une limite et d'un contrôle pré-trade, donc la société ne peut pas dépasser la somme des limites des desks, et nous avons fixé
+cette somme en dessous de l'appétit pour le risque de la société.~»
+\end{exercise}
+
+\section{Problème~: Deux desks, un même indice}
+
+\begin{problem}[{Problème du week-end --- une violation qu'aucun système ne pouvait voir}]\label{pb:pl:real-time-risk:1}
+L'après-midi du chapitre, les desks et l'agrégateur.
+
+\medskip\noindent\textbf{Partie I --- Le système.}
+\begin{enumerate}
+\item Que signifie le temps réel ici, par rapport au moteur de risque nocturne et à la barrière pré-trade~?
+\item Comment les expositions sont-elles agrégées, et pourquoi les limites des desks ne forment-elles pas une partition de celle de la société~?
+\item Qu'apporte une mise à jour incrémentale, sur une exécution et sur un tick~?
+\item Quand le cache est-il rafraîchi, et par quoi~?
+\item Que contient un instantané~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- L'après-midi.}
+\begin{enumerate}[resume]
+\item Qu'a négocié chaque desk, et qu'a-t-il contrôlé~?
+\item Quelles étaient les plus fortes expositions des desks~?
+\item Quand la limite de la société a-t-elle été dépassée~?
+\item Quelle était l'exposition de la société à la clôture, en multiple de son appétit~?
+\item Que dit le \omterm{def:pl:real-time-risk:whatif}{contrôle what-if} à la clôture~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'approximation.}
+\begin{enumerate}[resume]
+\item Comment le P\&L du cache se compare-t-il à la réévaluation complète~?
+\item Entre quels mouvements l'erreur est-elle inférieure à 1~\%~?
+\item Quelle est-elle à $+5~\%$ et à $+10~\%$~?
+\item Pourquoi est-elle nulle à $\pm1~\%$~?
+\item Quelles conséquences pour les chiffres de stress~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'heure à laquelle la limite au niveau de la société a été dépassée alors que chaque desk restait dans la sienne, l'exposition à
+la clôture, et la taille du mouvement de marché au-delà duquel l'erreur de P\&L du cache dépasse un pour cent de la réévaluation complète.
+\item Qui doit recevoir l'alerte, et que doit-on pouvoir faire~?
+\item Comment fixer le seuil de rafraîchissement~?
+\item Que faudrait-il agréger d'autre en temps réel~?
+\item En une phrase~: pourquoi faut-il additionner le risque au fur et à mesure qu'il est pris~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:real-time-risk:1}
+Deux desks restent chacun dans leurs limites. Comment la société peut-elle sortir des siennes~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:real-time-risk:2}
+Comment maintiendriez-vous à jour les expositions de l'ensemble de la société alors que des milliers d'exécutions et de ticks arrivent chaque seconde~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:real-time-risk:3}
+Quand une approximation delta--gamma du P\&L est-elle suffisante, et quand devez-vous réévaluer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:real-time-risk:4}
+Qu'est-ce qu'un \omterm{def:pl:real-time-risk:snapshot}{instantané de risque} doit dire à son lecteur, au-delà des chiffres~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:real-time-risk:5}
+Concevez un \omterm{def:pl:real-time-risk:system}{système de risque en temps réel} pour une société de trading à plusieurs desks.
+\end{interviewq}

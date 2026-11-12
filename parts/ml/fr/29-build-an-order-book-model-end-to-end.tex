@@ -1,0 +1,368 @@
+\chapter{Construction~: un modèle de carnet d'ordres, de bout en bout}\label{ch:ml:build-an-order-book-model-end-to-end}
+
+Le dernier modèle du livre est volontairement petit~: une prévision de la seconde suivante du prix milieu, entraînée sur les sessions du simulateur,
+validée sans fuite, compilée en quelques centaines de nanosecondes et exploitée dans le même simulateur, où chaque microseconde
+qu'il prend est une microseconde de décisions périmées. Chaque étape réutilise un composant construit plus tôt dans le livre, et l'exécution entière forme un seul
+graphe reproductible. Le chapitre se termine sur la question que pose le titre de son problème~: combien vaut une microseconde pour ce modèle~?
+La réponse n'est pas celle que suggère le titre. Le modèle gagne 21.73~\$ par session de vingt minutes sur six sessions de test, quatre fois
+ce que rapporte la même cotation sans lui~; son edge reste inchangé jusqu'à 50 millisecondes d'instant de décision et tombe à zéro vers
+106 millisecondes. Sur un marché dont le meilleur cours change quatre fois par seconde, les microsecondes ne valent rien et un dixième de
+seconde vaut tout~; ce que coûte la latence dépend de la vitesse du marché, et non de celle du code.
+
+\section{La spécification}
+
+Le modèle, rédigé comme la \omterm{def:ml:the-machine-learning-team:handoff}{spécification de transmission} (handoff) du chapitre~28 le prévoit~:
+\begin{itemize}
+\item \emph{Marché.} Le simulateur de bourse du livre~10, une plateforme et un instrument à 100~\$ avec un tick d'un cent, des frais par défaut (une
+remise de 0.002~\$ par action pour la fourniture de liquidité, 0.003~\$ pour la prise de liquidité), le flux \texttt{firm\_tape} du livre~7 comme flux de fond,
+l'agent derrière le modèle de latence du livre~10 (20~microsecondes dans chaque sens).
+\item \emph{Décision.} À chaque changement du meilleur cours, l'agent observe~: il calcule dix variables et prévoit la variation du mid
+dans la seconde suivante (en ticks), puis agit.
+\item \emph{Action.} Coter un lot (100 actions) au meilleur cours de chaque côté que sa position autorise (au plus un lot à l'achat ou à la vente),
+sauf du côté que la prévision annonce sur le point d'être balayé~: le cours acheteur est retiré lorsque la prévision est inférieure à $-\theta$, le cours vendeur
+lorsqu'elle est supérieure à $\theta$. Une cotation dont le prix reste au meilleur cours est laissée en place, car sa position dans la file mérite d'être conservée. Une
+position détenue pendant 30~secondes est clôturée au marché.
+\item \emph{Sessions.} Vingt minutes chacune, sur des graines disjointes~: huit pour l'entraînement, trois pour la validation, six pour le test.
+\item \emph{Budget et suivi.} L'instant de décision est la latence mesurée du modèle compilé~; les moniteurs d'entrée du chapitre~27 tournent sur
+les sessions de test.
+\end{itemize}
+
+La stratégie est celle d'un teneur de marché qui utilise le modèle pour éviter de subir la sélection adverse, usage classique d'une prévision à court horizon par un
+fournisseur de liquidité (Cartea, Jaimungal et Penalva en traitent la forme optimale). Une version preneuse de liquidité a été essayée en premier puis abandonnée~: sur
+ce marché, le mid bouge d'un tick ou plus en une seconde environ cinq fois sur cent, et traverser une fourchette d'un tick en payant
+deux fois les frais du preneur coûte 1.6 tick par aller-retour, davantage que ce que vaut ici la moindre prévision.
+
+L'ensemble de l'exécution est un seul graphe \texttt{firm.workflow} (\cref{lst:ml:lob:graph})~: deux étapes de données, une validation croisée purgée, l'ajustement
+et son export, le TCN challenger, le choix du seuil sur les sessions de validation, et les sessions de test à chaque latence.
+Chaque étape est indexée par son code, ses paramètres, sa graine et ses entrées, si bien qu'un changement en un point quelconque relance exactement ce qui en dépend.
+
+\section{Données, étiquettes et validation}
+
+Les sessions de recherche utilisent la même classe d'agent qu'en production, avec le trading désactivé~: il enregistre son flux sous forme d'événements
+du \omterm{def:ml:data-and-feature-stores:store}{feature store} du chapitre~24 (chaque changement du meilleur cours, avec l'incrément de son déséquilibre du flux d'ordres, et chaque transaction avec le signe de son
+preneur) et calcule ses variables en ligne à chaque changement du carnet (\cref{lst:ml:lob:onbook}). Les dix variables sont
+le déséquilibre au meilleur cours, la fourchette, le déséquilibre du flux d'ordres de Cont, Kukanov et Stoikov sur une et cinq secondes, le
+volume négocié signé sur une et cinq secondes, le nombre de transactions sur cinq secondes, la variation du mid sur une et cinq secondes, et le nombre
+de mises à jour du carnet sur une seconde. Les mêmes définitions calculées hors ligne sur les événements enregistrés égalent exactement les valeurs en ligne
+à chaque décision (le test d'acceptation de \texttt{firm.lobmodel})~; l'entraînement et le service ne peuvent pas diverger, puisqu'ils utilisent le
+même code.
+
+L'étiquette est l'\omterm{def:ml:targets-labels-and-sample-weights:fixed}{étiquette à horizon fixe} du chapitre~2, en temps événementiel (\cref{lst:ml:lob:data})~: la variation du mid, en ticks, entre le dernier
+événement connu à la décision et celui d'une seconde plus tard, calculée par \texttt{firm.labeling} sur les variations du mid par événement.
+La plupart des étiquettes sont nulles (89.4~\%)~: en une seconde, le mid ne bouge généralement pas. Les huit sessions d'entraînement donnent 51\,924 décisions et les
+trois sessions de validation 33\,457~; l'activité varie beaucoup d'une session à l'autre.
+
+La validation respecte le temps. Chaque étiquette couvre une seconde, si bien que des lignes voisines partagent leur futur~; la validation croisée purgée à cinq plis du
+chapitre~3 (\texttt{firm.cvsplit}, avec un embargo d'une seconde) retire de chaque pli d'entraînement les lignes dont les étiquettes chevauchent
+le pli de test. Trois configurations LightGBM de 150 arbres, à 7, 15 et 31 feuilles, obtiennent des coefficients d'information moyens par pli de
+0.558, 0.555 et 0.548~; la plus petite l'emporte. Réajustée sur l'ensemble des sessions d'entraînement, elle a un coefficient d'information de 0.625 dans l'échantillon (in-sample)
+et de 0.522 sur les sessions de validation.
+
+Le challenger est le \omterm{def:ml:sequence-models-on-order-books:tcn}{réseau convolutif temporel} (TCN) du chapitre~8 (\texttt{firm.lobseq}, 12\,867 paramètres), appliqué à des fenêtres des variables des 16 dernières
+décisions, entraîné sur sept sessions d'entraînement et arrêté tôt sur la huitième. Son coefficient d'information de validation est de
+0.452. La forêt l'emporte en précision et, comme la section suivante le mesure, c'est aussi le modèle que l'on peut rendre rapide~; Kolm, Turiel et
+Westray ont trouvé de même que des réseaux standard sur des entrées stationnaires de flux d'ordres surpassent des réseaux appliqués aux états bruts du carnet.
+
+\section{Le modèle et sa forme compilée}
+
+La forêt retenue compte 150 arbres de six divisions chacun. Exportée sous forme de tableaux plats par \texttt{firm.mlinfer} du chapitre~26, elle reproduit
+bit à bit les prédictions de LightGBM sur les lignes de validation~; il en va de même des branches C++20 générées, de la boucle C++ sur les tableaux et du
+noyau Rust, sur 200 vecteurs de test communs (\cref{lst:ml:lob:cpp}, \cref{lst:ml:lob:rust}). L'agent lui-même appelle un parcours NumPy des
+mêmes tableaux qui additionne les feuilles dans le même ordre (\cref{lst:ml:lob:predict}).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+chemin de service & médiane & 99\up{e}~centile & 99.9\up{e}~centile\\
+\midrule
+appel Python de LightGBM (une ligne) & 263 $\mu$s & 560 $\mu$s & 869 $\mu$s\\
+passe avant du TCN dans PyTorch (une fenêtre) & 166 $\mu$s & 460 $\mu$s & 718 $\mu$s\\
+forêt plate en Python et NumPy & 37 $\mu$s & 98 $\mu$s & 172 $\mu$s\\
+forêt plate, boucle C++20 & 1.1 $\mu$s & 2.5 $\mu$s & 9.1 $\mu$s\\
+forêt plate, branches C++20 générées & 153 ns & 383 ns & 1.1 $\mu$s\\
+\bottomrule
+\end{tabular}
+\caption{Latence d'une prédiction, mesurée une fois sur un ordinateur portable (Intel Core Ultra 7 155H, WSL2, une machine partagée sans
+cœurs isolés~; le coût propre de l'horloge est d'environ 15 nanosecondes). Données~: \texttt{bench\_lobmodel.py},
+\texttt{measured\_latency.csv}.}\label{tab:ml:lob:latency}
+\end{table}
+
+Le \Cref{tab:ml:lob:latency} donne l'autre côté du budget. Les branches générées répondent en 153 nanosecondes à la médiane, environ
+1\,700 fois plus vite que l'appel Python de LightGBM~; le TCN, moins précis, serait aussi mille fois plus lent que la
+forêt compilée. Les exécutions de trading utilisent ces mesures comme instant de décision déclaré de l'agent~: 150 nanosecondes pour le modèle compilé,
+263 microsecondes pour l'appel de la bibliothèque.
+
+\section{Le trading dans le simulateur}
+
+\begin{definition}[Péremption de la décision]\label{def:ml:build-an-order-book-model-end-to-end:staleness}
+La \emph{péremption de la décision}\index{péremption de la décision} d'un ordre est le temps écoulé entre l'événement de marché sur lequel sa décision repose jusqu'à
+l'instant où l'ordre quitte le trader~: la latence des données de marché, toute attente pendant que des décisions antérieures sont encore calculées, et
+l'instant de décision lui-même. Si les décisions sont déclenchées à un taux $\lambda$ et que chacune prend $L$, l'attente ne reste bornée que tant que
+$\lambda L<1$.
+\end{definition}
+
+La décision de l'agent (\cref{lst:ml:lob:act}) s'exécute à chaque changement du carnet qu'il observe. Son seuil est choisi sur les sessions de validation
+à la latence du modèle compilé~: P\&L net moyen par session de 43.4~\$, 53.9~\$, 48.0~\$ et 50.1~\$ pour $\theta$ de 0.05, 0.1, 0.15 et
+0.2 tick, soit $\theta=0.1$. Sur les six sessions de test, à 150 nanosecondes, le modèle gagne 21.73~\$ par session (erreur type
+3.90~\$), positif dans les six, à partir de 34.3 entrées par session~; ses frais d'échange nets sont un crédit de 6.73~\$. Le mark-out de ses entrées une seconde
+plus tard vaut 0.405 tick en sa faveur. La même cotation sans modèle (qui ne retire jamais de côté) gagne 5.47~\$ (erreur type
+2.22~\$) à partir de 58.7 entrées, avec un mark-out d'une seconde de 0.078 tick~: elle est exécutée plus souvent, et surtout par des ordres qui en savent
+davantage. La valeur du modèle réside dans les exécutions qu'il refuse.
+
+Les sessions de test passent aussi par le moniteur d'entrées du chapitre~27, chaque session étant comparée aux sessions d'entraînement. Le plus grand \omterm{def:ml:monitoring-and-retraining:psi}{indice de stabilité de la population}
+d'une session se situe entre 0.14 et 1.60, très au-dessus de toute règle empirique, et dans chaque session il provient d'une variable
+qui compte des événements (mises à jour de la dernière seconde, transactions des cinq dernières secondes), variable laquelle suit l'activité de la session~: les sessions de test
+voient entre 2.8 et 6.4 changements du carnet par seconde. Les quatre variables de prix restent entre 0.02 et 0.13. Le modèle est rentable
+dans les six sessions. Un moniteur portant sur des variables de comptage doit avoir une référence couvrant toute la gamme d'activité que le modèle rencontrera, ou
+des variables normalisées par l'activité, faute de quoi il alerte chaque après-midi calme.
+
+\section{Ce que coûte la latence}
+
+Les sessions de test sont de nouveau négociées, l'instant de décision étant fixé à chaque point d'une grille allant de zéro à 150 millisecondes
+(\cref{tab:ml:lob:results}, \cref{fig:ml:lob:pnl}). Tout le reste est identique~: les sessions, le modèle, le seuil.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+instant de décision & péremption médiane & P\&L net par session (\$) & mark-out à 1~s (ticks) & sessions positives\\
+\midrule
+0 & 0.02 ms & 21.73 & 0.405 & 6 sur 6\\
+150 ns & 0.02 ms & 21.73 & 0.405 & 6 sur 6\\
+263 $\mu$s & 0.28 ms & 21.73 & 0.405 & 6 sur 6\\
+1 ms & 1.02 ms & 21.23 & 0.399 & 6 sur 6\\
+10 ms & 10.0 ms & 21.72 & 0.405 & 6 sur 6\\
+30 ms & 30.0 ms & 20.63 & 0.394 & 6 sur 6\\
+50 ms & 50.0 ms & 20.52 & 0.417 & 6 sur 6\\
+70 ms & 70.0 ms & 12.40 & 0.353 & 6 sur 6\\
+100 ms & 154 ms & 1.60 & 0.245 & 3 sur 6\\
+150 ms & 802 ms & $-12.27$ & 0.148 & 2 sur 6\\
+sans modèle & 0.02 ms & 5.47 & 0.078 & \\
+\bottomrule
+\end{tabular}
+\caption{Le modèle sur six sessions de test à chaque instant de décision~: péremption médiane de la décision, P\&L net moyen par session de vingt minutes,
+mark-out moyen à une seconde des entrées, et les sessions au P\&L positif~; la dernière ligne donne la cotation sans modèle. Données~:
+\texttt{ml\_lobmodel.latency\_table}.}\label{tab:ml:lob:results}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xmode=log,xlabel={temps de décision (ms)},ylabel={P\&L net par session (\$)},xmin=1e-4,xmax=300,
+  ymin=-22,ymax=30,tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},legend pos=south west,
+  legend cell align=left,legend style={font=\small},table/col sep=comma]
+\addplot[name path=hi,draw=none,forget plot] table[x=ms,y=hi]{figdata/ml/29-build-an-order-book-model-end-to-end/latency.csv};
+\addplot[name path=lo,draw=none,forget plot] table[x=ms,y=lo]{figdata/ml/29-build-an-order-book-model-end-to-end/latency.csv};
+\addplot[omProp!25,forget plot] fill between[of=hi and lo];
+\addplot[omProp,very thick,mark=*,mark size=1.5pt] table[x=ms,y=pnl]{figdata/ml/29-build-an-order-book-model-end-to-end/latency.csv};
+\addplot[omDef,thick,dashed] table[x=ms,y=base]{figdata/ml/29-build-an-order-book-model-end-to-end/latency.csv};
+\addplot[black,thin] coordinates {(1e-4,0) (300,0)};
+\legend{le modèle ($\pm$ une erreur type),cotation sans modèle}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{P\&L net moyen par session de test de vingt minutes en fonction de l'instant de décision, de 150 nanosecondes (modèle compilé) à
+150 millisecondes (échelle logarithmique~; zéro donne le même résultat que 150 nanosecondes), avec une bande d'une erreur type sur les six sessions~;
+en pointillés~: la même cotation sans modèle. Données~: \texttt{ml\_lobmodel.latency\_table}.}\label{fig:ml:lob:pnl}
+\end{omfigure}
+
+Jusqu'à 50 millisecondes rien ne change~: le P\&L reste dans son erreur type de 21.73~\$, et le mark-out à moins de 0.02 ticks de
+0.405. Au-delà, l'edge se dégrade rapidement. À 70 millisecondes le P\&L est de 12.40~\$~; à 100 millisecondes il est de 1.60~\$, positif dans
+seulement trois sessions~; à 150 millisecondes il est de $-\$12.27$. Par interpolation linéaire sur la grille, le P\&L tombe à zéro vers 106
+millisecondes, et à ce que rapporte la cotation sans modèle vers 89 millisecondes~: au-delà, le modèle fait moins bien que l'absence de modèle.
+
+Deux mécanismes produisent la falaise, et la colonne de péremption les sépare. Jusqu'à 70 millisecondes la péremption médiane égale
+l'instant de décision~: chaque décision accuse exactement ce retard, et une cotation retirée avec 50 millisecondes de retard est rarement touchée pendant ces 50
+millisecondes, car le carnet ne change qu'environ quatre fois par seconde. À 100 millisecondes la péremption médiane est de 154
+millisecondes~: dans les rafales les plus intenses, les décisions arrivent plus vite qu'une toutes les 100 millisecondes, $\lambda L$ dépasse un, et elles font la queue
+les unes derrière les autres. À 150 millisecondes la péremption médiane est de 802 millisecondes, et l'agent cote sur un carnet vieux de presque une
+seconde. Un modèle lent en moyenne l'est encore davantage précisément quand le marché est actif, c'est-à-dire quand ses prévisions comptent.
+
+Le mark-out à une seconde raconte la même histoire du côté des exécutions, qui passe de 0.405 à 0.148 ticks~; il reste positif, car
+même un retrait tardif évite certaines des pires exécutions, mais pas assez pour payer le reste.
+
+Pourquoi les microsecondes ne comptent-elles pas ici~? Parce que le temps qui compte se mesure en événements du marché, et non en secondes. Kolm,
+Turiel et Westray ont établi que l'horizon effectif de leurs prévisions propres à chaque action valait environ deux variations moyennes de prix. Dans ce
+marché, le carnet change environ quatre fois par seconde et personne d'autre ne se dispute les mêmes cotations~: le flux de fond
+ne réagit pas à l'agent. Sur une bourse réelle, le haut du carnet d'un titre liquide change bien plus souvent que quatre fois par seconde, et les cotations de l'agent sont
+prises à revers par d'autres traders rapides~: Aquilina, Budish et O'Neill, à partir des messages de bourse, observent des courses d'arbitrage de latence environ
+une fois par minute et par action du FTSE~100, la course modale durant de 5 à 10 millionièmes de seconde. La même falaise se situerait
+d'autant plus près de zéro, et les microsecondes qui n'ont rien rapporté ici seraient toute l'affaire. Le simulateur
+répond à la question pour laquelle il a été conçu, le coût de la péremption dans son propre temps des événements~; transposer cette réponse à un marché réel
+signifie la recalibrer selon le taux d'événements de ce marché et y ajouter ses concurrents.
+
+\begin{method}[Construire un modèle à court horizon qui négocie]\label{met:ml:lob:method}
+\begin{enumerate}
+\item Spécifier le marché, la décision, l'action et le budget avant le modèle.
+\item Enregistrer les données de recherche avec l'agent de production, afin que les variables reposent sur le même code dans les deux cas~; vérifier que le mode hors ligne donne le même résultat que le mode en ligne.
+\item Valider avec des partitions purgées~; choisir le seuil sur des sessions qui n'ont pas servi à l'ajustement du modèle~; tester sur d'autres.
+\item Compiler le modèle retenu et vérifier la parité sur des vecteurs partagés~; mesurer sa latence et utiliser la mesure.
+\item Négocier le modèle sur une grille d'instants de décision, et présenter le P\&L, les mark-out et la péremption en fonction de l'instant, à côté d'une référence sans modèle.
+\item Lire la latence dans le temps d'événements du marché~: l'horizon de l'edge est un nombre de variations de prix, et non de microsecondes.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: les microsecondes sont de l'argent}\label{tut:ml:build-an-order-book-model-end-to-end:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Exécuter tout le pipeline, compiler le modèle, le négocier à chaque instant de décision, et trouver où s'arrête son edge.
+\textbf{État final~:} \cref{tab:ml:lob:latency}, \cref{tab:ml:lob:results}, \cref{fig:ml:lob:pnl}.
+\begin{tutsteps}
+\item \textbf{Le graphe.}
+\omcode{code/firm/lobmodel/firm_lobmodel.py}{344}{358}{Le chapitre comme un seul graphe firm.workflow.}\label{lst:ml:lob:graph}
+\item \textbf{Variables à chaque changement du carnet.}
+\omcode{code/firm/lobmodel/firm_lobmodel.py}{92}{111}{L'agent enregistre un événement, calcule ses variables en ligne, prévoit et déclare son instant de décision.}\label{lst:ml:lob:onbook}
+\item \textbf{Étiquettes.}
+\omcode{code/firm/lobmodel/firm_lobmodel.py}{167}{177}{Variables hors ligne et étiquette à horizon fixe en temps d'événements.}\label{lst:ml:lob:data}
+\item \textbf{Service en Python.}
+\omcode{code/firm/lobmodel/firm_lobmodel.py}{205}{225}{La forêt aplatie parcourue pour tous les arbres à la fois, feuilles ajoutées dans l'ordre.}\label{lst:ml:lob:predict}
+\item \textbf{Service en C++20.}
+\omcode{code/firm/lobmodel/cpp/lobmodel.hpp}{1}{23}{Le chemin de service C++20~: la boucle de firm.mlinfer et les branches générées.}\label{lst:ml:lob:cpp}
+\item \textbf{Service en Rust.}
+\omcode{code/firm/lobmodel/rust/src/lib.rs}{5}{23}{Le chemin de service Rust sur le noyau de firm.mlinfer.}\label{lst:ml:lob:rust}
+\item \textbf{La décision.}
+\omcode{code/firm/lobmodel/firm_lobmodel.py}{113}{130}{Coter chaque côté autorisé au meilleur cours, sauf si la prévision signale qu'il est sur le point d'être pris à revers.}\label{lst:ml:lob:act}
+\item \textbf{Exécuter} \texttt{ml\_lobmodel.summary()}, \texttt{latency\_table()}, \texttt{zero\_crossing()}, \texttt{monitors()},
+\texttt{fig\_lobmodel.py} (environ trois minutes sur un cœur), et \texttt{bench\_lobmodel.py} une fois pour les latences mesurées.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter au simulateur un second agent de cotation, plus rapide, qui retire ses cotations sur le même signal~: la falaise
+devrait se déplacer vers l'écart entre les instants de décision des deux agents.
+\end{tutorial}
+
+\section{Construction~: le modèle de carnet d'ordres}\label{bld:ml:build-an-order-book-model-end-to-end:lobmodel}
+
+\begin{build}
+\bfield{Rôle} Un modèle à court horizon, depuis les sessions simulées jusqu'à la négociation, avec chaque étape reproductible et son chemin de service dans
+trois langages.
+\bfield{Interface} \texttt{FEATURES}, \texttt{HORIZON}, \texttt{DEFAULT}~;
+\texttt{ModelAgent(predict, threshold, hold\_s, decision\_ns, qty, trade)} (un agent de \texttt{firm.exchsim})~; \texttt{run\_session}, \texttt{record}, \texttt{events\_array},
+\texttt{dataset}, \texttt{report}~; \texttt{ForestPredictor}~; les étapes \texttt{stage\_data}, \texttt{stage\_cv},
+\texttt{stage\_fit}, \texttt{stage\_tcn}, \texttt{stage\_threshold}, \texttt{stage\_test}~;
+\texttt{make\_pipeline(cache\_dir, cfg)}~; \texttt{cpp/lobmodel.hpp} et le crate Rust \texttt{firm\_lobmodel}~; \texttt{make\_lobmodel\_fixture.py}.
+\bfield{Règles} La recherche et la production partagent l'agent et le code des variables~; les sessions de rôles différents ne partagent jamais une graine~;
+l'instant de décision est une latence mesurée~; les chemins de service concordent bit à bit.
+\bfield{Tests d'acceptation} \texttt{code/firm/lobmodel/tests/}~: les variables en ligne sont égales aux variables hors ligne à chaque décision, et les étiquettes
+sont égales à la variation du mid~; la forêt plate, la marche NumPy et LightGBM concordent sur l'échantillon de référence, et le pipeline reconstruit la
+forêt de l'échantillon~; un instant de décision plus long rend les décisions plus anciennes. \texttt{cpp/lobmodel\_test.cpp} et \texttt{cargo test}~: parité exacte sur
+200 vecteurs.
+\bfield{Pour aller plus loin} Un agent rapide concurrent~; variables normalisées par l'activité~; le TCN compilé avec le chemin int8 du chapitre~26.
+\end{build}
+
+\begin{omsources}
+\item P.~N.~Kolm, J.~Turiel et N.~Westray, ``Deep order flow imbalance~: extracting alpha at multiple horizons from the limit
+order book'', \emph{Mathematical Finance}, 2023.
+\item J.~Sirignano et R.~Cont, ``Universal features of price formation in financial markets~: perspectives from deep learning'',
+\emph{Quantitative Finance}, 2019.
+\item R.~Cont, A.~Kukanov et S.~Stoikov, ``The price impact of order book events'', \emph{Journal of Financial Econometrics},
+2014.
+\item Á.~Cartea, S.~Jaimungal et J.~Penalva, \emph{Algorithmic and High-Frequency Trading}, Cambridge University Press, 2015.
+\item M.~Aquilina, E.~Budish et P.~O'Neill, ``Quantifying the high-frequency trading `arms race''', \emph{Quarterly Journal of
+Economics}, 2022.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:build-an-order-book-model-end-to-end:1}
+Pourquoi l'agent enregistre-t-il lui-même ses données de recherche, plutôt que de s'appuyer sur le flux complet du simulateur~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:build-an-order-book-model-end-to-end:2}
+Pourquoi a-t-on abandonné une stratégie preneuse~? Calculer son coût aller-retour en ticks.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:build-an-order-book-model-end-to-end:3}
+Le modèle rapporte davantage que la cotation sans lui, mais entre moins souvent. Expliquer à l'aide des mark-outs.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:build-an-order-book-model-end-to-end:4}
+À 100 millisecondes, la péremption médiane est de 154 millisecondes. Expliquer, avec $\lambda L$, et dire ce qu'un système de production ferait
+à ce sujet.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:build-an-order-book-model-end-to-end:5}
+Le moniteur d'entrée des sessions de test lit jusqu'à 1.60. Le modèle aurait-il dû être arrêté~? Que modifier dans le moniteur~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:build-an-order-book-model-end-to-end:6}
+\emph{Trouver la faille.} «~Le modèle compilé est 1\,700 fois plus rapide que l'appel Python de LightGBM, il rapportera donc 1\,700 fois plus
+d'argent.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:build-an-order-book-model-end-to-end:7}
+Où se situerait le passage par zéro pour une action dont le haut du carnet change 2\,000 fois par seconde, si l'horizon de l'edge est un nombre fixe
+de changements du carnet~? Que laisse de côté l'estimation~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:build-an-order-book-model-end-to-end:8}
+Écrire la spécification de surveillance de ce modèle en production~: les moniteurs, leurs références, leurs seuils et leurs propriétaires.
+\end{exercise}
+
+\section{Problème~: les microsecondes valent de l'argent}
+
+\begin{problem}[{Problème du week-end --- les microsecondes valent de l'argent}]\label{pb:ml:build-an-order-book-model-end-to-end:1}
+Le pipeline, le modèle et la grille de latences du chapitre.
+
+\medskip\noindent\textbf{Partie I --- Spécification et données.}
+\begin{enumerate}
+\item Préciser le marché, la décision, l'action et les sessions.
+\item Quelles sont les variables, et pourquoi les valeurs hors ligne et en ligne concordent-elles~?
+\item Comment l'étiquette est-elle définie, et pourquoi la plupart des étiquettes valent-elles zéro~?
+\item Comment le modèle est-il validé, et que choisit la validation croisée~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le modèle.}
+\begin{enumerate}[resume]
+\item Comment la forêt et le TCN se comparent-ils~?
+\item Quel est le coût par prédiction de la forêt compilée, et par rapport à quoi~?
+\item Comment la parité est-elle vérifiée~?
+\item Comment le seuil est-il choisi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Négociation.}
+\begin{enumerate}[resume]
+\item Que rapporte le modèle à 150 nanosecondes, et par rapport à quelle référence~?
+\item Que montrent les mark-outs~?
+\item Que signale le moniteur d'entrée, et pourquoi~?
+\item Définir la \omterm{def:ml:build-an-order-book-model-end-to-end:staleness}{péremption de la décision} et expliquer ses deux composantes.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le P\&L net par session et le mark-out à une seconde en fonction de la latence de décision, et la
+latence à laquelle l'edge du modèle tombe à zéro.
+\item Pourquoi la courbe est-elle plate jusqu'à 50 millisecondes~?
+\item Pourquoi chute-t-elle si vite ensuite~?
+\item Que changerait-il sur une bourse réelle~?
+\item La firme doit-elle investir dans le chemin de service C++ pour ce marché~?
+\item Qu'ajouterait-on au simulateur avant de faire confiance à la courbe~?
+\item Comment enregistrer et surveiller ce modèle~?
+\item En une phrase~: que vaut une microseconde~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:build-an-order-book-model-end-to-end:1}
+Quelles variables utiliseriez-vous pour prévoir le mid de l'action à la seconde suivante~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:build-an-order-book-model-end-to-end:2}
+Comment validez-vous un modèle dont les étiquettes se chevauchent dans le temps~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:build-an-order-book-model-end-to-end:3}
+Comment vous assurez-vous qu'un modèle calcule les mêmes variables en production qu'en recherche~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, trader}]\label{iq:ml:build-an-order-book-model-end-to-end:4}
+Un teneur de marché ajoute une prévision à court horizon. Où sa valeur apparaît-elle, et comment la mesurez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:build-an-order-book-model-end-to-end:5}
+Votre modèle prend 200 microsecondes en Python. Comment le ramenez-vous sous la microseconde, et comment savez-vous qu'il donne toujours les mêmes
+réponses~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur, développeur}]\label{iq:ml:build-an-order-book-model-end-to-end:6}
+Comment décideriez-vous de la somme à consacrer à la latence pour une stratégie donnée~?
+\end{interviewq}

@@ -1,0 +1,378 @@
+\chapter{Distribution des données de marché et droits d'accès}\label{ch:pl:market-data-distribution-and-entitlements}
+
+L'auditeur d'une bourse demande à une société la liste de toutes les personnes et de tous les programmes qui ont utilisé les données de profondeur de la bourse au cours des trois dernières années.
+La société peut citer quarante écrans~: elle en paie quarante. Elle ne peut pas citer, dans un premier temps, les onze applications qui lisent le même flux depuis la
+plateforme de distribution de la société --- stratégies, un service de risque, un enregistreur de ticks, un système de surveillance, un tableau de bord de recherche --- et chacune d'elles représente
+un usage facturé par la bourse. La société de ce chapitre est un modèle, mais les documents selon lesquels elle est auditée sont réels~: la grille tarifaire
+d'une bourse, ses politiques de données et son contrat d'abonnement. Le chapitre construit la plateforme qui distribue les données de marché au sein d'une société, et la partie de celle-ci
+qui fait le plus souvent défaut~: le registre de qui a utilisé quoi, dans quel but, compté de la façon dont la plateforme le compte.
+
+\section{Distribuer les données au sein de la société}
+
+Un flux direct (livre~1, chapitre~9) arrive une seule fois aux feed handlers de la société. De là, il doit atteindre des dizaines de consommateurs aux besoins très différents
+besoins~: une stratégie qui veut chaque message en quelques microsecondes, un service de risque qui veut les cours courants, l'écran d'un trader qui ne peut afficher
+plus de quelques mises à jour par seconde, un traitement de recherche qui enregistre tout. Relier chacun d'eux au flux multiplierait
+la charge du réseau, les licences et les points de défaillance~; la société interpose une seule plateforme entre le flux et les consommateurs.
+
+\begin{definition}[Plateforme de distribution des données de marché]\label{def:pl:market-data-distribution-and-entitlements:platform}
+Une \emph{plateforme de distribution des données de marché}\index{plateforme de distribution des données de marché} reçoit une fois les données de marché normalisées et les diffuse
+au sein de la société aux abonnés par thème (un instrument, une plateforme, un type de donnée), avec une politique de livraison propre à chaque abonné --- chaque message dans
+l'ordre, ou en conflation --- et avec un contrôle des \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} à chaque abonnement.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=5mm,
+  box/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,align=center,minimum height=9mm,text width=22mm},
+  chk/.style={draw=omThm,fill=omThm!8,rounded corners=2pt,align=center,minimum height=9mm,text width=22mm},
+  arr/.style={-{Stealth[length=2mm]},thick}]
+\node[box] (f) {feed handler\\(normalisé)};
+\node[box,right=8mm of f,minimum height=34mm,text width=18mm] (b) {bus~:\\thèmes,\\une file par\\abonné};
+\node[box,right=12mm of b,yshift=19.5mm,text width=36mm,minimum height=7mm] (s1) {stratégie, chaque message};
+\node[box,right=12mm of b,yshift=6.5mm,text width=36mm,minimum height=7mm] (s2) {service de risque};
+\node[box,right=12mm of b,yshift=-6.5mm,text width=36mm,minimum height=7mm] (s3) {tableau de bord de recherche};
+\node[box,right=12mm of b,yshift=-19.5mm,text width=36mm,minimum height=7mm] (s4) {écran du trader (en conflation)};
+\node[chk,below=12mm of f] (e) {système de\\droits d'accès};
+\node[chk,right=4mm of e,xshift=22mm,yshift=-12mm] (u) {journal d'utilisation};
+\node[chk,right=6mm of u] (r) {rapport d'utilisation\\et audit};
+\draw[arr] (f) -- (b);
+\foreach \x in {s1,s2,s3,s4} \draw[arr] (b.east) -- (\x.west);
+\draw[arr,omThm] (e.east) -- node[above,font=\scriptsize,sloped]{contrôle} (b.south west);
+\draw[arr,omThm] (b.south) |- (u.west);
+\draw[arr,omThm] (u) -- (r);
+\end{tikzpicture}
+
+\omcaption{La plateforme de distribution du chapitre~: un flux normalisé, un bus avec une file par abonné, un contrôle des \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} à l'abonnement
+et à la livraison, et chaque accès inscrit dans un journal d'utilisation, à partir duquel sont
+produits le \omterm{def:pl:market-data-distribution-and-entitlements:report}{rapport d'utilisation} mensuel et le \omterm{def:pl:post-trade-systems:recon}{rapprochement} de l'audit.}\label{fig:pl:market-data-distribution-and-entitlements:platform}
+\end{omfigure}
+
+Le bus du chapitre (\texttt{firm.entitle}) est simulé en temps virtuel. Dix minutes de mises à jour de profondeur pour vingt instruments --- 240\,267
+messages, issus du générateur de tape du livre~7, le flux d'ordres que rejoue le simulateur du livre~10 --- sont destinés à quatre abonnés~: une stratégie qui prend
+20~microsecondes par message, un service de risque qui prend 2~millisecondes, un tableau de bord de recherche qui prend 10, et l'écran d'un trader qui suit
+cinq instruments à 50~millisecondes par rafraîchissement. Chaque abonné a sa propre file, de sorte qu'un abonné lent ne puisse pas retarder les autres~: la
+conception publication--abonnement du chapitre~\ref{ch:pl:messaging-and-event-driven-architecture}, et le problème du consommateur lent
+du livre~13, chapitre~12, transposé un niveau plus haut.
+
+\omcode{code/firm/entitle/firm_entitle.py}{98}{111}{Les deux politiques de livraison~: une file de chaque mise à jour, dans l'ordre, ou la conflation, qui ne conserve que
+la dernière mise à jour par thème et sert le thème qui attend depuis le plus longtemps.}\label{lst:pl:market-data-distribution-and-entitlements:queue}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llrrrr}
+\toprule
+politique & abonné & livrés & file maximale & âge moyen & âge maximal\\
+\midrule
+chaque message & stratégie & 240\,267 & 1\,199 & 0.1~ms & 24~ms\\
+ & service de risque & 240\,267 & 1\,203 & 58~ms & 2.4~s\\
+ & tableau de bord de recherche & 240\,267 & 180\,267 & 891~s & 1\,803~s\\
+conflation & stratégie & 238\,870 & 20 & 0.0~ms & 0.4~ms\\
+ & service de risque & 221\,364 & 20 & 4.0~ms & 32~ms\\
+ & tableau de bord de recherche & 60\,012 & 20 & 67~ms & 134~ms\\
+\bottomrule
+\end{tabular}
+\caption{Dix minutes de mises à jour de profondeur pour vingt instruments livrés à trois abonnés, chaque message étant mis en file ou en conflation par
+instrument. L'âge d'un message est le temps écoulé entre sa publication et la fin de son traitement. L'écran, en conflation dans les deux exécutions, voit un
+âge moyen de 125~ms. La plus longue file de la stratégie est l'instantané d'ouverture, qui arrive en un seul instant.}
+\label{tab:pl:market-data-distribution-and-entitlements:policies}
+\end{table}
+
+Le tableau de bord de recherche illustre la leçon du \cref{tab:pl:market-data-distribution-and-entitlements:policies}. Il peut traiter 100 messages par
+seconde, et le flux en apporte environ 400~: avec chaque message mis en file, sa file grossit tout au long de la séance jusqu'à 180\,267 messages, et il affiche des cours
+vieux de quinze minutes en moyenne, et il est encore en train de traiter la séance une demi-heure après sa fin
+(\cref{fig:pl:market-data-distribution-and-entitlements:age}). En conflation, il traite un quart des messages et n'affiche jamais un cours
+plus ancien que 134~ms. Le service de risque suit en moyenne mais pas lors des rafales~; la conflation ramène son âge maximal de 2.4~secondes à 32~ms. Un
+écran ou un service de risque veut l'état courant, et non l'historique, et doit être en conflation~; une stratégie ou un enregistreur a besoin de chaque message
+et doit être assez rapide pour s'en passer.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.6cm,xlabel={temps depuis le début de la séance (s)},ylabel={âge du cours affiché (s, échelle log)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,xmin=0,xmax=2450,
+  ymin=0.01,ymax=5000,xtick={0,600,1200,1800,2400}]
+\addplot[omThm,thick,mark=none] table[x=t,y=age_s]{figdata/platforms/23-market-data-distribution-and-entitlements/age_all.csv};
+\addplot[omDef,thick,mark=none] table[x=t,y=age_s]{figdata/platforms/23-market-data-distribution-and-entitlements/age_conflate.csv};
+\draw[gray,dashed] (axis cs:600,0.01) -- (axis cs:600,5000) node[pos=0.5,right,font=\scriptsize]{fin de séance};
+\node[omThm,font=\scriptsize,anchor=north] at (axis cs:1500,250) {chaque message mis en file};
+\node[omDef,font=\scriptsize,anchor=south west] at (axis cs:20,0.15) {en conflation par instrument};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Âge des cours affichés par le tableau de bord de recherche, relevé toutes les 2\,000 livraisons (en file) ou toutes les 500 (en conflation). En file, l'âge
+augmente tout au long de la séance, et l'arriéré met encore une demi-heure à se résorber~; en conflation, il reste voisin d'un dixième de seconde. Données~:
+\texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:age}
+\end{omfigure}
+
+\section{Licences, usages et unités de comptage}
+
+Ce que la société paie n'est pas le flux, mais chacun de ses usages. Les plateformes distinguent l'usage en affichage, celui d'une personne qui regarde un écran, de
+l'usage non-display par une machine, que le livre~1, chapitre~29, a introduit avec la redevance non-display~; elles les comptent chacun dans une unité déclarée.
+
+\begin{definition}[Unité de comptage]\label{def:pl:market-data-distribution-and-entitlements:unit}
+Une \emph{unité de comptage}\index{unité de comptage} est ce que la licence de la plateforme compte pour facturer ses données~: pour l'usage en affichage, typiquement chaque appareil ou
+chaque identifiant utilisateur unique, de sorte qu'une personne qui dispose de deux identifiants compte deux fois~; pour l'usage non-display, typiquement chaque appareil (en général un
+serveur) qui reçoit les données et en tire profit, ou chaque personne qui peut modifier l'application en temps réel.
+\end{definition}
+
+La définition est celle de la plateforme, et c'est là que les sociétés perdent de l'argent. La plateforme du chapitre --- Nasdaq, dont les documents figurent dans le registre --- compte un
+abonné en affichage comme «~un appareil, un terminal informatique, un service automatisé, ou un couple identifiant utilisateur unique
+et mot de passe~», et l'usage non-display par les serveurs qui reçoivent les données et en tirent profit, y compris ceux qui les calculent ou
+en créent des \omterm{def:pl:market-data-distribution-and-entitlements:derived}{données dérivées} à partir d'elles. Les serveurs qui se contentent de transporter, de normaliser ou de stocker les données ne sont pas nécessairement assujettis à la redevance, mais la société doit pouvoir
+montrer lesquels ils sont. Une société qui compte des personnes au lieu d'identifiants, ou des applications au lieu de serveurs, sous-compte par construction.
+
+\section{Droits d'accès}
+
+\begin{definition}[Droit d'accès, système de droits d'accès]\label{def:pl:market-data-distribution-and-entitlements:entitlement}
+Un \emph{droit d'accès}\index{droit d'accès} (entitlement) est une autorisation accordée à un sujet --- un identifiant utilisateur ou une application --- de recevoir une source de
+données pour un usage. Un \emph{système de droits d'accès}\index{système de droits d'accès} (entitlement system) détient les droits d'accès avec leurs dates d'octroi et de révocation,
+répond à la question de savoir si un sujet a droit à un instant donné, et est vérifié par la plateforme de distribution avant toute livraison de données.
+\end{definition}
+
+La question est de savoir quand vérifier. La vérification à l'abonnement est peu coûteuse et suffit tant que rien ne change~; mais un trader qui quitte le desk, ou une
+application dont la licence arrive à échéance, continue de recevoir jusqu'à son prochain abonnement. Dans la simulation du chapitre, le \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droit d'accès} de l'utilisateur de l'écran est révoqué cinq
+minutes après le début de la session. Si la vérification n'a lieu qu'à l'abonnement, l'écran reçoit encore 6\,005 mises à jour auxquelles il n'avait pas droit~; avec une vérification
+à chaque livraison, il n'en reçoit aucune.
+
+\omcode{code/firm/entitle/firm_entitle.py}{133}{147}{Livraison~: le droit d'accès est vérifié à nouveau à chaque livraison, de sorte qu'une révocation prenne
+effet immédiatement, et l'âge de chaque message livré est enregistré.}\label{lst:pl:market-data-distribution-and-entitlements:serve}
+
+Une plateforme de distribution réelle n'appelle pas le \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{système de droits d'accès} pour chacun des millions de messages~: elle met en cache la réponse par abonnement et invalide le
+cache lorsqu'un \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droit d'accès} change, ce qui produit le même effet pour un coût quasi nul. L'essentiel est que la révocation soit transmise
+à la plateforme de distribution plutôt que découverte à la prochaine connexion.
+
+\section{Rapports d'utilisation et audits des données de marché}
+
+\begin{definition}[Rapport d'utilisation]\label{def:pl:market-data-distribution-and-entitlements:report}
+Un \emph{rapport d'utilisation}\index{rapport d'utilisation} (usage report) est la déclaration périodique que la société adresse à une source de données pour indiquer combien d'\omterm{def:pl:market-data-distribution-and-entitlements:unit}{unités de comptage} ont utilisé ses données,
+par produit et par usage, à partir de laquelle la source facture ses redevances.
+\end{definition}
+
+\begin{definition}[Audit des données de marché]\label{def:pl:market-data-distribution-and-entitlements:audit}
+Un \emph{audit des données de marché}\index{audit des données de marché} (market-data audit) est l'examen, par une plateforme ou un fournisseur, de l'usage réel que fait une société de ses données sur une période écoulée,
+rapproché de ce que la société a déclaré~; l'écart est refacturé, en général avec intérêts et, au-delà d'un seuil, les frais de l'audit.
+\end{definition}
+
+La société du chapitre a déclaré 40 abonnés en affichage chaque mois pendant trois ans, et aucun usage non-display. Son journal d'utilisation --- que la plateforme de distribution
+enregistre à chaque abonnement --- raconte une tout autre histoire (la \cref{fig:pl:market-data-distribution-and-entitlements:usage}). Le nombre de traders est passé de 38
+à 47, et six d'entre eux ont un second identifiant de connexion, si bien que les identifiants en affichage sont passés de 43 à 53~; les onze applications sont entrées
+en service les unes après les autres et, à la fin, tournaient sur 22 serveurs.
+
+\omcode{code/firm/entitle/firm_entitle.py}{168}{195}{Le rapport d'utilisation compte les unités de comptage distinctes par usage~; l'audit rapproche chaque mois
+les licences détenues et valorise l'écart selon le barème des redevances.}\label{lst:pl:market-data-distribution-and-entitlements:audit}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xlabel={mois},ylabel={unités de comptage},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=35,ymin=0,ymax=63,const plot]
+\addplot[omDef,thick] table[x=month,y=display_used]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\addplot[omDef,thick,dashed] table[x=month,y=display_licensed]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\addplot[omThm,thick] table[x=month,y=nd_used]{figdata/platforms/23-market-data-distribution-and-entitlements/usage.csv};
+\node[omDef,font=\scriptsize,anchor=south] at (axis cs:20,53) {identifiants en affichage utilisés};
+\node[font=\scriptsize,anchor=north] at (axis cs:24,39) {abonnés en affichage déclarés~: 40};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:25,24) {serveurs non-display utilisés (déclarés~: 0)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Trois ans du journal d'utilisation de la société modèle, comparés à ce qu'elle a déclaré. Les identifiants en affichage dépassent les 40 déclarés dès le premier mois
+(43, à cause des seconds identifiants) et atteignent 53~; les serveurs non-display passent de 4 à 22 à mesure que les onze applications entrent en service. Données~:
+\texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:usage}
+\end{omfigure}
+
+Valorisé aux redevances 2026 de la plateforme pour son produit de profondeur --- 84~\$ par mois et par abonné professionnel en affichage, et pour l'usage non-display 412~\$ par
+mois par abonné jusqu'à 39, puis un forfait de 16\,490~\$ par société de 40 à 99 (la \cref{fig:pl:market-data-distribution-and-entitlements:fees}) ---
+l'écart est de 1\,900~\$ le premier mois et de 10\,156~\$ le dernier, soit 258\,596~\$ sur les trois ans~: 22\,932~\$ pour l'affichage et 235\,664~\$ pour
+non-display. Les unités non déclarées atteignent 87.5~\% de celles qui ont été déclarées, très au-delà des 10~\% à partir desquels le contrat d'abonnement de la plateforme ajoute les
+frais de l'audit~; les intérêts s'ajoutent, à un taux que le modèle ne valorise pas. L'écart en affichage est la moindre part. La vraie erreur de la société
+a été de croire que des données qu'elle avait payées pour les recevoir pouvaient être utilisées par n'importe quel programme.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={abonnés non-display (serveurs)},ylabel={redevance mensuelle (milliers de \$)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=120,ymin=0,ymax=38,const plot]
+\addplot[omThm,thick] table[x=devices,y expr=\thisrow{fee}/1000]{figdata/platforms/23-market-data-distribution-and-entitlements/fees.csv};
+\draw[omDef,dashed] (axis cs:22,0) -- (axis cs:22,9.064);
+\draw[omDef,-{Stealth[length=1.5mm]}] (axis cs:55,6) node[right,font=\scriptsize]{la société modèle~: 22 serveurs, 9\,064~\$} -- (axis cs:23,8.8);
+\node[font=\scriptsize,anchor=south east] at (axis cs:37,17.5) {39~: 16\,068~\$};
+\node[font=\scriptsize,anchor=south] at (axis cs:70,17.5) {40 à 99~: 16\,490~\$};
+\node[font=\scriptsize,anchor=north east] at (axis cs:98,32) {100 à 249~: 32\,990~\$};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La redevance mensuelle non-display 2026 de la plateforme pour son produit de profondeur, en fonction du nombre d'abonnés assujettis à la redevance~: 412~\$ chacun jusqu'à 39,
+puis forfaitaire par société. Entre 40 et 99 serveurs, la redevance ne change pas, et c'est pourquoi le compte et le palier, et non le prix, déterminent la facture.
+Données~: \texttt{fig\_entitle.py}.}\label{fig:pl:market-data-distribution-and-entitlements:fees}
+\end{omfigure}
+
+Le remède est aussi technique que contractuel. Le journal d'utilisation de la plateforme de distribution est la preuve qu'exige un audit, et il doit enregistrer l'\omterm{def:pl:market-data-distribution-and-entitlements:unit}{unité de
+comptage} qu'utilise la plateforme --- des identifiants et non des personnes~; des serveurs et non des applications --- pendant toute la période de rétrospection. La plateforme du chapitre limite
+sa responsabilité pour une erreur de bonne foi aux trois années précédant la découverte de la sous-déclaration, si bien que trois ans de journaux constituent le minimum. Un
+\omterm{def:pl:post-trade-systems:recon}{rapprochement} mensuel du journal avec les licences, mené par la société avant qu'un auditeur ne le fasse, transforme un rappel de facturation en achat de licence.
+
+\section{Données dérivées}
+
+\begin{definition}[Données dérivées]\label{def:pl:market-data-distribution-and-entitlements:derived}
+Les \emph{données dérivées}\index{données dérivées} (derived data) sont des informations calculées en tout ou partie à partir des données de la plateforme, et qui ne permettent
+ni de les reconstituer ni de s'y substituer raisonnablement~: un indice, un signal, la fair value d'un modèle. Ce qui relève ou non des données dérivées est fixé par
+la politique de chaque plateforme.
+\end{definition}
+
+Une cotation conflatée n'est pas une donnée dérivée~: c'est la donnée de la plateforme, livrée moins souvent, et elle requiert la même licence. Un prix milieu publié chaque
+seconde peut être un substitut de la cotation~; une estimation de volatilité ou la fair value d'un panier ne l'est généralement pas. La distinction compte dans deux
+sens~: les \omterm{def:pl:market-data-distribution-and-entitlements:derived}{données dérivées} peuvent être redistribuées selon des conditions que les données brutes n'autorisent pas, et les serveurs qui les créent sont, pour la
+plateforme du chapitre, parmi les \omterm{def:pl:market-data-distribution-and-entitlements:unit}{unités de comptage} non-display. Le modèle de \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} doit donc porter l'usage --- affichage, non-display,
+dérivé --- et non pas seulement la source, et la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} du chapitre~\ref{ch:pl:a-tick-store-on-open-formats} doit enregistrer sous quelle licence
+chaque jeu de données a été capturé, puisque la licence suit les données jusque dans la recherche.
+
+\begin{dated}{2026-09}{Politiques de données et redevances d'une plateforme}\label{dat:pl:market-data-distribution-and-entitlements:nasdaq}
+La grille tarifaire des actions américaines de Nasdaq fixe, à compter du 1\up{er} janvier 2026, les redevances mensuelles de Nasdaq TotalView à 84.00~\$ par abonné professionnel (80.50~\$ en 2025) et à 15.00~\$ par abonné non professionnel~;
+pour l'usage non-display de ses données de profondeur avec accès direct, 412.00~\$ par abonné de 1 à 39,
+16\,490~\$ par société de 40 à 99, 32\,990~\$ de 100 à 249 et 75\,000~\$ à partir de 250~; et des redevances de distributeur de 1\,690~\$ par société pour la distribution
+interne et 3\,340~\$ pour l'accès direct. Ses US Equities and Options Data Policies (version 2.6) définissent l'abonné, l'usage non-display et les
+\omterm{def:pl:market-data-distribution-and-entitlements:derived}{données dérivées} tels que ce chapitre les définit, et précisent qu'un usage non déclaré d'un système ne peut pas être compensé sur la période d'audit.
+Son contrat d'abonné limite la responsabilité pour une erreur de bonne foi à trois ans de redevances impayées avec intérêts, et ajoute les frais de l'audit lorsque la sous-déclaration
+atteint 10~\% des unités déclarées.
+\end{dated}
+
+\section{Tutoriel~: distribuer, octroyer des droits, rapporter, auditer}\label{tut:pl:market-data-distribution-and-entitlements:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Distribuer un flux aux abonnés de vitesses différentes, faire respecter les \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} et réconcilier trois ans d'usage avec les
+licences détenues. \textbf{État final~:} le \cref{tab:pl:market-data-distribution-and-entitlements:policies} et le montant de l'audit
+258\,596~\$.
+\begin{tutsteps}
+\item \textbf{Flux}~: \texttt{pl\_entitle.updates()}, dix minutes sur vingt instruments.
+\item \textbf{Distribution}~: \texttt{distribute(ups, \textquotedbl all\textquotedbl)} et
+\texttt{distribute(ups, \textquotedbl conflate\textquotedbl)}~; comparer les files d'attente et les délais.
+\item \textbf{\omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{Droits d'accès}}~: relancer avec \texttt{check\_on\_delivery=False} et compter les livraisons à l'écran après la révocation.
+\item \textbf{Usage}~: \texttt{usage\_log()} et \texttt{firm\_entitle.usage\_report} pour un mois quelconque.
+\item \textbf{Audit}~: \texttt{audit()}, les mois, les insuffisances de déclaration et le montant dû.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Déplacer le tableau de bord de recherche sur les serveurs d'un niveau de distribution et voir ce que devient le décompte non-display~;
+chiffrer l'audit avec les redevances de chaque année au lieu de celles de 2026.
+\end{tutorial}
+
+\section{Construction~: droits d'accès}\label{bld:pl:market-data-distribution-and-entitlements:entitle}
+
+\begin{build}
+\bfield{Rôle} Livrer les données de marché à l'intérieur de la société à chaque abonné sous la forme qu'il peut utiliser, uniquement à ceux qui y ont droit, avec la preuve de
+chaque usage comptabilisé comme la plateforme le compte.
+\bfield{Interface} \texttt{Entitlement}, \texttt{EntitlementSystem} (\texttt{grant}, \texttt{revoke}, \texttt{check}), \texttt{Bus}
+(\texttt{subscribe}, \texttt{run}), \texttt{UsageLog}, \texttt{usage\_report}, \texttt{audit}.
+\bfield{Règles} Une file par abonné~; conflation pour les abonnés qui veulent l'état~; \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droit d'accès} vérifié à l'abonnement et appliqué à la
+livraison~; chaque usage consigné dans l'\omterm{def:pl:market-data-distribution-and-entitlements:unit}{unité de comptage} de la plateforme~; journaux conservés au moins aussi longtemps que la période de rétrospection~; une réconciliation mensuelle avant tout
+audit.
+\bfield{Tests d'acceptation} \texttt{code/firm/entitle/tests/}~: vérifications par sujet, source, usage et horodatage~; livraison en file et conflatée~; un abonné très
+sollicité, ordonnancé correctement~; révocation vérifiée à la livraison plutôt qu'à l'abonnement~; décomptes d'usage par identifiant et par appareil, et
+l'insuffisance et le montant de l'audit.
+\bfield{Pour aller plus loin} Redevances par paliers avec licences d'entreprise~; un registre des \omterm{def:pl:market-data-distribution-and-entitlements:derived}{données dérivées}~; un \omterm{def:pl:market-data-distribution-and-entitlements:report}{rapport d'utilisation} au format de fichier d'une plateforme.
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{U.S. Equities Price List}, redevances en vigueur en 2025, 2026 et 2027.
+\item Nasdaq, \emph{US Equities and Options Data Policies}, version 2.6.
+\item Nasdaq, \emph{Global Subscriber Agreement}, sections 5(g) et 5(h).
+\item Le livre~1, chapitres~9 et~29 (flux directs, redevances non-display)~; le livre~13, chapitre~12 (consommateurs lents et conflation).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:1}
+Expliquer pourquoi la plateforme garde une file par abonné plutôt qu'une file par sujet.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:2}
+Un trader utilise les mêmes données de profondeur sur un poste de travail et, avec un second identifiant de connexion, sur un ordinateur portable. Calculer le nombre d'abonnés à l'affichage que cela représente pour la
+plateforme du chapitre.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:market-data-distribution-and-entitlements:3}
+Calculer la redevance non-display de la société modèle pour le dernier mois, et ce qu'elle deviendrait avec 45 serveurs.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:4}
+Déterminer lequel des quatre abonnés doit être conflaté, et expliquer pourquoi ce n'est pas le cas de la stratégie.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:5}
+Expliquer pourquoi le tableau de bord de recherche, alimenté par une file d'attente, affiche en moyenne des cours vieux de quinze minutes alors qu'il met 10~millisecondes par message.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:6}
+La société veut vérifier les \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} à chaque livraison sans appeler le \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{système de droits d'accès} des millions de fois par minute. Expliquer comment s'y prendre.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:7}
+\emph{Programmation.} Relancer \texttt{audit} avec la société qui déclare correctement ses identifiants d'affichage chaque mois mais sans aucun usage non-display. Calculer le
+montant dû.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:market-data-distribution-and-entitlements:8}
+\emph{Trouver la faille.} «~Nous payons la redevance de distributeur pour la distribution interne, donc toute application interne à la société peut utiliser les
+données.~»
+\end{exercise}
+
+\section{Problème~: onze applications}
+
+\begin{problem}[{Problème du week-end --- onze applications}]\label{pb:pl:market-data-distribution-and-entitlements:1}
+La plateforme du chapitre, ses quatre abonnés et les trois années d'usage de la société modèle.
+
+\medskip\noindent\textbf{Partie I --- Distribution.}
+\begin{enumerate}
+\item Que fait la plateforme de distribution que ne fait pas le raccordement de chaque consommateur directement au flux~?
+\item À quelle vitesse chaque abonné traite-t-il les messages, et à quelle vitesse le flux arrive-t-il~?
+\item Que devient le tableau de bord de recherche lorsque chaque message est mis en file d'attente~?
+\item Que change la conflation pour le service de risque et pour le tableau de bord~?
+\item Quelle est la plus grande file de la stratégie, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{Droits d'accès}.}
+\begin{enumerate}[resume]
+\item Que désigne un \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droit d'accès}~?
+\item Que se passe-t-il après une révocation lorsque les \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} ne sont vérifiés qu'à l'abonnement~?
+\item Comment une plateforme applique-t-elle à moindre coût les \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} à chaque livraison~?
+\item Quelle est l'\omterm{def:pl:market-data-distribution-and-entitlements:unit}{unité de comptage} de l'usage à l'affichage et de l'usage non-display sur la plateforme du chapitre~?
+\item Quels serveurs ne sont pas nécessairement assujettis à redevance~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- L'audit.}
+\begin{enumerate}[resume]
+\item Qu'a déclaré la société, et que montrent son journal d'usage pour le premier et le dernier mois~?
+\item Quels sont les frais mensuels utilisés pour chiffrer l'écart~?
+\item Que doit-on pour le premier et le dernier mois~?
+\item Que doit-on sur les trois années, pour l'affichage et pour le non-display~?
+\item Pourquoi l'audit coûte-t-il plus cher à la société que les frais rétroactifs~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'écart de licence pour les utilisateurs en affichage et les applications en non-display, mis en évidence par le \omterm{def:pl:post-trade-systems:recon}{rapprochement} de trois années de
+journaux d'usage, et son coût rétroactif aux tarifs 2026 de la plateforme.
+\item Pendant combien de temps les journaux d'usage doivent-ils être conservés, et dans quelle unité~?
+\item Une cotation conflatée est-elle une donnée dérivée~?
+\item Quelle modification faudrait-il apporter en premier à la plateforme de la société~?
+\item En une phrase~: à quoi sert une licence de données de marché~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:market-data-distribution-and-entitlements:1}
+Qu'est-ce que la conflation, et quand l'utiliseriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:market-data-distribution-and-entitlements:2}
+Un consommateur lent bloque votre bus de données de marché. Que faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:market-data-distribution-and-entitlements:3}
+Quelle est la différence entre l'usage en affichage et l'usage non-display des données de marché, et pourquoi cela importe-t-il à un développeur~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:market-data-distribution-and-entitlements:4}
+Une bourse annonce un audit de votre usage des données sur les trois dernières années. De quoi devez-vous disposer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:market-data-distribution-and-entitlements:5}
+Concevez la \omterm{def:pl:market-data-distribution-and-entitlements:platform}{plateforme de distribution des données de marché} et des \omterm{def:pl:market-data-distribution-and-entitlements:entitlement}{droits d'accès} d'une société comptant mille utilisateurs et cent applications.
+\end{interviewq}

@@ -1,0 +1,310 @@
+\chapter{C++ pour la latence I~: mémoire}\label{ch:ll:cpp-for-latency-i-memory}
+
+Écrire un octet dans une page de mémoire qui venait d'être mappée a coûté au portable de ce livre environ \qty{1.3}{\micro\second}~:
+écrire le même octet dans la même page une seconde fois n'a coûté que \qty{30}{\nano\second}. La première écriture est passée par le noyau,
+qui a trouvé une page physique libre, l'a remplie de zéros et l'a installée dans les tables de pages~; la seconde était un simple store ordinaire. Un
+processus de trading qui demande de la mémoire au tas pendant qu'il traite un message peut, de temps à autre, emprunter ce chemin, ou plusieurs
+autres à l'intérieur de l'allocateur, rapides en moyenne mais lents de loin en loin. Ce chapitre porte sur la mémoire en C++ sur
+le chemin critique~: comment les objets sont disposés, ce que coûte une allocation et quand, et les arènes, les réserves et les \omterm{def:ll:cpp-for-latency-i-memory:sbo}{conteneurs à capacité fixe}
+qui permettent au chemin critique de fonctionner sans jamais allouer.
+
+\section{Disposition des objets, remplissage et alignement}
+
+\begin{definition}[Remplissage de structure]\label{def:ll:cpp-for-latency-i-memory:padding}
+Chaque type scalaire possède un alignement, égal à sa taille sur x86-64 (un \texttt{double} commence à un multiple de 8). Le
+compilateur dispose les champs d'une structure dans l'ordre de leur déclaration et insère un
+\emph{remplissage de structure}\index{remplissage de structure}, des octets inutilisés, avant tout champ qui serait sinon mal aligné, et à la fin, de sorte que la taille de la structure
+soit un multiple de son alignement le plus grand.
+\end{definition}
+
+\begin{example}[Ordonner les champs]\label{ex:ll:cpp-for-latency-i-memory:layout}
+Un ordre rédigé dans un premier jet déclare un \texttt{char} pour le côté, un \texttt{double} pour le prix, un \texttt{char} pour l'indicateur, un identifiant sur 64 bits,
+une quantité sur 32 bits et un \texttt{char} pour la durée de validité~: 23 octets de données occupent 40 octets, dont 17 de remplissage. Triés par taille
+(identifiant, prix, quantité, puis les trois caractères), les mêmes champs occupent 24 octets~: huit ordres tiennent dans trois \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} de 64 octets
+au lieu de cinq. Le compilateur ne réordonne pas lui-même les champs~: l'ordre fait partie de l'interface du type.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,x=0.17cm,y=1cm]
+\newcommand{\fld}[4]{\draw[fill=#4] (#1,#3) rectangle (#1+#2,#3+0.55);}
+\node[anchor=east] at (-1,0.28) {premier jet (40 octets)};
+\fld{0}{1}{0}{omDef!45}\fld{1}{7}{0}{gray!15}\fld{8}{8}{0}{omDef!45}\fld{16}{1}{0}{omDef!45}\fld{17}{7}{0}{gray!15}
+\fld{24}{8}{0}{omDef!45}\fld{32}{4}{0}{omDef!45}\fld{36}{1}{0}{omDef!45}\fld{37}{3}{0}{gray!15}
+\node at (4,0.28) {rempl.}; \node at (12,0.28) {prix}; \node at (20.5,0.28) {rempl.}; \node at (28,0.28) {id}; \node at (34,0.28) {qté};
+\node[anchor=east] at (-1,-0.72) {par taille (24 octets)};
+\fld{0}{8}{-1}{omMeth!40}\fld{8}{8}{-1}{omMeth!40}\fld{16}{4}{-1}{omMeth!40}\fld{20}{3}{-1}{omMeth!40}\fld{23}{1}{-1}{gray!15}
+\node at (4,-0.72) {id}; \node at (12,-0.72) {prix}; \node at (18,-0.72) {qté};
+\foreach \x in {0,8,16,24,32,40,48,56,64} {\draw[gray] (\x,-1.25) -- (\x,-1.1); \node[below,font=\scriptsize] at (\x,-1.2) {\x};}
+\draw[omThm,dashed] (64,-1.1) -- (64,0.7);
+\node[omThm,anchor=south,font=\scriptsize] at (64,0.7) {fin d'une ligne de 64 octets};
+\end{tikzpicture}
+
+\omcaption{L'ordre de l'\cref{ex:ll:cpp-for-latency-i-memory:layout} disposé octet par octet~: le premier jet porte 17
+octets de remplissage (en gris) sur 40~; les mêmes champs triés par taille en demandent 24, avec le côté, l'indicateur et la durée de validité dans les trois
+octets qui suivent la quantité.}\label{fig:ll:cpp-for-latency-i-memory:layout}
+\end{omfigure}
+
+Trois règles complémentaires. Placez en tête de structure les champs que lit le chemin critique, de sorte qu'une seule ligne suffise au
+cas courant, et déplacez le reste (texte, champs d'audit) dans une structure séparée. Alignez les structures écrites par des threads différents
+sur des \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} distinctes (chapitre~3). Et préférez les indices dans des tableaux aux pointeurs dans les structures chaudes~: un indice sur 32 bits ne pèse que la moitié d'un
+pointeur et survit à un déplacement du tableau.
+
+\section{Ce que coûte une allocation, et quand}
+
+\texttt{new} et \texttt{malloc} sont rapides en moyenne. L'allocateur de la bibliothèque C de GNU conserve les petits blocs libérés dans des
+caches par thread et les restitue en quelques dizaines de nanosecondes. Il lui arrive aussi, de temps en temps, de faire beaucoup plus~: il regroupe les
+blocs libres, agrandit le tas par un appel système, transmet directement au noyau les grands blocs (par défaut à partir de 128~KiB et au-delà, un
+seuil qu'il ajuste à mesure que le programme s'exécute), rend la mémoire au noyau lorsque le sommet du tas est libre (par défaut au-delà de
+128~KiB), et chaque nouvelle page qu'il touche provoque un \omterm{def:ll:cpp-for-latency-i-memory:fault}{défaut de page}.
+
+\begin{definition}[Défaut de page, pré-chargement des pages]\label{def:ll:cpp-for-latency-i-memory:fault}
+Un \emph{défaut de page}\index{défaut de page} est l'interruption par laquelle le processeur passe au noyau lorsqu'un programme touche une page virtuelle qui
+n'est pas encore adossée à de la mémoire physique (un défaut mineur~: le noyau alloue et remplit de zéros une page) ou dont le contenu se trouve sur disque
+(un défaut majeur). Le \emph{pré-chargement des pages}\index{pré-chargement des pages} consiste à toucher chaque page d'un tampon au démarrage, afin qu'aucun
+défaut ne survienne plus tard sur le chemin critique.
+\end{definition}
+
+La \Cref{fig:ll:cpp-for-latency-i-memory:faults} mesure les deux coûts. Remplacer l'un de 10\,000 ordres vivants de 64 octets, tiré au hasard,
+coûte une paire d'allocation et de libération environ \qty{25}{\nano\second} à la médiane, une réserve un peu moins, et les deux atteignent des dizaines de
+microsecondes à leur maximum, lorsque le thread a été interrompu. La première écriture dans chaque page d'un mappage neuf de 64~MiB
+coûte plus d'une microseconde par page~: 16\,384 défauts, soit quarante fois le coût des mêmes écritures une fois les pages existantes. Un chemin critique
+qui alloue est exposé aux chemins lents de l'allocateur et aux défauts sur une mémoire qu'il n'a pas encore touchée~; celui qui n'alloue pas
+n'est exposé ni à l'un ni à l'autre.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[name=churn,width=7.2cm,height=5.4cm,ybar,bar width=5pt,ymode=log,log origin y=infty,ymin=5,ymax=200000,
+  symbolic x coords={new/delete,pool,pmr pool},xtick=data,enlarge x limits=0.3,title={\small remplacement d'un ordre},
+  ylabel={ns (échelle log)},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=4,legend style={font=\footnotesize,at={(1.15,-0.22)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=allocator,y=p50]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=allocator,y=p99]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=allocator,y=p999]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\addplot[fill=gray!40,draw=gray] table[x=allocator,y=max]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_churn.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\begin{axis}[at={(churn.east)},anchor=west,xshift=2.1cm,width=5.2cm,height=5.4cm,ybar,bar width=14pt,ymode=log,log origin y=infty,
+  ymin=5,ymax=5000,symbolic x coords={first touch,pre-faulted},xtick=data,xticklabels={{premier\\ accès},{pré-\\chargée}},xticklabel style={align=center},enlarge x limits=0.5,title={\small écriture d'une page},
+  ylabel={ns par page (échelle log)},tick label style={font=\footnotesize},label style={font=\small},grid=major,
+  grid style={gray!25},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=kind,y=ns_per_page]{figdata/low-latency/06-cpp-for-latency-i-memory/measured_faults.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{À gauche~: destruction et création d'un des 10\,000 ordres vivants de 64 octets, tirés au hasard, avec le tas C++, la réserve du
+constructeur et la ressource de réserve de la bibliothèque standard (400\,000 remplacements). À droite~: la première écriture dans chaque page de 4~KiB d'un
+mappage neuf de 64~MiB, puis dans les mêmes pages une fois écrites. Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2, sans
+cœurs isolés, épinglé sur un seul CPU. Données~: \texttt{bench\_alloc.py}.}\label{fig:ll:cpp-for-latency-i-memory:faults}
+\end{omfigure}
+
+\section{Arènes, réserves et listes libres}
+
+\begin{definition}[Allocateur par arène]\label{def:ll:cpp-for-latency-i-memory:arena}
+Un \emph{allocateur par arène}\index{allocateur par arène} distribue des morceaux consécutifs d'un seul bloc préalloué en faisant avancer
+un décalage, et les libère tous d'un coup en le remettant à zéro~; les objets individuels ne sont jamais libérés.
+\end{definition}
+
+\begin{definition}[Réserve d'objets, liste libre]\label{def:ll:cpp-for-latency-i-memory:pool}
+Une \emph{réserve d'objets}\index{réserve d'objets} préalloue l'espace d'un nombre fixe d'objets d'un même type et le recycle~:
+créer un objet prend un emplacement libre, détruire un objet le rend. Une \emph{liste libre}\index{liste libre} est la liste des emplacements libres~;
+une liste libre intrusive range ses chaînons à l'intérieur même des emplacements libres, de sorte qu'elle n'a pas besoin de mémoire propre.
+\end{definition}
+
+Une arène convient à une mémoire dont la durée de vie est une phase~: l'espace de travail d'un message, reconstruit pour le suivant~; les champs analysés
+d'un lot. Une réserve convient à des objets d'un même type aux durées de vie indépendantes~: les ordres, créés et annulés dans n'importe
+quel ordre. Les deux ont une capacité fixe décidée à l'avance, et la question de conception qu'elles imposent est la bonne~: que se passe-t-il quand
+elle est épuisée. Sur le chemin critique, la réponse n'est jamais «~demander au tas~»~; il faut refuser (rejeter l'ordre, passer en
+mode dégradé) et déclencher une alarme, et dimensionner la réserve à partir du pic mesuré, avec une marge.
+
+La bibliothèque standard reprend ces idées sous forme de ressources mémoire (\texttt{std::pmr}, depuis C++17)~: une ressource tampon monotone
+est une arène, une ressource de réserve gère des \omterm{def:ll:cpp-for-latency-i-memory:pool}{listes libres} par taille. Elles permettent aux conteneurs standard de les utiliser, au prix d'un appel indirect
+à chaque allocation~; la réserve générique de la \cref{fig:ll:cpp-for-latency-i-memory:faults} est plus lente
+qu'une réserve pour un seul type.
+
+\section{Petits tampons et conteneurs à capacité fixe}
+
+\begin{definition}[Optimisation des petits tampons, conteneur à capacité fixe]\label{def:ll:cpp-for-latency-i-memory:sbo}
+Un type doté d'une \emph{optimisation des petits tampons}\index{optimisation des petits tampons} stocke les petits contenus à l'intérieur de l'objet et
+n'alloue que pour les grands~: l'implémentation GNU de \texttt{std::string} conserve jusqu'à 15 caractères en place. Un
+\emph{conteneur à capacité fixe}\index{conteneur à capacité fixe} stocke toujours ses éléments à l'intérieur de l'objet, jusqu'à une
+capacité fixée à la compilation, et refuse de grandir au-delà.
+\end{definition}
+
+L'\omterm{def:ll:cpp-for-latency-i-memory:sbo}{optimisation des petits tampons} fait dépendre l'allocation des données~: un symbole de quatre lettres n'alloue pas, un identifiant
+d'ordre client de 22 caractères alloue, et un test avec des identifiants courts ne le verra pas. Le gestionnaire du
+\cref{lst:ll:cpp-for-latency-i-memory:naive} est typique des premières versions. Compté avec un
+\texttt{operator new}, il alloue neuf fois par message~: une fois pour l'identifiant long, trois fois pendant la croissance du vecteur des exécutions jusqu'à trois, deux fois
+pour la nouvelle entrée de la table (le nœud de l'arbre et sa copie de l'identifiant), une fois quand la fonction lambda copie les exécutions, et deux fois quand
+\texttt{std::function} stocke la fonction lambda sur le tas et la copie. La réécriture avec une chaîne à taille fixe, un vecteur à taille fixe
+des exécutions et une table à taille fixe des entrées fait le même travail sans aucune allocation.
+
+\begin{method}[Supprimer l'allocation d'un chemin critique]\label{met:ll:cpp-for-latency-i-memory:remove}
+\begin{enumerate}
+\item Compter~: remplacer \texttt{operator new} global dans une compilation de test et vérifier le nombre d'allocations par message après l'échauffement.
+\item Pour chaque allocation, décider de la capacité~: identifiants et symboles dans des chaînes à taille fixe, listes par message dans des
+vecteurs à taille fixe, objets à durée de vie dans des réserves, espace de travail par message dans une arène réinitialisée à chaque message.
+\item Remplacer les objets appelables à effacement de type qui allouent (\texttt{std::function} avec de grandes captures) par des modèles (chapitre~7) ou
+par des pointeurs de fonction accompagnés d'un contexte.
+\item Allouer et toucher chaque réserve, arène et table au démarrage, dans le fil qui les utilisera (chapitre~4).
+\item Garder l'assertion dans les tests, afin qu'une modification ultérieure qui alloue fasse échouer la construction.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: compter et supprimer les allocations}\label{tut:ll:cpp-for-latency-i-memory:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Compter les allocations d'un gestionnaire de messages, les supprimer et mesurer ce que coûtent l'allocation et les \omterm{def:ll:cpp-for-latency-i-memory:fault}{défauts de page}.
+\textbf{État final~:} un gestionnaire sans aucune allocation par message après l'échauffement, et
+la \cref{fig:ll:cpp-for-latency-i-memory:faults}.
+\begin{tutsteps}
+\item \textbf{La première version.} Des chaînes, un vecteur qui grossit, une table, une fonction de rappel.
+\omcode{code/low-latency/06-cpp-for-latency-i-memory/cpp/ll_alloc.hpp}{22}{35}{Un gestionnaire de messages qui alloue neuf fois par message.}\label{lst:ll:cpp-for-latency-i-memory:naive}
+\item \textbf{Compter.} \texttt{firm\_alloc\_count.hpp} remplace \texttt{operator new} global par une version qui incrémente un
+compteur atomique~; le test traite un message, lit le compteur et vérifie 9 pour la première version et 0 pour la réécriture.
+\item \textbf{Une réserve avec \omterm{def:ll:cpp-for-latency-i-memory:pool}{liste libre} intrusive.} Chaque emplacement libre contient le pointeur vers l'emplacement libre suivant~; créer
+retire un emplacement de la liste, détruire le rajoute.
+\omcode{code/firm/arena/cpp/firm_arena.hpp}{45}{80}{La réserve d'objets.}\label{lst:ll:cpp-for-latency-i-memory:pool}
+\item \textbf{La même garantie en Rust.} Un allocateur global de comptage (\texttt{firm\_arena::CountingAlloc}) installé
+dans le binaire de test vérifie que les opérations de la réserve n'allouent rien.
+\item \textbf{Mesurer} avec \texttt{python bench\_alloc.py}~: la rotation des allocations et les \omterm{def:ll:cpp-for-latency-i-memory:fault}{défauts de page}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Réduire l'identifiant client à 15 caractères et recompter~; aligner les emplacements de la réserve
+sur les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} et comparer les centiles de rotation.
+\end{tutorial}
+
+\section{Construction~: la boîte à outils sans allocation}\label{bld:ll:cpp-for-latency-i-memory:arena}
+
+\begin{build}
+\bfield{Rôle} Le stockage qu'utilise chaque composant du chemin critique de la partie~IV (la réserve d'ordres du constructeur de carnet, les
+états d'ordres de la passerelle, l'espace de travail par message), et le compteur d'allocations sur lequel s'appuie chaque test d'acceptation.
+\bfield{Interface} C++20 \texttt{firm::arena}~: \texttt{Arena(bytes)} avec \texttt{allocate(n, align)}, \texttt{make<T>},
+\texttt{reset}~; \texttt{Pool<T, N>} avec \texttt{create}, \texttt{destroy}, \texttt{live}~; \texttt{FixedVector<T, N>}~;
+\texttt{FixedString<N>}~; \texttt{firm\_alloc\_count.hpp} avec \texttt{allocations()}. Rust \texttt{firm\_arena}~:
+\texttt{Arena} (décalages), \texttt{Pool<T>} (indices), \texttt{CountingAlloc} et \texttt{allocations()}.
+\bfield{Règles} Les capacités sont fixées à la construction~; l'épuisement renvoie un résultat nul, jamais une allocation sur le tas~; le stockage est
+pré-chargé à la construction~; aucune opération après la construction n'alloue.
+\bfield{Tests d'acceptation} \texttt{code/firm/arena/}~: décalages alignés, refus lorsque l'arène est pleine et réinitialisation~; ordre de réutilisation de la réserve et
+épuisement~; chaînes à taille fixe~; zéro allocation comptée sur l'ensemble, en C++20 et en Rust.
+\bfield{Pour aller plus loin} Une réserve dont les emplacements sont alignés sur les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} pour des objets écrits par des fils différents~; une arène qui
+enregistre son pic d'utilisation pour le dimensionnement.
+\end{build}
+
+\begin{omsources}
+\item Page de manuel Linux \texttt{mallopt(3)}~: \texttt{M\_MMAP\_THRESHOLD}, \texttt{M\_TRIM\_THRESHOLD}.
+\item cppreference, «~\texttt{std::pmr::memory\_resource}~» et ses ressources dérivées.
+\item C.~Cook, «~When a microsecond is an eternity~», CppCon 2017 (réutiliser la mémoire sur le chemin critique).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:1}
+Quelles sont la taille et le remplissage d'une structure contenant, dans cet ordre, un \texttt{char}, un \texttt{int32}, un \texttt{char},
+un \texttt{double} et un \texttt{int16}~? Et avec les champs triés par taille~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:2}
+Une réserve de 50\,000 ordres de 64 octets~: quelle quantité de mémoire, et combien de pages de 4~KiB faut-il pré-charger~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-i-memory:3}
+Au coût mesuré par page, combien de temps prend le fait de toucher un tampon neuf de 512~MiB au démarrage, et que coûterait-il si
+cela se produisait sur le chemin critique, une page à la fois~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:4}
+Lesquelles de ces instructions allouent avec la bibliothèque standard GNU~: \texttt{std::string s(\textquotedbl{}AAPL\textquotedbl{})}~;
+\texttt{std::string s(\textquotedbl{}CLIENT-ORDER-ID-42\textquotedbl{})}~; \texttt{std::vector<int> v; v.reserve(0)}~;
+\texttt{std::vector<int> v(1)}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:5}
+Le gestionnaire de départ alloue neuf fois par message. Quelles trois modifications suppriment le plus d'allocations, et combien chacune
+en supprime-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-i-memory:6}
+Lire la \cref{fig:ll:cpp-for-latency-i-memory:faults}~: à la médiane, le tas est presque aussi rapide que la réserve. Pourquoi
+utiliser malgré tout une réserve~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-i-memory:7}
+\emph{Programmation.} Ajouter à \texttt{firm::arena::Pool} un contrôle de capacité qui enregistre le high-water mark des objets vivants, lancez avec lui le
+benchmark de rotation, et proposez une règle de dimensionnement pour une réserve dont le pic est mesuré sur une année de jours chargés.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-i-memory:8}
+\emph{Trouver la faille.} «~Notre gestionnaire n'alloue rien~: nous l'avons vérifié avec un test qui envoie le même message, le symbole
+\texttt{ESZ6} et l'identifiant client \texttt{A1}, un million de fois.~»
+\end{exercise}
+
+\section{Problème~: quatre cents microsecondes, une fois par minute}
+
+\begin{problem}[{Problème du week-end --- un gestionnaire qui alloue}]\label{pb:ll:cpp-for-latency-i-memory:1}
+Le gestionnaire d'une stratégie prend environ \qty{2}{\micro\second} par message, sauf une ou deux fois par minute où il en prend plusieurs
+centaines. L'équipe soupçonne la mémoire. Le gestionnaire est le brouillon du \cref{lst:ll:cpp-for-latency-i-memory:naive}, alimenté par 50\,000
+messages par seconde.
+
+\medskip\noindent\textbf{Partie I --- Comptage.}
+\begin{enumerate}
+\item Combien d'allocations par seconde le brouillon effectue-t-il~?
+\item Lister les neuf allocations d'un message et la ligne qui produit chacune.
+\item Lesquelles disparaîtraient avec un identifiant de 15 caractères ou moins~?
+\item Pourquoi le compte ne dépend-il pas du nombre d'exécutions d'un message au-delà de trois~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les coûts.}
+\begin{enumerate}[resume]
+\item D'après la \cref{fig:ll:cpp-for-latency-i-memory:faults}, combien coûte une paire d'opérations sur le tas à la médiane~?
+\item Combien de temps par seconde les allocations du brouillon coûtent-elles à cette médiane~?
+\item Combien coûte un \omterm{def:ll:cpp-for-latency-i-memory:fault}{défaut de page}, et combien en faudrait-il pour porter un message à plusieurs centaines de microsecondes~?
+\item Nommer trois événements internes à l'allocateur, rares mais lents.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La réécriture.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qui remplace chaque allocation dans le gestionnaire corrigé~?
+\item Quelles capacités la réécriture a-t-elle retenues, et que se passe-t-il lorsqu'on en dépasse une~?
+\item Pourquoi le stockage du gestionnaire corrigé doit-il être touché au démarrage, et par quel fil~?
+\item Combien coûte la recherche linéaire sur 64 entrées de la réécriture, et quand faudrait-il lui substituer une table de hachage~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: allocations par message avant et après la réécriture, et coût d'un \omterm{def:ll:cpp-for-latency-i-memory:fault}{défaut de page}
+comparé à une écriture préchargée sur cet ordinateur portable.
+\item Comment le test empêche-t-il ce résultat de régresser~?
+\item Qu'est-ce qui, outre l'allocation, peut rendre lent un message sur une minute~?
+\item Comment montrer quelle cause il s'agissait sur l'hôte de production~?
+\item Pourquoi «~refuser quand c'est plein~» est-il acceptable sur le chemin critique, et «~allouer quand c'est plein~» ne l'est-il pas~?
+\item Où le jumeau en Rust fait-il respecter la même règle~?
+\item Quelle doit être la taille de la réserve si le pic d'ordres vivants sur une année a été de 38\,000~?
+\item En une phrase~: quelle est la règle mémoire d'un chemin critique~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:1}
+Pourquoi réordonner les champs d'une structure peut-il rendre un programme plus rapide~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:2}
+Pourquoi les systèmes à faible latence évitent-ils l'allocation sur le tas dans le chemin critique, si \texttt{malloc} ne prend que 20 nanosecondes~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:3}
+Implémentez une \omterm{def:ll:cpp-for-latency-i-memory:pool}{réserve d'objets} pour un type de taille fixe. Que se passe-t-il lorsqu'elle est vide~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:4}
+Qu'est-ce que l'optimisation des petites chaînes, et pourquoi peut-elle masquer des allocations à un test~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:5}
+Qu'est-ce qu'un \omterm{def:ll:cpp-for-latency-i-memory:fault}{défaut de page}, et comment les tenez-vous à l'écart d'un chemin critique~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-i-memory:6}
+Comment prouveriez-vous, en intégration continue, qu'un composant n'alloue jamais après le démarrage~?
+\end{interviewq}

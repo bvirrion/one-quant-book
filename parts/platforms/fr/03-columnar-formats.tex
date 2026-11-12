@@ -1,0 +1,432 @@
+\chapter{Formats en colonnes}\label{ch:pl:columnar-formats}
+
+Un chercheur demande les cotations d'un symbole sur une heure d'une journée, à partir d'un mois de cotations de cinquante symboles stockées dans un seul
+fichier de 19.5~Mo. La requête lit 17.0~Mo de ce fichier. Les mêmes cotations écrites dans l'ordre temporel, ou triées par symbole puis par temps, en
+groupes de 8\,192 lignes, répondent à la même requête en lisant 0.39 ou 0.36~Mo. Rien dans les données n'a changé, seulement l'endroit où se trouvent leurs
+octets et ce que le fichier en dit. Ce chapitre présente les deux formats ouverts en colonnes par lesquels transitent
+aujourd'hui la plupart des données de recherche de l'industrie --- l'un pour la mémoire, l'autre pour le disque --- avec assez de finesse pour prédire de tels chiffres, construit
+un petit format de fichier en colonnes (\texttt{firm.colfile}) à partir de zéro pour voir chaque octet, et mesure la disposition que doit avoir un
+fichier de données de marché.
+
+\section{Lignes contre colonnes}
+
+\begin{definition}[Disposition orientée lignes et disposition en colonnes]\label{def:pl:columnar-formats:layouts}
+Dans une \emph{disposition orientée lignes}\index{disposition orientée lignes} les champs de chaque enregistrement sont rangés les uns à côté des autres, enregistrement
+après enregistrement. Dans une \emph{disposition en colonnes}\index{disposition en colonnes} les valeurs de chaque champ sont rangées les unes à côté des autres, champ
+champ après champ, de sorte que le $i$-ième enregistrement soit la $i$-ième valeur de chaque colonne.
+\end{definition}
+
+Les enregistrements normalisés du chapitre~2 suivent une \omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes}~: 56 octets par message, chaque message entier. Une \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes} est la
+structure de tableaux (structure of arrays) du livre~13, chapitre~14, appliquée au stockage~: un tableau par champ.
+La \Cref{fig:pl:columnar-formats:layouts} montre les mêmes quatre cotations dans les deux dispositions.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\tiny,cell/.style={draw,minimum width=0.78cm,minimum height=0.42cm,inner sep=0.5pt}]
+\foreach \f/\c [count=\j from 0] in {sym/omDef,ts/omMeth,bid/omThm,ask/omProp} {
+  \foreach \r in {0,1,2,3} {
+    \node[cell,fill=\c!22] at (\j*0.78+\r*3.3,1.3) {\f$_\r$};
+    \node[cell,fill=\c!22] at (\r*0.78+\j*3.3,0) {\f$_\r$};
+  }
+}
+\node[anchor=east,font=\scriptsize] at (-0.4,1.3) {lignes};
+\node[anchor=east,font=\scriptsize] at (-0.4,0) {colonnes};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (6.21,-0.3) -- (9.33,-0.3) node[midway,below=4pt,font=\scriptsize]{une requête sur \texttt{bid} lit une seule plage};
+\end{tikzpicture}
+
+\omcaption{Les mêmes quatre cotations dans une \omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes} (en haut~: chaque enregistrement entier) et dans une \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes} (en bas~: chaque champ
+entier). Une requête qui ne demande qu'un champ de chaque enregistrement lit une plage contiguë dans la \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes}, et tous les enregistrements dans la
+\omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes}.}\label{fig:pl:columnar-formats:layouts}
+\end{omfigure}
+
+\begin{proposition}[Ce que lit un balayage]\label{prop:pl:columnar-formats:scan}
+Une requête qui demande $k$ des $m$ champs à largeur fixe de chaque enregistrement, de largeurs $w_1,\dots,w_m$, lit
+$n\sum_{i=1}^m w_i$ octets dans une \omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes} et $n\sum_{i\in K} w_i$ dans une \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes}, où $K$ est l'ensemble des
+champs qu'elle demande.
+\end{proposition}
+
+\begin{proof}
+Dans la \omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes}, les champs utiles sont entrelacés avec les autres à chaque enregistrement, et le stockage est lu par blocs bien plus grands
+qu'un champ, de sorte que chaque octet est lu. Dans la \omterm{def:pl:columnar-formats:layouts}{disposition en colonnes}, les colonnes utiles sont contiguës et les autres ne sont jamais touchées.
+\end{proof}
+
+Deux autres avantages découlent de la même source. Une colonne contient des valeurs d'un même type et souvent d'une même nature --- un horodatage qui
+croît, un symbole qui se répète, un prix qui varie d'un tick --- si bien qu'elle se compresse bien mieux qu'une ligne de champs hétérogènes
+(le chapitre~2 l'a mesuré). Et un tableau d'un même type est ce que réclament les instructions vectorielles (le livre~13, chapitre~14) et la programmation par
+tableaux (chapitre~8). Le coût se paie à l'écriture et à la lecture d'enregistrements entiers~: ajouter un enregistrement touche chaque
+colonne, ce qui explique que la base intrajournalière du chapitre~4 ajoute des lignes et que la base historique conserve des colonnes.
+
+\section{Le standard colonnaire en mémoire~: tampons, validité, dictionnaires}
+
+Le standard ouvert pour les colonnes en mémoire (Apache Arrow) fixe la manière dont une colonne se présente en mémoire, afin que deux bibliothèques, ou deux
+processus, puissent la partager sans la convertir~: les échanges sans copie des chapitres~4 et~9 reposent dessus. Une colonne (un
+\emph{tableau}) est constituée de quelques tampons contigus, qu'il est recommandé d'aligner et de compléter à 64 octets.
+
+\begin{definition}[Bitmap de validité]\label{def:pl:columnar-formats:validity}
+Le \emph{bitmap de validité}\index{bitmap de validité} d'une colonne est un tampon contenant un bit par valeur, à 1 lorsque la valeur est
+présente et à 0 lorsqu'elle est nulle, numérotés à partir du bit de poids faible de chaque octet~; une colonne sans valeur nulle peut s'en passer.
+\end{definition}
+
+Une colonne à largeur fixe se réduit à son \omterm{def:pl:columnar-formats:validity}{bitmap de validité} et à un tampon de valeurs. Une colonne de chaînes de caractères ajoute un tampon de décalages de $n+1$ entiers~:
+la valeur $i$ correspond aux octets compris entre les décalages $i$ et $i+1$ d'un tampon de données. Une colonne encodée par dictionnaire est une colonne
+d'indices renvoyant vers une colonne séparée de valeurs distinctes. La \Cref{fig:pl:columnar-formats:buffers} liste les tampons des
+1\,000 premières lignes de trois colonnes des cotations du chapitre.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,buf/.style={draw,rounded corners=1pt,minimum height=0.5cm,inner sep=2pt,align=center}]
+\node[anchor=east] at (-0.2,1.5) {\texttt{ts} (int64)};
+\node[buf,fill=gray!10,text width=2.3cm] at (1.45,1.5) {validité~: aucune};
+\node[buf,fill=omDef!18,text width=5.0cm] at (5.4,1.5) {valeurs~: 1\,000 $\times$ 8 = 8\,000 octets};
+\node[anchor=east] at (-0.2,0.6) {\texttt{condition} (chaîne)};
+\node[buf,fill=omThm!15,text width=2.3cm] at (1.45,0.6) {validité~: 125 octets};
+\node[buf,fill=omMeth!18,text width=2.6cm] at (3.9,0.6) {décalages~: 1\,001 $\times$ 4};
+\node[buf,fill=omDef!18,text width=1.9cm] at (6.7,0.6) {données~: 49 octets};
+\node[anchor=west] at (7.85,0.6) {951 nuls};
+\node[anchor=east] at (-0.2,-0.3) {\texttt{symbol} (dictionnaire)};
+\node[buf,fill=omMeth!18,text width=2.3cm] at (1.45,-0.3) {indices~: 4\,000 octets};
+\node[buf,fill=omDef!18,text width=3.3cm] at (4.35,-0.3) {dictionnaire~: 50 chaînes};
+\end{tikzpicture}
+
+\omcaption{Tampons des 1\,000 premières lignes de trois colonnes des cotations du chapitre, dans le format en colonnes en mémoire~: une colonne d'entiers
+sans valeur nulle n'a pas besoin de \omterm{def:pl:columnar-formats:validity}{bitmap de validité}~; une colonne de chaînes qui admet des nuls a un bitmap, $n+1$ décalages et un tampon de données ne contenant que
+les 49 caractères de ses 49 valeurs présentes~; une colonne dictionnaire contient des indices sur 4 octets pointant vers 50 symboles distincts. Données~:
+\texttt{pl\_colfmt.arrow\_buffers}.}\label{fig:pl:columnar-formats:buffers}
+\end{omfigure}
+
+Les valeurs nulles coûtent chacune un bit, ni une valeur sentinelle ni un octet~: le code de condition, nul sur 95~\% des lignes, coûte 125 octets de
+bitmap pour ses 1\,000 lignes, plus les décalages. Les données de marché ont besoin de valeurs nulles en permanence~: une cotation sans cours acheteur, une transaction sans condition,
+un champ ajouté l'an dernier par une plateforme.
+
+\section{Le standard colonnaire sur disque~: groupes de lignes, pages, encodages}
+
+Le standard ouvert pour les colonnes sur disque (Apache Parquet) ajoute ce dont la mémoire n'a pas besoin~: la compression, les statistiques et la possibilité de
+lire une partie d'un fichier. Sa disposition (voir la \cref{fig:pl:columnar-formats:anatomy}) comporte trois niveaux.
+
+\begin{definition}[Groupe de lignes, bloc de colonne, page de données]\label{def:pl:columnar-formats:rowgroup}
+Un \emph{groupe de lignes}\index{groupe de lignes} est une tranche horizontale des lignes d'un fichier en colonnes, stocké sous forme d'un \emph{bloc de
+colonne}\index{bloc de colonne} par colonne, chacun contigu dans le fichier. Un bloc de colonne se découpe en \emph{pages
+de données}\index{page de données}, l'unité de l'encodage et de la compression. Les métadonnées du fichier (son schéma, la position, la taille, l'encodage
+et les statistiques de chaque bloc) sont écrites dans un pied de fichier après les données, de sorte que le fichier puisse être écrit en une seule passe et lu à partir de
+sa fin.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,ch/.style={draw,minimum height=0.55cm,inner sep=1pt,align=center}]
+\foreach \g/\x in {0/0,1/4.3} {
+  \node[ch,fill=omDef!18,minimum width=1.2cm] at (\x+0.6,0) {\texttt{symbol}};
+  \node[ch,fill=omMeth!18,minimum width=1.2cm] at (\x+1.8,0) {\texttt{ts}};
+  \node[ch,fill=omThm!18,minimum width=1.2cm] at (\x+3.0,0) {\texttt{bid}};
+  \draw[decorate,decoration={brace,amplitude=4pt}] (\x,0.35) -- (\x+3.6,0.35) node[midway,above=4pt]{groupe de lignes \g};
+}
+\node at (8.5,0) {\dots};
+\node[ch,fill=gray!15,minimum width=2.6cm] (ft) at (10.6,0) {pied de fichier};
+\foreach \p in {0,1,2} {\node[ch,fill=omMeth!10,minimum width=0.36cm,minimum height=0.4cm] at (1.44+\p*0.36,-1.2) {};}
+\draw[dashed] (1.2,-0.28) -- (1.26,-1.0); \draw[dashed] (2.4,-0.28) -- (2.34,-1.0);
+\node[anchor=north] at (1.8,-1.5) {pages de données~: l'unité de l'encodage et de la compression};
+\node[align=left,anchor=north,text width=3.0cm] at (10.6,-0.45) {schéma~; pour chaque bloc de colonne~: décalage, taille, encodage, nombre de lignes, min, max};
+\end{tikzpicture}
+
+\omcaption{Anatomie d'un fichier au format en colonnes sur disque~: \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} de \omterm{def:pl:columnar-formats:rowgroup}{blocs de colonne}, chaque bloc étant une suite de \omterm{def:pl:columnar-formats:rowgroup}{pages de données},
+et un pied de fichier après les données, qui indique où se trouve chaque bloc et quelle plage de valeurs il contient.}\label{fig:pl:columnar-formats:anatomy}
+\end{omfigure}
+
+Dans une page, les valeurs sont encodées avant d'être compressées. Quatre encodages font l'essentiel du travail sur les données de marché, et
+\texttt{firm.colfile} implémente les quatre en numpy (le \cref{lst:pl:columnar-formats:encode}).
+
+\begin{definition}[Encodage par dictionnaire, codage par plages, encodage delta~; compactage de bits]\label{def:pl:columnar-formats:encodings}
+L'\emph{encodage par dictionnaire}\index{encodage par dictionnaire} stocke une seule fois les valeurs distinctes d'une colonne, et chaque valeur sous la forme d'un indice vers celles-ci
+Le \emph{codage par plages}\index{codage par plages} (run-length encoding) stocke chaque suite de valeurs égales consécutives sous la forme
+de la valeur et de la longueur de la suite. L'\emph{encodage delta}\index{encodage delta} stocke la première valeur, puis l'écart de chaque valeur avec la précédente,
+le plus souvent sous la forme de l'excès sur le plus petit écart d'un bloc. Le \emph{compactage de bits}\index{compactage de bits} (bit packing) stocke de petits
+entiers positifs ou nuls dans le plus petit nombre de bits qui contiennent le plus grand d'entre eux, sans frontière d'octet entre les valeurs.
+\end{definition}
+
+\omcode{code/firm/colfile/firm_colfile.py}{96}{125}{Les quatre encodages de \texttt{firm.colfile}~: valeurs brutes, un dictionnaire avec
+indices compactés en bits, plages dont les longueurs sont compactées en bits, et deltas par rapport à un minimum par bloc, compactés à la largeur propre à chaque bloc.}\label{lst:pl:columnar-formats:encode}
+
+\begin{dated}{2026-09}{Les encodages du format ouvert sur disque}\label{dat:pl:columnar-formats:encodings}
+La spécification du format ouvert en colonnes sur disque (consultée en septembre 2026) énumère comme encodages les valeurs brutes, le dictionnaire (brut ou
+à plages), un hybride de \omterm{def:pl:columnar-formats:encodings}{codage par plages} et de \omterm{def:pl:columnar-formats:encodings}{compactage de bits}, trois \omterm{def:pl:columnar-formats:encodings}{encodages delta} (entiers compactés en binaire, longueurs de tableaux d'octets,
+et préfixes de tableaux d'octets), découpage en flux d'octets pour les flottants, et ALP (flottants adaptatifs sans perte). Son \omterm{def:pl:columnar-formats:encodings}{encodage delta}
+compacte en bits des mini-blocs de deltas, chacun à sa propre largeur de bits, après soustraction d'un delta minimal.
+\end{dated}
+
+Le \Cref{tab:pl:columnar-formats:encodings} encode une journée de cotations du chapitre (50\,000 lignes) colonne par colonne. Chaque colonne
+a un gagnant net, et ce n'est pas toujours le même~: la date, une seule valeur pour toute la journée, pèse 13 octets en dictionnaire~; le symbole, 50 valeurs
+répété, pèse 37.9~ko en dictionnaire dans l'ordre de capture et 480~octets en plages une fois la journée triée par symbole~; l'horodatage,
+croissant, se réduit de moitié en deltas~; le cours acheteur, quelques centaines de prix distincts, est au mieux un dictionnaire~; la plateforme, quatre valeurs, occupe deux
+bits par ligne.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrl}
+\toprule
+colonne (50\,000 lignes) & brut & dictionnaire & plages & delta & meilleur \\
+\midrule
+date & 200\,000 & 13 & 15 & 449 & dictionnaire \\
+symbole, ordre de capture & 400\,008 & 37\,917 & 404\,432 & -- & dictionnaire \\
+symbole, trié par symbole & 400\,008 & 37\,917 & 480 & -- & plages \\
+horodatage & 400\,000 & 500\,009 & 406\,259 & 201\,085 & delta \\
+cours acheteur & 400\,000 & 99\,097 & 410\,505 & 137\,947 & dictionnaire \\
+taille du cours acheteur & 200\,000 & 37\,705 & 208\,072 & 87\,948 & dictionnaire \\
+plateforme & 400\,008 & 12\,549 & 318\,436 & -- & dictionnaire \\
+\bottomrule
+\end{tabular}
+\caption{Octets de chaque colonne d'une journée de cotations selon chacun des encodages de \texttt{firm.colfile}, avant toute compression~;
+les chaînes sont stockées brutes sous forme de décalages et d'octets, et l'\omterm{def:pl:columnar-formats:encodings}{encodage delta} ne s'applique qu'aux entiers. Données~:
+\texttt{pl\_colfmt.encodings\_by\_column}.}\label{tab:pl:columnar-formats:encodings}
+\end{table}
+
+\section{Statistiques et report}
+
+Ce sont les statistiques du pied de fichier qui permettent à un lecteur de sauter les données qu'il n'a pas lues.
+
+\begin{definition}[Carte de zones, report des prédicats, report des projections]\label{def:pl:columnar-formats:pushdown}
+Une \emph{carte de zones}\index{carte de zones} (zone map) est le minimum et le maximum d'une colonne à l'intérieur d'une unité de stockage (un \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes}, une page).
+Le \emph{report des prédicats}\index{report des prédicats} (predicate pushdown) évalue le filtre d'une requête sur les cartes de zones avant la lecture, et saute chaque
+unité dont la plage de valeurs ne peut pas le satisfaire. Le \emph{report des projections}\index{report des projections} (projection pushdown) ne lit que les colonnes qu'une requête nomme,
+dans sa sortie ou dans son filtre.
+\end{definition}
+
+\begin{proposition}[Élagage par cartes de zones]\label{prop:pl:columnar-formats:pruning}
+Le \omterm{def:pl:columnar-formats:pushdown}{report des prédicats} ne saute jamais une ligne qui correspond, et il saute un \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes} exactement lorsqu'une condition du filtre est fausse pour
+toute valeur de la plage du groupe. Un filtre sur une colonne élague donc d'autant plus que les plages de cette colonne sont étroites dans
+chaque \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes}~: bien sur une colonne selon laquelle le fichier est trié, presque pas sur une colonne dont les valeurs sont réparties dans tous les groupes.
+\end{proposition}
+
+\begin{proof}
+Une ligne qui correspond a, dans son \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes}, une valeur comprise dans l'intervalle du filtre pour chaque colonne filtrée, de sorte que l'intervalle
+$[\min,\max]$ du groupe intersecte cet intervalle et le groupe est lu. Réciproquement, un groupe n'est sauté que si une condition échoue sur
+tout son intervalle. Si les valeurs d'une colonne sont triées, la plage de chaque groupe est un intervalle étroit et seuls les groupes qui recoupent le
+filtre survivent~; si chaque groupe contient presque toutes les valeurs, chaque plage contient celle du filtre.
+\end{proof}
+
+\omcode{code/firm/colfile/firm_colfile.py}{201}{238}{Élagage et lecture dans \texttt{firm.colfile}~: un groupe de lignes est sauté lorsqu'une
+condition échoue sur sa carte de zones~; les blocs des colonnes nécessaires des autres sont lus, décodés et filtrés.}\label{lst:pl:columnar-formats:read}
+
+La proposition contient à elle seule toute la conception de la disposition. Le mois de cotations du chapitre, écrit de trois façons dans le format sur disque avec
+compression zstd, répond à trois formes de requête à travers un objet fichier qui compte chaque octet que pyarrow lit
+(le \cref{tab:pl:columnar-formats:queries}). Mélangé, le fichier n'offre aucune plage étroite à un filtre, et chaque requête en lit la plus grande partie~:
+le \omterm{def:pl:columnar-formats:pushdown}{report des projections} seul évite les colonnes non nommées. Dans l'ordre de capture, l'horodatage est trié, si bien que les requêtes d'une heure lisent
+3~\% du fichier~; le mois d'un seul symbole lit encore 28~\%, les colonnes projetées de chaque groupe. Trié par symbole puis par horodatage,
+les requêtes sur un seul symbole en lisent 1--3~\%, et la coupe transversale d'une heure 86~\%.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+requête & mélangé & ordre temporel & symbole, puis horodatage \\
+\midrule
+un symbole, une heure & 86.0~\% & 3.30~\% & 3.30~\% \\
+un symbole, un mois & 34.1~\% & 28.2~\% & 1.07~\% \\
+tous les symboles, une heure & 81.7~\% & 3.13~\% & 86.1~\% \\
+\bottomrule
+\end{tabular}
+\caption{Part du fichier lue par trois requêtes (projetant le cours acheteur et le cours vendeur) sur un mois de cotations pour cinquante symboles au
+format en colonnes sur disque, selon trois ordres de lignes, avec des groupes de 32\,768 lignes. Compté par un objet fichier enveloppant le fichier. Données~:
+\texttt{pl\_colfmt.study}.}\label{tab:pl:columnar-formats:queries}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,xmode=log,ymode=log,log basis x=2,xlabel={lignes par groupe de lignes (échelle log)},
+  ylabel={Mo lus (échelle log)},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  xtick={2048,8192,32768,131072,524288},xticklabels={2\,048,8\,192,32\,768,131\,072,524\,288},ymin=0.2,ymax=40,
+  ytick={0.3,1,3,10,30},yticklabels={0.3,1,3,10,30},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[thick,mark=*,gray] table[x=rows,y=shuffled]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\addplot[thick,mark=square*,omDef] table[x=rows,y=time]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\addplot[thick,mark=triangle*,omThm] table[x=rows,y=symbol]{figdata/platforms/03-columnar-formats/rowgroups.csv};
+\legend{mélangé,ordre temporel,{symbole, puis horodatage}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Octets lus par la requête d'un symbole sur une heure, en fonction de la taille des \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes}, pour les trois ordres de lignes. Trié,
+la courbe est en U~: les grands groupes rendent les \omterm{def:pl:columnar-formats:pushdown}{cartes de zones} grossières, les petits allongent le pied de page que chaque requête lit~; son minimum
+se situe ici à 8\,192 lignes (0.39~Mo en ordre temporel, 0.36~Mo trié par symbole). Mélangé, seule la projection aide. Données~:
+\texttt{pl\_colfmt.study}.}\label{fig:pl:columnar-formats:rowgroups}
+\end{omfigure}
+
+La taille des \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} est l'autre levier (\cref{fig:pl:columnar-formats:rowgroups}). Les grands groupes font couvrir à chaque \omterm{def:pl:columnar-formats:pushdown}{carte de zones} une longue
+tranche de temps, si bien que la requête d'une heure lit de 5.5 à 6.0~Mo pour un demi-million de lignes par groupe. Les petits groupes affinent les \omterm{def:pl:columnar-formats:pushdown}{cartes de zones}, mais
+allongent le pied de page que chaque requête lit en premier, avec une entrée par colonne et par groupe~: pour 2\,048 lignes (489 groupes), le pied de page du fichier ordonné
+dans le temps fait 444~ko, contre 115~ko pour 8\,192 lignes, et la requête lit de 0.57 à 0.64~Mo. Le minimum se situe là où les deux coûts
+s'équilibrent.
+
+\section{Choisir une disposition pour les données de marché}
+
+Aucun ordre unique ne sert toutes les requêtes~: l'ordre temporel convient aux coupes transversales d'une heure, l'ordre par symbole à l'historique d'un nom,
+et chacun est mauvais pour l'autre. Les réponses du secteur combinent trois outils.
+
+\begin{method}[Disposer un fichier de données de marché]\label{met:pl:columnar-formats:layout}
+(1) Partitionner selon le filtre le plus grossier que toutes les requêtes utilisent, presque toujours la date (chapitre~2), de sorte qu'aucun fichier ne mélange des jours.
+(2) À l'intérieur d'une partition, trier selon le filtre le plus utilisé par les requêtes après la date (le symbole, pour la recherche sur les noms), puis par
+l'heure, de sorte que les deux \omterm{def:pl:columnar-formats:pushdown}{cartes de zones} soient étroites. (3) Choisir la taille des \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} à partir d'une mesure comme celle de la
+\cref{fig:pl:columnar-formats:rowgroups} sur de vraies requêtes, et laisser l'écrivain choisir l'encodage de chaque colonne. (4) Si une seconde forme de requête
+compte autant que la première, conserver une seconde copie dans l'autre ordre~: le stockage coûte moins cher qu'un balayage complet répété chaque
+jour.
+\end{method}
+
+\begin{remark}[Données imbriquées, et d'où vient la conception]\label{rem:pl:columnar-formats:dremel}
+Le format sur disque stocke les enregistrements imbriqués (un ordre avec une liste d'exécutions) grâce à l'algorithme de découpage et d'assemblage des enregistrements,
+publié pour le système Dremel de Google en 2010~; le format en mémoire reprend les mêmes types imbriqués. Les tables plates de données de marché
+n'en utilisent aucun, mais les enregistrements d'ordres et de transactions issus des systèmes de gestion des ordres arrivent souvent imbriqués.
+\end{remark}
+
+\section{Tutoriel~: les mêmes cotations, trois dispositions}\label{tut:pl:columnar-formats:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Voir chaque tampon d'une colonne en mémoire et chaque bloc d'un fichier sur disque, puis mesurer l'effet de la disposition et de la taille des
+\omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} sur une requête. \textbf{État final~:} \cref{fig:pl:columnar-formats:buffers,fig:pl:columnar-formats:rowgroups} et
+\cref{tab:pl:columnar-formats:encodings,tab:pl:columnar-formats:queries}.
+\begin{tutsteps}
+\item \textbf{Générer} \texttt{pl\_colfmt.quotes()}~: un million de lignes, cinquante symboles, vingt jours, dans l'ordre de capture.
+\item \textbf{Tampons.} \texttt{arrow\_buffers()} liste les tampons d'un entier, d'une chaîne à valeurs nulles et d'une colonne par dictionnaire.
+\item \textbf{Encodages.} \texttt{encodings\_by\_column()}, dans l'ordre de capture et trié, avec les quatre
+encodages de \texttt{firm.colfile} (\cref{lst:pl:columnar-formats:encode}).
+\item \textbf{Dispositions.} \texttt{study()} écrit le mois selon trois ordres et cinq tailles de \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes}, et compte les octets que chaque requête
+lit avec \texttt{CountingFile}.
+\item \textbf{Fichier personnel.} Écrire le mois avec \texttt{firm\_colfile.write}, puis l'interroger avec \texttt{ColFile.read}
+(\cref{lst:pl:columnar-formats:read}), et comparer la réponse et les octets lus avec ceux de pyarrow.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Partitionner le mois par date et trier chaque jour par symbole, puis relancer les trois requêtes~; ajouter une
+\omterm{def:pl:columnar-formats:pushdown}{carte de zones} au niveau des pages à \texttt{firm.colfile} et mesurer ce qu'elle fait gagner sur de grands \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes}.
+\end{tutorial}
+
+\section{Construction~: un fichier en colonnes à partir de zéro}\label{bld:pl:columnar-formats:colfile}
+
+\begin{build}
+\bfield{Rôle} Un format en colonnes assez petit pour être lu en entier~: la référence à laquelle on vérifie les affirmations du chapitre
+sur les encodages, les \omterm{def:pl:columnar-formats:pushdown}{cartes de zones} et le \omterm{def:pl:columnar-formats:pushdown}{report des prédicats}, et le modèle des formats plats du chapitre~4.
+\bfield{Interface} \texttt{ENCODINGS}~; \texttt{bitpack(values, width)}, \texttt{bitunpack(data, width, n)}~;
+\texttt{encode(values, encoding)}, \texttt{decode(data, encoding, dtype, n)}, \texttt{best\_encoding(values)}~;
+\texttt{write(path, columns, row\_group\_size, encodings)} renvoyant le pied de page~;
+\texttt{ColFile(path).read(columns, where) -> (columns, stats)} avec \texttt{row\_groups}, \texttt{row\_groups\_read}, \texttt{bytes\_read}, \texttt{file\_bytes}.
+\bfield{Règles} Nombre magique aux deux extrémités et un pied de page des positions des blocs, des encodages et des \omterm{def:pl:columnar-formats:pushdown}{cartes de zones}~; un bloc n'est décodé que si son
+\omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes} peut correspondre~; un filtre ne perd jamais une ligne qui correspond~; la réponse du lecteur est égale à celle d'un balayage complet.
+\bfield{Tests d'acceptation} \texttt{code/firm/colfile/tests/}~: empaquetage de bits pour des largeurs de 0 à 64~; chaque encodage fait l'aller-retour
+pour chaque type de colonne, et delta refuse les non-entiers~; l'encodage évident choisi pour une plage, une progression et un petit alphabet~; une lecture filtrée
+égale à celle de pyarrow, lisant un \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes} sur vingt~; une projection qui ne lit que ses blocs.
+\bfield{Pour aller plus loin} \omterm{def:pl:columnar-formats:pushdown}{Cartes de zones} au niveau des pages~; compression de chaque bloc après encodage~; colonnes à valeurs nulles avec un \omterm{def:pl:columnar-formats:validity}{bitmap de validité}~;
+pages de dictionnaire partagées par les \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} d'une colonne.
+\end{build}
+
+\begin{omsources}
+\item Apache Arrow, \emph{Arrow Columnar Format} (spécification)~; Apache Parquet, \emph{File Format}, \emph{Concepts} et
+\emph{Encodings} (spécification).
+\item D.~J.~Abadi, S.~R.~Madden et N.~Hachem, «~Column-stores vs.\ row-stores~: how different are they really~?~», 
+\emph{SIGMOD}, 2008.
+\item S.~Melnik et al., «~Dremel~: interactive analysis of web-scale datasets~», \emph{Proceedings of the VLDB Endowment} 3(1),
+2010.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:1}
+Un tableau compte cinq champs de 8~octets et un million de lignes. Combien d'octets un balayage d'un champ lit-il dans une \omterm{def:pl:columnar-formats:layouts}{disposition orientée lignes} et dans une
+\omterm{def:pl:columnar-formats:layouts}{disposition en colonnes}, avant compression~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:2}
+Une colonne de chaînes à valeurs nulles de 1\,000 lignes compte 49 valeurs présentes d'un seul caractère chacune. Calculer les octets de son \omterm{def:pl:columnar-formats:validity}{bitmap de validité}, de ses
+décalages sur 32~bits et de ses données.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:columnar-formats:3}
+La colonne venue prend quatre valeurs sur 50\,000 lignes. Combien de bits par valeur, et combien d'octets, l'\omterm{def:pl:columnar-formats:encodings}{encodage par dictionnaire} avec
+des indices à \omterm{def:pl:columnar-formats:encodings}{compactage de bits} demande-t-il, et pourquoi le \cref{tab:pl:columnar-formats:encodings} affiche-t-il 12\,549~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:4}
+Pourquoi la colonne d'horodatage se compresse-t-elle à environ 32~bits par valeur sous \omterm{def:pl:columnar-formats:encodings}{encodage delta} dans l'ordre de capture,
+et pourquoi la compression est-elle moins bonne une fois la journée triée par symbole~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:5}
+Dans l'ordre temporel, pourquoi la requête sur un seul symbole et un seul mois lit-elle encore 28~\% du fichier, alors qu'elle ne renvoie que 2~\% des lignes~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:columnar-formats:6}
+Expliquer la forme en U de la \cref{fig:pl:columnar-formats:rowgroups}~: qu'est-ce qui croît de part et d'autre du minimum~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:columnar-formats:7}
+\emph{Programmation.} Écrire le mois avec \texttt{firm\_colfile.write} trié par symbole puis par temps, en \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} de 8\,192 lignes,
+et lire la requête sur un seul symbole et une seule heure avec \texttt{ColFile.read}. Combien de \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes} lit-elle, et la réponse
+est-elle égale à celle de pyarrow~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:columnar-formats:8}
+\emph{Trouver la faille.} «~Notre fichier de cotations est trié par temps et possède des statistiques sur chaque colonne, donc tout filtre est reporté et une
+requête sur un seul symbole ne lit que les données de ce symbole.~»
+\end{exercise}
+
+\section{Problème~: l'essentiel du fichier pour une heure}
+
+\begin{problem}[{Problème du week-end --- disposition d'un mois de cotations}]\label{pb:pl:columnar-formats:1}
+Le mois de cotations du chapitre (cinquante symboles, vingt jours, un million de lignes), ses trois ordres de lignes et ses cinq tailles de \omterm{def:pl:columnar-formats:rowgroup}{groupes de lignes}.
+
+\medskip\noindent\textbf{Partie I --- Lignes et colonnes.}
+\begin{enumerate}
+\item Quelle part d'une table orientée lignes de neuf champs lit une requête portant sur deux champs, si tous les champs ont la même largeur~?
+\item Quels tampons une colonne de chaînes à valeurs nulles possède-t-elle dans le format en mémoire~?
+\item Pourquoi une valeur nulle ne coûte-t-elle qu'un bit~?
+\item Quel encodage l'emporte pour la date, le symbole dans l'ordre de capture, l'horodatage et le cours acheteur~?
+\item Pourquoi le tri par symbole fait-il passer le \omterm{def:pl:columnar-formats:encodings}{codage par plages} du symbole de 404\,432 à 480~octets~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Report.}
+\begin{enumerate}[resume]
+\item Que contient une \omterm{def:pl:columnar-formats:pushdown}{carte de zones}, et quand permet-elle à un lecteur de sauter un \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes}~?
+\item Le \omterm{def:pl:columnar-formats:pushdown}{report des prédicats} peut-il renvoyer une réponse fausse~? Pourquoi pas~?
+\item Dans le fichier mélangé, quelle part lit la requête sur un seul symbole et une seule heure, et qu'est-ce qui lui épargne quoi que ce soit~?
+\item Dans l'ordre temporel, quelle part lisent les deux requêtes sur une heure à 32\,768 lignes par groupe~?
+\item Trié par symbole, quelle part lit la requête sur une heure pour tous les symboles, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- \omterm{def:pl:columnar-formats:rowgroup}{Groupes de lignes}.}
+\begin{enumerate}[resume]
+\item Combien de mégaoctets lit la requête sur un seul symbole et une seule heure à 524\,288 lignes par groupe dans l'ordre temporel~?
+\item Et à 8\,192~?
+\item Pourquoi la requête coûte-t-elle de nouveau plus cher à 2\,048 lignes~?
+\item De combien le pied de page du fichier trié par temps est-il plus volumineux à 2\,048 lignes qu'à 8\,192~?
+\item Quelle taille de \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes} retenir, et sur quelle preuve~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la part du fichier lue par la requête sur un seul symbole et une seule heure dans chaque ordre, et la meilleure
+taille de \omterm{def:pl:columnar-formats:rowgroup}{groupe de lignes}.
+\item Quel ordre sert quelle forme de requête, et lequel n'en sert aucune~?
+\item Quelle disposition donner à un mois de cotations qui serve à la fois les requêtes sur un seul symbole et celles sur une heure~?
+\item Que faudrait-il mesurer avant de se fier à ces chiffres sur des données réelles~?
+\item En une phrase~: qu'est-ce qui détermine le nombre d'octets qu'une requête lit dans un fichier en colonnes~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:columnar-formats:1}
+Pourquoi les formats en colonnes sont-ils utilisés pour la recherche sur les données de marché, et quand un format en lignes est-il préférable~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:columnar-formats:2}
+Qu'est-ce que le \omterm{def:pl:columnar-formats:pushdown}{report des prédicats}, et quel rapport la disposition du fichier entretient-elle avec lui~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:columnar-formats:3}
+Quels encodages attendriez-vous pour une colonne d'horodatage, une colonne de symboles et une colonne de prix, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:columnar-formats:4}
+Comment les valeurs nulles sont-elles représentées dans le standard en colonnes en mémoire, et que coûte une valeur nulle~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:columnar-formats:5}
+Les requêtes de recherche sur votre entrepôt de cotations sont lentes. Comment savoir si c'est la disposition qui pose problème, et que changez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:columnar-formats:6}
+Concevez la disposition du fichier pour cinq ans de transactions sur actions américaines que les chercheurs interrogent par symbole sur de longues périodes et par temps sur
+l'ensemble des symboles.
+\end{interviewq}

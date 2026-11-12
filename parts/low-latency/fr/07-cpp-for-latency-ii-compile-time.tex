@@ -1,0 +1,269 @@
+\chapter{C++ pour la latence II~: temps de compilation}\label{ch:ll:cpp-for-latency-ii-compile-time}
+
+Quatre étapes d'un chemin critique (hot path), chacune une classe avec une fonction virtuelle appelée à travers un pointeur, coûtent sur l'ordinateur portable de ce livre environ
+sept nanosecondes par événement. Les mêmes quatre étapes composées sous forme de paramètres de patron coûtent environ une~: le compilateur, voyant
+chaque appel, a inliné les quatre dans treize instructions machine sans aucun appel restant. Le travail était identique~; ce qui
+a changé est la quantité d'information dont dispose le compilateur au moment où il compile. Ce chapitre traite du déplacement des décisions du temps d'exécution vers le temps
+de compilation en C++~: répartition par patrons au lieu de fonctions virtuelles, valeurs calculées par le compilateur, \omterm{def:ll:cpp-for-latency-ii-compile-time:inline}{inlining} et ce qui l'empêche,
+ainsi que la disposition du code rare à l'écart du chemin commun.
+
+\section{Répartition virtuelle et son coût}
+
+\begin{definition}[Répartition dynamique, dévirtualisation]\label{def:ll:cpp-for-latency-ii-compile-time:dyn}
+Dans la \emph{répartition dynamique}\index{répartition dynamique} (dynamic dispatch), la fonction appelée dépend du type à l'exécution d'un objet~: un appel C++
+virtuel charge la table des pointeurs de fonctions de l'objet et appelle à travers elle, un appel indirect. La \emph{dévirtualisation}\index{dévirtualisation}
+est le remplacement par le compilateur d'un tel appel par un appel direct, lorsqu'il peut établir le type de l'objet (une classe \texttt{final},
+un objet local, une analyse de programme complet).
+\end{definition}
+
+Un appel indirect coûte peu lorsque le processeur prédit sa cible~: le prédicteur de branchement conserve un historique des cibles,
+et un chemin critique qui voit toujours le même type de message appelle toujours la même fonction. Il coûte une \omterm{def:ll:cpu-microarchitecture:branch}{erreur de prédiction de branchement} lorsque la
+cible change de façon imprévisible, et il coûte toujours les optimisations qu'il bloque~: le compilateur ne peut pas inliner une fonction sans pouvoir la nommer,
+ce qui l'empêche de replier le travail de la fonction appelée dans l'appelant, de garder des valeurs dans les registres à travers l'appel, ou de vectoriser
+la boucle qui l'entoure. La mesure publiée du coût direct des appels virtuels en C++ (Driesen et Hölzle, 1996) le trouve
+modeste en cycles~; le coût indirect, l'optimisation perdue, est en général plus élevé et n'apparaît pas dans un \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} de
+l'appel seul.
+
+\section{Polymorphisme statique~: templates, CRTP et concepts}
+
+\begin{definition}[Polymorphisme statique, curiously recurring template pattern]\label{def:ll:cpp-for-latency-ii-compile-time:static}
+Le \emph{polymorphisme statique}\index{polymorphisme statique} (static polymorphism) sélectionne la fonction à appeler à la compilation, par templates ou
+surcharge, de sorte que chaque appel soit direct. Dans le
+\emph{curiously recurring template pattern}\index{curiously recurring template pattern} (CRTP), une classe template prend sa propre classe dérivée comme paramètre, \texttt{struct Book : Base<Book>},
+et la base appelle les fonctions de la classe dérivée par un \texttt{static\_cast} de \texttt{this}.
+\end{definition}
+
+Un chemin critique de trading a rarement besoin de polymorphisme à l'exécution~: l'ensemble des types de messages est fixé par le protocole, et la stratégie
+est choisie au démarrage du processus. Les deux peuvent être des paramètres de template. Les concepts de C++20 énoncent l'exigence qu'un paramètre doit
+satisfaire («~a \texttt{bool on(E\&)}~»), de sorte que l'erreur pour une étape inadaptée tient sur une ligne au lieu d'une page.
+La \Cref{fig:ll:cpp-for-latency-ii-compile-time:dispatch} compare trois mécanismes de répartition d'un même message vers l'un de quatre gestionnaires
+(ajout, annulation, exécution, transaction), chacun effectuant une ou deux additions~: gestionnaires virtuels dans une table, \texttt{std::variant} avec
+\texttt{std::visit}, et CRTP avec un \texttt{switch}. Sur un flux d'un seul type de message, où chaque branchement est prédit, le
+répartiteur CRTP coûte environ une demi-nanoseconde par message et le répartiteur virtuel environ quatre fois plus~; sur un mélange aléatoire de
+les quatre types, les trois subissent des erreurs de prédiction, et l'écart se resserre. Les deux dernières barres sont le pipeline à quatre étapes du
+début, en versions statique et dynamique.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ybar,bar width=10pt,ymin=0,
+  symbolic x coords={virtual,variant,CRTP,pipeline static,pipeline dynamic},xtick=data,enlarge x limits=0.12,
+  xticklabels={virtuel,variant,CRTP,{pipeline\\ statique},{pipeline\\ dynamique}},xticklabel style={align=center},
+  ylabel={ns par message},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=design,y=one_type]{figdata/low-latency/07-cpp-for-latency-ii-compile-time/measured_dispatch.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=design,y=mixed]{figdata/low-latency/07-cpp-for-latency-ii-compile-time/measured_dispatch.csv};
+\legend{un seul type de message,mélange aléatoire de quatre}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coût par message de trois façons de le répartir vers son gestionnaire, sur un flux d'un type et sur un mélange aléatoire, et
+d'un pipeline à quatre étapes composé statiquement (\texttt{firm.pipeline}) et par appels virtuels (le coût du pipeline ne dépend pas du
+mélange de messages). Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés, épinglé à un seul processeur,
+meilleur de 15 exécutions de 65\,536 messages. Données~: \texttt{bench\_dispatch.py}.}\label{fig:ll:cpp-for-latency-ii-compile-time:dispatch}
+\end{omfigure}
+
+\section{Évaluation à la compilation}
+
+\begin{definition}[Évaluation à la compilation]\label{def:ll:cpp-for-latency-ii-compile-time:consteval}
+L'\emph{évaluation à la compilation}\index{evaluation@évaluation à la compilation} (compile-time evaluation) calcule une valeur pendant la compilation plutôt qu'à l'exécution~:
+une fonction \texttt{constexpr} peut être évaluée par le compilateur lorsque ses arguments sont des constantes, et une fonction \texttt{consteval}
+doit l'être, de sorte que son résultat soit une constante intégrée au programme.
+\end{definition}
+
+Les tables sont l'usage typique~: puissances de dix pour rééchelonner les prix entre protocoles aux décimales implicites différentes, la
+correspondance entre l'octet de type de message d'un protocole et l'indice d'un gestionnaire, les longueurs des messages à taille fixe, les tables de sommes de contrôle. Construite
+par le compilateur, une table ne coûte rien au démarrage, ne peut pas être oubliée dans une routine d'initialisation, et est vérifiée par
+\texttt{static\_assert} à la compilation du programme. Les faits de disposition relèvent aussi de cette approche~: la construction du chapitre~3 affirme
+à la compilation qu'un compteur avec remplissage occupe exactement une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}, et le chapitre~16 vérifie la taille de chaque message
+par rapport à la spécification du protocole.
+
+\section{Inlining et ses limites}
+
+\begin{definition}[Inlining]\label{def:ll:cpp-for-latency-ii-compile-time:inline}
+L'\emph{inlining}\index{inlining} est le remplacement, par le compilateur, d'un appel par le corps de la fonction appelée, ce qui supprime
+le coût propre de l'appel et, plus important encore, laisse le compilateur optimiser le code combiné~: propager les constantes, garder les valeurs
+dans les registres, supprimer le travail dont le résultat n'est pas utilisé.
+\end{definition}
+
+Le pipeline statique du \cref{lst:ll:cpp-for-latency-ii-compile-time:asm-static} réalise tout l'effet en treize
+instructions~: les additions des quatre étapes, le ou exclusif, la comparaison et la mise à jour conditionnelle, les objets d'étape
+repliés en lectures et écritures. Son jumeau dynamique (\cref{lst:ll:cpp-for-latency-ii-compile-time:asm-dyn}) est une boucle
+sur un vecteur de pointeurs avec un appel indirect par étape. Le compilateur décide de l'\omterm{def:ll:cpp-for-latency-ii-compile-time:inline}{inlining} selon un modèle de coût~: petites fonctions, fonctions
+appelées une seule fois, fonctions dont il voit la définition. Il n'inline pas à travers les unités de traduction sans
+optimisation à l'édition de liens (LTO) (chapitre~8), à travers un pointeur de fonction qu'il ne peut résoudre, ou une fonction marquée \texttt{noinline}~; et il peut
+renoncer à inliner une grande fonction dans une boucle critique. \texttt{[[gnu::always\_inline]]} outrepasse le modèle de coût pour les rares
+fonctions qui doivent être inlinées~; c'est une affirmation sur les heuristiques de ce compilateur, qui doit être vérifiée dans le
+code assembleur plutôt que de lui faire confiance.
+
+\section{Disposition des branchements et chemins froids}
+
+\begin{definition}[Chemin froid]\label{def:ll:cpp-for-latency-ii-compile-time:cold}
+Un \emph{chemin froid}\index{chemin froid} (cold path) est un code qui s'exécute rarement (gestion des erreurs, journalisation d'une anomalie, reprise). Le tenir
+hors de la fonction critique, en marquant la branche rare \texttt{[[unlikely]]} et la fonction rare \texttt{cold} et
+\texttt{noinline}, garde le code critique petit et contigu dans le cache d'instructions, le cas courant se poursuivant sans saut.
+\end{definition}
+
+GCC place les fonctions marquées \texttt{cold} dans une section distincte avec les autres fonctions froides et traite les branchements vers elles
+comme peu probables. La fonction de rééchelonnement du tutoriel vérifie ses arguments, et la vérification coûte une comparaison et une
+branche prédite~; le signalement d'un mauvais argument, avec sa sortie formatée, vit hors du chemin principal. La discipline compte davantage
+que n'importe quel attribut isolé~: la fonction critique doit contenir le cas courant et les appels vers tout le reste.
+
+\section{Tutoriel~: trois répartiteurs et un pipeline}\label{tut:ll:cpp-for-latency-ii-compile-time:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Répartir les messages de trois façons, composer un pipeline à la compilation et lire dans l'assembleur ce qu'a fait le compilateur de chacune.
+\textbf{État final~:} la \cref{fig:ll:cpp-for-latency-ii-compile-time:dispatch} et les deux listings d'assembleur.
+\begin{tutsteps}
+\item \textbf{CRTP.} La méthode \texttt{on} de la base aiguille selon le type et appelle directement le gestionnaire de la classe dérivée.
+\omcode{code/low-latency/07-cpp-for-latency-ii-compile-time/cpp/ll_dispatch.hpp}{45}{64}{Répartition statique avec le curiously recurring template pattern (CRTP).}\label{lst:ll:cpp-for-latency-ii-compile-time:crtp}
+\item \textbf{Une table que le compilateur construit,} et un chemin rare qu'il tient à l'écart.
+\omcode{code/low-latency/07-cpp-for-latency-ii-compile-time/cpp/ll_dispatch.hpp}{66}{85}{Une table évaluée à la compilation et un chemin froid pour les erreurs.}\label{lst:ll:cpp-for-latency-ii-compile-time:consteval}
+\item \textbf{Composer les étapes.} Une expression de pliage sur un tuple d'étapes, contrainte par un concept~; \texttt{\&\&} s'arrête à
+la première étape qui rejette l'événement.
+\omcode{code/firm/pipeline/cpp/firm_pipeline.hpp}{19}{33}{Le pipeline statique de firm.pipeline.}\label{lst:ll:cpp-for-latency-ii-compile-time:pipeline}
+\item \textbf{Lire l'assembleur.} \texttt{python ll\_asm.py} compile deux fonctions d'une ligne avec
+\texttt{-O2 -masm=intel} et en extrait les corps.
+\omcode{code/low-latency/07-cpp-for-latency-ii-compile-time/cpp/asm/run_static.s}{1}{14}{Le pipeline statique à quatre étapes après inlining (g++ 11.4, -O2).}\label{lst:ll:cpp-for-latency-ii-compile-time:asm-static}
+\omcode{code/low-latency/07-cpp-for-latency-ii-compile-time/cpp/asm/run_dynamic.s}{1}{31}{Le même pipeline par appels virtuels~: une boucle avec un appel indirect par étape.}\label{lst:ll:cpp-for-latency-ii-compile-time:asm-dyn}
+\item \textbf{Mesurer} avec \texttt{python bench\_dispatch.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Marquer les gestionnaires de la table de répartition \texttt{final} et y accéder par leurs types concrets,
+et voir si le compilateur dévirtualise~; ajouter \texttt{[[gnu::noinline]]} à une étape du pipeline statique et relire
+l'assembleur une nouvelle fois.
+\end{tutorial}
+
+\section{Construction~: le pipeline à la compilation}\label{bld:ll:cpp-for-latency-ii-compile-time:pipeline}
+
+\begin{build}
+\bfield{Rôle} La composition du chemin critique (hot path) de la partie~IV (décodage, carnet d'ordres, stratégie, risque, passerelle)
+sous la forme d'une seule chaîne d'appels à répartition statique, avec un jumeau à polymorphisme dynamique pour les tests et pour les configurations choisies au démarrage.
+\bfield{Interface} C++20 \texttt{firm::pipeline}~: concept \texttt{Stage<S, E>}~; \texttt{Pipeline<E, S\dots>} avec
+\texttt{on(E\&)} et \texttt{stage<I>()}~; \texttt{AnyStage<E>}, \texttt{DynPipeline<E>} avec \texttt{add} et \texttt{on}.
+Rust \texttt{firm\_pipeline}~: trait \texttt{Stage<E>}, \texttt{Chain<A, B>} et la macro \texttt{chain!},
+\texttt{DynPipeline<E>}.
+\bfield{Règles} Les étapes s'exécutent dans l'ordre~; le premier \texttt{false} arrête l'événement~; les pipelines statique et dynamique donnent les
+mêmes résultats et le même ordre d'effets~; une étape qui ne satisfait pas le concept ne compile pas.
+\bfield{Tests d'acceptation} \texttt{code/firm/pipeline/}~: ordre et court-circuit sur un événement tracé, statique contre dynamique, en
+C++20 et Rust~; le test du chapitre vérifie que l'assembleur du pipeline statique ne contient aucun appel et que le pipeline dynamique
+contient un appel indirect.
+\bfield{Pour aller plus loin} Des étapes qui renvoient un nouveau type d'événement (un message décodé en mise à jour du carnet), avec les types de la chaîne vérifiés
+par le compilateur.
+\end{build}
+
+\begin{omsources}
+\item K.~Driesen et U.~Hölzle, «~The direct cost of virtual function calls in C++~», OOPSLA 1996.
+\item Manuel GCC, «~Common function attributes~» (\texttt{cold}, \texttt{noinline}, \texttt{always\_inline}).
+\item cppreference, \texttt{consteval}~; attributs \texttt{likely} et \texttt{unlikely}.
+\item C.~Cook, «~When a microsecond is an eternity~», CppCon 2017 (modèles pour la configuration).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:1}
+D'après la \cref{fig:ll:cpp-for-latency-ii-compile-time:dispatch}, combien de fois plus cher revient la \omterm{def:ll:cpp-for-latency-ii-compile-time:dyn}{répartition dynamique} que le CRTP sur un
+seul type de message, et sur le mélange~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:2}
+À 5 millions de messages par seconde, combien de temps de traitement par seconde le pipeline dynamique ajoute-t-il par rapport au pipeline statique~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:3}
+Donner la valeur de \texttt{rescale(250, 2, 4)} et de \texttt{rescale(2500, 4, 2)}, et dire ce que fait
+\texttt{rescale(1, 2, 20)}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:4}
+Pourquoi le mélange aléatoire ralentit-il aussi le répartiteur CRTP, alors qu'il ne fait aucun appel indirect~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:5}
+Compter les instructions du \cref{lst:ll:cpp-for-latency-ii-compile-time:asm-static} qui relèvent de chaque étape. De quelle étape
+l'objet a-t-il entièrement disparu, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:6}
+Un fichier de configuration choisit au démarrage l'une de trois stratégies. Comment conserver une répartition statique~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:7}
+\emph{Programmation.} Rendre une étape du pipeline statique \texttt{[[gnu::noinline]]}, régénérer l'assembleur et mesurer. Qu'est-ce qui
+change dans le listing et dans le temps par événement~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpp-for-latency-ii-compile-time:8}
+\emph{Trouver la faille.} «~Un appel virtuel coûte 1.9 nanosecondes dans notre \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} et notre chemin en fait cinq, donc les
+supprimer fait gagner au plus dix nanosecondes.~»
+\end{exercise}
+
+\section{Problème~: le branchement indirect}
+
+\begin{problem}[{Problème du week-end --- une architecture à plug-ins sur le chemin critique}]\label{pb:ll:cpp-for-latency-ii-compile-time:1}
+Un moteur de trading a été conçu avec des plug-ins~: le décodeur, le carnet d'ordres, la stratégie et le contrôle de risque sont chargés au démarrage et appelés
+par une classe de base. Il traite quatre types de messages dans un mélange proche d'un tirage aléatoire. L'équipe mesure les variantes présentées dans ce
+chapitre (voir la \cref{fig:ll:cpp-for-latency-ii-compile-time:dispatch}).
+
+\medskip\noindent\textbf{Partie I --- La mesure.}
+\begin{enumerate}
+\item Combien coûte, par message, chacun des trois répartiteurs, sur un seul type et sur le mélange~?
+\item Quel effet rend le mélange coûteux pour les trois~?
+\item Combien coûte le pipeline à quatre étapes, en version statique et en version dynamique~?
+\item Pourquoi le coût du pipeline ne dépend-il pas du mélange~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les mécanismes.}
+\begin{enumerate}[resume]
+\item Que fait le pipeline dynamique à chaque étape, que le statique ne fait pas (voir le \cref{lst:ll:cpp-for-latency-ii-compile-time:asm-dyn})~?
+\item Combien d'instructions le pipeline statique exécute-t-il lorsque l'événement traverse toutes les étapes~?
+\item Quelles optimisations sont devenues possibles une fois les étapes inlinées~?
+\item Que changerait \texttt{final} sur les classes de plug-ins, et qu'est-ce qu'il ne changerait pas~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La refonte.}
+\begin{enumerate}[resume]
+\item Comment des plug-ins choisis au démarrage peuvent-ils encore être répartis statiquement~?
+\item Que perd-on~: qu'est-ce qui ne peut plus changer sans recompilation~?
+\item Combien de variantes de programme le choix de trois stratégies et de deux contrôles de risque produit-il~?
+\item Comment faut-il tester les variantes~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le coût par message de l'appel virtuel face à la répartition statique, prévisible ou non, et le
+coût du pipeline à quatre étapes dans les deux cas.
+\item Pourquoi le \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} d'un appel virtuel seul est-il la mauvaise mesure~?
+\item Quand la \omterm{def:ll:cpp-for-latency-ii-compile-time:dyn}{répartition dynamique} est-elle le bon choix dans un système de trading~?
+\item Qu'apporte un concept à une interface de patrons~?
+\item À quoi sert l'\omterm{def:ll:cpp-for-latency-ii-compile-time:consteval}{évaluation à la compilation} sur le chemin critique (hot path)~?
+\item Pourquoi garder la gestion des erreurs hors ligne~?
+\item Pourquoi vérifier l'assembleur plutôt que faire confiance à \texttt{always\_inline}~?
+\item En une phrase~: que doit savoir le compilateur lorsqu'il compile le chemin critique~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:1}
+Comment fonctionne un appel de fonction virtuelle, et combien coûte-t-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:2}
+Expliquez le \omterm{def:ll:cpp-for-latency-ii-compile-time:static}{curiously recurring template pattern} et dans quels cas vous l'utiliseriez.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:3}
+Quelle est la différence entre \texttt{constexpr} et \texttt{consteval}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:4}
+Pourquoi l'\omterm{def:ll:cpp-for-latency-ii-compile-time:inline}{inlining} peut-il accélérer le code de plus que le coût de l'appel supprimé~? Dans quel cas peut-il le ralentir~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:5}
+\texttt{std::variant} ou une hiérarchie de classes pour les types de messages~: lequel choisiriez-vous sur un chemin critique (hot path), et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:cpp-for-latency-ii-compile-time:6}
+Concevez un moteur de trading dont la stratégie est choisie au démarrage, mais dont le chemin critique (hot path) ne contient aucun appel indirect.
+\end{interviewq}

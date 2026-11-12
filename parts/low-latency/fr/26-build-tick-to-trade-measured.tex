@@ -1,0 +1,336 @@
+\chapter{Construction~: tick-to-trade, mesuré}\label{ch:ll:build-tick-to-trade-measured}
+
+Un paquet quitte la bourse simulée sur ses deux lignes à la fois. Quelques microsecondes plus tard, le \omterm{def:ll:the-feed-handler:handler}{feed handler} le reçoit, et une microseconde
+après, la stratégie a décidé, et un ordre part vers la plateforme en passant par la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} (risk gate) et la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}.
+Chacune de ces étapes a été construite et mesurée isolément dans ce livre~; ce chapitre les assemble sur un seul chemin, sur quatre threads
+d'une même machine, et mesure l'ensemble avec un horodatage à chaque frontière. Le résultat est le \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} du chapitre~1, où les
+suppositions sont remplacées par des mesures~: quelle étape coûte combien, à la médiane et dans la queue de distribution, et où un vrai serveur devrait
+être différent. La réponse, sur cet ordinateur portable, est sévère sur un point et rassurante sur un autre. Le code écrit dans ce livre
+prend quelques centaines de nanosecondes~; le noyau, la pile réseau et une machine partagée prennent le reste, et ce reste en est l'essentiel.
+
+\section{Assemblage du chemin}
+
+Le chemin est constitué des composants du livre, dans l'ordre (\cref{fig:ll:build-tick-to-trade-measured:path}). Un thread \emph{bourse} rejoue
+la ligne enregistrée~: la journée à petit pas de cotation du chapitre~19, 6\,000 événements dans 1\,200 paquets MoldUDP64, envoyés en UDP sur l'interface
+de bouclage (loopback) sur la ligne A et, cinq microsecondes plus tard, sur la ligne B, à vingt fois son espacement enregistré (un paquet toutes les
+\qty{100}{\micro\second}). Un thread \emph{feed} reçoit les deux lignes et exécute le \omterm{def:ll:the-feed-handler:handler}{feed handler} du chapitre~18, qui
+les arbitre et publie chaque événement sur un anneau (chapitre~12). Un thread \emph{moteur} prélève chaque événement de l'anneau et exécute
+dans \texttt{firm.ticktotrade}, son \texttt{Path}~: le moteur de stratégie du chapitre~20, avec son \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} (book builder, chapitre~19), puis, pour chaque
+ordre qu'il décide, la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} du chapitre~22 et la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres} du chapitre~21, qui écrit le message binaire de la plateforme
+(chapitre~16) et l'envoie sur une session TCP. Un thread \emph{plateforme} reçoit les trames de la session. Chaque thread est épinglé à son
+propre CPU (chapitre~4), et rien sur le chemin n'alloue après la phase de chauffe (chapitre~6)~: le harnais le compte et trouve zéro dans
+chaque exécution.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.8cm,align=center,
+  inner sep=3pt,fill=omDef!12},pt/.style={circle,fill=omThm,inner sep=1.4pt}]
+\node[box,fill=gray!12] (ex) at (0,0) {bourse\\ thread};
+\node[box] (fd) at (3.3,0) {feed handler\\ (thread feed)};
+\node[box,fill=omMeth!15] (rg) at (5.6,0) {anneau};
+\node[box,minimum width=4.2cm] (en) at (8.8,0) {thread moteur~:\\ carnet, stratégie, barrière\\ de risque, passerelle};
+\node[box,fill=gray!12] (vn) at (12.4,0) {plateforme\\ thread};
+\draw[->] (ex) -- node[above=1pt,font=\tiny]{UDP A, B} (fd);
+\draw[->] (fd) -- (rg);
+\draw[->] (rg) -- (en);
+\draw[->] (en) -- node[above]{TCP} (vn);
+\foreach \x in {0.75,1.95,4.2,6.15,11.35,11.6} {\node[pt] at (\x,-0.62) {};}
+\node[below,align=center] at (0.75,-0.7) {bourse};
+\node[below,align=center] at (1.95,-0.7) {reçu};
+\node[below,align=center] at (4.2,-0.7) {publ.};
+\node[below,align=center] at (6.15,-0.7) {prél.};
+\node[below,align=center] at (8.8,-0.7) {carnet, décision,\\ risque, encodage};
+\node[below,align=center] at (11.9,-0.7) {envoi,\\ plateforme};
+\foreach \x in {7.3,8.2,9.2,10.2} {\node[pt] at (\x,-0.62) {};}
+\draw[gray] (0.3,-0.62) -- (12.8,-0.62);
+\end{tikzpicture}
+
+\omcaption{Le chemin assemblé et ses \omterm{def:ll:build-tick-to-trade-measured:points}{points d'instrumentation}. Quatre threads sur quatre CPU d'un même ordinateur portable~; chaque ordre porte dix
+lectures du \omterm{def:ll:cpu-microarchitecture:tsc}{compteur d'horodatage} (TSC), depuis l'envoi par la bourse du paquet qui l'a provoqué jusqu'à la réception par la
+plateforme de l'ordre.}\label{fig:ll:build-tick-to-trade-measured:path}
+\end{omfigure}
+
+Le chemin est vérifié avant d'être mesuré. Le test C++ rejoue les mêmes événements hors ligne dans le même \texttt{Path} et
+obtient 1\,050 ordres (nouveaux ordres, remplacements et annulations) dont l'empreinte est figée~; le jumeau Rust, assemblé à partir du \omterm{def:ll:the-feed-handler:handler}{feed
+handler}, moteur, \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} et passerelle, produit la même empreinte~; le harnais en direct, avec ses threads, ses sockets et
+l'arbitrage entre les deux lignes, la reproduit à chaque exécution. Ce qui est mesuré est donc le chemin qui calcule les bons
+ordres.
+
+\omcode{code/firm/ticktotrade/cpp/firm_ticktotrade.hpp}{82}{91}{Le travail du thread moteur pour un événement de marché~: le moteur
+décide, puis chaque ordre traverse la barrière et la passerelle.}\label{lst:ll:build-tick-to-trade-measured:path}
+
+\section{Points d'instrumentation et horodatages des étapes}
+
+\begin{definition}[Point d'instrumentation, attribution de la latence]\label{def:ll:build-tick-to-trade-measured:points}
+Un \emph{point d'instrumentation}\index{point d'instrumentation} est un endroit d'un chemin où le temps est lu et enregistré avec
+l'identifiant du message qui le traverse. L'\emph{attribution de la latence}\index{attribution de la latence} découpe la latence de bout en bout d'un message
+en intervalles consécutifs entre points d'instrumentation, de sorte que chaque partie soit imputée à l'étape qui l'a consommée.
+\end{definition}
+
+Chaque point lit le \omterm{def:ll:cpu-microarchitecture:tsc}{compteur d'horodatage} (chapitre~5), que tous les cœurs de cette machine partagent, de sorte qu'une lecture sur le feed
+thread et une sur le thread moteur sont comparables. Les dix points de la \cref{fig:ll:build-tick-to-trade-measured:path} donnent huit
+étapes~: \emph{réception}, de l'envoi \texttt{sendto} par la bourse jusqu'à l'appel \texttt{recv} du thread feed, soit le chemin UDP du noyau sur
+l'interface de loopback~; \emph{décodage}, l'arbitrage et la normalisation par le handler jusqu'à ce que l'événement soit sur l'anneau~; \emph{anneau},
+l'attente sur l'anneau~; \emph{carnet}, \emph{stratégie}, \emph{risque} et \emph{passerelle} sur le thread moteur~; et \emph{transmission},
+de l'écriture du message à la réception par le thread plateforme, soit le chemin TCP du noyau. Les horodatages voyagent avec l'événement (dans le
+message de l'anneau) et avec l'ordre (dans un enregistrement préalloué), et les horodatages de la bourse et de la plateforme sont joints a posteriori par
+numéro de séquence et identifiant d'ordre client (\cref{lst:ll:build-tick-to-trade-measured:loop}). Deux pièges ont façonné la conception.
+La lecture de l'horloge n'est pas gratuite~: chaque point coûte environ \qty{11}{\nano\second} avec \texttt{rdtscp} (chapitre~5), donc les points
+sont peu nombreux et aucun n'est à l'intérieur d'une boucle. Et
+lorsqu'un événement provoque deux ordres, le second attend que le premier soit envoyé, quelques microsecondes que l'attribution naïve
+impute à son contrôle de risque~; les étapes sont donc attribuées au premier ordre de chaque événement, et les chiffres de bout en bout sur
+chaque ordre.
+
+\omcode{code/firm/ticktotrade/cpp/firm_ticktotrade_live.hpp}{162}{187}{Le thread moteur~: prélever un événement de l'anneau, l'horodater,
+exécuter le chemin, envoyer chaque ordre et l'horodater.}\label{lst:ll:build-tick-to-trade-measured:loop}
+
+\section{Le budget confronté à la mesure}
+
+La \Cref{fig:ll:build-tick-to-trade-measured:stages} donne les étapes sur dix exécutions, 5\,250 premiers ordres (10\,500 au total), sur cet
+ordinateur portable sans cœurs isolés, la machine étant par ailleurs inactive. Le code propre au livre est rapide~: la mise à jour du carnet prend environ
+\qty{160}{\nano\second} à la médiane, la stratégie environ 100, la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} environ 50 et la passerelle environ 30, toutes bien en dessous d'une
+microseconde au 99\up{e}~centile. L'étape de décodage, environ \qty{440}{\nano\second}, inclut l'attente des messages antérieurs
+du même paquet~: cinq événements arrivent ensemble et sortent les uns après les autres. La médiane de l'anneau, environ \qty{0.8}{\micro\second}, est la
+même file d'attente, côté moteur, derrière les ordres des événements précédents. Les étapes du noyau écrasent le reste~: la réception d'un
+paquet UDP sur l'interface de loopback prend environ \qty{1.4}{\micro\second}, l'envoi de l'ordre en TCP environ \qty{2.9}{\micro\second},
+et dans la queue, l'anneau attend des millisecondes chaque fois que le thread moteur est préempté sur son CPU (par le noyau, l'hyperviseur
+ou par toute autre tâche),
+ce qu'aucun code en espace utilisateur ne peut empêcher sur une machine qui ne l'a pas isolé (chapitre~13).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=7.2cm,xbar,xmode=log,xmin=10,xmax=5e6,log origin=infty,bar width=3.2pt,
+  ytick={0,1,2,3,4,5,6,7,8,9},yticklabels={réception,décodage,anneau,carnet,stratégie,risque,passerelle,transmission,tick-to-trade,en traitement},
+  y dir=reverse,xlabel={nanosecondes},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend pos=outer north east,legend style={font=\scriptsize,cells={anchor=west}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=p50_ns]{figdata/low-latency/26-build-tick-to-trade-measured/measured_stages.csv};
+\addlegendentry{médiane}
+\addplot[fill=omMeth!45,draw=omMeth] table[y expr=\coordindex,x=p99_ns]{figdata/low-latency/26-build-tick-to-trade-measured/measured_stages.csv};
+\addlegendentry{99\up{e}~centile}
+\addplot[fill=omThm!40,draw=omThm] table[y expr=\coordindex,x=p999_ns]{figdata/low-latency/26-build-tick-to-trade-measured/measured_stages.csv};
+\addlegendentry{99.9\up{e}~centile}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le chemin assemblé, étape par étape et de bout en bout~: médianes, 99\up{e} et 99.9\up{e}~centiles sur dix passes
+(les étapes sur le premier ordre de chaque événement, les totaux sur les 10\,500 ordres), sur un ordinateur portable (Intel Core Ultra 7 155H, WSL2) sans cœurs isolés,
+la machine étant par ailleurs au repos. Données~: \texttt{bench\_t2t.py}.}\label{fig:ll:build-tick-to-trade-measured:stages}
+\end{omfigure}
+
+De bout en bout, de l'envoi du paquet par la bourse à la réception de l'ordre qu'il a provoqué par la plateforme, la médiane vaut environ
+\qty{9}{\micro\second}~; dans le processus, de la réception du paquet au message de l'ordre, environ \qty{3.7}{\micro\second}
+(la \cref{fig:ll:build-tick-to-trade-measured:ccdf}). Les distributions ont la forme que le livre annonce depuis le chapitre~1~: un corps
+serré et une queue située trois ordres de grandeur plus loin, fixée par la machine plutôt que par le code. La \cref{tab:ll:build-tick-to-trade-measured:budget}
+vérifie le budget de trois microsecondes du chapitre~1 avec \texttt{firm.latbudget}~: la stratégie et la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} atteignent leurs cibles~;
+le \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} et le décodage les manquent (le carnet d'un tiers, le décodage à cause de la file d'attente du paquet), et la réception
+et la transmission par le noyau les manquent d'un facteur 1.6 et 3.6, comme il fallait s'y attendre~: le budget supposait une
+carte réseau à \omterm{def:ll:linux-tuning:polling}{contournement du noyau}.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10cm,height=5.8cm,xmode=log,ymode=log,xmin=1000,xmax=5e6,ymin=0.001,ymax=1.1,
+  xlabel={nanosecondes},ylabel={fraction des ordres plus lents},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},legend pos=south west,legend style={font=\scriptsize,cells={anchor=west}},
+  table/col sep=comma]
+\addplot[omThm,thick,restrict expr to domain={\coordindex}{0:60}] table[x=ns,y=ccdf]{figdata/low-latency/26-build-tick-to-trade-measured/measured_t2t_ccdf.csv};
+\addlegendentry{tick to trade (de la bourse à la plateforme)}
+\addplot[omDef,thick,restrict expr to domain={\coordindex}{61:121}] table[x=ns,y=ccdf]{figdata/low-latency/26-build-tick-to-trade-measured/measured_t2t_ccdf.csv};
+\addlegendentry{dans le processus (réception au message)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les distributions de bout en bout du chemin assemblé, en fraction des 10\,500 ordres plus lents que chaque latence
+(échelles logarithmiques), sur le même ordinateur portable. Données~: \texttt{bench\_t2t.py}.}\label{fig:ll:build-tick-to-trade-measured:ccdf}
+\end{omfigure}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrl}
+\toprule
+étape (médiane) & budget (ns) & mesuré (ns) & \\
+\midrule
+réception & 900 & 1\,400 & au-dessus \\
+décodage & 60 & 440 & au-dessus \\
+carnet & 120 & 160 & au-dessus \\
+stratégie & 200 & 100 & dans le budget \\
+risque & 50 & 47 & dans le budget \\
+transmission & 800 & 2\,900 & au-dessus \\
+de bout en bout & 3\,000 & 7\,400 & au-dessus \\
+\bottomrule
+\end{tabular}
+\caption{Budget de trois microsecondes du chapitre~1 vérifié par rapport aux étapes mesurées avec \texttt{firm.latbudget} (médianes~; le
+bout en bout composé à partir des étapes des premiers ordres). Données~: \texttt{bench\_t2t.py}.}\label{tab:ll:build-tick-to-trade-measured:budget}
+\end{table}
+
+\section{Ce qu'un serveur réglé changerait}
+
+Trois changements séparent cet ordinateur portable d'un serveur de trading, et chacun vise une partie du tableau. Une carte réseau à \omterm{def:ll:linux-tuning:polling}{contournement du noyau}
+supprime les appels système du chemin des données~: l'interface \texttt{ef\_vi} des adaptateurs d'un fabricant, par exemple, donne à l'application un
+«~accès direct~» au chemin de données de l'adaptateur, avec des opérations sur ce chemin qui «~ne nécessitent pas d'appels système~»~;
+le budget du chapitre~1 supposait \qty{0.9}{\micro\second} pour recevoir et \qty{0.8}{\micro\second} pour transmettre sur un tel chemin, carte et câble compris. Les cœurs isolés
+(chapitre~13) tiennent les autres travaux à l'écart des processeurs du chemin, ce qui constitue la queue de l'étape de l'anneau. Enfin, le chemin lui-même
+peut être raccourci~: la file d'attente du paquet derrière le décodage et l'anneau disparaît si les événements sont remis par lots ou si
+le fil du flux exécute la stratégie dans les cas simples, et les \qty{160}{\nano\second} du carnet sont l'échelle du chapitre~19 sur un
+instrument à petit tick, avec un appel de moteur par événement que le lot amortirait.
+
+Remplacer la réception et la transmission mesurées par les valeurs du budget à \omterm{def:ll:linux-tuning:polling}{contournement du noyau}, et conserver les étapes mesurées dans le processus,
+donne une médiane projetée d'environ \qty{3.2}{\micro\second}~: $0.9 + 0.8$ pour le réseau, auxquels s'ajoutent environ \qty{1.5}{\micro\second} pour
+le décodage, l'anneau, le carnet, la stratégie, le risque et la passerelle, dont l'attente dans le décodage et l'anneau représente environ les deux tiers. Cela dépasse le
+budget de trois microsecondes à cause de la file d'attente, qui est la prochaine chose à supprimer, et non à cause d'un composant que le livre a construit. La projection est
+un calcul arithmétique reposant sur une hypothèse énoncée, non une mesure~; la mesure sur le serveur cible est la seule preuve, et le harnais
+de ce chapitre sert à la réaliser.
+
+\section{Tutoriel~: faire tourner le chemin, lire le budget}\label{tut:ll:build-tick-to-trade-measured:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Vérifier le chemin assemblé, le faire tourner en direct sur l'interface de bouclage et lire ses étapes par rapport au budget.
+\textbf{État final~:} \cref{fig:ll:build-tick-to-trade-measured:stages,fig:ll:build-tick-to-trade-measured:ccdf}, le tableau
+du budget, et des tests verts en C++ et en Rust.
+\begin{tutsteps}
+\item \textbf{La ligne.} \texttt{make\_t2t\_fixtures.py} encode la journée à petit tick comme flux du simulateur~; le test C++ vérifie que le
+constructeur d'événements (\omterm{def:ll:the-feed-handler:handler}{feed handler}) la retransforme en les mêmes 6\,000 événements.
+\item \textbf{Hors ligne.} Les tests C++ et Rust rejouent les événements à travers le chemin et obtiennent les ordres validés.
+\item \textbf{En direct.} \texttt{firm\_ticktotrade\_live\_test.cpp} fait tourner une fois les quatre fils d'exécution et vérifie les ordres, l'ordre des
+horodatages et l'absence d'allocation~; \texttt{python bench\_t2t.py} exécute dix passes épinglées et écrit les étapes, les
+distributions et le rapport de budget.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remettre les événements d'un paquet au moteur en un seul lot et mesurer à nouveau les étapes de décodage et d'anneau~;
+épingler deux fils sur les deux hyperthreads d'un même cœur et observer les étapes qui le partagent.
+\end{tutorial}
+
+\section{Construction~: tick-to-trade}\label{bld:ll:build-tick-to-trade-measured:ticktotrade}
+
+\begin{build}
+\bfield{Rôle} Les composants du livre assemblés en un chemin de trading unique avec son harnais de mesure~: la preuve qu'ils calculent
+ensemble les bons ordres, et la mesure de ce que coûte chacun.
+\bfield{Interface} C++20 \texttt{firm::t2t}\,~: \texttt{Path(tick)} avec \texttt{on\_event(event, now, stamp, send)}, \texttt{out},
+\texttt{order\_hash}, \texttt{read\_events}, \texttt{Stamp}\,~; \texttt{run\_live(Config)} renvoyant \texttt{Result} avec les
+horodatages des ordres, les ordres, les compteurs et les allocations après la phase d'échauffement. Rust \texttt{firm\_ticktotrade}\,~: \texttt{Path},
+\texttt{events\_from\_line}, \texttt{order\_hash}. Python\,~: \texttt{make\_t2t\_fixtures.py}~; le \texttt{ll\_t2t.py} du chapitre
+calcule les étapes et vérifie le budget avec \texttt{firm.latbudget}.
+\bfield{Règles} Le chemin en direct et le rejeu hors ligne produisent les mêmes ordres~; chaque horodatage est pris hors de toute boucle, dans l'ordre du chemin~;
+aucune allocation après la phase d'échauffement~; les étapes sont attribuées au premier ordre de chaque événement.
+\bfield{Tests d'acceptation} \texttt{code/firm/ticktotrade/}\,~: la ligne enregistrée décodée en événements du \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet}~; les ordres
+hors ligne égaux à l'empreinte validée en C++ et en Rust, sans allocation lors d'une seconde passe~; une exécution en direct avec les mêmes ordres,
+les horodatages de chaque ordre dans l'ordre et reçus par la plateforme, et aucune allocation après la phase d'échauffement.
+\bfield{Pour aller plus loin} Le serveur de simulation en direct (livre~10) comme plateforme, avec les accusés de réception passant par la machine à états de la passerelle~;
+une remise par lots depuis le fil du flux~; des \omterm{def:ll:measuring-latency:hwts}{horodatages matériels} issus d'une carte réseau~; le harnais sur un serveur réglé.
+\end{build}
+
+\begin{omsources}
+\item Xilinx (AMD), \emph{ef\_vi User Guide}, SF-114063-CD, issue 10, 2019.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:build-tick-to-trade-measured:1}
+En utilisant les médianes de la \cref{fig:ll:build-tick-to-trade-measured:stages}, quelle part du temps passé dans le processus est
+consommée par les composants propres au livre (livre, stratégie, risque, passerelle)~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:build-tick-to-trade-measured:2}
+Pourquoi l'horloge lue à chaque \omterm{def:ll:build-tick-to-trade-measured:points}{point d'instrumentation} doit-elle être le même compteur sur chaque cœur, et que se passerait-il avec
+une horloge par fil d'exécution~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:build-tick-to-trade-measured:3}
+Cinq événements arrivent dans un même paquet et chacun prend environ \qty{100}{\nano\second} pour être décodé et publié. Quelle est, en moyenne, la durée de
+l'étape de décodage vécue par les cinq événements, et pourquoi l'étape d'anneau montre-t-elle le même effet~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:build-tick-to-trade-measured:4}
+Un événement déclenche deux ordres, chacun envoyé en environ \qty{4}{\micro\second}. Si les étapes étaient attribuées à chaque ordre, quelle étape
+absorberait l'attente du second, et de combien sa médiane se déplacerait-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:build-tick-to-trade-measured:5}
+Recalculer la projection de la dernière section si l'attente dans le décodage et dans l'anneau était entièrement supprimée. Le chemin projeté
+respecte-t-il le budget de trois microsecondes~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:build-tick-to-trade-measured:6}
+L'étape de réception inclut le \texttt{sendto} du fil d'échange. Pourquoi ce harnais ne peut-il pas séparer l'appel système de l'émetteur de celui du récepteur, et que changerait
+un \omterm{def:ll:measuring-latency:hwts}{horodatage matériel} sur le fil~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:build-tick-to-trade-measured:7}
+\emph{Programmation.} Transmettre les événements d'un paquet au moteur sous la forme d'un seul message d'anneau et exécuter le moteur sur le lot. Vérifier que les ordres sont inchangés, puis
+mesurer à nouveau les étapes de décodage et d'anneau.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:build-tick-to-trade-measured:8}
+\emph{Trouver la faille.} «~Notre tick-to-trade est de \qty{800}{\nano\second}~: nous chronométrons depuis le moment où notre code reçoit le paquet jusqu'au
+moment où nous appelons \texttt{send}, et nous publions la moyenne.~»
+\end{exercise}
+
+\section{Problème~: Le budget, démontré}
+
+\begin{problem}[{Problème du week-end --- le chemin du livre, étape par étape}]\label{pb:ll:build-tick-to-trade-measured:1}
+Utiliser les \cref{fig:ll:build-tick-to-trade-measured:stages,tab:ll:build-tick-to-trade-measured:budget} (\texttt{measured\_stages.csv},
+\texttt{measured\_budget.csv}).
+
+\medskip\noindent\textbf{Partie I --- La mesure.}
+\begin{enumerate}
+\item Énumérer les huit étapes et les \omterm{def:ll:build-tick-to-trade-measured:points}{points d'instrumentation} qui bornent chacune d'elles.
+\item Donner les médianes, les 99\up{e} et 99.9\up{e}~centiles de la \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade} et de la latence dans le processus.
+\item Quelle étape a la plus grande médiane, et laquelle le plus grand 99.9\up{e}~centile~?
+\item Pourquoi le 99.9\up{e}~centile de l'étape d'anneau est-il si éloigné de sa médiane sur cet ordinateur portable~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La vérification.}
+\begin{enumerate}[resume]
+\item Quelles étapes respectent le budget du chapitre~1 à la médiane, et lesquelles le dépassent, et de quel facteur~?
+\item Pourquoi le chiffre de bout en bout du budget est-il composé à partir des étapes des premiers ordres plutôt que tiré de la
+distribution du tick-to-trade~?
+\item Pourquoi les centiles des étapes ne s'additionnent-ils pas pour donner le centile du total~?
+\item Qu'établit la vérification que les tests fonctionnels n'établissent pas~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La projection.}
+\begin{enumerate}[resume]
+\item Remplacer les étapes de réception et d'émission par les chiffres de \omterm{def:ll:linux-tuning:polling}{contournement du noyau} du budget, puis calculer la médiane projetée.
+\item Quelle part de l'écart restant relève de l'attente, et quelle part du calcul~?
+\item Que changeraient des cœurs isolés sur la figure, et que ne changeraient-ils pas~?
+\item Pourquoi la projection n'est-elle pas une mesure, et que faudrait-il pour qu'elle le devienne~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la médiane mesurée, les 99\up{e} et 99.9\up{e}~centiles par étape et de bout en bout sur cet ordinateur portable,
+et la médiane projetée pour un serveur réglé.
+\item Quelle part de la médiane dans le processus est le code écrit dans ce livre, et quelle part est de l'attente~?
+\item La technique de quel chapitre répond à chacune des trois plus grandes contributions~?
+\item Pourquoi les chemins hors ligne et en direct doivent-ils produire les mêmes ordres avant que toute mesure de temps ne soit crédible~?
+\item Pourquoi l'absence d'allocation est-elle vérifiée à chaque exécution~?
+\item Que faudrait-il mesurer en premier sur un serveur de production~?
+\item Quel résultat du livre inspirerait le plus de méfiance si ce harnais n'avait pas été construit~?
+\item En une phrase~: que faut-il pour connaître une latence, plutôt que pour y croire~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:build-tick-to-trade-measured:1}
+Qu'est-ce que la \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade}, et où commencez-vous et arrêtez-vous exactement l'horloge~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:build-tick-to-trade-measured:2}
+Comment instrumenteriez-vous un chemin de trading pour trouver l'étape lente, sans le ralentir~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:build-tick-to-trade-measured:3}
+Votre tick-to-trade médian est correct, mais votre 99.9\up{e}~centile est mille fois plus grand. Où regardez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:build-tick-to-trade-measured:4}
+Décrivez le parcours d'un paquet depuis la carte réseau jusqu'à votre stratégie et en sens inverse, avec une latence pour chaque étape sur un
+serveur réglé.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:ll:build-tick-to-trade-measured:5}
+L'équipe stratégie demande un \omterm{def:ll:where-latency-comes-from:budget}{budget de latence}. Comment l'écrivez-vous, et comment prouvez-vous qu'il est respecté~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:build-tick-to-trade-measured:6}
+Concevez le harnais de mesure d'un système de trading en production~: que horodate-t-on, où, avec quelle horloge, comment les horodatages
+sont-ils rapprochés, et comment les résultats parviennent-ils aux personnes qui en ont besoin~?
+\end{interviewq}

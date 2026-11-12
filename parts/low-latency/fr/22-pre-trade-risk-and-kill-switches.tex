@@ -1,0 +1,393 @@
+\chapter{Contrôle de risque pré-négociation et kill switches}\label{ch:ll:pre-trade-risk-and-kill-switches}
+
+Le 1\up{er} août 2012, l'un des huit serveurs du routeur d'ordres d'un broker-dealer, Knight Capital Americas, portait encore un vieux
+morceau de code que le nouveau déploiement aurait dû remplacer. Pour 212 ordres entrants, il envoyait des ordres enfants au marché «~sans
+tenir compte du nombre d'exécutions d'actions~» déjà reçues, selon les termes de l'ordonnance du régulateur~: 4~millions d'exécutions sur 154
+titres, plus de 397 millions d'actions, en environ 45 minutes, et une perte de 460~millions de dollars (le livre~7, chapitre~21, raconte l'histoire
+du déploiement, et le livre~11, chapitre~27, la politique de risque qui en a découlé). Ce chapitre lit la même ordonnance comme
+le ferait un ingénieur~: sous forme d'une liste d'exigences. Chaque paragraphe qui dit ce qui manquait à la société (un contrôle qui comparait les ordres
+sortant du routeur avec ceux qui y étaient entrés, une limite de position qui comptait les ordres en cours, un seuil à l'échelle de la société qui
+arrêtait automatiquement les ordres, un moyen de suspendre le routeur face à ses propres dysfonctionnements) est un contrôle à implémenter, sur le chemin de chaque
+ordre, en quelques dizaines de nanosecondes. Le chapitre construit cette \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque}, puis rejoue à travers elle un emballement de la forme de 2012, avec
+un contrôle à la fois, et constate que la plupart des contrôles auxquels une société penserait d'abord n'auraient pas suffi à l'arrêter.
+
+\section{Le document d'exigences}
+
+\begin{definition}[Barrière de risque, conception à défaillance fermée]\label{def:ll:pre-trade-risk-and-kill-switches:gate}
+Une \emph{barrière de risque}\index{barrière de risque} (risk gate) est le composant placé sur le chemin de chaque ordre, entre le code qui décide de l'envoyer et
+la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}, qui le confronte aux limites de la société et le refuse si l'une d'elles est dépassée~; rien n'atteint la plateforme de négociation
+sans l'avoir franchi. Une \emph{conception à défaillance fermée}\index{conception à défaillance fermée} (fail-closed design) est une conception dont les défaillances arrêtent l'activité qu'elle protège~:
+une barrière de risque qui a perdu ses limites, ses prix de référence ou sa connaissance de la position de la société refuse les ordres plutôt
+que de les laisser passer.
+\end{definition}
+
+L'ordonnance du régulateur (Release 34-70694) est précise sur ce qui manquait. La société disposait de contrôles avant que les ordres n'atteignent le
+routeur, mais aucun après lui~: rien ne comparait «~les ordres qui sortaient de SMARS avec ceux qui y étaient entrés~», et il n'existait aucune procédure
+«~pour arrêter les opérations de SMARS en réponse à sa propre activité aberrante~». Elle disposait d'un cap de prix, à 9.5~\% du meilleur prix lorsque l'ordre parent
+est arrivé. Ce cap n'aidait pas tant que les cours bougeaient moins que cela et ne valait pas pour les ordres destinés à l'enchère
+d'ouverture. Elle avait des limites de position pour certains groupes, mais «~ces limites ne tenaient pas compte de l'exposition de la société découlant
+des ordres en cours~». Elle n'avait aucun seuil de capital à l'échelle de la société lié à des contrôles automatisés, et son suivi de position «~reposait entièrement sur
+une surveillance humaine~». La règle à laquelle elle était soumise, la Market Access Rule, exige des contrôles qui empêchent l'entrée des ordres
+qui dépassent des «~seuils de crédit ou de capital préétablis~» et des ordres erronés qui «~dépassent des paramètres de prix ou de taille
+appropriés, au niveau de chaque ordre ou sur une courte période, ou qui indiquent des ordres en double~». La traduction technique
+est une liste~: un tunnel de prix (price collar), des limites de taille et de notionnel par ordre, une limite de position qui compte les \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol}, un
+seuil de capital à l'échelle de la société, une limite de débit, un contrôle des doublons et un kill switch que la barrière peut actionner elle-même. Le contrôle
+de risque pré-négociation et le tunnel de prix sont définis dans le livre~11 (chapitre~27), qui en fixe la politique~; ce chapitre porte sur
+la mise en œuvre rapide et correcte de ces contrôles.
+
+\begin{dated}{2026-09}{Ce que les règles exigent des contrôles pré-négociation}\label{dat:ll:pre-trade-risk-and-kill-switches:rules}
+Aux États-Unis, la Rule 15c3-5 du Securities Exchange Act (consulté en septembre 2026) impose à un courtier ou à un dealer ayant
+accès au marché de disposer de contrôles qui empêchent l'entrée d'ordres dépassant des seuils de crédit ou de capital préétablis globalement,
+pour chaque client et pour elle-même, et d'ordres erronés dépassant des paramètres de prix ou de taille, au niveau de chaque ordre ou sur une courte
+période, ou indiquant des ordres en double. Dans l'Union européenne, le Commission Delegated Regulation (EU) 2017/589 exige qu'une
+entreprise d'investissement de pouvoir annuler immédiatement tout ou partie de ses ordres non exécutés sur toutes les plateformes ou certaines d'entre elles (article 12)~; de disposer de
+tunnels de prix, valeurs maximales par ordre, volumes maximaux par ordre et limites maximales de messages (article 15), et des
+limiteurs d'exécution automatisés répétés~; et de générer des alertes en temps réel dans un délai de cinq secondes après l'événement concerné.
+\end{dated}
+
+La barrière s'insère dans le processus de trading, sur le thread du moteur de stratégie ou juste après lui, avant la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}
+(la \cref{fig:ll:pre-trade-risk-and-kill-switches:where})~: l'ordre du moteur ne devient le message de la passerelle que si la barrière
+le valide. Tout le reste de la figure l'alimente. Les limites proviennent d'un service de risque, sous forme d'instantanés complets, avec un \omterm{def:ll:protocols-i-fix:session}{heartbeat}~; les
+prix de référence viennent du \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} (book builder)~; les exécutions et les annulations remontent de la passerelle, de sorte que la vue qu'a la barrière
+de la position et des \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol} est celle de la passerelle~; et le kill switch peut être actionné par la barrière elle-même, par une personne
+du desk de risque, ou par la plateforme de négociation.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.75cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (eng) at (0,0) {moteur\\ de stratégie};
+\node[box,fill=omThm!18,minimum width=2.2cm,minimum height=1.1cm] (gate) at (3.3,0) {\textbf{barrière de risque}\\ 12 contrôles,\\ un seul masque};
+\node[box] (gw) at (6.6,0) {passerelle\\ d'ordres};
+\node[box,fill=gray!10] (venue) at (9.4,0) {plateforme};
+\node[box,fill=omMeth!15] (lim) at (1.6,2.0) {service de risque~:\\ instantanés de limites,\\ heartbeats};
+\node[box,fill=omMeth!15] (bb) at (5.0,2.0) {constructeur de carnet~:\\ prix de référence};
+\node[box,fill=omMeth!15] (desk) at (3.3,-2.1) {desk de risque~:\\ kill switch};
+\draw[->,thick] ([yshift=2mm]eng.east) -- node[above]{ordre} ([yshift=2mm]gate.west);
+\draw[->,thick] (gate) -- node[above]{accepté} (gw);
+\draw[->,thick] (gw) -- (venue);
+\node[box,fill=gray!10] (mon) at (9.4,2.0) {moniteur\\ post-négociation};
+\draw[->] (lim) -- (gate);
+\draw[->] (bb) -- (gate);
+\draw[->] (desk) -- (gate);
+\draw[->,dashed] (gw.south) -- ++(0,-0.7) -| node[pos=0.25,below]{exécutions, annulations} ([xshift=8mm]gate.south);
+\draw[->,dashed] (venue) -- node[right]{drop copy} (mon);
+\draw[->,omThm] ([yshift=-2.5mm]gate.west) -- node[below,text=omThm]{refusé} ([yshift=-2.5mm]eng.east);
+\end{tikzpicture}
+
+\omcaption{Emplacement de la barrière~: sur le chemin de chaque ordre, avant la passerelle, alimentée par des limites assorties de \omterm{def:ll:protocols-i-fix:session}{heartbeats}, des prix de référence
+et par la propre vue de la passerelle sur les exécutions et les \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol}. Un moniteur post-négociation branché sur le \omterm{def:ll:order-gateway-and-order-management:dropcopy}{drop copy} (chapitre~21) est une
+seconde ligne, et non un substitut~: il voit ce qui s'est déjà produit.}\label{fig:ll:pre-trade-risk-and-kill-switches:where}
+\end{omfigure}
+
+\section{Contrôles en nanosecondes}
+
+\begin{definition}[Exposition dans le pire cas]\label{def:ll:pre-trade-risk-and-kill-switches:worst}
+L'\emph{exposition dans le pire cas}\index{exposition dans le pire cas} (worst-case exposure) d'une société sur un instrument est sa position, plus tout ce que ses
+ordres ouverts pourraient encore ajouter s'ils étaient tous exécutés~: du côté acheteur, la position plus la quantité restante de chaque ordre d'achat ouvert,
+y compris ceux dont l'accusé de réception ou l'annulation n'est pas parvenu~; du côté vendeur, la même chose avec les ordres de vente. Une limite est
+respectée dans le pire cas si un nouvel ordre s'inscrit sous elle, par-dessus cette exposition.
+\end{definition}
+
+Une \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} est évaluée sur chaque ordre~: elle doit donc coûter peu, et coûter autant qu'elle accepte ou qu'elle refuse~; une barrière qui est
+rapide sur le chemin courant et lente sur le chemin rare est la plus lente précisément lorsqu'un emballement envoie des ordres. La barrière de la construction est
+organisée pour cela. Les limites sont tenues dans des tables denses indexées par instrument (le code locate de la plateforme) et par stratégie, et non dans des
+tables associatives indexées par nom. Tout ce qui peut être calculé avant l'arrivée de l'ordre l'est~: le tunnel de prix est conservé sous forme de deux prix, recalculé lorsque le
+prix de référence ou les limites changent, de sorte que le contrôle du tunnel se réduit à une seule comparaison~; les expositions sont des sommes cumulées, mises à jour par
+les comptes rendus comme au chapitre~21, de sorte que le contrôle de position se réduit à une addition et une comparaison. Et chaque contrôle est calculé, sans
+branchement, dans un bit d'un masque (le \cref{lst:ll:pre-trade-risk-and-kill-switches:check})~; l'ordre passe si le masque vaut zéro,
+et un refus signale le bit à 1 le plus bas, tandis que l'enregistrement d'audit conserve le masque entier, car la seconde raison compte lorsque
+la première est corrigée.
+
+\omcode{code/firm/riskgate/cpp/firm_riskgate.hpp}{124}{140}{Douze contrôles, un masque~: chaque condition positionne un bit sans
+branchement, et un refus signale le premier.}\label{lst:ll:pre-trade-risk-and-kill-switches:check}
+
+La \Cref{fig:ll:pre-trade-risk-and-kill-switches:cost} en donne la mesure. Avec tous les ordres acceptés et le contrôle des doublons désactivé, un contrôle
+coûte environ \qty{11}{\nano\second} en médiane~; le contrôle des doublons, qui compare l'ordre aux seize plus récents de la stratégie,
+ajoute environ \qty{10}{\nano\second}. La première version de ce contrôle comparait cinq champs par ordre mémorisé
+et coûtait plus que tous les autres contrôles réunis~; l'empaquetage de la quantité et du prix dans un mot, et de l'instrument et du sens dans un autre
+(les quantités et les prix du fil sont des champs de 32 bits, donc l'empaquetage est exact) l'a ramené à ce niveau. Sur le flux du jeu de test, où toutes les sortes de
+refus se produisent et où chaque contrôle suit l'analyse de sa ligne d'entrée, il coûte environ \qty{26}{\nano\second} à la médiane,
+soit le même pour les ordres acceptés et pour les ordres refusés~: le masque ne rend les refus ni moins chers ni plus coûteux.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=14pt,ymin=0,ymax=45,xmin=-0.6,xmax=4.6,
+  xtick={0,1,2,3,4},xticklabels={{jeu de test~:\\ tous},{jeu de test~:\\ acceptés},{jeu de test~:\\ refusés},{tous\\ acceptés},{tous acceptés~:\\ doublons\\ activés}},
+  xticklabel style={align=center,font=\footnotesize},ylabel={ns par contrôle (médiane)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x expr=\coordindex/2,y=ns,
+  restrict expr to domain={mod(\coordindex,2)}{0:0}]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/measured_check.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le coût d'un passage par les douze contrôles de la barrière, médiane des appels mesurés au TSC~: sur les 4\,874 ordres du jeu de test
+(toutes les sortes de refus, tables froides), réparti selon le résultat~; et sur un flux où tous les ordres passent, avec le contrôle des doublons désactivé
+puis activé. Mesures faites sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2. Données~:
+\texttt{bench\_risk.py}.}\label{fig:ll:pre-trade-risk-and-kill-switches:cost}
+\end{omfigure}
+
+Des dizaines de nanosecondes sont peu de chose à côté du trajet d'un ordre à travers le noyau et le réseau (chapitre~1), et rien ne justifie
+de les réduire en contrôlant moins. La tentation va dans l'autre sens~: sortir les contrôles du processus de trading, vers un processus de risque
+distinct qui voit les ordres sur un anneau et répond. Cela coûte un aller-retour entre cœurs, environ \qty{200}{\nano\second} par les
+anneaux du chapitre~12, soit huit fois le contrôle lui-même, et, plus grave, cela crée une seconde défaillance à gérer~: si le processus de risque cesse de répondre, le processus de trading doit
+soit attendre, soit envoyer sans contrôle. Une barrière dans le processus de trading, avec des limites qu'elle peut vérifier seule, ne tombe en panne que d'une seule façon.
+
+\section{Limites en hiérarchie, mises à jour en direct}
+
+Les limites se fixent à plusieurs niveaux~: la firme dispose d'un seuil de capital, chaque desk d'une part de ce seuil, chaque stratégie d'un débit, d'un nombre
+d'ordres ouverts et de sa propre part, chaque instrument d'un collar, d'une taille maximale et d'une limite de position (la hiérarchie de risque du livre~6,
+chapitre~29, et la politique du livre~11, chapitre~27). Un ordre est contrôlé à chaque niveau auquel il appartient, et la barrière tient à jour une
+exposition courante par niveau. Les limites changent au cours de la journée, lorsqu'un trader en demande davantage ou que le desk de risque en retire,
+et la barrière applique les changements de la même façon que le moteur de stratégie applique les paramètres (chapitre~20)~: par instantanés complets et versionnés,
+entre deux ordres, jamais au milieu d'un contrôle, afin qu'aucun ordre ne soit contrôlé en partie selon un ancien instantané et en partie
+selon un nouveau.
+
+La barrière se ferme en cas de défaillance. Un instantané porte un âge maximal~: le service de risque envoie des \omterm{def:ll:protocols-i-fix:session}{heartbeats}, et si le dernier
+instantané ou \omterm{def:ll:protocols-i-fix:session}{heartbeat} est plus vieux que cet âge, chaque ordre est refusé comme périmé. Le jeu de test de la construction comprend un service de risque
+qui se tait pendant trois secondes avec un âge maximal de deux~: dès que son dernier \omterm{def:ll:protocols-i-fix:session}{heartbeat} a deux secondes, et jusqu'à l'arrivée du suivant,
+la barrière refuse chaque ordre, soit 50 ordres. Il en va de même pour les prix de référence qui servent au collar~: un instrument dont la référence est
+plus vieille que son âge maximal ne peut pas être négocié, car un collar autour d'un prix périmé n'est pas un collar. Se fermer en cas de défaillance a un coût, puisqu'une stratégie
+s'arrête lorsqu'un service de surveillance tombe en panne, et la firme doit décider de quels services dépend la négociation. La règle de la construction est que
+tout ce dont un contrôle a besoin est un tel service.
+
+\section{Kill switches~: bloquer, annuler, aplatir}
+
+\begin{definition}[Annulation de masse]\label{def:ll:pre-trade-risk-and-kill-switches:mass}
+Une \emph{annulation de masse}\index{annulation de masse} (mass cancel) est une requête qui annule beaucoup d'ordres à la fois, tous les ordres ouverts d'une session,
+d'un instrument ou d'un sens, soit comme un seul message que la plateforme offre (le message \texttt{M} du simulateur), soit comme une annulation pour chaque
+ordre ouvert, envoyées ensemble~; les ordres restent en vol, et peuvent encore être exécutés, jusqu'à ce que chaque annulation soit confirmée.
+\end{definition}
+
+Un kill switch arrête un nœud de la hiérarchie (une stratégie, un desk, la firme) et peut faire trois choses, par ordre croissant de gravité.
+\emph{Bloquer} refuse chaque nouvel ordre sous le nœud~: rien de plus ne sort, et rien de ce qui est déjà sorti n'est touché.
+\emph{Annuler} envoie en plus une \omterm{def:ll:pre-trade-risk-and-kill-switches:mass}{annulation de masse} pour les ordres ouverts du nœud~; tant que chaque annulation n'est pas confirmée, les ordres comptent dans
+l'exposition, et ceux qui sont exécutés dans l'intervalle sont des situations de course du type de celles du chapitre~21. \emph{Aplatir} envoie en plus des ordres qui
+clôturent les positions, au prix de référence, que le collar admet~; c'est le plus dangereux des trois, car il négocie
+dans un marché que l'emballement a pu déplacer, et la construction renvoie ces ordres à une personne pour confirmation au lieu de les envoyer.
+Qui actionne le kill switch relève de la politique (livre~11)~: la barrière le déclenche lors d'une violation d'une limite stricte, le desk de risque peut
+le déclencher à la main, et beaucoup de plateformes en proposent un propre. Le réarmement relève toujours d'une décision humaine.
+
+\omcode{code/firm/riskgate/firm_riskgate.py}{198}{210}{Le kill switch de la référence Python~: bloquer, annuler (une annulation de masse
+des ordres ouverts du nœud), aplatir (les ordres de clôture, renvoyés pour confirmation).}\label{lst:ll:pre-trade-risk-and-kill-switches:kill}
+
+\section{Où se placent les contrôles}
+
+Les contrôles peuvent se placer à quatre endroits, et une firme en utilise plusieurs. Dans le processus de trading, comme ici~: l'endroit le moins coûteux et le seul
+qui voie chaque ordre avant qu'il ne parte, avec la vue propre de la firme sur les \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol}. Dans un processus de risque distinct ou un appareil
+placé sur le trajet~: indépendant du code de trading, au prix d'un saut supplémentaire, et la seule protection contre un bogue dans
+le processus de trading lui-même. Chez le courtier, lorsque la firme atteint la plateforme par l'accès sponsorisé d'un courtier
+(livre~1, chapitre~4)~: le courtier répond, au titre de la Market Access Rule, des ordres qu'il laisse passer, quels que soient les
+contrôles de la firme. Et à la plateforme, dont les collars, les limites et les kill switches protègent le marché plutôt que la firme. Le routeur de 2012
+avait des contrôles en amont et une surveillance en aval, et rien sur le trajet de sa propre sortie. Un test utile de toute architecture consiste à
+demander, pour chaque composant qui génère des ordres, quel contrôle voit sa sortie avant que la plateforme ne la voie.
+
+\section{Tutoriel~: une course, un contrôle à la fois}\label{tut:ll:pre-trade-risk-and-kill-switches:tut}
+
+\texttt{firm\_riskgate\_runaway.py} reconstruit la forme de 2012 face au moteur d'appariement du livre~10. La course envoie des ordres enfants d'achat
+de 100 actions par rafales de quinze, espacés d'une microseconde, toutes les \qty{10}{\milli\second}~: 1\,500 par seconde en moyenne, soit le rythme de
+4 millions d'exécutions en 45 minutes, d'environ 99 actions chacune. Elle les cote cinq ticks au-dessus de la dernière transaction et ne regarde jamais
+ses exécutions. Un fournisseur de liquidité tient une échelle d'ordres de vente et la remonte d'un tick toutes les dix exécutions, de sorte que la course fait monter
+le prix à mesure qu'elle achète. Le \Cref{tab:ll:pre-trade-risk-and-kill-switches:runaway} et
+la \cref{fig:ll:pre-trade-risk-and-kill-switches:runaway} en donnent cinq secondes, chaque contrôle étant activé à tour de rôle.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{5.6cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}@{}}
+\toprule
+contrôle activé & ordres envoyés & actions achetées & premier refus & reporté sur 45 min \\
+\midrule
+aucun & 7\,500 & 750\,000 & --- & 405 millions \\
+collar, 5~\% autour de la dernière transaction & 7\,500 & 750\,000 & --- & 405 millions \\
+taille et notionnel par ordre & 7\,500 & 750\,000 & --- & 405 millions \\
+limitation, 500 ordres par seconde & 2\,545 & 254\,500 & \qty{40}{\milli\second} & 135 millions \\
+doublons dans \qty{100}{\milli\second} & 55 & 5\,500 & première répétition & 3.0~millions \\
+position 20\,000, exécutions seulement & 210 & 21\,000 & \qty{140}{\milli\second} & 21\,000 \\
+position 20\,000, en vol & 200 & 20\,000 & \qty{130}{\milli\second} & 20\,000 \\
+seuil de capital, 2.5~millions de dollars & 249 & 24\,900 & \qty{160}{\milli\second} & 24\,900 \\
+\bottomrule
+\end{tabular}
+\caption{Une course de la forme de 2012, cinq secondes face au moteur d'appariement, avec un contrôle à la fois. «~Reporté sur
+45 minutes~» prolonge le rythme de la dernière seconde lorsque la course envoie encore, et conserve la position lorsqu'elle a été
+arrêtée. Données~: \texttt{fig\_runaway.py} (déterministe).}\label{tab:ll:pre-trade-risk-and-kill-switches:runaway}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ymode=log,xmin=0,xmax=5000,ymin=50,ymax=2e6,
+  xlabel={temps depuis le début de la course (ms)},ylabel={position (actions)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=outer north east,legend style={font=\scriptsize,cells={anchor=west}},table/col sep=comma]
+\addplot[omThm,thick] table[x=t_ms,y=none]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{aucun (ou collar, taille)}
+\addplot[omMeth,thick] table[x=t_ms,y=throttle]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{limitation}
+\addplot[gray,thick,dashed] table[x=t_ms,y=duplicates]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{doublons}
+\addplot[omDef,thick] table[x=t_ms,y=position_in_flight]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{position, en vol}
+\addplot[black,thick,dotted] table[x=t_ms,y=capital_threshold]{figdata/low-latency/22-pre-trade-risk-and-kill-switches/runaway_trace.csv};
+\addlegendentry{seuil de capital}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La position du fuyard, toutes les \qty{50}{\milli\second}, avec un seul contrôle à la fois. Les contrôles portant sur chaque ordre isolément
+ne se déclenchent jamais~; un débit limité ralentit le fuyard et le contrôle des doublons le freine presque entièrement, tandis qu'une limite de position qui compte les \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol},
+ou un seuil de capital, l'arrête en moins de 250 ordres. Données~: \texttt{fig\_runaway.py}.}\label{fig:ll:pre-trade-risk-and-kill-switches:runaway}
+\end{omfigure}
+
+Le tableau constitue l'argument du chapitre. Les contrôles qui regardent chaque ordre seul (collar, taille, notionnel) ne se déclenchent jamais~: chaque ordre enfant
+est petit et fixé près d'un marché que le fuyard fait lui-même évoluer, si bien qu'un collar autour de la dernière transaction se déplace avec lui
+(le cours a monté de 7.5~\% en cinq secondes, davantage que le collar, et le collar ne l'a jamais remarqué). Un débit limité ralentit le fuyard jusqu'à
+son rythme et ne l'arrête pas~: 135 millions d'actions en 45 minutes restent une catastrophe. Le contrôle des doublons freine presque ce
+fuyard, parce que ses ordres enfants se répètent, mais raterait celui qui varierait sa quantité. Ce qui l'arrête est une limite sur ce que la
+firme détient, comptée dans le pire cas~: la limite de position à 20\,000 actions après 200 ordres, le seuil de capital à
+24\,900. Si l'on ne compte que les exécutions, le dépassement porte sur les \omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol}~: ici une rafale de dix ordres, soit 1\,000 actions~; avec davantage d'\omterm{def:ll:order-gateway-and-order-management:inflight}{ordres en vol},
+ou un chemin de rapport plus lent, le dépassement est plus grand. Le kill switch change ce qui se passe ensuite~: sans lui, le fuyard
+continue d'envoyer et la barrière continue de refuser, soit 7\,300 refus en cinq secondes~; avec lui, la stratégie est bloquée à la première
+violation et ses ordres ouverts sont annulés.
+
+\section{Construction~: la barrière de risque}\label{bld:ll:pre-trade-risk-and-kill-switches:riskgate}
+
+\begin{build}
+\bfield{Rôle} Le contrôle sur le chemin de chaque ordre, entre le moteur de stratégie (chapitre~20) et la \omterm{def:ll:order-gateway-and-order-management:gateway}{passerelle d'ordres}
+(chapitre~21)~; la politique qu'il applique est celle du livre~11 (\texttt{firm.riskctl}, chapitre~27), et ses enregistrements d'audit vont au
+journal binaire (chapitre~23).
+\bfield{Interface} Référence Python \texttt{firm\_riskgate}~: \texttt{Limits.from\_dict}, \texttt{from\_riskctl},
+\texttt{Gate(limits, t)} avec \texttt{check}, \texttt{set\_limits}, \texttt{heartbeat}, \texttt{set\_reference},
+\texttt{on\_fill}, \texttt{on\_done}, \texttt{kill}, \texttt{unkill}, \texttt{audit}~; \texttt{replay}, \texttt{decisions}~;
+\texttt{firm\_riskgate\_runaway.run} contre le moteur du livre~10. C++20 \texttt{firm::risk}~: \texttt{parse\_limits},
+\texttt{Gate} avec les mêmes opérations et \texttt{Decision\{code, mask\}}. Rust \texttt{firm\_riskgate}~: \texttt{Gate},
+\texttt{parse\_limits}, \texttt{replay}.
+\bfield{Règles} Chaque contrôle est calculé dans un masque, sans branchement sur le résultat~; les limites sont des instantanés complets entre deux ordres~; les limites
+ou les prix de référence périmés entraînent un refus (à défaillance fermée)~; l'exposition compte chaque \omterm{def:ll:order-gateway-and-order-management:inflight}{ordre en vol}~; aucune allocation par contrôle~; un kill ne se lève
+que par une personne.
+\bfield{Tests d'acceptation} \texttt{code/firm/riskgate/}~: les 4\,874 ordres du jeu de test rejoués aux mêmes décisions en Python, C++
+et Rust, chaque contrôle refusant au moins une fois~; chaque contrôle à sa frontière~; défaillance fermée sur les limites et les références périmées~; les trois
+actions du kill switch au niveau de la firme, du desk et de la stratégie~; les sommes courantes égales à un recomptage après des flux aléatoires~; zéro
+allocation~; le fuyard arrêté par la limite de position et le seuil de capital, et non par le collar~; les limites \texttt{firm.riskctl} du livre~11,
+exportées pour la barrière, rejouées en Python et C++.
+\bfield{Pour aller plus loin} Une limite de perte sur le profit réalisé et non réalisé (exercice~7)~; des limites de messages par plateforme~; des limites partagées
+par plusieurs passerelles via une mémoire partagée, avec un seul écrivain~; les moniteurs du livre~11 (perte, débit de messages) alimentant le kill switch.
+\end{build}
+
+\begin{omsources}
+\item U.S. Securities and Exchange Commission, Release No. 34-70694, \emph{In the Matter of Knight Capital Americas LLC}, 2013.
+\item 17 CFR 240.15c3-5, \emph{Risk management controls for brokers or dealers with market access}.
+\item Commission Delegated Regulation (EU) 2017/589 of 19 July 2016 (RTS 6).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:1}
+Le prix de référence est 25.0000 (250\,000 en unités de \num{e-4}) et le collar est de 500 points de base. Lesquels des ordres d'achat à
+26.2500 et 26.2600, et des ordres de vente à 23.7500 et 23.7400, passent~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:2}
+La limite longue est de 5\,000 actions. La position est de 2\,000 longues, et des ordres d'achat de 1\,500 et 1\,000 sont ouverts, dont l'un n'est pas
+encore acquitté. Un achat de 600 est-il accepté~? Quel est le plus grand achat qui l'est~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:3}
+À partir des totaux du régulateur, calculer le nombre moyen d'exécutions par seconde et d'actions par exécution de l'incident.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:4}
+Une rafale de quinze ordres enfants identiques part à une microseconde d'intervalle. La fenêtre de doublons est de \qty{100}{\milli\second}. Combien
+de ces quinze ordres passent, et comment le fuyard devrait-il changer pour tous les laisser passer~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:5}
+L'âge maximal des limites est de deux secondes et les \omterm{def:ll:protocols-i-fix:session}{heartbeats} arrivent toutes les \qty{400}{\milli\second}. Le service de risque s'arrête à l'instant
+$t$. Jusqu'à quand les ordres sont-ils acceptés, et pourquoi «~jusqu'au retour du service~» est-ce la mauvaise réponse~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:6}
+Un contrôle coûte environ \qty{26}{\nano\second} sur le flux du jeu de test. Quelle fraction d'un budget tick-to-trade de
+\qty{1}{\micro\second} cela représente-t-il, et que coûterait en plus un contrôle dans un processus séparé sur un autre cœur~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:7}
+\emph{Programmation.} Ajouter une limite de perte par stratégie~: le profit réalisé issu des exécutions plus le profit non réalisé au prix de référence, avec
+un kill (blocage et annulation) lorsqu'il descend sous la limite. Où la perte est-elle mise à jour, et pourquoi n'est-elle pas un contrôle pré-négociation comme les
+autres~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:pre-trade-risk-and-kill-switches:8}
+\emph{Trouver la faille.} «~Nos contrôles de risque tournent dans leur propre processus, qui lit une copie de chaque ordre envoyé par la passerelle et envoie
+un kill dès qu'il voit une violation. Ils restent ainsi hors du chemin de latence.~»
+\end{exercise}
+
+\section{Problème~: quarante-cinq minutes}
+
+\begin{problem}[{Problème du week-end --- quels contrôles auraient arrêté le fuyard de 2012}]\label{pb:ll:pre-trade-risk-and-kill-switches:1}
+Utiliser le \cref{tab:ll:pre-trade-risk-and-kill-switches:runaway} (\texttt{runaway.csv}) et les totaux du régulateur~: 4 millions
+d'exécutions, plus de 397 millions d'actions, environ 45 minutes.
+
+\medskip\noindent\textbf{Partie I --- Les débits.}
+\begin{enumerate}
+\item Calculer le débit d'exécution de l'incident et vérifier que les 1\,500 ordres par seconde du fuyard lui correspondent.
+\item Combien d'actions le fuyard non contrôlé achète-t-il en cinq secondes, et en 45 minutes au même débit~? Comparer avec
+l'incident.
+\item Dans la simulation, le prix a monté d'un tick toutes les dix exécutions. De combien a-t-il monté en cinq secondes~?
+\item Pourquoi le collar ne s'est-il jamais déclenché, alors que le prix a bougé de plus que le collar~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les contrôles qui ne l'arrêtent pas.}
+\begin{enumerate}[resume]
+\item Pourquoi les limites de taille et de notionnel par ordre ne se déclenchent-elles jamais~?
+\item Le débit limité se déclenche après \qty{40}{\milli\second}. Pourquoi si tard, et quel est ensuite le débit du fuyard~?
+\item Reporter le débit limité sur 45 minutes.
+\item Le contrôle des doublons laisse passer 55 ordres en cinq secondes. Lesquels, et quel petit changement du fuyard le mettrait en
+échec~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les contrôles qui l'arrêtent.}
+\begin{enumerate}[resume]
+\item Combien d'ordres la limite de position de 20\,000 actions, comptée en vol, laisse-t-elle passer, et à partir de quel moment se déclenche-t-elle~?
+\item La limite qui ne compte que les exécutions s'arrête à 21\,000. Expliquer la différence.
+\item Dans quelles circonstances cette différence serait-elle importante~?
+\item Le seuil de capital est de 2.5~millions de dollars. À environ 100~\$ par action, pourquoi arrête-t-il le fuyard vers 24\,900 actions~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: ordres et actions avant le déclenchement de chaque contrôle, reportés sur 45 minutes, face aux
+totaux de l'incident.
+\item Que le kill switch ajoute-t-il à la limite de position dans cette simulation~?
+\item Le fuyard a négocié 154 titres. Qu'est-ce que cela change pour une limite de position par instrument, et quel contrôle y est insensible~?
+\item Lequel des contrôles manquants listés dans l'ordonnance du régulateur correspond à chaque ligne du tableau~?
+\item Pourquoi la barrière doit-elle être à défaillance fermée~?
+\item Pourquoi un moniteur post-négociation, aussi rapide soit-il, ne remplace-t-il pas la barrière~?
+\item Quels faux positifs le contrôle des doublons déclencherait-il un jour ordinaire~?
+\item En une phrase~: quel type de limite arrête un fuyard~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:pre-trade-risk-and-kill-switches:1}
+Listez les contrôles pré-négociation que vous placeriez sur chaque ordre, et dites lesquels vous attendriez pour repérer un algorithme fuyard.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:pre-trade-risk-and-kill-switches:2}
+Comment faites-vous pour qu'un contrôle de risque coûte quelques nanosecondes, et qu'il coûte autant lorsqu'il accepte que lorsqu'il refuse~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:ll:pre-trade-risk-and-kill-switches:3}
+Votre service de risque cesse d'envoyer ses limites. Que fait le système de négociation, et pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, trader}]\label{iq:ll:pre-trade-risk-and-kill-switches:4}
+Que doit faire un kill switch, et qui doit pouvoir le déclencher et l'annuler~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:pre-trade-risk-and-kill-switches:5}
+Comment modifiez-vous les limites d'une stratégie en cours de journée sans l'arrêter~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, risque}]\label{iq:ll:pre-trade-risk-and-kill-switches:6}
+Lire l'incident de 2012 comme un document d'exigences. Concevez les contrôles, leur emplacement, et comment vous vérifieriez qu'ils arrêtent un
+fuyard.
+\end{interviewq}

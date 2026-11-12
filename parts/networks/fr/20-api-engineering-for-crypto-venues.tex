@@ -1,0 +1,353 @@
+\chapter{Ingénierie des API pour les plateformes crypto}\label{ch:nw:api-engineering-for-crypto-venues}
+
+Une grande plateforme crypto laisse une seule connexion WebSocket porter au plus 1\,024 flux, accepte au plus 300 nouvelles connexions par adresse toutes les
+cinq minutes, coupe toute connexion au bout de 24 heures et attend une réponse à son ping dans la minute. Une société qui suit 400 symboles avec
+la profondeur et négocie chacun d'eux a 800 flux à répartir, un carnet à reconstruire chaque fois qu'un message est perdu, et un seul budget de poids de requête pour
+les snapshots qui le reconstruisent et les ordres passés. Lorsqu'une connexion perd un message et que la société resynchronise chaque symbole qui s'y trouve
+à partir de snapshots de profondeur complète, le budget est épuisé après 24 d'entre eux, et le dernier des 80 symboles reste périmé pendant trois minutes.
+
+Les chapitres~16 à~19 portaient sur l'emplacement de la plateforme et sur le chemin que suivent les paquets pour l'atteindre. Ce chapitre porte sur l'interface elle-même~: comment les flux sont répartis
+entre les connexions et les adresses, comment les trous sont détectés et réparés, comment un même budget de débit est partagé, comment un \omterm{def:nw:api-engineering-for-crypto-venues:path}{chemin de saisie d'ordres} est choisi, et
+quels horodatages il faut retenir. Il utilise le constructeur de carnet (book builder) et le régulateur de limite de débit du livre~3, ainsi que le client WebSocket du livre~13, et la
+documentation des plateformes, datée.
+
+\section{Répartition des connexions WebSocket}
+
+\begin{definition}[Répartition des connexions (sharding)]\label{def:nw:api-engineering-for-crypto-venues:shard}
+La \emph{répartition des connexions (sharding)}\index{répartition des connexions (sharding)} est l'affectation des flux d'un ensemble d'abonnements à plusieurs connexions, et des
+connexions à plusieurs adresses source, de sorte qu'aucune connexion ni aucune adresse ne dépasse les limites de la plateforme et qu'une panne ou un consommateur lent
+n'affecte qu'une partie de l'ensemble.
+\end{definition}
+
+\begin{dated}{2026-09}{Limites WebSocket, selon la documentation des plateformes}\label{dat:nw:api-engineering-for-crypto-venues:limits}
+\begin{itemize}
+\item Flux spot de Binance~: au plus 1\,024 flux par connexion~; 300 connexions par tentative toutes les 5 minutes et par IP~; 5 messages entrants par
+  seconde et par connexion, au-delà de quoi la connexion est fermée (et les IP déconnectées de façon répétée peuvent être bannies)~; connexions valides 24 heures~; un ping
+  toutes les 20 secondes, auquel il faut répondre par un pong dans la minute~; les événements de profondeur portent un temps d'événement \texttt{E}, les transactions un temps de transaction \texttt{T}. Un
+  snapshot de profondeur complète (jusqu'à 5\,000 niveaux) coûte un poids de requête de 250~; 1\,000 niveaux coûtent 50~; la limite de poids est de 6\,000 par minute.
+\item OKX~: 3 demandes de connexion par seconde et par IP~; 480 demandes d'abonnement, de désabonnement ou de connexion par connexion et par heure~; une connexion sans donnée
+  pendant 30 secondes est fermée.
+\end{itemize}
+\end{dated}
+
+Le plafond de la plateforme est un maximum, non une cible. Une seule connexion pourrait porter les 800 flux, mais elle les porterait en file~: une rafale sur un symbole
+retarde derrière elle les messages de tous les autres symboles (le \omterm{def:nw:networking-for-trading:hol}{blocage en tête de file} du chapitre~1, au niveau applicatif), une seule déconnexion fait tomber tous les carnets, et
+la remise à zéro des 24 heures coupe tout le flux d'un coup. La société du chapitre plafonne une connexion à 160 flux (80 symboles), ce qui demande cinq
+connexions~; reconnecter les cinq en même temps reste très en deçà de 300 par adresse et par cinq minutes, si bien qu'une seule adresse suffit.
+
+\begin{proposition}[Combien de connexions et d'adresses]\label{prop:nw:api-engineering-for-crypto-venues:shards}
+Pour $S$ flux, un plafond de $c$ flux par connexion (celui de la plateforme ou un plafond inférieur) et une limite de la plateforme de $L$ nouvelles connexions par adresse et par fenêtre $W$,
+une conception qui doit pouvoir reconnecter l'ensemble en $w \le W$ demande $\lceil S/c \rceil$ connexions et $\lceil \lceil S/c \rceil / (L\,w/W)
+\rceil$ adresses, si la limite est répartie uniformément sur la fenêtre.
+\end{proposition}
+
+\begin{proof}
+Chaque connexion porte au plus $c$ flux. Reconnecter $n$ connexions en $w$ utilise $n$ tentatives de connexion~; une adresse en autorise $L w/W$ en
+$w$ selon la lecture uniforme de la limite.
+\end{proof}
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{46}{54}{Le planificateur de répartition~: connexions au plafond de la plateforme ou de la société, et adresses pour une
+reconnexion dans une fenêtre donnée.}\label{lst:nw:api-engineering-for-crypto-venues:shards}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.5cm,align=center,inner sep=2pt},>=Stealth]
+\node[b,fill=omDef!15,minimum height=3.4cm,minimum width=2.2cm] (s) at (0,0) {400 symboles\\ $\times$ 2 flux\\ (profondeur, transactions)};
+\foreach \k/\y in {1/1.4,2/0.7,3/0,4/-0.7,5/-1.4}{\node[b,fill=gray!10,minimum width=2.8cm] (c\k) at (4.2,\y) {connexion \k~: 160 flux};
+  \draw[->] (s.east) -- (c\k.west);}
+\node[b,fill=omThm!15,minimum height=3.4cm,minimum width=1.8cm] (a) at (8.2,0) {une adresse\\ source};
+\foreach \k in {1,...,5}{\draw[->] (c\k.east) -- (a.west);}
+\node[b,fill=omThm!25,minimum height=3.4cm] (v) at (11.2,0) {serveurs\\ de flux\\ de la plateforme};
+\draw[->,thick] (a.east) -- (v.west);
+\node[font=\scriptsize,align=center,omMeth] at (4.2,-2.2) {un trou sur une connexion n'affecte que ses 80 symboles};
+\end{tikzpicture}
+
+\omcaption{Le plan de répartition du chapitre, schématiquement~: 800 flux répartis sur cinq connexions de 160, depuis une seule adresse. La plateforme autoriserait une connexion
+de 800~; le plafond de la société limite le \omterm{def:nw:networking-for-trading:hol}{blocage en tête de file} et les dégâts d'une déconnexion.}\label{fig:nw:api-engineering-for-crypto-venues:shards}
+\end{omfigure}
+
+\section{Snapshots, deltas et trous de séquence à grande échelle}
+
+\begin{definition}[Resynchronisation par symbole]\label{def:nw:api-engineering-for-crypto-venues:resync}
+La \emph{resynchronisation par symbole}\index{resynchronisation par symbole} répare un carnet après un trou de séquence en demandant un snapshot pour les symboles dont
+la propre séquence de mises à jour révèle le trou, plutôt que pour chaque symbole porté par la connexion sur laquelle des messages ont été perdus.
+\end{definition}
+
+La procédure de la plateforme est celle du livre~3~: mettre les deltas en tampon, demander un snapshot, écarter les deltas antérieurs à celui-ci, appliquer les autres, et si le premier numéro de mise à jour
+du delta dépasse le dernier numéro du carnet plus un, abandonner le carnet et recommencer. La \texttt{firm.wsbook} du livre~3 l'implémente~; alimentée par un flux qui perd un
+événement, elle répond «~applied~», «~applied~», puis «~gap~». Ce qu'un trou coûte est décidé par le nombre de carnets que la société jette et par celui de snapshots que son
+budget de poids peut payer.
+
+\begin{proposition}[Ce que coûte un trou]\label{prop:nw:api-engineering-for-crypto-venues:gap}
+Si chaque snapshot coûte $w$ sur un budget de $B$ par fenêtre $T$ qui n'est partagé avec rien d'autre, et que $m$ carnets doivent être reconstruits, le dernier revient après environ
+$\lceil m\,w/B \rceil - 1$ fenêtres entières plus un aller-retour~; avec la \omterm{def:nw:api-engineering-for-crypto-venues:resync}{resynchronisation par symbole}, $m$ est le nombre de symboles ayant perdu des messages, avec
+la resynchronisation par connexion, c'est chaque symbole de la connexion.
+\end{proposition}
+
+\begin{proof}
+Le régulateur admet $\lfloor B/w \rfloor$ snapshots par fenêtre~; les autres attendent les fenêtres suivantes.
+\end{proof}
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{57}{70}{Reprise sous le régulateur de poids~: chaque snapshot attend le budget, et un carnet reste périmé
+jusqu'au retour de son snapshot.}\label{lst:nw:api-engineering-for-crypto-venues:resync}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.2cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+Profondeur du snapshot & Poids & Par symbole (5 carnets) & Par connexion (80 carnets) & Dernier carnet rétabli \\
+ & & (symboles-s périmés) & (symboles-s périmés) & par connexion (s) \\
+\midrule
+5\,000 niveaux & 250 & 0.5 & 5\,769 & 180.1 \\
+1\,000 niveaux & 50 & 0.5 & 11.2 & 0.2 \\
+\bottomrule
+\end{tabular}
+\caption{Simulation~: cinq messages perdus sur une connexion de 80 symboles (ils touchent cinq symboles), réparés par symbole ou par connexion, avec
+des snapshots à deux profondeurs sous le régulateur de 6\,000 de poids par minute du livre~3 et un aller-retour de \qty{100}{\milli\second}~; la péremption est exprimée en
+symboles-seconde. Données~: \texttt{nw\_api.resync\_rows()}.}\label{tab:nw:api-engineering-for-crypto-venues:resync}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[ybar,width=10cm,height=5.8cm,bar width=16pt,ymode=log,ymin=0.1,ymax=20000,log origin=infty,xtick=data,
+  symbolic x coords={5000 levels,1000 levels},xticklabels={5\,000 niveaux,1\,000 niveaux},
+  ylabel={symboles-seconde périmés (log)},tick label style={font=\footnotesize},
+  label style={font=\small},grid=major,grid style={gray!25},legend pos=north east,legend style={font=\footnotesize},
+  table/col sep=comma,enlarge x limits=0.5]
+\addplot[fill=omDef!55,draw=omDef] table[x=case,y=per_symbol]{figdata/networks/20-api-engineering-for-crypto-venues/staleness.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=case,y=per_conn]{figdata/networks/20-api-engineering-for-crypto-venues/staleness.csv};
+\legend{par symbole,par connexion}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: symboles-secondes périmés après la perte de cinq messages sur une connexion, selon la conception de la reprise et la profondeur des instantanés
+(\cref{tab:nw:api-engineering-for-crypto-venues:resync}). La reprise par connexion avec des instantanés de pleine profondeur coûte quatre ordres de grandeur de plus.
+Données~: \texttt{fig\_api.py}.}\label{fig:nw:api-engineering-for-crypto-venues:stale}
+\end{omfigure}
+
+Le tableau plaide pour la voie la plus exigeante. La reprise par symbole demande des numéros de séquence par symbole (les \texttt{U} et \texttt{u} de la plateforme) et un
+carnet par symbole qui peut être abandonné seul~; en contrepartie, cinq messages perdus coûtent cinq instantanés. La reprise par connexion est plus simple et, à pleine
+profondeur, catastrophique~: 80 instantanés de poids 250 demandent trois minutes et demie d'un budget de 6\,000 unités de poids, pendant lesquelles la firme n'a plus aucun poids pour
+envoyer des ordres. Des instantanés de 1\,000 niveaux rendent même la conception négligente supportable, ce qui est une seconde leçon~: demander la profondeur dont la stratégie a besoin.
+
+\section{Gouverneurs de limites de débit par clé et par adresse}
+
+Les limites d'une plateforme s'appliquent par adresse, par compte et par clé, et plusieurs stratégies les partagent. La firme a besoin d'un gouverneur par limite, que
+toutes les stratégies franchissent (\texttt{firm.ratelimit} du livre~3), et d'une règle pour la partager. L'allocateur du chapitre attribue à chaque stratégie jusqu'à sa demande, en
+proportion de son poids de priorité et répartit ce que les stratégies satisfaites laissent~: avec 6\,000 par minute, un processus de risque qui demande 500 obtient la totalité de sa demande, et
+le market making et l'arbitrage, qui demandent 4\,000 et 3\,000 avec les poids 3 et 2, obtiennent 3\,300 et 2\,200. Les instantanés de reprise doivent être prélevés sur le même
+budget, ce qui fait de la conception de la reprise une question de budget de débit.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar,width=10.5cm,height=5.2cm,bar width=9pt,xmin=0,xmax=4500,ytick=data,enlarge y limits=0.25,
+  yticklabels={tenue de marché,arbitrage,risque},y dir=reverse,
+  xlabel={poids de requête par minute},tick label style={font=\footnotesize,/pgf/number format/1000 sep={\,}},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=south east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[fill=gray!35,draw=gray] table[y expr=\coordindex,x=demand]{figdata/networks/20-api-engineering-for-crypto-venues/budget.csv};
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=share]{figdata/networks/20-api-engineering-for-crypto-venues/budget.csv};
+\legend{demande,allocation}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Une minute de 6\,000 unités de poids partagée entre trois stratégies de poids de priorité 3, 2 et 1~: les 500 du processus de risque sont servis intégralement, les autres se partagent
+le reste au prorata. Données~: \texttt{fig\_api.py}, \texttt{nw\_api.budget()}.}\label{fig:nw:api-engineering-for-crypto-venues:budget}
+\end{omfigure}
+
+\section{Choisir entre les chemins de saisie d'ordres}
+
+\begin{definition}[Chemin de saisie d'ordres]\label{def:nw:api-engineering-for-crypto-venues:path}
+Un \emph{chemin de saisie d'ordres}\index{chemin de saisie d'ordres} est l'une des interfaces par lesquelles une plateforme accepte des ordres (requêtes REST, ordres transmis
+dans une session WebSocket, une session FIX, un protocole binaire propre à la plateforme), chacune avec son propre modèle de connexion, ses limites de débit, sa latence et son comportement en cas de défaillance.
+\end{definition}
+
+La grande plateforme de ce chapitre en documente plusieurs (une interface REST, une API WebSocket, une API FIX, et des flux de données de marché en
+codage binaire), et les \omterm{def:nw:private-connectivity-to-crypto-venues:endpoint}{points de terminaison privés} du chapitre~18 ajoutent des routes vers elles. Le choix suit la stratégie~: une session persistante supprime l'établissement de la connexion
+pour chaque ordre~; l'absence d'état de REST facilite la reprise~; FIX apporte des numéros de séquence au niveau de la session et des demandes de renvoi. Quel que soit le chemin, il s'appuie
+sur le même gouverneur, et une firme qui envoie des ordres par deux chemins doit savoir si la plateforme les impute à une seule limite ou à deux.
+
+\section{Connexions redondantes et quels horodatages retenir}
+
+\begin{definition}[Dérive d'horloge de la plateforme]\label{def:nw:api-engineering-for-crypto-venues:skew}
+La \emph{dérive d'horloge de la plateforme}\index{dérive d'horloge de la plateforme} est l'écart entre l'horloge qui horodate les messages d'une plateforme (ses horodatages d'événement et de transaction)
+et l'horloge synchronisée propre à la firme, qui varie dans le temps~; elle est estimée, jamais donnée.
+\end{definition}
+
+Chaque message porte l'horodatage d'événement de la plateforme~; la firme horodate son arrivée. L'écart est le délai unidirectionnel plus l'erreur d'horloge de la plateforme, et les
+deux ne peuvent pas être séparés depuis un seul côté. Son minimum sur une fenêtre, en revanche, vaut le plus petit délai augmenté de l'erreur~: si ce plus petit délai est stable,
+suivre ce minimum revient à suivre l'horloge de la plateforme (le filtre à délai minimal du chapitre~4, appliqué à l'horloge d'un tiers).
+
+\omcode{code/firm/cryptofeed/firm_cryptofeed.py}{91}{96}{L'estimateur d'horloge de la plateforme~: le minimum du temps de réception moins le temps d'événement sur chaque fenêtre.}\label{lst:nw:api-engineering-for-crypto-venues:skew}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=0,xmax=61,ymin=-4.6,ymax=-1.8,xlabel={minutes},
+  ylabel={min(réception $-$ événement) (ms)},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north east,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick,only marks,mark=*,mark size=1.2pt] table[x=minute,y=estimate]{figdata/networks/20-api-engineering-for-crypto-venues/skew.csv};
+\addplot[omThm,thick,no markers] table[x=minute,y=truth]{figdata/networks/20-api-engineering-for-crypto-venues/skew.csv};
+\legend{estimation (fenêtres d'une minute),vérité~: délai minimal $-$ décalage de la plateforme}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: une horloge de plateforme en avance de 3 à \qty{5}{\milli\second} sur celle de la firme pendant une heure, dix messages par seconde avec un délai minimal
+unidirectionnel de \qty{0.8}{\milli\second} et une gigue (jitter) exponentielle~; le minimum sur une minute suit la vérité à \qty{15}{\micro\second} près. Données~:
+\texttt{fig\_api.py}, \texttt{nw\_api.skew\_series()}.}\label{fig:nw:api-engineering-for-crypto-venues:skew}
+\end{omfigure}
+
+Les connexions redondantes rendent la question plus aiguë~: deux connexions au même flux livrent deux fois le même événement, à deux instants d'arrivée, et la
+firme garde le premier (la course du chapitre~19, appliquée aux données). L'horodatage d'événement de la plateforme ordonne les événements entre symboles et connexions~; l'horodatage d'arrivée de la firme
+dit quand elle pourrait agir. Une stratégie qui utilise l'horodatage d'événement pour mesurer sa propre latence doit d'abord soustraire la dérive estimée, sous peine de mesurer
+l'horloge de la plateforme.
+
+\begin{method}[Exploiter les interfaces d'une plateforme crypto]\label{met:nw:api-engineering-for-crypto-venues:run}
+\begin{enumerate}
+\item Consigner les limites de la plateforme (flux, connexions, messages, poids, durées de vie) avec leurs dates, et les relire à chaque avis de changement.
+\item Répartir les connexions (sharding) sous les caps, étaler les reconnexions dans le temps et entre les adresses, et échelonner les réinitialisations de 24~heures.
+\item Détecter les trous par symbole et resynchroniser par symbole, avec des instantanés qui ne dépassent pas la profondeur dont la stratégie a besoin.
+\item Faire passer chaque requête, chaque instantané et chaque ordre par un gouverneur par limite, et l'allouer selon la priorité.
+\item Estimer en continu la dérive d'horloge de chaque plateforme et horodater tout à l'arrivée avec une horloge synchronisée.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: quatre cents symboles}\label{tut:nw:api-engineering-for-crypto-venues:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Planifier les répartitions de connexions, comparer les conceptions de reprise sous le gouverneur de poids, partager un budget et estimer l'horloge d'une plateforme.
+\textbf{État final~:} les \cref{fig:nw:api-engineering-for-crypto-venues:stale,fig:nw:api-engineering-for-crypto-venues:budget,fig:nw:api-engineering-for-crypto-venues:skew}
+et le \cref{tab:nw:api-engineering-for-crypto-venues:resync}.
+\begin{tutsteps}
+\item \textbf{Répartition.} \texttt{firm\_cryptofeed.plan\_shards} (\cref{lst:nw:api-engineering-for-crypto-venues:shards}) avec le
+  \texttt{LIMITS} daté~; \texttt{nw\_api.plan()}.
+\item \textbf{Trous.} \texttt{nw\_api.gap\_demo()} alimente le \texttt{firm.wsbook} du livre~3 avec un flux dans lequel un événement est perdu~; \texttt{resync\_staleness}
+  (\cref{lst:nw:api-engineering-for-crypto-venues:resync}) chiffre la reprise sous le gouverneur du livre~3.
+\item \textbf{Budget.} \texttt{allocate} répartit une minute de poids.
+\item \textbf{Horloge.} \texttt{skew} (\cref{lst:nw:api-engineering-for-crypto-venues:skew}) sur \texttt{skew\_series()}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Alimenter le modèle de reprise avec les fixtures décodées du \texttt{firm.wsclient} du livre~13, puis donner au gouverneur le trafic
+d'ordres aussi, et observer comment la reprise l'affame.
+\end{tutorial}
+
+\section{Construction~: le feed handler crypto}\label{bld:nw:api-engineering-for-crypto-venues:cryptofeed}
+
+\begin{build}
+\bfield{Rôle} La couche d'interface vers les plateformes crypto~: \omterm{def:nw:api-engineering-for-crypto-venues:shard}{répartition des connexions (sharding)}, reprise, budgets partagés et horloges des plateformes~; l'entrée des lignes crypto du
+plan du chapitre~29.
+\bfield{Interface} \texttt{firm\_cryptofeed}~: \texttt{Limits}, \texttt{LIMITS}, \texttt{plan\_shards}, \texttt{resync\_staleness}, \texttt{allocate},
+\texttt{skew}~; les \texttt{firm.ratelimit} et \texttt{firm.wsbook} du livre~3, encapsulés et non modifiés.
+\bfield{Règles} Les limites sont des lignes datées avec leurs sources~; chaque requête passe par un gouverneur~; la reprise se fait par symbole partout où les numéros de séquence de la plateforme
+le permettent~; l'horloge de la plateforme est estimée, non supposée.
+\bfield{Tests d'acceptation} \texttt{code/firm/cryptofeed/tests/}~: nombre de shards aux plafonds, reprise en attente de la fenêtre suivante, water-filling, et
+l'estimateur de skew à la main.
+\bfield{Pour aller plus loin} Un gestionnaire de shards en direct qui rééquilibre les flux selon le débit de messages~; reprise par snapshots incrémentiels lorsqu'une plateforme en propose.
+\end{build}
+
+\begin{omsources}
+\item Binance spot API documentation (flux WebSocket, procédure de carnet d'ordres local, poids de requête du carnet d'ordres)~; OKX API v5 documentation (limites WebSocket).
+\item RFC 6455, The WebSocket Protocol~; \texttt{firm.wsbook} et \texttt{firm.ratelimit} de One Quant Book~3, \texttt{firm.wsclient} de One Quant Book~13.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:1}
+Calculer combien de snapshots en profondeur complète, de poids 250, tiennent dans une minute de 6\,000 de poids~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:2}
+Expliquer pourquoi plafonner une connexion à 160 flux alors que la plateforme en autorise 1\,024~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:api-engineering-for-crypto-venues:3}
+Préciser ce que doit faire un client lorsqu'il reçoit un ping WebSocket, et ce qui se passe sur la plateforme de ce chapitre s'il ne le fait pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:4}
+En utilisant la \cref{prop:nw:api-engineering-for-crypto-venues:shards}, calculer combien d'adresses une firme doit mobiliser pour reconnecter 40 connexions en 10 secondes, à raison de 300
+connexions par 5 minutes et par adresse~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:5}
+Expliquer pourquoi le minimum du temps de réception moins le temps de l'événement suit l'horloge de la plateforme, et quand il échoue~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:6}
+Une stratégie mesure sa latence tick-to-order comme son heure d'envoi de l'ordre moins l'heure d'événement de la plateforme. Repérer ce qui est faux dans cette mesure.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:7}
+\emph{Programmation.} Avec \texttt{firm.cryptofeed}, trouver le plus grand poids de snapshot pour lequel une reprise par connexion de 80 symboles se termine dans la
+première minute.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:api-engineering-for-crypto-venues:8}
+\emph{Trouver la faille.} «~On s'abonne à tout sur une seule connexion~; la plateforme l'autorise, et moins de connexions sont plus fiables.~»
+\end{exercise}
+
+\section{Problème~: Quatre cents symboles, cinq connexions}
+
+\begin{problem}[{Problème du week-end --- shards et reprise}]\label{pb:nw:api-engineering-for-crypto-venues:1}
+Une firme suit 400 symboles sur une plateforme soumise aux limites de l'\cref{dat:nw:api-engineering-for-crypto-venues:limits}, avec un flux de profondeur et un flux de transactions pour chacun,
+au plus 160 flux par connexion, et une minute de poids 6\,000 pour les snapshots et les ordres.
+
+\medskip\noindent\textbf{Partie I --- Shards.}
+\begin{enumerate}
+\item Combien de flux, de connexions et d'adresses faut-il~?
+\item Combien en faudrait-il au plafond propre à la plateforme~?
+\item Combien d'adresses faut-il pour tout reconnecter en 10 secondes~?
+\item Que signifie la limite de 24 heures pour la conception~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Un trou.}
+\begin{enumerate}[resume]
+\item Cinq messages sont perdus sur une connexion. Combien de symboles ont besoin d'un snapshot par symbole, et par connexion~?
+\item Avec des snapshots en profondeur complète, combien de temps faut-il pour que le dernier carnet soit rétabli par connexion, et combien de symboles-secondes obsolètes~?
+\item Et avec des snapshots de 1\,000 niveaux~?
+\item Que la firme ne peut-elle pas faire pendant qu'une reprise par connexion est en cours~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Budget et horloges.}
+\begin{enumerate}[resume]
+\item Comment l'allocateur répartit-il 6\,000 entre le market making (4\,000, poids 3), l'arbitrage (3\,000, poids 2) et le risque (500, poids 1)~?
+\item Où les snapshots de reprise se situent-ils dans cette allocation~?
+\item Dans la simulation, dans quelle mesure le minimum sur une minute estime-t-il l'horloge de la plateforme~?
+\item Pourquoi l'estimer, tout simplement~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le nombre minimal de connexions et d'adresses pour l'ensemble d'abonnement sous les limites de la plateforme, et la péremption de carnet que coûte un
+  trou avec une \omterm{def:nw:api-engineering-for-crypto-venues:resync}{resynchronisation par symbole} face à une resynchronisation par connexion.
+\item Quel choix de conception compte le plus~?
+\item Que changerait-il sur une plateforme sans numéros de séquence par symbole~?
+\item Comment répartir les shards entre les réinitialisations de 24 heures de la journée~?
+\item Qu'apporte une seconde connexion vers les mêmes flux~?
+\item Qu'ajoute le gouverneur du livre~3 que ne ferait pas un simple compteur~?
+\item Où cela se place-t-il dans le plan du chapitre~29~?
+\item En une phrase~: que coûte un message perdu~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:api-engineering-for-crypto-venues:1}
+Comment maintenez-vous un carnet d'ordres local juste à partir d'un snapshot et d'un flux de deltas~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:api-engineering-for-crypto-venues:2}
+Il vous faut 2\,000 flux d'une plateforme. Comment concevez-vous les connexions~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:api-engineering-for-crypto-venues:3}
+Trois stratégies partagent la limite de débit d'une même clé d'API. Comment empêchez-vous l'une d'elles d'affamer les deux autres~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:api-engineering-for-crypto-venues:4}
+Comment estimeriez-vous l'erreur d'horloge d'une plateforme à partir de ses données de marché~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:api-engineering-for-crypto-venues:5}
+REST, WebSocket ou FIX pour la saisie d'ordres~: comment choisissez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:api-engineering-for-crypto-venues:6}
+Votre feed handler perd des messages chaque jour à la même heure. Qu'examinez-vous~?
+\end{interviewq}

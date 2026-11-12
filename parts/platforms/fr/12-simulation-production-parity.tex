@@ -1,0 +1,389 @@
+\chapter{Parité simulation--production}\label{ch:pl:simulation-production-parity}
+
+Une stratégie qui avait réussi son test de parité du rejeu a coté avec un tick plus large que prévu dès sa première matinée en production, pendant toute la matinée.
+Sa période d'ouverture se terminait sur un timer, et ce timer avait été réglé sur l'horloge de la machine~: en production, l'horloge de la
+machine et celle de la plateforme étaient alignées~; dans le backtest, elles ne l'étaient pas, et le test de parité avait comparé le backtest à lui-même.
+Le code était le même objet aux deux endroits~; les environnements qui l'entouraient ne l'étaient pas. Ce chapitre construit l'hôte qui permet à un seul objet de stratégie de tourner dans un
+backtest, dans le simulateur et sur un chemin calqué sur la production, ainsi que le \omterm{def:pl:simulation-production-parity:harness}{harnais de parité} qui repère, événement par événement, l'endroit où deux de ces exécutions divergent.
+
+\section{Une stratégie, plusieurs environnements}
+
+\begin{definition}[Parité simulation--production]\label{def:pl:simulation-production-parity:parity}
+La \emph{parité simulation--production}\index{parité simulation--production} est la propriété d'une stratégie qui, recevant les mêmes entrées
+dans le même ordre, produit les mêmes sorties en simulation et en production~: les mêmes ordres et annulations, aux mêmes prix et
+quantités, en réaction aux mêmes événements.
+\end{definition}
+
+La parité est une propriété de la stratégie et de tout ce qui l'entoure. Le livre~7 (chapitre~19) la testait en réinjectant les entrées d'une journée réelle
+dans le backtest et en comparant les ordres~; le livre~12 (chapitre~24) rencontrait son cousin en apprentissage automatique, l'écart entraînement--service (training--serving skew). Une stratégie peut
+échouer à ce test par elle-même (elle lit quelque chose qui n'est pas une entrée~: l'horloge de la machine, un nombre aléatoire, l'ordre d'un dictionnaire) ou par
+ses environnements (ils livrent le même marché sous des types, des ordres ou des sémantiques différents). La plateforme écarte la seconde catégorie par
+construction, et met au jour la première par le test.
+
+\begin{definition}[Hôte de stratégie, adaptateur d'environnement]\label{def:pl:simulation-production-parity:host}
+Un \emph{hôte de stratégie}\index{hôte de stratégie} est le composant qui détient un objet de stratégie, lui donne sa seule vision du monde --- une
+horloge, des données de marché et une saisie d'ordres --- et livre ses entrées dans le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements} de la plateforme. Un \emph{adaptateur
+d'environnement}\index{adaptateur d'environnement} connecte l'hôte à un environnement (un backtest, un simulateur, une connexion de production), en traduisant
+les événements de cet environnement en entrées de l'hôte et les demandes de la stratégie en messages de cet environnement.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.7cm,inner sep=3pt},>=Stealth]
+\node[box,fill=omMeth!15,minimum width=3.4cm] (s) at (0,2.5) {objet de stratégie\\ (le même dans chaque environnement)};
+\node[box,fill=omDef!15,minimum width=10.4cm] (h) at (0,1.2) {hôte de stratégie~: horloge $\cdot$ données de marché $\cdot$ saisie d'ordres $\cdot$
+entrées livrées dans le modèle d'événements};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a1) at (-4.0,-0.4) {simulateur en processus\\ contexte d'agent, objets};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a2) at (0,-0.4) {calqué sur la production\\ passerelle, octets, journal};
+\node[box,fill=omThm!10,minimum width=3.1cm] (a3) at (4.4,-0.4) {rejeu\\ un journal de production};
+\draw[<->] (s) -- (h);
+\foreach \a in {a1,a2,a3} {\draw[<->] (\a.north) -- (\a.north|-h.south);}
+\node[box,fill=gray!10,minimum width=5.2cm] (x) at (-1.8,-1.9) {\texttt{firm.exchsim}~: une plateforme, la même séance};
+\draw[->] (a1.south) -- (a1.south|-x.north);
+\draw[->] (a2.south) -- (a2.south|-x.north);
+\draw[->,dashed] (a2.east) -- node[above,font=\tiny]{journal} (a3.west);
+\end{tikzpicture}
+
+\omcaption{Un objet de stratégie dans trois environnements. L'hôte lui fournit une horloge, des données de marché et une saisie d'ordres, et livre chaque entrée
+dans le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements}~; chaque \omterm{def:pl:simulation-production-parity:host}{adaptateur d'environnement} traduit le sien. L'adaptateur en processus et celui calqué sur la production opèrent
+sur la même séance simulée~; le rejeu lit le journal des entrées de l'exécution de production.}\label{fig:pl:simulation-production-parity:host}
+\end{omfigure}
+
+Les trois environnements du chapitre s'appuient sur le simulateur du livre~10, avec une heure de \texttt{firm.tape} comme flux de fond (chapitre~11). Le
+premier appelle directement le contexte d'agent du simulateur. Le second est calqué sur la production~: les ordres de la stratégie transitent par la
+passerelle d'ordres du livre~13 (\texttt{firm.ordergw}~: son automate d'état de l'ordre, son limiteur de débit et son contrôle d'exposition dans le pire cas), sont encodés en
+messages de saisie d'ordres du simulateur, dans des trames SoupBinTCP sur un flux d'octets en mémoire, et les comptes rendus de la plateforme reviennent de la même façon sous forme d'octets~;
+chaque entrée reçue par la stratégie est écrite dans le journal des entrées, au format du livre~13 (chapitre~23~: un instant de réception et un enregistrement de 48~octets). Le
+troisième rejoue ce journal dans un objet de stratégie neuf~: le backtest des entrées enregistrées.
+
+\section{Abstraction du temps}
+
+L'horloge de l'hôte est la seule horloge qu'une stratégie peut lire~: \texttt{ctx.now} est l'instant de l'entrée en cours de livraison, et
+\texttt{ctx.set\_timer(delay, tag)} demande une entrée de timer \texttt{delay} plus tard. Dans le simulateur, les deux sont du temps simulé~; en production
+les deux seraient l'horloge de la machine, synchronisée sur celle de la plateforme~; dans le rejeu, \texttt{now} est l'heure de réception du journal, et les timers ne sont pas réglés
+mais rejoués, puisque les timers qui se sont déclenchés en production sont des entrées du journal. Une stratégie qui lit directement l'horloge de la machine lit
+quelque chose que l'hôte ne contrôle pas, et son comportement dépend alors de l'endroit où elle tourne et de sa vitesse. Le harnais du chapitre rend cela
+visible en donnant à chaque environnement l'horloge de la machine qu'il aurait réellement~: l'heure de la plateforme en production et, dans le simulateur et le
+rejeu, l'horloge d'une machine qui rejoue la séance à 20~h~00, cent fois plus vite que le temps réel.
+
+\section{Abstraction des données de marché}
+
+\begin{definition}[Abstraction des données de marché]\label{def:pl:simulation-production-parity:md}
+Une \emph{abstraction des données de marché}\index{abstraction des données de marché} est l'unique représentation des événements de marché
+qu'une stratégie hébergée reçoit dans chaque environnement~: ici le sommet du carnet sous forme d'entiers~--- cours acheteur, quantité au cours acheteur, cours vendeur, quantité au cours vendeur~--- avec des prix en 1/10\,000 de l'unité
+monétaire, quel que soit l'encodage propre à la source.
+\end{definition}
+
+La règle selon laquelle les prix sont des entiers est celle du livre~10 et de la série~: un prix est un compte de la plus petite unité, et toute conversion en
+nombre à virgule flottante binaire est une occasion de se tromper d'une unité. La documentation de Python le dit clairement~: la plupart des fractions décimales ne peuvent pas être représentées
+exactement sous forme de fractions binaires. \texttt{99.99 - 0.01} vaut \texttt{99.97999999999999}, et \texttt{int()} de dix mille fois ce nombre donne
+999\,799, soit une unité en dessous de la grille des ticks, située à 999\,800.
+
+\section{Abstraction de la saisie d'ordres}
+
+\begin{definition}[Abstraction de la saisie d'ordres]\label{def:pl:simulation-production-parity:oe}
+Une \emph{abstraction de la saisie d'ordres}\index{abstraction de la saisie d'ordres} est l'unique interface par laquelle une stratégie hébergée envoie et annule
+des ordres et apprend leur sort, avec la même sémantique dans chaque environnement~: quels ordres comptent comme actifs (ici, envoyés et non encore
+connus comme terminés, acquittés ou non), quels rappels arrivent (acquittement, exécution, annulation, rejet), et ce qui advient d'une demande qui
+ne peut plus aboutir.
+\end{definition}
+
+La sémantique est l'endroit où les environnements divergent en silence. La passerelle du livre~13 (chapitre~21) refuse d'annuler un ordre qu'elle sait déjà entièrement exécuté~;
+le contexte d'agent d'un simulateur transmet l'annulation à la plateforme, qui la rejette car trop tardive. La même stratégie voit alors un rejet dans un
+environnement et rien dans l'autre, et la plateforme reçoit un message de trop qui consomme 500~nanosecondes du temps de son moteur d'appariement (matching engine). Le
+harnais présenté plus bas a relevé exactement cette différence dès sa première exécution propre, avant qu'aucun défaut n'ait été introduit~: l'adaptateur en processus refuse désormais, comme le fait la passerelle, d'annuler
+un ordre qu'un compte rendu a déjà terminé.
+
+\omcode{code/firm/strathost/firm_strathost.py}{125}{145}{Le côté hôte des abstractions~: quels ordres sont actifs, les timers, et
+la livraison des entrées simultanées dans le modèle d'événements (données de marché, puis saisie d'ordres, puis timers).}\label{lst:pl:simulation-production-parity:host}
+
+\omcode{code/firm/strathost/firm_strathost.py}{278}{305}{L'adaptateur calqué sur la production~: un ordre passe par la passerelle du livre~13, est encodé
+et encadré sur un flux d'octets, puis devient un ordre du côté plateforme du flux.}\label{lst:pl:simulation-production-parity:prod}
+
+\section{Le harnais de parité}
+
+\begin{definition}[Harnais de parité]\label{def:pl:simulation-production-parity:harness}
+Un \emph{harnais de parité}\index{harnais de parité} exécute une stratégie dans deux environnements sur les mêmes entrées et compare leurs sorties
+événement par événement, en signalant la première sortie qui diffère, les entrées livrées avant elle, et combien de sorties diffèrent au total.
+\end{definition}
+
+Le harnais compare l'exécution calquée sur la production à l'exécution du simulateur en processus (la même séance, deux adaptateurs) et au rejeu de
+son propre journal (les mêmes entrées, livrées de nouveau). Les sorties sont comparées telles que la plateforme les verrait~: heure, ordre ou annulation, sens, prix sur
+le fil, quantité. La première différence et le nombre d'entrées qui la précèdent sont ce qu'un développeur doit examiner en premier~; le décompte des
+sorties différentes indique combien coûte un défaut en une heure.
+
+\omcode{code/firm/strathost/firm_strathost.py}{431}{448}{Comparaison~: la première sortie qui diffère, les entrées livrées avant elle,
+et les sorties d'une exécution sans équivalent identique dans l'autre.}\label{lst:pl:simulation-production-parity:compare}
+
+La stratégie du chapitre (le \cref{lst:pl:simulation-production-parity:quoter}) cote beaucoup au meilleur cours, d'un tick plus large pendant une
+période d'ouverture de trente secondes à partir du début de la séance, qu'un minuteur termine~; elle cesse d'ajouter au-delà de trois lots d'inventaire. Quatre défauts sont
+introduits, un à la fois, dans l'exécution calquée sur la production~:
+\begin{itemize}
+\item \emph{horloge murale}~: la stratégie tire de l'horloge de la machine la fin de sa période d'ouverture et le délai de son minuteur~;
+\item \emph{prix en virgule flottante}~: les adaptateurs de production remettent les prix à la stratégie en monnaie à virgule flottante et les reconvertissent
+avec \texttt{int()}~;
+\item \emph{ordre des rappels}~: l'hôte de production livre les entrées simultanées dans l'ordre où son adaptateur les a lues, la saisie d'ordres en premier~;
+\item \emph{sémantique des accusés de réception}~: \texttt{working()} de la production ne liste que les ordres accusés de réception.
+\end{itemize}
+
+\omcode{code/platforms/12-simulation-production-parity/python/pl_parity.py}{26}{60}{La stratégie hébergée. Avec le défaut d'horloge murale activé,
+\texttt{\_now} lit la machine, et le délai du minuteur mêle l'horloge de la machine à celle de l'hôte.}\label{lst:pl:simulation-production-parity:quoter}
+
+\section{Quatre défauts}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xbar,bar width=7pt,xmode=log,xmin=1,xmax=40000,log origin=infty,
+  ytick=data,symbolic y coords={ack semantics,callback order,float prices,wall clock},yticklabels={horloge murale,prix en flottant,ordre des callbacks,sémantique des acks},enlarge y limits=0.2,
+  xlabel={nombre (échelle logarithmique)},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2},table/col sep=comma,
+  nodes near coords,point meta=explicit symbolic,nodes near coords style={font=\scriptsize,anchor=west}]
+\addplot[fill=omDef!45,draw=omDef] table[x=events,y=defect,meta=events]{figdata/platforms/12-simulation-production-parity/defects_sim.csv};
+\addlegendentry{entrées avant la première sortie divergente}
+\addplot[fill=omThm!45,draw=omThm] table[x=affected,y=defect,meta=affected]{figdata/platforms/12-simulation-production-parity/defects_sim.csv};
+\addlegendentry{sorties touchées dans l'heure}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Chaque défaut introduit dans l'exécution calquée sur la production, comparé au simulateur en processus, sur la même séance d'une heure~: les entrées
+livrées avant la première sortie qui diffère, et les sorties (ordres et annulations) de l'exécution de production qui n'ont aucune sortie identique dans
+l'exécution du simulateur. Données~: \texttt{fig\_parity.py}.}\label{fig:pl:simulation-production-parity:defects}
+\end{omfigure}
+
+La \Cref{fig:pl:simulation-production-parity:defects} et le \cref{tab:pl:simulation-production-parity:defects} donnent le rapport du harnais
+pour chaque défaut, avec la graine~1.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}>{\centering\arraybackslash}p{2.0cm}@{}}
+\toprule
+défaut & \multicolumn{2}{c}{première sortie divergente} & entrées avant & \multicolumn{2}{c}{sorties touchées} \\
+ & indice & secondes & & vs simulateur & vs rejeu \\
+\midrule
+horloge murale & 14 & 30.0 & 175 & 539 sur 553 & 305 \\
+prix en virgule flottante & 3 & 24.4 & 126 & 1\,686 sur 1\,690 & 1\,161 \\
+ordre des rappels & 20 & 33.0 & 203 & 387 sur 463 & 416 \\
+sémantique des accusés de réception & 2 & 1.0 & 2 & 8\,449 sur 8\,452 & 8\,450 \\
+\bottomrule
+\end{tabular}
+\caption{Rapport du harnais pour chaque défaut introduit~: l'indice et l'heure (en secondes depuis le début de la séance, une seconde avant
+l'ouverture) de la première sortie de l'exécution calquée sur la production qui diffère de celle du simulateur en processus, les entrées livrées avant elle, et les
+sorties de l'exécution de production sans équivalent identique dans l'exécution du simulateur ni dans le rejeu de son propre journal.}
+\label{tab:pl:simulation-production-parity:defects}
+\end{table}
+
+\begin{example}[Le matin où le minuteur s'est déclenché]\label{ex:pl:simulation-production-parity:timer}
+Avec le défaut d'horloge murale, la production n'est pas touchée~: son horloge machine est celle de la plateforme, le minuteur se déclenche trente secondes après le début et
+la stratégie passe au meilleur cours. Dans le simulateur, le délai du minuteur vaut 20~h~00 de la machine, plus trente secondes, moins les 09:29:59 de la séance,
+soit plus de dix heures, et il ne se déclenche jamais dans l'heure~; l'horloge de la machine, cent fois plus lente que celle de la séance, maintient ouverte
+la période d'ouverture pendant cinquante minutes. La première sortie divergente est l'annulation de la production à 30.0~secondes, après 175 entrées, et 539 des 553
+sorties de la production n'ont pas d'équivalent dans le simulateur. Le rejeu du journal propre à la production reçoit le minuteur depuis le journal, mais lit toujours sa propre
+horloge de la machine, recote un tick plus large et se retire à 30.1~secondes.
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,x=0.19cm]
+\foreach \y/\l in {0/production,-1.1/simulateur,-2.2/rejeu} {\node[anchor=east] at (-1,\y) {\l};
+  \draw[gray] (0,\y) -- (60,\y);}
+\draw[->] (0,-3.0) -- (61.5,-3.0) node[right]{minutes};
+\foreach \m in {0,10,20,30,40,50,60} {\draw (\m,-2.9) -- (\m,-3.1) node[below]{\m};}
+\fill[omThm!50] (0,-0.15) rectangle (0.5,0.15);
+\draw[omThm,thick] (0.5,0.35) -- (0.5,-0.15) node[pos=0,above,font=\tiny]{minuteur~: 30 s};
+\fill[omDef!40] (0.5,-0.12) rectangle (60,0.12);
+\fill[omThm!50] (0,-1.25) rectangle (50,-0.95);
+\fill[omDef!40] (50,-1.22) rectangle (60,-0.98);
+\node[font=\tiny] at (25,-0.75) {un tick de large pendant 50 minutes~; le minuteur (10.5 heures) ne se déclenche jamais};
+\fill[omThm!50] (0,-2.35) rectangle (50,-2.05);
+\fill[omDef!40] (50,-2.32) rectangle (60,-2.08);
+\draw[omThm,thick] (0.5,-1.85) -- (0.5,-2.35);
+\node[font=\tiny] at (25,-1.85) {le minuteur journalisé se déclenche~; l'horloge de la machine le maintient large};
+\end{tikzpicture}
+
+\omcaption{Le défaut d'horloge murale dans les trois environnements sur l'heure~: en teinte foncée, la stratégie cote un tick de large~; en teinte claire, au
+meilleur cours. En production, l'horloge de la machine est celle de la plateforme et l'ouverture dure trente secondes. Dans le simulateur et le rejeu, la machine
+fonctionne cent fois plus lentement que la séance, à partir de 20~h~00, et l'ouverture dure cinquante minutes.}\label{fig:pl:simulation-production-parity:clock}
+\end{omfigure}
+
+Les trois autres défauts se lisent de la même façon. Avec les prix en virgule flottante, la première différence est la troisième sortie, à 24.4~secondes~: le cours acheteur élargi
+de la stratégie $99.99 - 0.01$ sort sous la forme 999\,799~; 1\,161 des 1\,501 ordres de la production sont hors de la grille des ticks, rejetés par la plateforme et renvoyés à la
+cotation suivante. Avec des entrées livrées dans l'ordre d'arrivée, la stratégie diverge pour la première fois à 33.0~secondes, après 203 entrées, à un instant où une exécution et un changement de
+cotation arrivaient ensemble~: si l'exécution est livrée en premier, elle envoie aussitôt son ordre de vente suivant~; livrées comme le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements} les livre,
+cotation d'abord, elle a envoyé le même ordre 0.19~secondes plus tard. Aucun des deux ordres n'est faux~; deux ordres le sont. Avec working au sens d'ordres accusés de réception, le
+changement de cotation qui suit les deux premiers ordres, une demi-microseconde plus tard et bien avant leurs accusés de réception, conduit la stratégie à
+les renvoyer tous les deux, et chaque changement de cotation pendant l'aller-retour de quarante microsecondes fait de même~: 8\,452 sorties dans l'heure, dont 8\,406 refusées par
+la limite d'exposition dans le pire cas de la passerelle d'ordres, et c'est tout ce qui arrête la tempête.
+
+\begin{remark}[Pourquoi le rejeu seul ne suffisait pas]\label{rem:pl:simulation-production-parity:replay}
+Un test de parité du rejeu (livre~7, chapitre~19) détecte une stratégie qui lit ce qui n'est pas une entrée, mais seulement si l'environnement de rejeu diffère de
+la production sur cette entrée~: il a détecté l'horloge murale ici parce que le harnais donnait au rejeu une horloge de machine propre. Il détecte les défauts d'adaptateur
+seulement lorsque l'hôte de rejeu a la bonne sémantique et que celui de la production ne l'a pas. Comparer deux environnements de type production sur la même
+séance détecte ce que le rejeu manque~; comparer le rejeu à la production détecte ce que deux simulateurs ont en commun.
+\end{remark}
+
+\section{Parité après les corrections}
+
+Avec tous les défauts corrigés --- la stratégie ne lit que l'horloge de l'hôte, les prix sont des entiers de bout en bout, l'hôte livre partout des entrées simultanées
+dans le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements} partout, et «~en cours~» signifie «~envoyé et non terminé~» partout --- les trois environnements s'accordent sur chaque sortie pour dix
+séances d'une heure (\cref{tab:pl:simulation-production-parity:clean})~: 8\,887 sorties pour 188\,079 entrées, aucune différence entre l'exécution de forme
+production, le simulateur et le rejeu.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{rrrcc}
+\toprule
+graine & entrées & sorties & simulateur & rejeu \\
+\midrule
+1 & 9\,492 & 553 & identique & identique \\
+2 & 16\,085 & 832 & identique & identique \\
+3 & 36\,396 & 1\,463 & identique & identique \\
+4 & 37\,621 & 1\,359 & identique & identique \\
+5 & 13\,911 & 784 & identique & identique \\
+6 & 29\,785 & 1\,426 & identique & identique \\
+7 & 6\,947 & 409 & identique & identique \\
+8 & 13\,410 & 726 & identique & identique \\
+9 & 20\,027 & 979 & identique & identique \\
+10 & 4\,405 & 356 & identique & identique \\
+\bottomrule
+\end{tabular}
+\caption{Parité après les corrections~: pour dix séances d'une heure, les entrées et les sorties de l'exécution de forme production, et si l'exécution du simulateur en processus
+et le rejeu du journal de production ont produit des sorties identiques.}\label{tab:pl:simulation-production-parity:clean}
+\end{table}
+
+\section{Tutoriel~: une stratégie, trois environnements, quatre défauts}\label{tut:pl:simulation-production-parity:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Héberger une stratégie dans trois environnements, introduire quatre défauts de parité et laisser le harnais trouver chacun d'eux~; montrer ensuite la parité.
+\textbf{État final~:} \cref{tab:pl:simulation-production-parity:defects,tab:pl:simulation-production-parity:clean}.
+\begin{tutsteps}
+\item \textbf{Environnements}~: \texttt{run\_env} avec \texttt{prod} et avec \texttt{sim} sur la même séance~; \texttt{replay} du
+journal de l'exécution de production.
+\item \textbf{Le harnais}~: \texttt{compare(prod, sim)} et \texttt{compare(prod, replay)}.
+\item \textbf{Défauts}~: \texttt{pl\_parity.defect\_table()}, un défaut à la fois.
+\item \textbf{Parité}~: \texttt{pl\_parity.clean()} sur les graines 1 à 10.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Introduire un cinquième défaut --- une stratégie qui parcourt un ensemble d'identifiants d'ordres lorsqu'elle annule --- et voir
+si le harnais le trouve~; donner à l'adaptateur en processus une latence différente de celle de la production et voir ce que la parité signifie alors.
+\end{tutorial}
+
+\section{Construction~: l'hôte de stratégie}\label{bld:pl:simulation-production-parity:strathost}
+
+\begin{build}
+\bfield{Rôle} Une seule stratégie qui s'exécute sans modification dans le backtest, le simulateur et la production, et un harnais qui le prouve.
+\bfield{Interface} \texttt{HostedStrategy} (\texttt{on\_start}, \texttt{on\_book}, \texttt{on\_ack}, \texttt{on\_fill},
+\texttt{on\_cancel}, \texttt{on\_reject}, \texttt{on\_timer}) ~; le contexte (\texttt{now}, \texttt{set\_timer}, \texttt{send},
+\texttt{cancel}, \texttt{working}, \texttt{position})~; \texttt{run\_env(env, strategy, seconds, seed, defects)}~;
+\texttt{replay(journal, strategy)}~; \texttt{compare(a, b) -> Parity}~; \texttt{Defects}.
+\bfield{Règles} La stratégie ne lit rien que l'hôte ne lui donne~; les prix sont des entiers~; entrées simultanées dans le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements}~; la même
+sémantique de saisie d'ordres dans chaque adaptateur~; les entrées de la production journalisées dans le format du livre~13~; la passerelle du livre~13 et le simulateur du livre~10 utilisés,
+non modifiés.
+\bfield{Tests d'acceptation} \texttt{code/firm/strathost/tests/}~: l'ordre de livraison des entrées simultanées, avec et sans le défaut~; parité
+nette de la production, du simulateur et du rejeu sur une courte séance, et les enregistrements du journal~; divergence sous chaque défaut d'adaptateur~; l'horloge
+murale~; la troncature de l'adaptateur en nombres à virgule flottante~; aucune annulation d'un ordre terminé.
+\bfield{Pour aller plus loin} Un quatrième environnement sur un vrai socket~; parité entre langages d'implémentation (les passerelles C++20 et Rust du livre~13)~; un
+harnais par dichotomie sur \texttt{first\_difference} du livre~13.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~7, chapitre~19 (parité du rejeu)~; One Quant Book~13, chapitres 21 et 23 (la passerelle d'ordres, les journaux d'entrées)~; One Quant
+Book~10, chapitre~26 (le simulateur et ses protocoles).
+\item Documentation Python, «~Floating-Point Arithmetic: Issues and Limitations~».
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:1}
+Pourquoi \texttt{int(ten thousand times (99.99 - 0.01))} vaut-il 999\,799, et quelle est la conversion correcte~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:2}
+Dans l'environnement de rejeu, pourquoi les minuteries ne sont-elles pas armées mais rejouées~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:simulation-production-parity:3}
+Avec le défaut d'horloge murale, pourquoi la production elle-même n'est-elle pas affectée~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:4}
+Pourquoi le défaut de sémantique des accusés de réception produit-il une tempête plutôt que quelques ordres en double, et qu'est-ce qui l'arrête~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:5}
+Le harnais a trouvé une différence non prévue lors de sa première exécution propre~: la décrire, et dire quel adaptateur avait raison.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:simulation-production-parity:6}
+Pourquoi le nombre de sorties touchées peut-il différer entre la comparaison avec le simulateur et celle avec le rejeu~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:simulation-production-parity:7}
+\emph{Programmation.} Exécuter \texttt{run\_three} pour la graine~2 avec chaque défaut. Les premières sorties divergentes apparaissent-elles aux mêmes instants que pour la graine~1~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:simulation-production-parity:8}
+\emph{Trouver la faille.} «~Notre test de parité rejoue les entrées du backtest d'hier dans le backtest et obtient des ordres identiques, donc la stratégie
+est prête pour la production.~»
+\end{exercise}
+
+\section{Problème~: Le matin où la minuterie s'est déclenchée}
+
+\begin{problem}[{Problème du week-end --- quatre défauts et un bilan propre}]\label{pb:pl:simulation-production-parity:1}
+La \cref{lst:pl:simulation-production-parity:quoter} présente la stratégie, trois environnements, séances d'une heure.
+
+\medskip\noindent\textbf{Partie I --- L'hôte.}
+\begin{enumerate}
+\item Que peut lire une stratégie hébergée, et par quel moyen~?
+\item Pourquoi l'hôte met-il les entrées en mémoire tampon par instant~?
+\item Que l'adaptateur de forme production ajoute-t-il à celui en processus~?
+\item Que contient le journal des entrées, et dans quel format~?
+\item Que fait l'environnement de rejeu des ordres de la stratégie~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les défauts.}
+\begin{enumerate}[resume]
+\item Comment le défaut d'horloge murale se manifeste-t-il dans le simulateur et dans le rejeu~?
+\item Que fait le défaut de prix en nombre à virgule flottante sur le cours acheteur large~?
+\item Quand le défaut d'ordre des rappels a-t-il de l'importance~?
+\item Que change la sémantique des accusés de réception, et pourquoi la tempête~?
+\item Lequel des quatre une rejeu du journal de production dans un hôte correct manquerait-il, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le rapport.}
+\begin{enumerate}[resume]
+\item Donner les entrées précédant la première sortie divergente pour chaque défaut.
+\item Donner les sorties touchées dans l'heure pour chaque défaut.
+\item Quel défaut est le plus rapide à se manifester, et lequel le plus lent~?
+\item Quelle différence non prévue le harnais a-t-il détectée~?
+\item Combien de sorties et d'entrées comptent les dix séances propres, et combien de différences~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les entrées jusqu'au premier ordre divergent de chaque défaut, les ordres touchés en une heure, et la
+parité après les correctifs.
+\item Qu'exigeriez-vous de chaque stratégie avant la production~?
+\item Qu'exigeriez-vous de chaque \omterm{def:pl:simulation-production-parity:host}{adaptateur d'environnement}~?
+\item Pourquoi comparer deux environnements sur la même séance en plus de rejouer un journal~?
+\item En une phrase~: qu'est-ce qui fait de la parité une propriété de la plateforme plutôt que de chaque stratégie~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:simulation-production-parity:1}
+Votre stratégie se comporte différemment en production du backtest le même jour. Où regardez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:simulation-production-parity:2}
+Pourquoi un système de trading devrait-il représenter les prix par des entiers~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:simulation-production-parity:3}
+Comment rendriez-vous testable l'usage que fait une stratégie du temps~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:simulation-production-parity:4}
+Une mise à jour de cotation et une exécution portent le même horodatage. Laquelle la stratégie doit-elle voir en premier, et pourquoi cela compte-t-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:simulation-production-parity:5}
+Concevez un harnais qui prouve qu'une stratégie se comporte à l'identique en simulation et en production.
+\end{interviewq}

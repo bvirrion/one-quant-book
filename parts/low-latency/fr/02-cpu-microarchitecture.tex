@@ -1,0 +1,409 @@
+\chapter{Microarchitecture du processeur}\label{ch:ll:cpu-microarchitecture}
+
+En juin 2012, un programmeur demande pourquoi douze lignes de C++, additionnant les éléments d'un tableau supérieurs ou égaux à 128,
+s'exécutent en 11.5~s sur des données aléatoires et en 1.9~s une fois ces mêmes données triées. Rien dans le source n'a
+changé~; seul l'ordre des valeurs a changé, et avec lui la fréquence à laquelle le processeur devine correctement le sens dans lequel
+un \texttt{if} va se dérouler. La réponse est devenue l'une des plus lues de l'histoire du site. Le chemin critique (hot path)
+d'un système de trading ne compte que quelques milliers d'instructions, et le processeur qui les exécute n'est pas la machine séquentielle
+que décrit le code source~: il recouvre des dizaines d'instructions, les exécute dans le désordre, devine les branchements et modifie
+lui-même sa vitesse d'horloge. Ce chapitre décrit cette machine du point de vue du programme, mesure chaque effet sur l'ordinateur portable
+de ce livre, et construit le banc d'essai que chaque chapitre ultérieur utilisera pour se chronométrer.
+
+\section{Pipelines et exécution superscalaire}
+
+\begin{definition}[Pipeline d'instructions, instructions par cycle]\label{def:ll:cpu-microarchitecture:pipeline}
+Un \emph{pipeline d'instructions}\index{pipeline d'instructions} découpe l'exécution d'une instruction en étages (chargement,
+décodage, renommage, ordonnancement, exécution, validation), chacun assuré par un matériel dédié, de sorte que de nombreuses instructions
+sont en cours de traitement à la fois, chacune à un étage différent. Un pipeline superscalaire traite plusieurs instructions par étage et par cycle.
+Les \emph{instructions par cycle}\index{instructions par cycle} (IPC) désignent le nombre d'instructions qu'un cœur achève en un cycle
+de son horloge, moyenné sur un morceau de code.
+\end{definition}
+
+Un cœur de performance actuel décode et renomme six \omterm{def:ll:cpu-microarchitecture:pipeline}{instructions par cycle} et peut en valider six par cycle en régime soutenu,
+lorsque les instructions sont indépendantes. Le code atteint rarement ce niveau~: un IPC compris entre un et trois est courant.
+L'écart entre la largeur de la machine et l'IPC effectivement obtenu est le terrain de la conception orientée latence~: chaque
+cycle au cours duquel moins d'instructions sont validées qu'il n'aurait été possible est un cycle perdu à attendre un résultat, la mémoire,
+ou la reprise du pipeline après une mauvaise supposition.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum height=0.8cm,minimum width=1.55cm,align=center}]
+\node[st] (f) at (0,0) {chargement\\ (prédiction)};
+\node[st] (d) at (2.1,0) {décodage};
+\node[st] (r) at (4.2,0) {renommage};
+\node[st] (s) at (6.75,0) {ordonnancement};
+\node[st,minimum height=2.0cm] (x) at (9.05,0) {exécution\\ (ALU,\\ lectures,\\ écritures)};
+\node[st] (t) at (11.25,0) {validation};
+\foreach \a/\b in {f/d,d/r,r/s,s/x,x/t} \draw[-Stealth,thick] (\a) -- (\b);
+\draw[draw=omThm,fill=omThm!8,rounded corners=2pt] (3.4,-2.2) rectangle (12.05,-1.3);
+\node[font=\footnotesize,align=center] at (7.725,-1.75) {tampon de réordonnancement~:\\ ordre du programme, achèvement dans le désordre};
+\draw[-Stealth,omThm] (r.south) -- (4.2,-1.3);
+\draw[-Stealth,omThm] (11.25,-1.3) -- (t.south);
+\draw[-Stealth,thick,omProp] (x.north) to[out=120,in=60,looseness=0.6] node[pos=0.5,above,font=\footnotesize]{branchement mal prédit~: vidage et rechargement} (f.north);
+\end{tikzpicture}
+
+\omcaption{Pipeline d'un cœur à \omterm{def:ll:cpu-microarchitecture:ooo}{exécution dans le désordre}, simplifié. Les instructions entrent et sortent dans l'ordre du programme~; entre les deux,
+l'ordonnanceur lance chacune dès que ses entrées sont prêtes, et le \omterm{def:ll:cpu-microarchitecture:ooo}{tampon de réordonnancement} conserve l'ordre du programme
+pour la validation. Un branchement mal prédit écarte toutes les instructions chargées après lui.}\label{fig:ll:cpu-microarchitecture:pipeline}
+\end{omfigure}
+
+\section{Exécution dans le désordre et tampon de réordonnancement}
+
+\begin{definition}[Exécution dans le désordre, tampon de réordonnancement]\label{def:ll:cpu-microarchitecture:ooo}
+Dans l'\emph{exécution dans le désordre}\index{exécution dans le désordre} (out-of-order), le cœur lance chaque instruction dès que ses entrées
+sont disponibles, et non dans l'ordre du programme, mais rend les résultats visibles dans l'ordre du programme. Le
+\emph{tampon de réordonnancement}\index{tampon de réordonnancement} (reorder buffer) contient les instructions comprises entre le renommage et la validation~; sa taille borne
+la distance à laquelle le cœur peut chercher du travail indépendant en avant d'une instruction bloquée.
+\end{definition}
+
+Le \omterm{def:ll:cpu-microarchitecture:ooo}{tampon de réordonnancement} de la famille de cœurs de performance de cet ordinateur portable contient 512 instructions. Lorsqu'un chargement échoue
+dans tous les caches et attend cent nanosecondes la mémoire (chapitre~3), le cœur continue d'exécuter les instructions indépendantes qui
+le suivent jusqu'à ce que le tampon soit plein, puis il se bloque. Ce qu'il ne peut pas faire, c'est raccourcir une chaîne de dépendances~: chaque
+instruction qui a besoin du résultat de la précédente attend ce résultat, quelle que soit la largeur de la machine.
+
+Pour observer ces effets, le livre chronomètre de petits morceaux de code isolés.
+
+\begin{definition}[Microbenchmark, barrière de compilation]\label{def:ll:cpu-microarchitecture:ubench}
+Un \emph{microbenchmark}\index{microbenchmark} chronomètre un petit morceau de code isolé, de nombreuses fois, afin de mesurer une
+propriété de la machine ou du code. Une \emph{barrière de compilation}\index{barrière de compilation} est une instruction que le compilateur
+doit traiter comme une lecture ou une écriture en mémoire (ou sur une valeur donnée), bien qu'elle n'émette aucune instruction~; elle empêche
+l'optimiseur de supprimer ou de déplacer le code chronométré.
+\end{definition}
+
+Un \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} ne mesure que ce qu'il mesure~: une boucle sur des données qui restent dans le cache de premier niveau, sur un cœur
+déjà chauffé, une fois ses branchements appris. C'est le meilleur cas du chemin critique, et non son comportement après une période calme
+(caches froids, cœur dans un état de faible consommation), qui est souvent ce qui compte en trading (chapitre~5).
+
+\begin{proposition}[Chaînes nécessaires pour saturer les unités]\label{prop:ll:cpu-microarchitecture:little}
+Si une opération a une latence de $\ell$ cycles et que le cœur peut en lancer $w$ par cycle, une boucle a besoin d'au moins $\ell w$
+chaînes de dépendances indépendantes pour en lancer $w$ par cycle~; avec $k < \ell w$ chaînes, elle achève au plus $k/\ell$ opérations par cycle.
+\end{proposition}
+
+\begin{proof}
+Chaque chaîne a au plus une opération en cours, qui occupe $\ell$ cycles~; $k$ chaînes ont donc au plus $k$ opérations en cours. Par
+la loi de Little, le débit d'achèvement est au plus $k/\ell$, qui n'atteint $w$ que lorsque $k \ge \ell w$.
+\end{proof}
+
+La \Cref{fig:ll:cpu-microarchitecture:chains} somme 4\,096 doubles, conservés dans le cache, avec de un à seize accumulateurs. Une
+addition de flottants sur ce cœur a une latence de deux cycles lorsqu'elle est suivie d'une autre addition, et deux peuvent être lancées
+par cycle~: la \cref{prop:ll:cpu-microarchitecture:little} prédit quatre chaînes, et le coût mesuré par addition est divisé par deux
+de un à deux accumulateurs, de nouveau divisé par deux à quatre, puis ne s'améliore plus au-delà. Le compilateur ne le fait pas de lui-même~:
+sans autorisation de réassocier les additions de flottants (\texttt{-ffast-math}, chapitre~8), il doit conserver la seule
+chaîne écrite dans le source.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.2cm,ybar,bar width=14pt,ymin=0,enlarge y limits={upper,value=0.2},
+  symbolic x coords={1,2,4,8,16},xtick=data,enlarge x limits=0.15,
+  xlabel={accumulateurs indépendants},ylabel={ns par addition},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  point meta=y,every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=2},
+  table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=accumulators,y=ns_per_add]{figdata/low-latency/02-cpu-microarchitecture/measured_chains.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Coût par addition de flottants lors de la somme de 4\,096 doubles avec 1 à 16 accumulateurs indépendants. Deux
+cycles de latence et deux additionneurs suffisent à atteindre quatre chaînes (\cref{prop:ll:cpu-microarchitecture:little}). Mesuré sur un
+ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés, épinglé sur un seul CPU, meilleur résultat sur 30 exécutions. Données~:
+\texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:chains}
+\end{omfigure}
+
+Le cœur peut aussi supprimer les dépendances que contient le programme. Une chaîne de dix additions dépendantes d'un registre s'exécute à
+une addition par cycle, comme il se doit~; la même chaîne ajoutant la constante 1 s'exécutait à environ cinq additions par
+cycle sur cet ordinateur portable, parce que le renommeur de cette famille de cœurs résout lui-même les additions à petite immédiate, jusqu'à six par cycle, sans
+les envoyer à une unité d'exécution. Un \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} qui utilise \texttt{add \$1} pour compter des cycles mesure le renommeur~;
+le harnais ci-dessous mesure l'horloge avec la forme à registre.
+
+\section{Prédiction de branchement}
+
+\begin{definition}[Prédiction de branchement, erreur de prédiction de branchement]\label{def:ll:cpu-microarchitecture:branch}
+La \emph{prédiction de branchement}\index{prédiction de branchement} (branch prediction) est la supposition du cœur, formulée à la lecture, sur la direction et la cible de
+chaque branchement, afin que le pipeline puisse continuer à lire les instructions avant que le branchement soit exécuté. Une \emph{erreur de
+prédiction de branchement}\index{erreur de prédiction de branchement} (branch misprediction) est une supposition fausse~: le cœur jette chaque instruction lue après le
+branchement et relit depuis la bonne cible, ce qui fait perdre autant de cycles que la profondeur de l'avant du pipeline.
+\end{definition}
+
+\begin{proposition}[Quand le code sans branchement gagne]\label{prop:ll:cpu-microarchitecture:breakeven}
+Un corps de boucle comportant un branchement dépendant des données coûte en moyenne $c_0 + mP$ cycles par itération, où $m$ est le
+taux d'erreurs de prédiction et $P$ la pénalité d'erreur de prédiction~; une réécriture sans branchement qui fait toujours le travail des deux côtés,
+coûte $c_0 + c$. La réécriture est moins chère exactement lorsque $m > c/P$.
+\end{proposition}
+
+\begin{proof}
+Chaque itération subit une erreur de prédiction avec probabilité $m$ et paie alors $P$~; la linéarité de l'espérance donne $c_0 + mP$. Comparer
+à $c_0 + c$.
+\end{proof}
+
+La \Cref{fig:ll:cpu-microarchitecture:branch} reprend la boucle de 2012. Sur des données triées, le prédicteur a raison à chaque itération sauf
+une sur 32\,768 itérations, et la boucle avec branchements est la plus rapide~; sur des données mélangées, il a raison une fois sur deux, et la boucle
+est environ treize fois plus lente. La boucle sans branchement, qui masque chaque élément par des uns ou des zéros, coûte autant
+dans les deux cas. La moitié des itérations subissent une erreur de prédiction sur des données mélangées, donc l'écart entre les deux barres avec branchements est la
+moitié de la pénalité par élément~: environ \qty{5.2}{\nano\second}, soit quelque 24 cycles à l'horloge mesurée de ce cœur, un peu au-dessus de la
+valeur «~parfois plus de 20 cycles d'horloge~» qu'une mesure publiée donne pour cette famille de cœurs. La boucle sans branchement
+coûte environ \qty{0.11}{\nano\second} de plus par élément sur des données triées, donc, selon la
+\cref{prop:ll:cpu-microarchitecture:breakeven}, elle l'emporte dès que plus d'environ deux itérations sur cent
+subissent une erreur de prédiction.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.2cm,ybar,bar width=16pt,ymin=0,
+  symbolic x coords={sorted,shuffled},xtick=data,xticklabels={données triées,données mélangées},enlarge x limits=0.5,
+  ylabel={ns par élément},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=order,y=branchy]{figdata/low-latency/02-cpu-microarchitecture/measured_branch.csv};
+\addplot[fill=omDef!45,draw=omDef] table[x=order,y=branchless]{figdata/low-latency/02-cpu-microarchitecture/measured_branch.csv};
+\legend{avec branchement,sans branchement}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La boucle de la question de 2012 (sommer les éléments $\ge 128$ de 32\,768 octets aléatoires) avec un branchement et avec un
+masque, sur des données triées et mélangées. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés,
+épinglé sur un seul CPU, meilleur résultat sur 30 exécutions. Données~: \texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:branch}
+\end{omfigure}
+
+La leçon pour le trading n'est pas «~supprimer les branchements~». La plupart des branchements sur le chemin critique (hot path) sont prévisibles (le type de message est
+généralement le même, le contrôle de risque passe le plus souvent) et ne coûtent presque rien. Les plus coûteux dépendent du marché~:
+de quel côté se situe un message, si un prix améliore le carnet d'ordres. Ils subissent des erreurs de prédiction par rafales, précisément quand le marché est
+animé, et il vaut la peine de les mesurer un à un.
+
+\section{Variation dynamique de fréquence, turbo et états de veille}
+
+\begin{definition}[Variation dynamique de fréquence, état de veille]\label{def:ll:cpu-microarchitecture:dvfs}
+La \emph{variation dynamique de fréquence}\index{variation dynamique de fréquence} (dynamic frequency scaling) modifie l'horloge (et la tension) d'un cœur pendant qu'il tourne,
+selon la charge, la température, le budget de puissance et le nombre de cœurs actifs~; les fréquences les plus élevées, appelées turbo,
+ne sont disponibles que tant que le boîtier reste dans ses limites. Un \emph{état de veille}\index{etat@état de veille} (C-state) est un
+état à faible consommation qu'un cœur adopte lorsqu'il n'a rien à exécuter, et dont le réveil prend quelques microsecondes, les états
+plus profonds demandant davantage de temps.
+\end{definition}
+
+\begin{definition}[Compteur d'horodatage]\label{def:ll:cpu-microarchitecture:tsc}
+Le \emph{compteur d'horodatage}\index{compteur d'horodatage} (TSC) est un registre de 64 bits de chaque cœur x86 qui compte à une
+cadence constante sur les processeurs actuels, quelle que soit l'horloge du cœur, lu par les instructions \texttt{rdtsc} et
+\texttt{rdtscp} en quelques nanosecondes.
+\end{definition}
+
+Les deux définitions interagissent. Le TSC compte du temps, non des cycles~: sur cet ordinateur portable, il cadence à environ 3.0~GHz pendant que le cœur
+fonctionne à une fréquence qui va de son horloge de veille à plusieurs gigahertz. Un \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} qui affiche les battements du TSC comme des «~cycles~» se trompe d'un
+facteur égal à ce rapport. Le harnais affiche des nanosecondes et, lorsque les cycles comptent, mesure l'horloge du cœur avec une chaîne d'additions dépendantes
+sur des registres, un cycle chacune. Sur un serveur, la leçon est opérationnelle~: un cœur inactif depuis un certain temps
+répond à son premier message depuis un \omterm{def:ll:cpu-microarchitecture:dvfs}{état de veille} profond et à une horloge basse, si bien qu'un hôte de trading limite les \omterm{def:ll:cpu-microarchitecture:dvfs}{états de veille} et fixe
+sa fréquence (chapitre~13).
+
+\begin{dated}{2026-09}{L'ordinateur portable utilisé pour les mesures de ce livre}\label{dat:ll:cpu-microarchitecture:laptop}
+L'Intel Core Ultra 7 155H, lancé au T4 2023, compte 16 cœurs~: 6 cœurs de performance dotés chacun de deux
+threads matériels, 8 cœurs efficaces et 2 cœurs efficaces basse consommation, 22 threads au total, avec des fréquences turbo maximales de
+4.8~GHz sur les cœurs de performance et 3.8~GHz sur les cœurs efficaces, et 24~Mo de cache partagé (page
+de spécification d'Intel).
+\end{dated}
+
+\section{Multithreading simultané et cœurs hétérogènes}
+
+\begin{definition}[Multithreading simultané, cœurs hétérogènes]\label{def:ll:cpu-microarchitecture:smt}
+Dans le \emph{multithreading simultané}\index{multithreading simultané} (SMT, hyper-threading), un cœur exécute deux
+threads matériels, qui partagent ses unités d'exécution, ses caches et ses prédicteurs~; chacun apparaît au système d'exploitation comme un CPU.
+Un processeur possède des \emph{cœurs hétérogènes}\index{cœurs hétérogènes} (heterogeneous cores) lorsque ses cœurs diffèrent par leur conception, typiquement de grands
+cœurs de performance et de petits cœurs efficaces, aux vitesses différentes pour un même code.
+\end{definition}
+
+Les deux comptent pour un thread sensible à la latence. Son thread matériel jumeau se dispute les mêmes unités d'exécution et
+les caches de premier niveau, si bien que les hôtes de trading désactivent soit le SMT, soit laissent inactif le jumeau de chaque cœur critique. Sur un
+processeur hétérogène, le même code s'exécute à des vitesses différentes selon l'endroit où le système d'exploitation le place~; un
+thread critique doit être épinglé sur un cœur de performance.
+
+Cet ordinateur portable ajoute une couche que n'ont généralement pas les serveurs installés dans un site de colocation~: il fait tourner Linux dans une
+machine virtuelle. Les 22 CPU que voit Linux sont des CPU virtuels, que l'hyperviseur planifie sur le cœur physique de son choix,
+et le compte rendu du processeur sur les types de ses cœurs est masqué à l'invité. La \Cref{fig:ll:cpu-microarchitecture:freq}
+mesure l'horloge perçue par chaque CPU virtuel~: les cœurs de performance et les cœurs efficaces n'apparaissent pas en deux groupes, et
+épingler un thread sur un CPU virtuel n'équivaut pas à l'épingler sur un seul cœur physique. Les mesures de ce livre sont donc les
+valeurs au mieux de l'ordinateur portable, et chaque légende le signale.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5cm,ybar,bar width=6pt,ymin=0,ymax=5.5,xmin=-0.8,xmax=21.8,
+  xtick={0,2,4,6,8,10,12,14,16,18,20},xlabel={CPU virtuel},ylabel={horloge mesurée (GHz)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[x=cpu,y=ghz_reg]{figdata/low-latency/02-cpu-microarchitecture/measured_freq.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'horloge à laquelle chacun des 22 CPU virtuels de l'ordinateur portable exécute une chaîne d'additions dépendantes dans des registres (une
+addition par cycle), meilleure valeur sur 15 exécutions. L'hyperviseur masque quel cœur physique exécute quel CPU virtuel~; les six
+cœurs de performance et les dix cœurs efficaces n'apparaissent pas en groupes. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2,
+sans cœurs isolés, la machine étant par ailleurs au repos. Données~: \texttt{bench\_cpu.py}.}\label{fig:ll:cpu-microarchitecture:freq}
+\end{omfigure}
+
+\section{Tutoriel~: chronométrer honnêtement un noyau}\label{tut:ll:cpu-microarchitecture:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire le harnais de \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark}, puis l'utiliser pour mesurer une \omterm{def:ll:cpu-microarchitecture:branch}{erreur de prédiction de branchement}, une chaîne de dépendances et
+l'horloge. \textbf{État final~:}
+\cref{fig:ll:cpu-microarchitecture:branch,fig:ll:cpu-microarchitecture:chains,fig:ll:cpu-microarchitecture:freq} et une
+estimation de la pénalité de mauvaise prédiction en cycles.
+\begin{tutsteps}
+\item \textbf{Garder le code vivant et encadrer le compteur.} Une instruction \texttt{asm} vide qui prend la valeur en entrée est une
+\omterm{def:ll:cpu-microarchitecture:ubench}{barrière de compilation}~: l'optimiseur doit calculer la valeur et ne peut pas déplacer de travail au-delà. La région chronométrée
+commence par \texttt{lfence; rdtsc} et se termine par \texttt{rdtscp; lfence}, afin que le travail antérieur soit achevé avant la
+première lecture et que la seconde lecture attende la fin de la région.
+\omcode{code/firm/ubench/cpp/firm_ubench.hpp}{22}{41}{Le harnais C++20~: barrières et lectures encadrées du compteur d'horodatage.}\label{lst:ll:cpu-microarchitecture:cpp}
+\item \textbf{Le même en Rust.} Rust dispose de \texttt{std::hint::black\_box} pour la barrière~; le compteur demande les
+intrinsèques de \texttt{std::arch} et un bloc \texttt{unsafe}, dont l'argument de sûreté figure dans un commentaire.
+\omcode{code/firm/ubench/rust/src/lib.rs}{7}{27}{Les lectures encadrées de la réplique Rust.}\label{lst:ll:cpu-microarchitecture:rust}
+\item \textbf{Les noyaux.} La boucle à branchement conserve son branchement parce qu'une instruction \texttt{asm} opaque s'y trouve~;
+sans elle, le compilateur peut transformer le \texttt{if} en mouvement conditionnel et l'expérience disparaît.
+\omcode{code/low-latency/02-cpu-microarchitecture/cpp/ll_cpu.hpp}{9}{31}{La boucle de 2012 avec un branchement et avec un masque.}\label{lst:ll:cpu-microarchitecture:kernels}
+\item \textbf{Lancer} \texttt{python bench\_cpu.py}~: il compile \texttt{ll\_cpu\_bench.cpp}, exécute les trois modes épinglés
+avec \texttt{taskset}, et écrit les CSV mesurés ainsi que leurs fichiers \texttt{.meta}~; \texttt{ll\_cpu.penalty()} transforme
+les valeurs de branchement en une pénalité en cycles.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Retirer l'instruction \texttt{asm} de \texttt{sum\_branchy}, examiner le désassemblage
+(\texttt{objdump -d}) et mesurer de nouveau~; remplacer les octets aléatoires par un motif de période 8 et observer le prédicteur
+l'apprendre.
+\end{tutorial}
+
+\section{Construction~: le harnais de microbenchmark}\label{bld:ll:cpu-microarchitecture:ubench}
+
+\begin{build}
+\bfield{Rôle} Une façon commune de mesurer le temps de code dans tout le livre, en C++20, en Rust et dans les pilotes Python qui produisent chaque
+figure mesurée, afin que les chiffres de chapitres différents soient comparables et indiquent leur provenance.
+\bfield{Interface} C++20 \texttt{firm::ubench}~: \texttt{do\_not\_optimize(x)}, \texttt{clobber()},
+\texttt{tsc\_start()}, \texttt{rdtscp()}, \texttt{Clock::calibrate(ms)} et \texttt{Clock::ns(ticks)},
+\texttt{overhead()}, \texttt{run(fn, reps, warm)}, \texttt{quantile(v, p)}. \texttt{firm\_ubench} en Rust~: les mêmes
+fonctions. \texttt{firm\_ubench} en Python~: \texttt{compile\_cpp}, \texttt{run(exe, *args, cpus)},
+\texttt{machine()}, \texttt{write\_measured(csv, header, rows, **meta)}, \texttt{quantiles}.
+\bfield{Règles} Chaque région chronométrée est encadrée~; les résultats sont en nanosecondes (les ticks n'apparaissent que dans le harnais)~; chaque CSV mesuré
+est accompagné d'un fichier \texttt{.meta} qui nomme la machine, le compilateur, les options, la liste des CPU et la charge~; les pilotes s'appellent
+\texttt{bench\_*.py} et ne sont jamais lancés par \texttt{make figdata}.
+\bfield{Tests d'acceptation} \texttt{code/firm/ubench/}~: calibration entre 0.5 et 6 ticks par nanoseconde, un compteur monotone, un travail
+plus coûteux qu'une région vide (C++, Rust), et l'aller-retour du CSV et des métadonnées du pilote (Python).
+\bfield{Pour aller plus loin} Lire le compteur de cycles du cœur par \texttt{perf\_event\_open} lorsque cela est permis~; indiquer l'étendue des
+exécutions répétées avec chaque chiffre.
+\end{build}
+
+\begin{omsources}
+\item Stack Overflow, ``Why is processing a sorted array faster than processing an unsorted array?'', question
+11227809, 2012.
+\item A.~Fog, \emph{The microarchitecture of Intel, AMD and VIA CPUs}, mis à jour en 2026.
+\item Chips and Cheese, ``Popping the hood on Golden Cove'' (2021) et ``Lion Cove: Intel's P-core roars'' (2024).
+\item Intel, \emph{Intel 64 and IA-32 Architectures Optimization Reference Manual}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:1}
+Un cœur retire 2.4 \omterm{def:ll:cpu-microarchitecture:pipeline}{instructions par cycle} à 4.0~GHz. Combien d'instructions un chemin critique de \qty{600}{\nano\second}
+exécute-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:2}
+Un \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmark} indique 3\,000 ticks TSC pour une fonction sur un ordinateur portable dont le TSC cadence à 3.0~GHz tandis que le cœur tourne à
+4.5~GHz. Combien de temps la fonction a-t-elle pris, et combien de cycles de cœur~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:cpu-microarchitecture:3}
+Une opération a une latence de 4 cycles et le cœur peut en lancer deux par cycle. Combien de chaînes indépendantes une boucle
+doit-elle comporter pour atteindre le débit du cœur, et quelle fraction de ce débit atteint une boucle à trois chaînes~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:4}
+Un gestionnaire de messages comporte un branchement, selon le côté du message, qui se trompe dans 30~\% des cas, avec une pénalité de 20 cycles. Une
+version sans branchement coûte 4 cycles supplémentaires à chaque message. Laquelle est la plus rapide, et de combien par message~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:5}
+À partir de la \cref{fig:ll:cpu-microarchitecture:branch}, estimer la pénalité de mauvaise prédiction en nanosecondes, puis en cycles à
+l'horloge de la \cref{fig:ll:cpu-microarchitecture:freq} pour le CPU~2. Sur quelle hypothèse concernant les données mélangées repose
+l'estimation~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:cpu-microarchitecture:6}
+Pourquoi le \omterm{def:ll:cpu-microarchitecture:ooo}{tampon de réordonnancement} ne peut-il pas masquer une chaîne de dépendances, quelle que soit sa taille~? Que masque-t-il à la place~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpu-microarchitecture:7}
+\emph{Programmation.} Ajouter un mode à \texttt{ll\_cpu\_bench.cpp} qui exécute la boucle à branchement sur des données dont les valeurs alternent par
+blocs de $b$ éléments au-dessus et au-dessous de 128, pour $b = 1, 2, 4, 8, 64$. Qu'apprend le prédicteur, et pour quel $b$ la boucle atteint-elle la
+vitesse du cas trié~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:cpu-microarchitecture:8}
+\emph{Trouver la faille.} «~Nous avons mesuré notre encodeur d'ordres à 40 cycles avec une boucle d'instructions \texttt{add \$1} comme
+référence de cycle, sur un cœur déjà chaud, en l'appelant dix millions de fois de suite sur le même ordre.~»
+\end{exercise}
+
+\section{Problème~: Le branchement qui a coûté une cotation}
+
+\begin{problem}[{Problème du week-end --- un \texttt{if} dans le chemin de cotation}]\label{pb:ll:cpu-microarchitecture:1}
+Le chemin critique du moteur de cotation comporte un seul branchement dépendant des données~: savoir si une transaction entrante s'est faite au cours acheteur ou au cours vendeur.
+Un jour calme, les deux côtés alternent par longues séries~; un jour chargé, ils sont presque aléatoires. L'équipe mesure la boucle de 2012 comme
+substitut (la \cref{fig:ll:cpu-microarchitecture:branch}) et doit décider s'il faut réécrire ce branchement.
+
+\medskip\noindent\textbf{Partie I --- La mesure.}
+\begin{enumerate}
+\item Quels sont les quatre coûts mesurés par élément~?
+\item Pourquoi la boucle à branchements sur les données triées est-elle plus rapide que la boucle sans branchement~?
+\item Estimer la pénalité d'une \omterm{def:ll:cpu-microarchitecture:branch}{erreur de prédiction de branchement} en nanosecondes.
+\item La convertir en cycles avec la fréquence d'horloge mesurée du CPU~2.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le modèle.}
+\begin{enumerate}[resume]
+\item Écrire le coût attendu par itération des boucles à branchements et sans branchement en fonction du
+taux d'\omterm{def:ll:cpu-microarchitecture:branch}{erreur de prédiction de branchement}.
+\item À quel taux d'erreur de prédiction les deux versions coûtent-elles autant~?
+\item Un jour calme, le branchement se trompe sur 1~\% des transactions. Quelle version l'emporte, et de combien par transaction~?
+\item Un jour chargé, il se trompe sur 35~\%. Laquelle l'emporte, et de combien~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Ce que cela vaut.}
+\begin{enumerate}[resume]
+\item Un jour chargé, les transactions arrivent par rafales, à 50\,000 par seconde. Combien de temps de traitement
+par seconde la version à branchements gaspille-t-elle~?
+\item Par rapport au budget de \qty{1.3}{\micro\second} du chemin critique pour les étapes logicielles (chapitre~1), la pénalité par
+transaction mal prédite est-elle grande ou petite~?
+\item Pourquoi les erreurs de prédiction se regroupent-elles les jours qui comptent~?
+\item Que changerait un prédicteur qui aurait appris le motif du jour chargé~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- La décision.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la pénalité d'erreur de prédiction mesurée sur cet ordinateur portable, en nanosecondes et en cycles, et le
+taux d'erreur de prédiction au-delà duquel la réécriture sans branchement l'emporte.
+\item Pourquoi la pénalité mesurée dépasse-t-elle la valeur publiée pour la famille de cœurs~?
+\item Que mesure le TSC dans cette expérience, et pourquoi ne s'agit-il pas de cycles~?
+\item Pourquoi épingler le benchmark sur un seul CPU, et que signifie l'épinglage sous un hyperviseur~?
+\item Que ferait un compilateur de la boucle à branchements si l'instruction \texttt{asm} était supprimée~?
+\item Citer un autre branchement du chemin critique de trading qui est prévisible, et un qui ne l'est pas.
+\item Comment mesurer le taux d'erreur de prédiction sur l'hôte de production~?
+\item En une phrase~: quand vaut-il la peine d'écrire du code sans branchement~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:1}
+Pourquoi trier un tableau peut-il rendre une boucle qui le parcourt plusieurs fois plus rapide, alors que le travail de la boucle ne dépend pas de l'ordre~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:2}
+Expliquez l'\omterm{def:ll:cpu-microarchitecture:ooo}{exécution dans le désordre} (out-of-order). Qu'est-ce qui limite la quantité de travail indépendant que le cœur peut trouver~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:3}
+Pourquoi la somme d'un tableau avec quatre accumulators s'exécute-t-elle plus vite qu'avec un seul~? Pourquoi le compilateur ne le fait-il pas pour vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:4}
+Vous voulez chronométrer une fonction qui prend 50 nanosecondes. Comment vous y prenez-vous, et que peut-il mal se passer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:5}
+Un thread critique pour la latence doit-il partager un cœur avec son thread jumeau en hyper-threading~? Pourquoi~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:cpu-microarchitecture:6}
+Le premier ordre après une minute calme est toujours plus lent que les suivants. Citez trois causes dans le processeur et
+comment vous confirmeriez chacune.
+\end{interviewq}

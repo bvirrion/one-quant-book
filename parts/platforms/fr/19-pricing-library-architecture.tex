@@ -1,0 +1,329 @@
+\chapter{Architecture de la bibliothèque de pricing}\label{ch:pl:pricing-library-architecture}
+
+Un client a demandé vendredi un prix pour un autocallable worst-of à coupons mémoire, avec un lookback sur la barrière de knock-in~: le capital est exposé
+dès que la pire performance a été inférieure à 60~\% à une date d'observation, et non seulement à l'échéance. La bibliothèque ne contenait aucune classe
+pour cela. Dès lundi, le produit était pricé à partir de onze lignes de \omterm{def:pl:pricing-library-architecture:script}{script de payoff}, sur les mêmes \omterm{def:pl:pricing-library-architecture:market}{objets de marché}, le même modèle et le même moteur
+Monte Carlo que toutes les autres transactions de la bibliothèque, avec les grecques, les scénarios et les \omterm{def:pl:the-platform-map:batch}{traitements par lots} en prime. Ce chapitre porte sur l'architecture qui rend cela possible~: une bibliothèque en couches, dont les moteurs ne savent pas quels produits ils
+pricent, et un petit langage dans lequel un produit est une donnée.
+
+\section{La bibliothèque analytique et ses couches}
+
+\begin{definition}[Bibliothèque analytique]\label{def:pl:pricing-library-architecture:library}
+Une \emph{bibliothèque analytique}\index{bibliothèque analytique} est le code commun de la firme pour valoriser et gérer le risque des instruments~: \omterm{def:pl:pricing-library-architecture:market}{objets de marché},
+modèles, moteurs numériques et instruments, séparés de sorte que chacun puisse être remplacé ou étendu sans les autres, et appelés de la même façon par
+les outils de pricing, les systèmes de risque et la recherche.
+\end{definition}
+
+Le livre~5 en a construit une (\texttt{firm.pricing}, chapitre~28) et en a figé l'interface pour le reste de la série~: les instruments sont des descriptions de
+flux de trésorerie~; les données de marché sont un instantané immuable~; un modèle décrit l'évolution du marché~; un moteur calcule la valeur d'un instrument selon
+un modèle sur un instantané~; et chaque grecque, chaque scénario et chaque \omterm{def:pl:the-platform-map:batch}{traitement par lots} est une seule fonction de repricing appliquée à des instantanés modifiés. Les couches
+font l'architecture~: un nouveau moteur price les anciens instruments, un nouvel instrument utilise les anciens moteurs, et un système de risque (chapitre~18, et le moteur du livre~6)
+n'a besoin de connaître que la fonction de repricing.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.8cm,inner sep=3pt},>=Stealth]
+\node[box,fill=gray!10,minimum width=11cm] (api) at (0,2.2) {appels~: \texttt{price}, \texttt{greeks}, \texttt{sensitivities},
+\texttt{reprice}, \texttt{price\_batch} --- une seule fonction de repricing sur des instantanés modifiés};
+\node[box,fill=omMeth!12,minimum width=2.6cm] (i) at (-4.7,0.9) {instruments\\ flux de trésorerie};
+\node[box,fill=omMeth!12,minimum width=2.6cm] (m) at (-1.57,0.9) {objets de marché\\ courbes, surfaces};
+\node[box,fill=omMeth!12,minimum width=2.6cm] (mo) at (1.57,0.9) {modèles\\ Black--Scholes, Heston};
+\node[box,fill=omMeth!12,minimum width=2.6cm] (e) at (4.7,0.9) {moteurs\\ analytique, EDP, MC};
+\node[box,fill=omDef!15,minimum width=3.8cm] (s) at (-3.2,-0.6) {instrument scripté\\ script + échéanciers};
+\node[box,fill=omDef!15,minimum width=3.8cm] (se) at (3.2,-0.6) {moteur de script\\ analyse, échéancier, évaluation};
+\draw[->] (s.north) -- (s.north|-i.south); \draw[->] (se.north) -- (se.north|-e.south);
+\draw[->] (se.west) -- (s.east);
+\foreach \x in {i,m,mo,e} {\draw[->] (\x.north) -- (\x.north|-api.south);}
+\node[font=\scriptsize\itshape] at (0,-1.55) {enregistré avec \texttt{firm.pricing.register}~: pricé, choqué et traité par lots comme les autres};
+\end{tikzpicture}
+
+\omcaption{Les couches de la bibliothèque et la place du moteur de script dans celles-ci. Un instrument scripté est un instrument~; le moteur de script est un
+moteur, enregistré pour le modèle de Black--Scholes~; tout ce qui est au-dessus --- grecques, scénarios, \omterm{def:pl:the-platform-map:batch}{traitements par lots} --- s'applique sans modification.}\label{fig:pl:pricing-library-architecture:layers}
+\end{omfigure}
+
+\section{Instruments, objets de marché, modèles et moteurs}
+
+\begin{definition}[Objet de marché]\label{def:pl:pricing-library-architecture:market}
+Un \emph{objet de marché}\index{objet de marché} est un objet de la bibliothèque qui représente un élément de l'état du marché --- un cours, une courbe d'actualisation, une
+surface de volatilité, une corrélation --- et répond à des questions à son sujet (un facteur d'actualisation, une volatilité implicite), de sorte que les moteurs lisent le
+marché à travers une interface fixe, quelle que soit sa construction.
+\end{definition}
+
+Dans \texttt{firm.pricing}, un instantané contient les \omterm{def:pl:pricing-library-architecture:market}{objets de marché}, et un choc crée un nouvel instantané dans lequel un objet est remplacé. Le moteur Monte Carlo
+lit les forwards, les variances et les corrélations dans cet instantané et génère les trajectoires à partir d'une graine fixée par instrument (nombres aléatoires communs, livre~5), de sorte
+qu'un prix choqué ne diffère du prix de base que par le choc seul. Le moteur de script de ce chapitre réutilise ces trajectoires~: c'est le moteur Monte Carlo
+dont le payoff est tiré d'un script et non d'une classe.
+
+\section{Scripts de payoff}
+
+\begin{definition}[Langage de script de payoff, script de payoff]\label{def:pl:pricing-library-architecture:script}
+Un \emph{langage de script de payoff}\index{langage de script de payoff} est un petit langage de programmation dans lequel les flux de trésorerie d'un produit sont
+écrits comme des événements aux dates d'observation --- conditions sur la trajectoire, paiements, état reporté d'une date à l'autre --- et évalués par un
+moteur générique sur des trajectoires simulées. Un \emph{script de payoff}\index{script de payoff} est un produit écrit dans ce langage~: une donnée que la bibliothèque price,
+et non du code qu'il faudrait étendre.
+\end{definition}
+
+Le langage du chapitre (\texttt{firm.payoffdsl}) ne contient que ce dont les produits du chapitre ont besoin~: variables d'état, blocs exécutés aux dates
+d'échéanciers nommés, affectations, \texttt{if}/\texttt{else}, \texttt{pay} et \texttt{stop}, arithmétique et comparaisons, ainsi que
+\texttt{min}, \texttt{max} et \texttt{abs}. À chaque date, un bloc voit \texttt{S} (le cours au comptant du premier sous-jacent), \texttt{perf} (la pire
+performance) et \texttt{t}. Un analyseur lexical transforme le texte en jetons, un analyseur syntaxique par descente récursive les transforme en arbre syntaxique avec une
+position d'erreur pour tout élément illisible, et l'échéancier est extrait de l'arbre~: les dates de chaque bloc, dans l'ordre des dates, et dans l'ordre du script
+à une même date.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.9cm,minimum width=1.9cm,
+  fill=omDef!10},>=Stealth]
+\node[box] (a) at (0,0) {texte du script};
+\node[box] (b) at (2.5,0) {jetons\\ avec positions};
+\node[box] (c) at (5.0,0) {arbre\\ syntaxique};
+\node[box] (d) at (7.6,0) {échéancier\\ d'événements\\ (date, bloc)};
+\node[box,fill=omMeth!12] (e1) at (10.7,0.6) {interpréteur\\ par trajectoire};
+\node[box,fill=omMeth!12] (e2) at (10.7,-0.6) {tableaux compilés,\\ masques};
+\draw[->] (a) -- (b); \draw[->] (b) -- (c); \draw[->] (c) -- (d); \draw[->] (d) -- (e1.west); \draw[->] (d) -- (e2.west);
+\node[font=\scriptsize\itshape,omThm] at (3.4,-0.95) {erreurs avec ligne et colonne};
+\node[font=\scriptsize\itshape,align=center] at (7.6,1.15) {trajectoires de la bibliothèque\\ à ces dates};
+\end{tikzpicture}
+
+\omcaption{D'un script au prix~: l'analyseur lexical et l'analyseur syntaxique construisent l'arbre, l'échéancier est lu à partir de ses blocs, et l'un ou l'autre
+évaluateur fait tourner l'arbre sur les trajectoires de la bibliothèque aux dates de l'échéancier.}\label{fig:pl:pricing-library-architecture:pipeline}
+\end{omfigure}
+
+\omcode{code/platforms/19-pricing-library-architecture/python/pl_payoffdsl.py}{36}{44}{L'autocallable Phoenix worst-of à coupons mémoire
+sous forme de script de payoff~: coupons à chaque date d'observation, rappel anticipé à toutes les dates sauf la dernière, capital exposé
+à l'échéance.}\label{lst:pl:pricing-library-architecture:autocall}
+
+\omcode{code/firm/payoffdsl/firm_payoffdsl.py}{176}{199}{Les instructions de l'analyseur~: \texttt{if}/\texttt{else}, \texttt{pay}, \texttt{stop}
+et affectation~; chaque jeton conserve sa ligne et sa colonne pour les messages d'erreur.}\label{lst:pl:pricing-library-architecture:parser}
+
+Le produit du client change en trois lignes~: une variable d'état \texttt{lowest}, mise à jour avec \texttt{lowest = min(lowest, perf)} à chaque
+observation, et le test de maturité porte sur \texttt{lowest} au lieu de \texttt{perf}. Il se price à 94.25 pour 100, soit 1.63 de moins que
+l'autocallable simple à 95.88~: la barrière de knock-in lookback se déclenche sur les trajectoires qui passent sous 60~\% puis remontent.
+
+\section{Deux façons d'évaluer un script}
+
+L'évaluateur le plus simple parcourt l'arbre syntaxique une fois par trajectoire et par événement, avec des valeurs scalaires~: c'est un interpréteur. Il est facile à vérifier et lent.
+L'évaluateur compilé parcourt l'arbre une fois par événement, avec des tableaux sur l'ensemble des trajectoires~: chaque instruction s'exécute sous un masque des trajectoires
+auxquelles elle s'applique, un \texttt{if} scinde le masque, un \texttt{pay} ajoute sous ce masque, un \texttt{stop} retire des trajectoires de l'ensemble vivant
+(voir le \cref{lst:pl:pricing-library-architecture:compile}). Les deux donnent les mêmes nombres jusqu'au dernier chiffre (les tests les comparent)~; le second
+est 19 à 34 fois plus rapide (voir la \cref{fig:pl:pricing-library-architecture:speed}).
+
+\omcode{code/firm/payoffdsl/firm_payoffdsl.py}{357}{388}{L'évaluation compilée~: des masques au lieu de branches, des tableaux au lieu de
+boucles.}\label{lst:pl:pricing-library-architecture:compile}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{loglogaxis}[width=11cm,height=5.6cm,xlabel={trajectoires (échelle log)},ylabel={secondes par prix (échelle log)},grid=major,grid style={gray!20},
+  tick label style={font=\small},label style={font=\small},table/col sep=comma,legend style={font=\footnotesize,at={(0.5,1.03)},
+  anchor=south,legend columns=2}]
+\addplot[color=omThm,very thick,mark=*] table[x=paths,y=interpreted_s]{figdata/platforms/19-pricing-library-architecture/measured_speed.csv};
+\addlegendentry{interprété (par trajectoire)}
+\addplot[color=omDef,very thick,mark=square*] table[x=paths,y=compiled_s]{figdata/platforms/19-pricing-library-architecture/measured_speed.csv};
+\addlegendentry{compilé (tableaux sur les trajectoires)}
+\end{loglogaxis}
+\end{tikzpicture}
+
+\omcaption{Temps mis pour pricer le script autocallable par l'interpréteur et par l'évaluateur compilé, génération des trajectoires comprise, meilleur de trois exécutions,
+un seul thread. La version compilée est 18.8 fois plus rapide à 1\,000 trajectoires, 34.3 fois à 10\,000 et 33.4 fois à 30\,000. Mesures faites sur un portable (Intel Core Ultra 7
+155H) sous WSL2, la machine étant par ailleurs inactive. Données~: \texttt{bench\_payoffdsl.py}.}\label{fig:pl:pricing-library-architecture:speed}
+\end{omfigure}
+
+Le moteur de script est enregistré dans la bibliothèque comme tout autre moteur (\cref{lst:pl:pricing-library-architecture:engine})~: il analyse le script,
+extrait l'échéancier, demande au moteur Monte Carlo des trajectoires aux dates de l'échéancier avec la graine de l'instrument, et évalue. Comme la
+graine ne dépend que de l'identifiant de l'instrument, un script portant le même identifiant qu'un instrument de la bibliothèque voit les mêmes trajectoires.
+
+\omcode{code/firm/payoffdsl/firm_payoffdsl.py}{403}{429}{Le moteur de script~: échéancier, trajectoires de la bibliothèque, actualisation sur la
+courbe de l'instrument, et l'évaluateur.}\label{lst:pl:pricing-library-architecture:engine}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.8cm}>{\centering\arraybackslash}p{1.8cm}>{\centering\arraybackslash}p{1.8cm}>{\centering\arraybackslash}p{1.8cm}>{\centering\arraybackslash}p{1.8cm}>{\raggedright\arraybackslash}p{2.5cm}@{}}
+\toprule
+produit & script & erreur type & biblio\-thèque & écart (e.t.) & moteur de la bibliothèque \\
+\midrule
+call européen & 11.3953 & 0.0570 & 11.3485 & 0.82 & analytique \\
+call asiatique (12 fixings mensuels) & 6.8012 & 0.0327 & 6.8012 & 0.00 & Monte Carlo \\
+call down-and-out quotidien & 11.0373 & 0.0568 & 11.0226 & 0.26 & forme fermée (BGK) \\
+autocallable worst-of & 95.8750 & 0.0717 & 95.8750 & 0.00 & Monte Carlo \\
+autocallable, knock-in lookback & 94.2474 & 0.0726 & --- & --- & aucun \\
+\bottomrule
+\end{tabular}
+\caption{Scripts confrontés aux moteurs propres de la bibliothèque, 100\,000 trajectoires. Face à un moteur analytique ou à forme fermée, l'écart est une erreur Monte Carlo
+inférieure à une erreur type~; face au moteur Monte Carlo de la bibliothèque, sur nombres aléatoires communs, elle est nulle, car les trajectoires et le
+calcul du payoff sont les mêmes.}\label{tab:pl:pricing-library-architecture:validation}
+\end{table}
+
+\begin{example}[Prix dès lundi]\label{ex:pl:pricing-library-architecture:monday}
+L'autocallable scripté vaut 95.8750 pour 100, et le moteur autocallable propre à la bibliothèque donne 95.8750~: l'écart vaut 0.00
+erreur type, car les deux évaluent le même payoff sur les mêmes trajectoires. Leurs deltas par rapport au premier sous-jacent sont égaux aussi, 0.1518 par unité de spot
+pour 100 de notionnel, puisque les grecques bump-and-reprice de la bibliothèque fonctionnent sur tout moteur. La variante lookback du client, que la bibliothèque ne peut pas exprimer,
+vaut 94.2474 ($\pm0.0726$) avec la même mécanique. L'évaluateur compilé rend le moteur de script aussi rapide qu'un moteur à tableaux
+écrit à la main~; l'interpréteur, 22 à 37 fois plus lent, reste la référence qui le vérifie.
+\end{example}
+
+\section{Recalcul paresseux et observateurs}
+
+\begin{definition}[Motif observateur]\label{def:pl:pricing-library-architecture:observer}
+Le \emph{motif observateur}\index{motif observateur} permet à un objet (l'observable) de tenir une liste de dépendants (les observateurs) et de les notifier
+lorsqu'il change, sans savoir qui ils sont~; une courbe observe ses cotations, un prix observe sa courbe.
+\end{definition}
+
+\begin{definition}[Recalcul paresseux]\label{def:pl:pricing-library-architecture:lazy}
+Le \emph{recalcul paresseux}\index{recalcul paresseux} marque un résultat comme périmé à l'arrivée d'une notification et ne le recalcule que lorsque le résultat
+est demandé à nouveau, de sorte qu'une rafale de changements de marché ne coûte qu'un recalcul par lecteur, au lieu d'un par changement.
+\end{definition}
+
+La \texttt{LazyObject} de QuantLib est l'implémentation la plus connue~: un «~cadre de calcul à la demande et de mise en cache des résultats~» qui est à la fois
+observateur et observable. Le \texttt{LazyPrice} du chapitre reprend la même idée en vingt lignes
+(\cref{lst:pl:pricing-library-architecture:lazy})~: un call européen observant une cotation de taux est calculé une fois (11.35), la cotation change trois
+fois, et la lecture suivante recalcule une fois (11.59) --- deux calculs pour quatre états du marché. La conception par instantanés de
+\texttt{firm.pricing} est l'autre réponse au même problème~: rien n'est modifiable, donc rien ne devient périmé~; un nouvel instantané est une nouvelle question.
+Les bibliothèques qui servent des outils interactifs privilégient les observateurs~; celles qui servent le calcul de risque par lots privilégient les instantanés.
+
+\omcode{code/firm/payoffdsl/firm_payoffdsl.py}{469}{490}{Un prix paresseux~: périmé à la notification, recalculé à la demande, et lui-même observable
+par ce qui en dépend.}\label{lst:pl:pricing-library-architecture:lazy}
+
+\section{Liaisons vers d'autres langages}
+
+Une bibliothèque écrite une fois est appelée depuis de nombreux endroits~: la recherche en Python, un service de pricing en C++, un tableur sur le desk d'un trader. Le chapitre~9
+a mesuré ce que coûte une liaison par appel~; pour une bibliothèque, la leçon est de lier au niveau des requêtes entières --- un lot de transactions, un instantané
+--- jamais au niveau d'une opération. La bibliothèque du livre~5 dispose de jumeaux C++20 et Rust de son cœur, testés face à la référence Python sur les
+mêmes entrées~; un \omterm{def:pl:pricing-library-architecture:script}{script de payoff} est portable par construction, puisqu'il s'agit d'un texte que toute implémentation du langage peut pricer, ce qui explique pourquoi
+les scripts circulent plus facilement que les classes entre les outils de front-office, les systèmes de risque et le modèle canonique de transaction du chapitre~21.
+
+\section{Tutoriel~: un langage, un moteur, cinq produits}\label{tut:pl:pricing-library-architecture:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Écrire les produits sous forme de scripts, les pricer par la bibliothèque, les confronter aux moteurs de la bibliothèque, et mesurer les deux
+évaluateurs. \textbf{État final~:} le \cref{tab:pl:pricing-library-architecture:validation} et la \cref{fig:pl:pricing-library-architecture:speed}.
+\begin{tutsteps}
+\item \textbf{Analyse}~: \texttt{firm\_payoffdsl.parse} sur chaque script~; en casser un et lire la position de l'erreur.
+\item \textbf{Pricer}~: \texttt{firm.pricing.price} sur un \texttt{ScriptedInstrument}~; \texttt{greeks} dessus.
+\item \textbf{Valider}~: \texttt{pl\_payoffdsl.validation()}.
+\item \textbf{Mesurer}~: \texttt{bench\_payoffdsl.py}.
+\item \textbf{Observer}~: \texttt{lazy\_demo()}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une fonction \texttt{worst} sur des sous-jacents nommés et un lookback quotidien entre les dates d'observation~; compiler un
+script en source Python plutôt qu'en fermetures, et mesurer de nouveau.
+\end{tutorial}
+
+\section{Construction~: le langage de script de payoff}\label{bld:pl:pricing-library-architecture:payoffdsl}
+
+\begin{build}
+\bfield{Rôle} Des produits pour lesquels la bibliothèque n'a pas de classe, pricés, bumpés et calculés par lots comme ceux qu'elle possède, à partir de scripts qui peuvent être stockés,
+relus et transférés d'un système à l'autre.
+\bfield{Interface} \texttt{parse}, \texttt{schedule}, \texttt{Interpreter}, \texttt{compile\_program}, \texttt{ScriptedInstrument},
+\texttt{ScriptEngine} (enregistré pour le modèle de Black--Scholes), \texttt{ScriptError}~; \texttt{Quote}, \texttt{LazyPrice}.
+\bfield{Règles} Les trajectoires et graines de la bibliothèque, jamais celles du moteur~; actualisation sur la courbe de l'instrument~; l'interpréteur et
+l'évaluateur compilé s'accordent sur chaque trajectoire~; les erreurs désignent une ligne et une colonne.
+\bfield{Tests d'acceptation} \texttt{code/firm/payoffdsl/tests/}~: analyse et positions d'erreur~; l'ordre de l'échéancier des événements~; l'interpréteur égal
+à l'évaluateur compilé sur un script dépendant du chemin~; un européen scripté égal au prix Monte Carlo de la bibliothèque et proche de son
+prix analytique, avec son delta~; les prix paresseux et les observateurs enchaînés.
+\bfield{Pour aller plus loin} Plusieurs sous-jacents nommés~; grecques adjointes (AAD) à travers le script compilé (livre~4, chapitre~28)~; une bibliothèque de scripts avec
+des produits versionnés et relus.
+\end{build}
+
+\begin{omsources}
+\item Documentation de référence de QuantLib, \texttt{LazyObject}.
+\item Livre~5, chapitres 4, 18 et 28 (grecques, autocallables, la bibliothèque)~; livre~4, chapitre~26 (Monte Carlo).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:pricing-library-architecture:1}
+Écrire une option digitale d'achat qui verse 10 à l'échéance si le spot est supérieur à 105, sous forme de \omterm{def:pl:pricing-library-architecture:script}{script de payoff}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:pricing-library-architecture:2}
+Pourquoi le prix de l'autocallable scripté est-il exactement celui de la bibliothèque, alors que l'européen scripté s'écarte du prix analytique de 0.82
+erreur type~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:pricing-library-architecture:3}
+Dans le script de l'autocallable, pourquoi le bloc du coupon doit-il précéder le bloc de l'autocall à la même date~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:pricing-library-architecture:4}
+Comment l'évaluateur compilé traite-t-il \texttt{stop}, et que se passerait-il s'il se contentait de sauter le reste du bloc~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:pricing-library-architecture:5}
+Pourquoi l'accélération de l'évaluateur compilé croît-elle avec le nombre de trajectoires, puis se stabilise-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:pricing-library-architecture:6}
+Observateurs ou instantanés~: lequel choisiriez-vous pour l'écran de pricing d'un trader, et lequel pour le calcul de risque de nuit~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:pricing-library-architecture:7}
+\emph{Programmation.} Pricer l'autocallable lookback avec un niveau de knock-in à 50~\% puis à 70~\%. Comment le prix évolue-t-il, et que dit cela
+de la sensibilité du produit à la barrière~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:pricing-library-architecture:8}
+\emph{Trouver la faille.} «~Notre moteur de script tire ses propres nombres aléatoires, donc les prix des scripts sont indépendants de la bibliothèque et
+constituent un bon contrôle croisé.~»
+\end{exercise}
+
+\section{Problème~: prêt pour lundi}
+
+\begin{problem}[{Problème du week-end --- un produit pour lequel la bibliothèque n'a pas de classe}]\label{pb:pl:pricing-library-architecture:1}
+\texttt{firm.pricing}, \texttt{firm.payoffdsl} et les cinq produits du chapitre.
+
+\medskip\noindent\textbf{Partie I --- La bibliothèque.}
+\begin{enumerate}
+\item Quelles sont les quatre couches de la bibliothèque, et qu'est-ce qui les relie~?
+\item Que répond un \omterm{def:pl:pricing-library-architecture:market}{objet de marché}, et pourquoi un instantané immuable~?
+\item Pourquoi les prix après choc ne diffèrent-ils que par le choc lui-même~?
+\item Que doit fournir un moteur pour être enregistré~?
+\item Pourquoi un système de risque n'a-t-il besoin que de la fonction de repricing~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le langage.}
+\begin{enumerate}[resume]
+\item Que peut dire un script, et que voit chaque bloc~?
+\item Comment l'échéancier des événements est-il extrait~?
+\item En quoi l'interpréteur et l'évaluateur compilé diffèrent-ils~?
+\item En quoi le produit du client diffère-t-il de l'autocallable simple dans le script~?
+\item Que se passe-t-il pour une erreur de syntaxe~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les chiffres.}
+\begin{enumerate}[resume]
+\item Donner les prix du script et de la bibliothèque pour les cinq produits, ainsi que leurs écarts en erreurs types.
+\item Pourquoi deux écarts sont-ils exactement nuls~?
+\item Quels sont les deltas de l'autocallable par le script et par la bibliothèque~?
+\item Quelle est l'accélération de l'évaluateur compilé~?
+\item Que compte la démonstration du prix paresseux~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le prix et le delta de l'autocallable scripté face au moteur d'autocallable de la bibliothèque sur
+nombres aléatoires communs, leur écart en erreurs types, et l'accélération du script compilé par rapport au script interprété.
+\item Que faudrait-il exiger avant qu'un produit scripté soit négocié~?
+\item Quand un produit doit-il avoir sa propre classe et son propre moteur plutôt qu'un script~?
+\item Comment faudrait-il stocker et versionner les scripts~?
+\item En une phrase~: qu'apporte un langage de payoff à une bibliothèque de pricing~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:pricing-library-architecture:1}
+Pourquoi séparer les instruments, les modèles et les moteurs dans une bibliothèque de pricing~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:pricing-library-architecture:2}
+Comment pricerez-vous un nouvel exotique d'ici lundi sans écrire de nouveau moteur~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:pricing-library-architecture:3}
+Comment rendez-vous un évaluateur de payoff Monte Carlo rapide en Python~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:pricing-library-architecture:4}
+Qu'est-ce que l'\omterm{def:pl:dataframes:eager}{évaluation paresseuse} dans une bibliothèque de pricing, et quand est-ce une mauvaise idée~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:pricing-library-architecture:5}
+Concevez un \omterm{def:pl:pricing-library-architecture:script}{langage de script de payoff} pour un desk de produits dérivés.
+\end{interviewq}

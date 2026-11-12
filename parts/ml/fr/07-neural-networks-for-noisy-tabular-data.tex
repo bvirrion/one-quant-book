@@ -1,0 +1,329 @@
+\chapter{Réseaux de neurones pour les données tabulaires bruitées}\label{ch:ml:neural-networks-for-noisy-tabular-data}
+
+Deux chercheurs entraînent le même petit réseau, sur les mêmes données, avec le même code, et rapportent des coefficients
+d'information de 0.057 et 0.065 sur les mêmes dix années de test. Ils discutent de l'utilité d'une troisième couche cachée~; en moyenne, elle ajoute
+0.002. La seule différence entre leurs deux exécutions est la graine aléatoire, et elle vaut quatre fois l'architecture
+sur laquelle ils se disputent. Sur les données de marché, un \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{réseau de neurones} est une variable aléatoire avant d'être un modèle~: ses poids initiaux,
+ses masques de \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{dropout} et l'ordre de ses \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{mini-lots} font tous bouger le résultat, et le signal est trop faible pour les noyer.
+Ce chapitre construit le \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{perceptron multicouche}, l'entraîne comme l'exigent les données tabulaires bruitées, et mesure ses graines comme une
+source de variance.
+
+\section{Le perceptron multicouche et la rétropropagation}
+
+\begin{definition}[Réseau de neurones, perceptron multicouche, fonction d'activation]\label{def:ml:neural-networks-for-noisy-tabular-data:mlp}
+Un \emph{réseau de neurones}\index{réseau de neurones} (neural network) est une fonction construite par composition d'applications linéaires paramétrées avec
+des fonctions non linéaires fixées. Un \emph{perceptron multicouche}\index{perceptron multicouche} (multilayer perceptron, MLP) est le cas entièrement connecté~:
+$z_0 = x$, $z_l = \mathrm{act}(A_lz_{l-1} + c_l)$ pour $l = 1,\dots,L$, et $f_\theta(x) = A_{L+1}z_L + c_{L+1}$, avec
+paramètres $\theta = (A_l, c_l)_l$. La \emph{fonction d'activation}\index{fonction d'activation} (activation function) $\mathrm{act}$ s'applique
+coordonnée par coordonnée~; la plus courante est $\mathrm{relu}(u) = \max(u, 0)$.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[x=2.4cm,y=0.55cm,font=\footnotesize,
+  neuron/.style={circle,draw=omDef,fill=omDef!12,minimum size=9pt,inner sep=0pt}]
+\foreach \i in {1,...,6} { \node[neuron] (a\i) at (0,\i-3.5) {}; }
+\foreach \i in {1,...,5} { \node[neuron] (b\i) at (1,\i-3) {}; }
+\foreach \i in {1,...,3} { \node[neuron] (c\i) at (2,\i-2) {}; }
+\node[neuron,draw=omThm,fill=omThm!15] (d) at (3,0) {};
+\foreach \i in {1,...,6} { \foreach \j in {1,...,5} { \draw[gray!45] (a\i) -- (b\j); } }
+\foreach \i in {1,...,5} { \foreach \j in {1,...,3} { \draw[gray!45] (b\i) -- (c\j); } }
+\foreach \i in {1,...,3} { \draw[gray!45] (c\i) -- (d); }
+\node[align=center] at (0,-4.6) {40 caractéristiques\\classées};
+\node[align=center] at (1,-4.6) {32 unités\\$\mathrm{relu}(A_1x + c_1)$};
+\node[align=center] at (2,-4.6) {16 unités\\$\mathrm{relu}(A_2z_1 + c_2)$};
+\node[align=center] at (3,-4.6) {prévision\\$A_3z_2 + c_3$};
+\end{tikzpicture}
+
+\omcaption{Le petit réseau du chapitre (dessiné avec moins d'unités qu'il n'en a)~: 40 entrées, couches cachées de 32 et 16
+unités, une sortie, environ 1\,850 paramètres. Le réseau plus grand ajoute une première couche de 64 unités.}\label{fig:ml:nets:mlp}
+\end{omfigure}
+
+\begin{definition}[Rétropropagation, mini-lot, époque]\label{def:ml:neural-networks-for-noisy-tabular-data:backprop}
+La \emph{rétropropagation}\index{rétropropagation} (backpropagation) calcule le gradient de la perte par rapport à chaque paramètre d'un
+réseau par différentiation algorithmique en mode inverse (livre~4, chapitre~28)~: une passe avant mémorise les valeurs des
+couches, puis une passe arrière propage $\partial\mathcal L/\partial z_l$ de la sortie vers l'entrée. Un \emph{mini-lot}\index{mini-lot} (mini-batch)
+est le sous-ensemble aléatoire de lignes d'entraînement sur lequel on calcule un pas de gradient~; une \emph{époque}\index{epoque@époque} (epoch) est un passage
+complet sur l'\omterm{def:ml:why-financial-machine-learning-is-different:sets}{ensemble d'entraînement}, découpé en mini-lots.
+\end{definition}
+
+Le coût du gradient est un petit multiple du coût de la passe avant, quel que soit le nombre de paramètres~: c'est le
+résultat du livre~4 sur le mode inverse, et c'est pourquoi les réseaux peuvent compter des millions de paramètres. Les réseaux du chapitre en ont entre deux et
+cinq mille et s'entraînent en une seconde environ sur un seul fil d'exécution CPU.
+
+\section{Optimiseurs, normalisation et régularisation}
+
+\begin{definition}[Adam, décroissance des poids]\label{def:ml:neural-networks-for-noisy-tabular-data:adam}
+\emph{Adam}\index{Adam} est une descente de gradient stochastique (livre~4, chapitre~24) avec un pas propre à chaque paramètre~: avec le gradient
+$g_k$ à l'étape $k$, il conserve des moyennes $m_k = \beta_1m_{k-1} + (1-\beta_1)g_k$ et $v_k = \beta_2v_{k-1} + (1-\beta_2)g_k^2$
+et déplace $\theta$ de $-\eta\,\hat m_k/(\sqrt{\hat v_k} + \epsilon)$, où les chapeaux corrigent le biais des moyennes vers zéro
+(Kingma et Ba). La \emph{décroissance des poids}\index{décroissance des poids} (weight decay) réduit chaque poids de $\eta\lambda\theta$ à chaque pas, en dehors
+du pas de gradient (AdamW, Loshchilov et Hutter)~; pour une descente de gradient ordinaire, c'est une pénalité ridge.
+\end{definition}
+
+\begin{definition}[Dropout, normalisation par lot et par couche]\label{def:ml:neural-networks-for-noisy-tabular-data:dropout}
+Le \emph{dropout}\index{dropout} met à zéro chaque unité cachée avec probabilité $d$ pendant l'entraînement, en multipliant les autres par
+$1/(1 - d)$, et utilise le réseau complet à la prédiction. La \emph{normalisation par lot}\index{normalisation par lot} (batch normalisation) standardise
+chaque unité cachée sur les lignes du \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{mini-lot} (moyennes glissantes à la prédiction)~; la \emph{normalisation par
+couche}\index{normalisation par couche} (layer normalisation) standardise les unités de chaque ligne, indépendamment du lot.
+\end{definition}
+
+Les données du chapitre sont le panel du chapitre~4 (500 actions, quarante caractéristiques classées avec risque factoriel, un plafond de
+0.71~\%)~: les réseaux sont entraînés sur les mois 0 à 199, avec \omterm{def:ml:trees-and-boosting:early}{arrêt précoce} sur les mois 201 à 239 (règle du chapitre~5, un
+mois purgé), et évalués sur les dix années de test avec le rapport de \texttt{firm.mlbase}, exactement comme les modèles du chapitre~4.
+L'\omterm{def:ml:trees-and-boosting:early}{arrêt précoce} les interrompt après deux à quatre \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} (\cref{fig:ml:nets:history})~: sur des données aussi bruitées, le
+score de validation culmine presque immédiatement, et chaque \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque} supplémentaire ajuste davantage de bruit que de signal.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.2cm,xlabel={époque},ylabel={$R^2$ de validation (\%)},tick label style={font=\small},
+  label style={font=\small},xmin=0.5,xmax=9.5,ymin=0.3,ymax=0.85,xtick={1,2,3,4,5,6,7,8,9},grid=major,
+  grid style={gray!25},legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma,unbounded coords=jump]
+\addplot[omDef,very thick,mark=*] table[x=epoch,y=s1]{figdata/ml/07-neural-networks-for-noisy-tabular-data/history.csv};
+\addplot[omThm,very thick,mark=square*] table[x=epoch,y=s2]{figdata/ml/07-neural-networks-for-noisy-tabular-data/history.csv};
+\addplot[omProp,very thick,mark=triangle*] table[x=epoch,y=s3]{figdata/ml/07-neural-networks-for-noisy-tabular-data/history.csv};
+\legend{graine 1,graine 2,graine 3}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{R-carré de validation du petit réseau après chaque \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque}, pour trois graines~; l'entraînement s'arrête cinq \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} après le
+meilleur point. Les graines culminent aux \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} 2, 2 et 4. Données~: \texttt{ml\_nets.fitted}.}\label{fig:ml:nets:history}
+\end{omfigure}
+
+Avec trois graines par variante, un \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{dropout} de 0.2 fait passer le IC moyen de test de 0.059 à 0.062, une \omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{décroissance des poids} de 0.01 ne change rien
+à cette échelle, et les deux normalisations nuisent~: \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{normalisation par lot} à 0.052, \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{normalisation par couche} à 0.056. Normaliser
+les unités cachées aident les réseaux profonds à s'entraîner~; ceux-ci sont peu profonds, leurs entrées sont déjà des rangs, et les statistiques d'un lot sont
+une source de bruit de plus. Les écarts se chiffrent en quelques millièmes de IC, comparables au bruit des graines mesuré ensuite, et
+trois graines par variante sont trop peu nombreuses pour les classer avec confiance.
+
+\section{Les graines comme source de variance}
+
+Dix graines du petit réseau (32 et 16 unités) donnent des IC de test allant de 0.057 à 0.065, avec une moyenne de 0.0601 et un
+écart type de 0.0023~; dix graines du réseau plus grand (64, 32 et 16) donnent en moyenne 0.0619 (\cref{fig:ml:nets:seeds}).
+Leur R-carré varie bien plus que leur IC, de 0.08~\% à 0.30~\% pour le petit réseau~: la graine modifie l'échelle des
+prévisions, ce que le R-carré pénalise et ce qu'un classement ignore (chapitre~1). Le ratio de Sharpe net du portefeuille par déciles passe
+de 1.37 à 1.78.
+
+\begin{proposition}[Combien de graines une comparaison exige]\label{prop:ml:nets:seeds}
+Si les scores de deux architectures varient selon les graines avec un écart type $s$, de façon indépendante, et si leurs moyennes diffèrent de
+$\delta$, la différence de leurs moyennes sur $n$ graines a une erreur type $s\sqrt{2/n}$, donc elle atteint deux erreurs types
+lorsque $n \ge 8s^2/\delta^2$.
+\end{proposition}
+
+\begin{proof}
+$\Var(\bar a - \bar b) = s^2/n + s^2/n$~; résoudre $\delta = 2s\sqrt{2/n}$ pour $n$.
+\end{proof}
+
+Avec $s = 0.0024$ (écart type groupé) et $\delta = 0.0019$, la comparaison requiert 14 graines par architecture. Une seule exécution de chacune,
+la pratique habituelle, qui compare deux tirages dont la différence a une erreur type de 0.0035, soit presque le double de l'effet.
+
+\begin{definition}[Ensemble profond]\label{def:ml:neural-networks-for-noisy-tabular-data:ensemble}
+Un \emph{ensemble profond}\index{ensemble profond} (deep ensemble) moyenne les prédictions de réseaux de même architecture entraînés à partir de
+graines aléatoires différentes sur les mêmes données (Lakshminarayanan, Pritzel et Blundell, 2017).
+\end{definition}
+
+Faire la moyenne élimine la variance que les graines introduisent. L'ensemble à dix graines du petit réseau atteint un IC de 0.066, au-dessus
+de chacun de ses membres, avec un R-carré de 0.32~\% et un ratio de Sharpe net de 1.73~; l'ensemble du réseau plus grand
+atteint 0.066 également. La question de l'architecture qui opposait les deux chercheurs disparaît dès que chaque réseau
+est moyenné sur ses graines~: la moyenne a apporté ce que l'architecture ne pouvait pas. C'est à nouveau la \cref{prop:ml:trees:bagging}
+avec les graines jouant le rôle des échantillons bootstrap.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5.6cm,ylabel={coefficient d'information de test},xmin=0.4,xmax=2.6,ymin=0.054,ymax=0.068,
+  xtick={1,2},xticklabels={{32, 16 unités},{64, 32, 16 unités}},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},yticklabel style={/pgf/number format/fixed,/pgf/number format/precision=3},
+  scaled y ticks=false,legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[only marks,mark=*,mark size=1.8pt,gray] table[x=arch,y=ic]{figdata/ml/07-neural-networks-for-noisy-tabular-data/seeds.csv};
+\addplot[only marks,mark=-,mark size=9pt,very thick,omDef] table[x=arch,y=mean]{figdata/ml/07-neural-networks-for-noisy-tabular-data/means.csv};
+\addplot[only marks,mark=star,mark size=4pt,thick,omThm] table[x=arch,y=ensemble]{figdata/ml/07-neural-networks-for-noisy-tabular-data/means.csv};
+\legend{une graine,moyenne de 10 graines,ensemble de 10}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{IC de test de dix graines de deux architectures sur le panel du chapitre~4, leurs moyennes, et l'IC de chaque
+ensemble de dix graines. Données~: \texttt{ml\_nets.seed\_study} et \texttt{ml\_nets.ensemble}.}\label{fig:ml:nets:seeds}
+\end{omfigure}
+
+\section{Ensembles}
+
+Un ensemble de graines coûte $n$ entraînements et rien d'autre, et il se parallélise sans effort. Il apporte aussi quelque chose qu'un
+seul réseau ne peut fournir~: la dispersion des prévisions de ses membres pour chaque ligne, que le chapitre~11 utilise comme mesure de
+l'incertitude propre au modèle. Les ensembles d'architectures différentes, ou de réseaux associés à des arbres boostés et à une
+régression ridge (stacking, livre~7, chapitre~14), vont plus loin lorsque les erreurs des membres sont moins corrélées que celles des graines.
+
+\begin{method}[Entraîner un réseau sur des données tabulaires bruitées]\label{met:ml:nets:training}
+\begin{enumerate}
+\item Trier les variables par date~; diviser la cible par son écart type d'entraînement.
+\item Commencer petit (deux couches cachées, quelques dizaines d'unités), avec AdamW, un \omterm{def:ml:trees-and-boosting:boosting}{taux d'apprentissage} voisin de $10^{-3}$, et un \omterm{def:ml:trees-and-boosting:early}{arrêt précoce} sur un
+bloc de validation purgé.
+\item Figer chaque source d'aléa (initialisation, \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{dropout}, ordre des lots) à une graine par exécution~; entraîner plusieurs graines de
+tout ce qu'on compare, et présenter la moyenne et la dispersion.
+\item Déployer l'ensemble de graines, et non la meilleure graine.
+\item Comparer avec la régression ridge et les arbres boostés, sur les mêmes mois et avec le même rapport.
+\end{enumerate}
+\end{method}
+
+\section{Réseaux contre boosting sur des données tabulaires}
+
+La comparaison avec le chapitre~4 se fait à conditions égales~: même panel, mêmes années de test, même rapport. Un seul petit réseau
+(IC 0.060, ratio de Sharpe net de 1.37--1.78 selon les graines) égale la régression ridge (0.060, 1.59)~; son ensemble de dix graines
+(0.066, 1.73) égale l'IC du lasso et reste derrière les arbres boostés par défaut de la maison (0.075, 2.02). Gu, Kelly et Xiu ont trouvé
+des réseaux légèrement devant les arbres sur des actions américaines réelles, avec soixante ans de données, et Grinsztajn, Oyallon et Varoquaux des arbres
+devant les réseaux sur la plupart des bancs d'essai tabulaires~: sur des panels de variables classées, les deux familles sont proches, le
+réseau a besoin d'un ensemble pour être compétitif, et l'ensemble d'arbres coûte moins cher à régler.
+
+\section{Tutoriel~: vingt graines}\label{tut:ml:neural-networks-for-noisy-tabular-data:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Entraîner de petits réseaux et des réseaux plus grands à dix graines chacun, les regrouper en ensemble, essayer quatre régularisateurs et comparer
+à la régression ridge et aux arbres boostés. \textbf{État final~:} les \cref{fig:ml:nets:history,fig:ml:nets:seeds}, les chiffres du chapitre.
+\begin{tutsteps}
+\item \textbf{La boucle d'entraînement déterministe}~: un générateur pour l'ordre des lots, la graine pour l'initialisation et
+le \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{dropout}, un \omterm{def:ml:trees-and-boosting:early}{arrêt précoce} fondé sur la perte de validation.
+\omcode{code/firm/nettab/firm_nettab.py}{77}{115}{Boucle d'entraînement déterministe avec arrêt précoce.}\label{lst:ml:nets:fit}
+\item \textbf{Exécuter} \texttt{ml\_nets.seed\_study()}, \texttt{ensemble()}, \texttt{ablation()}, \texttt{baselines()} et
+\texttt{fig\_nets.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Entraîner avec 30 graines par architecture et vérifier la prédiction de la \cref{prop:ml:nets:seeds}~;
+remplacer ReLU par tanh et voir si la dispersion des graines change.
+\end{tutorial}
+
+\section{Construction~: les réseaux tabulaires de la maison}\label{bld:ml:neural-networks-for-noisy-tabular-data:nettab}
+
+\begin{build}
+\bfield{Rôle} Tout réseau que la maison entraîne sur des données tabulaires est reproductible bit à bit et comparé d'une graine à l'autre.
+\bfield{Interface} \texttt{set\_determinism(threads)}, \texttt{MLP(p, hidden, dropout, norm, activation)},
+\texttt{fit(X, y, Xv, yv, hidden, dropout, norm, lr, weight\_decay, batch, epochs, patience, seed) -> Fitted} avec
+\texttt{predict}, \texttt{history}, \texttt{best\_epoch}, \texttt{state\_hash()}~; \texttt{SeedEnsemble(seeds, **kw)}.
+\bfield{Règles} Un seul thread, algorithmes déterministes, chaque tirage aléatoire issu de la graine de l'exécution~; entrées standardisées avec
+les statistiques d'entraînement stockées dans le modèle~; le bloc de validation purgé par l'appelant.
+\bfield{Tests d'acceptation} \texttt{code/firm/nettab/tests/}~: deux exécutions avec une même graine donnent des empreintes de poids identiques, deux
+graines donnent des empreintes différentes~; le réseau apprend une fonction non linéaire injectée~; l'\omterm{def:ml:trees-and-boosting:early}{arrêt précoce} conserve les poids de la meilleure
+\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque}~; l'ensemble fait la moyenne de ses membres.
+\bfield{Pour aller plus loin} Entraînement en précision mixte et chargeur de données pour des panels plus grands (chapitre~23)~; exportation des poids pour
+l'inférence quantifiée du chapitre~26.
+\end{build}
+
+\begin{omsources}
+\item D.~P.~Kingma et J.~Ba, ``Adam: a method for stochastic optimization'', \emph{ICLR}, 2015.
+\item I.~Loshchilov et F.~Hutter, ``Decoupled weight decay regularization'', \emph{ICLR}, 2019.
+\item N.~Srivastava, G.~Hinton, A.~Krizhevsky, I.~Sutskever et R.~Salakhutdinov, ``Dropout: a simple way to prevent
+neural networks from overfitting'', \emph{JMLR} 15, 2014.
+\item S.~Ioffe et C.~Szegedy, ``Batch normalization'', \emph{ICML}, 2015~; J.~L.~Ba, J.~R.~Kiros et G.~E.~Hinton,
+``Layer normalization'', arXiv, 2016.
+\item B.~Lakshminarayanan, A.~Pritzel et C.~Blundell, ``Simple and scalable predictive uncertainty estimation using deep
+ensembles'', \emph{NeurIPS}, 2017.
+\item D.~E.~Rumelhart, G.~E.~Hinton et R.~J.~Williams, ``Learning representations by back-propagating errors'',
+\emph{Nature} 323, 1986.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:1}
+Compter les paramètres d'un \omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{perceptron multicouche} à 40 entrées, des couches cachées de 32 et 16 unités et une sortie. Et avec une première couche
+de 64 unités ajoutée~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:2}
+Les ICs de test de deux architectures varient selon les graines avec un écart type de 0.003 et diffèrent de 0.001 en moyenne. Combien
+de graines par architecture une comparaison à deux erreurs types exige-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:3}
+Avec 160\,000 lignes d'entraînement et des \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{mini-lots} de 512, combien de pas de gradient compte une \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque}~? Et pour les
+100\,000 lignes du chapitre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:4}
+Pourquoi la graine fait-elle bouger le R-deux (de 0.08~\% à 0.30~\%) bien davantage que l'IC (de 0.057 à 0.065)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:5}
+Pourquoi la \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{normalisation par lot} peut-elle nuire à un réseau peu profond sur des entrées rangées, et que faut-il attendre d'un réseau profond~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:6}
+\emph{Trouver la faille.} «~Nous avons entraîné vingt graines et déployé celle qui obtenait le meilleur score de validation.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:7}
+\emph{Programmation.} Calculer l'IC des ensembles formés des 2, 5 et 10 premières graines du petit réseau. Quelle part du gain entre
+une et dix graines les deux premières procurent-elles déjà~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:neural-networks-for-noisy-tabular-data:8}
+Montrer que, pour une couche ReLU et une perte quadratique, le gradient de la \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{rétropropagation} par rapport à $A_1$ vaut $\sum_i
+(\partial\ell_i/\partial z_{1,i})\odot\mathbf 1\{A_1x_i + c_1 > 0\}\,x_i^\top$, puis comparer son coût à celui de la
+passe avant.
+\end{exercise}
+
+\section{Problème~: Vingt graines}
+
+\begin{problem}[{Problème du week-end --- un réseau comme variable aléatoire}]\label{pb:ml:neural-networks-for-noisy-tabular-data:1}
+Le panel du chapitre~4~; réseaux entraînés sur les mois 0 à 199, arrêtés sur les mois 201 à 239, évalués sur les mois 240 à 359.
+
+\medskip\noindent\textbf{Partie I --- Entraînement.}
+\begin{enumerate}
+\item Combien de paramètres possèdent les deux réseaux~?
+\item Après combien d'\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} l'\omterm{def:ml:trees-and-boosting:early}{arrêt précoce} (early stopping) les arrête-t-il, et pourquoi si tôt~?
+\item Que font le \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{dropout}, la \omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{décroissance des poids} et les deux normalisations à l'IC~?
+\item Pourquoi trois graines par variante sont-elles insuffisantes pour les classer~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Graines.}
+\begin{enumerate}[resume]
+\item Quelle plage d'IC, de R-deux et de ratio de Sharpe net couvrent dix graines du petit réseau~?
+\item Quels sont les ICs moyens des deux architectures, leur écart et l'écart type poolé des graines~?
+\item Combien de graines par architecture une comparaison à deux erreurs types exige-t-elle~?
+\item Quelle est l'erreur type d'une comparaison d'une exécution de chaque modèle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Ensembles.}
+\begin{enumerate}[resume]
+\item Quels scores obtiennent les deux ensembles de dix graines~?
+\item Pourquoi l'ensemble bat-il chacun de ses membres~?
+\item Que devient la question de l'architecture une fois chaque réseau mis en ensemble~?
+\item Qu'apporte un ensemble au-delà d'une meilleure prévision~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Comment les réseaux se comparent-ils à la régression ridge, au lasso et aux arbres boostés sur les mêmes mois~?
+\item Énoncer le \emph{résultat nommé}~: l'écart type des graines de l'IC de test face à l'écart d'architecture, et le
+nombre de graines nécessaire pour le résoudre à deux erreurs types.
+\item Quel modèle faudrait-il déployer, et sous quelle forme~?
+\item Que doit consigner un journal de recherche à propos d'un réseau~?
+\item Comment le tableau changerait-il avec soixante ans de données~?
+\item Que garantit le hachage d'état, et que ne garantit-il pas~?
+\item D'où provient l'aléa de l'entraînement d'un réseau~?
+\item En une phrase~: qu'est-ce qu'un réseau entraîné une seule fois sur des données bruitées~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML}]\label{iq:ml:neural-networks-for-noisy-tabular-data:1}
+Que calcule la \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{rétropropagation}, et pourquoi son coût est-il faible~?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML, chercheur}]\label{iq:ml:neural-networks-for-noisy-tabular-data:2}
+Expliquez la différence entre \omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{Adam} et AdamW.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:neural-networks-for-noisy-tabular-data:3}
+Votre nouvelle architecture bat l'ancienne de 0.003 d'IC en une exécution chacune. Que faites-vous avant d'y croire~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:neural-networks-for-noisy-tabular-data:4}
+Comment rendez-vous un entraînement PyTorch reproductible sur CPU~? Qu'est-ce qui peut encore casser la reproductibilité~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:neural-networks-for-noisy-tabular-data:5}
+\omterm{def:ml:neural-networks-for-noisy-tabular-data:mlp}{Réseau de neurones} ou \omterm{def:ml:trees-and-boosting:boosting}{gradient boosting} pour un modèle de rendements en coupe transversale~? Argumentez les deux positions.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{chercheur, ingénieur ML}]\label{iq:ml:neural-networks-for-noisy-tabular-data:6}
+Pourquoi moyenner des réseaux entraînés à partir de graines différentes améliore-t-il la prévision, et quand cesse-t-il d'aider~?
+\end{interviewq}

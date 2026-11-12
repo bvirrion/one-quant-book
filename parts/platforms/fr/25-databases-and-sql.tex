@@ -1,0 +1,354 @@
+\chapter{Bases de données et SQL}\label{ch:pl:databases-and-sql}
+
+Un régulateur demande le rapport des positions de la société tel qu'il était exactement à 18~h~00 mardi dernier. Le mercredi matin, les opérations avaient corrigé
+les erreurs du lundi et du mardi --- quantités saisies dix fois trop grandes, transactions qui n'ont jamais eu lieu, transactions enregistrées avec un jour de retard --- et elles
+elles les avaient corrigées sur place. La table des positions donne désormais la bonne réponse pour le mardi soir, et personne ne peut dire quelle réponse la société a donnée
+le mardi soir. Ce chapitre construit la base de données des transactions de la société de sorte que les deux réponses restent disponibles~: tables relationnelles à clés, écritures dans
+des transactions qui ne perdent aucune mise à jour, des index choisis en lisant les \omterm{def:pl:databases-and-sql:index}{plans de requête}, et un second axe temporel qui consigne ce que la base de données a cru
+et à quel moment.
+
+\section{Le modèle relationnel pour les transactions et les positions}
+
+\begin{definition}[Modèle relationnel, clé primaire, clé étrangère]\label{def:pl:databases-and-sql:relational}
+Le \emph{modèle relationnel}\index{modèle relationnel}, proposé par Codd en 1970, stocke les données sous forme de relations --- tables de lignes aux
+colonnes nommées et typées --- manipulées par des opérations sur des relations entières (sélection, projection, jointure), indépendamment de la manière dont les lignes sont stockées. Une \emph{clé
+primaire}\index{clé primaire} est un ensemble de colonnes dont les valeurs identifient une ligne~; une \emph{clé étrangère}\index{clé étrangère} est un ensemble de colonnes dont
+les valeurs doivent figurer comme clé primaire d'une ligne d'une autre table.
+\end{definition}
+
+\begin{definition}[Forme normale]\label{def:pl:databases-and-sql:normal}
+Un schéma est en \emph{forme normale}\index{forme normale} lorsque chaque fait n'est stocké qu'une fois~: toute colonne hors clé dépend de la clé, de la clé entière
+et de rien d'autre que la clé (troisième forme normale), de sorte que la devise d'un instrument, par exemple, figure dans la table des instruments et non sur chaque transaction.
+\end{definition}
+
+Le schéma du chapitre (\texttt{firm.tradedb}) comporte trois tables~: instruments, comptes et transactions, chaque transaction pointant vers son compte et son
+instrument au moyen de \omterm{def:pl:databases-and-sql:relational}{clés étrangères} que la base de données fait respecter --- une transaction pour un compte qui n'existe pas est refusée, non stockée. Les positions
+ne sont pas une table~: ce sont une requête sur les transactions, de sorte qu'elles ne peuvent pas les contredire. Les changements de schéma sont des migrations numérotées, appliquées une fois chacune et
+enregistrées dans la base de données, de sorte que chaque copie de la base peut indiquer quel schéma elle possède.
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{26}{41}{Le schéma sous forme de migrations~: clés primaires, clés étrangères et table des transactions avec deux intervalles
+temporels par ligne.}\label{lst:pl:databases-and-sql:schema}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,
+  tab/.style={draw=omDef,fill=omDef!6,rounded corners=2pt,align=left,text width=38mm,inner sep=4pt},
+  arr/.style={-{Stealth[length=2mm]},thick,omThm}]
+\node[tab] (i) at (0,1.4) {\textbf{instruments}\\\underline{id}, symbole (unique), devise};
+\node[tab] (a) at (0,-0.9) {\textbf{comptes}\\\underline{id}, nom (unique)};
+\node[tab,text width=64mm] (t) at (7.4,0.25) {\textbf{transactions}\\\underline{trade\_id}, account\_id, instrument\_id,\\qty, price,
+valid\_from, valid\_to,\\\underline{sys\_from}, sys\_to};
+\draw[arr] (t.west |- 0,0.75) -- node[above,font=\scriptsize]{instrument\_id} (i.east |- 0,0.75);
+\draw[arr] (t.west |- 0,-0.55) -- node[below,font=\scriptsize]{account\_id} (a.east |- 0,-0.55);
+\node[font=\scriptsize,text width=64mm,align=left] at (7.4,-1.75) {clé primaire soulignée~; les flèches représentent des clés étrangères};
+\end{tikzpicture}
+
+\omcaption{Le schéma du chapitre. Les instruments et les comptes sont référencés par les transactions au moyen de \omterm{def:pl:databases-and-sql:relational}{clés étrangères} imposées~; la \omterm{def:pl:databases-and-sql:relational}{clé primaire}
+de la table des transactions est l'identifiant de la transaction accompagné du début de son \omterm{def:pl:databases-and-sql:system}{temps système}, car une transaction corrigée comporte plusieurs versions.}
+\label{fig:pl:databases-and-sql:schema}
+\end{omfigure}
+
+\section{Transactions et isolation}
+
+\begin{definition}[Transaction ACID]\label{def:pl:databases-and-sql:acid}
+Une \emph{transaction ACID}\index{transaction ACID} est un ensemble de lectures et d'écritures qui est atomique (tout ou rien), cohérente (elle fait passer la
+base de données d'un état valide à un autre), isolée (les transactions concurrentes ne voient pas le travail partiel les unes des autres) et durable (une fois validée,
+elle survit à une panne).
+\end{definition}
+
+\begin{definition}[Niveau d'isolation, journal d'écriture anticipée]\label{def:pl:databases-and-sql:isolation}
+Un \emph{niveau d'isolation}\index{niveau d'isolation} précise quelles anomalies de concurrence une base de données autorise entre transactions, de la
+lecture non validée jusqu'à la sérialisabilité, sous laquelle le résultat est celui d'un certain ordre sériel. Un \emph{journal d'écriture anticipée}\index{journal d'écriture anticipée} (write-ahead log) enregistre chaque
+modification avant son application au fichier principal de la base, de sorte qu'une panne puisse être réparée en la rejouant ou en la supprimant~: en mode WAL de SQLite
+«~le contenu d'origine est conservé dans le fichier de la base et les modifications sont ajoutées dans un fichier WAL séparé~».
+\end{definition}
+
+L'anomalie qui coûte de l'argent à une société de trading est la mise à jour perdue, que Berenson et ses coauteurs définissent comme une transaction lisant un élément,
+une autre le mettant à jour, puis la première écrivant une valeur calculée à partir de sa lecture antérieure, de sorte que la mise à jour de la seconde est perdue. Deux passerelles
+ajoutent chacune 100 actions à la même position~: chacune lit la position, ajoute son exécution et écrit le résultat. SQLite est sérialisable --- elle
+«~implémente les transactions sérialisables en sérialisant réellement les écritures~» --- mais seulement à l'intérieur d'une transaction~; une
+application qui lit dans une instruction et écrit dans une autre a fait deux transactions, et la base de données ne peut pas la protéger.
+
+\omcode{code/platforms/25-databases-and-sql/python/pl_tradedb.py}{132}{144}{Les deux étapes d'un écrivain dans chacun des trois modes~: lecture puis écriture
+en deux transactions, la même chose dans une seule transaction ouverte par BEGIN, ou une instruction qui lit et écrit.}
+\label{lst:pl:databases-and-sql:lost}
+
+Sur 1\,000 entrelacements aléatoires des étapes des deux écrivains, l'application lecture-puis-écriture perd une mise à jour 636 fois, proche des deux
+tiers des entrelacements où les deux lectures précèdent une écriture. Dans une transaction ouverte avec \texttt{BEGIN IMMEDIATE}, le second écrivain est
+refusé jusqu'à ce que le premier valide, puis réessaie~: aucune mise à jour n'est perdue. Un seul \texttt{UPDATE pos SET q = q + 100} fait la lecture et l'écriture
+en une seule instruction, et ne perd rien non plus. La règle~: envoyer un incrément à la base de données sous forme d'incrément, ou laisser la lecture et l'écriture
+partager une seule transaction, avec une nouvelle tentative.
+
+\section{Index et plans de requête}
+
+\begin{definition}[Index en arbre B, plan de requête]\label{def:pl:databases-and-sql:index}
+Un \emph{index en arbre B}\index{index en arbre B} conserve une copie de colonnes choisies d'une table dans un arbre équilibré et trié pointant vers les lignes, de sorte
+que les lignes ayant des valeurs données ou situées dans un intervalle soient trouvées en temps logarithmique au lieu d'être parcourues en lisant la table. Un
+\emph{plan de requête}\index{plan de requête} est la suite d'opérations que la base de données choisit pour répondre à une requête --- quelles tables elle parcourt, quels index elle interroge, comment elle joint
+et regroupe les données --- et peut s'afficher avant l'exécution de la requête.
+\end{definition}
+
+Trois requêtes portent sur les 500\,008 transactions de la semaine~: une requête ponctuelle (la position d'un compte dans un instrument à 18~h~00 le mardi), le
+rapport (les positions de chaque compte à 18~h~00 le mardi, jointes aux noms des comptes et des instruments), et une requête analytique (la
+valeur échangée de la semaine par instrument). \texttt{EXPLAIN QUERY PLAN} montre que chacune lit toute la table des transactions (\texttt{SCAN trades})~; le conseiller du chapitre
+signale de tels parcours complets, et la question pour chacun est de savoir si un index sélectionnerait assez peu de lignes pour que cela en vaille la peine.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.6cm,ybar,bar width=8pt,ylabel={ms (médiane de 5, log)},symbolic x coords={point,report,analytic},
+  xtick=data,xticklabels={requête\\ponctuelle,rapport des\\positions,valeur échangée\\par instrument},xticklabel style={align=center},enlarge x limits=0.22,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,ymin=0.005,ymax=2000,
+  log origin=infty,
+  legend cell align=left,
+  legend style={font=\scriptsize,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,/tikz/every even column/.append style={column sep=3mm}}]
+\addplot[fill=omThm!60,draw=omThm] table[x=query,y=sqlite_none]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=omDef!60,draw=omDef] table[x=query,y=sqlite_ai]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=omDef!20,draw=omDef] table[x=query,y=sqlite_v]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\addplot[fill=gray!50,draw=gray] table[x=query,y=duckdb]{figdata/platforms/25-databases-and-sql/queries_wide.csv};
+\legend{SQLite sans index,SQLite avec index sur (account~; instrument),SQLite avec index sur le temps de validité,DuckDB (sans index)}
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Temps de requête mesurés sur 500\,008 transactions (échelle logarithmique~; un cœur, en mémoire, médiane de cinq exécutions, sur une machine
+inactive par ailleurs). L'index sur (account, instrument) ramène la requête ponctuelle de 13.7~ms à 0.01~ms~; l'index sur le temps de validité n'aide presque aucune requête,
+car mardi 18~h~00 sélectionne encore deux jours sur cinq~; DuckDB exécute le rapport 15 fois plus vite et la requête analytique 53 fois plus vite que SQLite
+sans aucun index. Données~: \texttt{bench\_tradedb.py}, \texttt{measured\_queries.csv}.}\label{fig:pl:databases-and-sql:queries}
+\end{omfigure}
+
+Les mesures (\cref{fig:pl:databases-and-sql:queries}) donnent à la règle empirique ses chiffres. Un index est rentable lorsqu'il sélectionne une petite part de
+la table~: la requête ponctuelle lit une cinquantaine de lignes sur 500\,008 grâce à l'index (account, instrument), soit un gain de trois ordres de grandeur.
+Un index sur le temps de validité sélectionne 40~\% des lignes pour le rapport du mardi et ne fait presque rien gagner, et aucun index n'aide une requête qui doit lire chaque
+ligne. Chaque index coûte aussi une écriture supplémentaire à chaque insertion, de sorte que la liste de l'assistant est une liste de candidats, et non d'index à créer.
+
+\section{Le temps dans la base~: temps système et requêtes temporelles}
+
+Le livre~7, chapitre~3, a stocké des données avec deux temps, le temps de validité que décrit une valeur et le temps de connaissance auquel elle est devenue disponible, et a rendu
+la recherche reproductible grâce à eux. Une base de transactions a besoin des mêmes deux axes, pour une raison légèrement différente.
+
+\begin{definition}[Temps système, requête temporelle]\label{def:pl:databases-and-sql:system}
+Le \emph{temps système}\index{temps système} (system time) d'une version de ligne est l'intervalle pendant lequel la base l'a tenue pour courante~: depuis la
+transaction qui l'a insérée jusqu'à la transaction qui l'a remplacée. Une \emph{requête temporelle}\index{requête temporelle} (time travel) demande les lignes
+valables à un instant donné telles que la base les tenait à un autre, en filtrant sur les deux intervalles.
+\end{definition}
+
+Le \omterm{def:pl:databases-and-sql:system}{temps système} diffère du temps de connaissance du livre~7 sur un point~: c'est le moment où la base de la société a enregistré un fait, que la base horodate
+elle-même et que personne ne peut antidater, alors que le temps de connaissance est le moment où le fait est devenu disponible, qui peut être antérieur et qui est fourni par les données.
+SQL~:2011 a normalisé les deux axes~: le temps de transaction par les tables à versionnement système, le temps de validité par les périodes de temps applicatif, et des requêtes
+de la forme \texttt{FOR SYSTEM\_TIME AS OF}.
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{82}{92}{Une correction clôt le temps système de l'ancienne version et insère la version corrigée~:
+rien de ce qui était tenu pour vrai n'est écrasé.}\label{lst:pl:databases-and-sql:correct}
+
+\begin{omfigure}
+\begin{tikzpicture}[x=0.85cm,y=0.85cm,font=\small]
+\draw[-{Stealth[length=2mm]}] (0,0) -- (12.2,0) node[right,font=\scriptsize]{temps système};
+\draw[-{Stealth[length=2mm]}] (0,0) -- (0,4.4) node[above,font=\scriptsize,align=center]{temps de validité};
+\foreach \d/\n in {0/lun.,2.4/mar.,4.8/mer.,7.2/jeu.,9.6/ven.} {\draw (\d,0) -- (\d,-0.1) node[below,font=\scriptsize]{\n};
+  \draw (0,\d*0.4) -- (-0.1,\d*0.4) node[left,font=\scriptsize]{\n};}
+\fill[omThm!25,draw=omThm] (1.2,0.48) rectangle (5.8,4.1);
+\fill[omDef!25,draw=omDef] (5.8,0.48) rectangle (12,4.1);
+\node[align=center,font=\scriptsize] at (2.7,3.0) {version 1~:\\700 actions\\connue depuis\\lundi 12~h~01};
+\node[align=center,font=\scriptsize] at (8.9,3.3) {version 2~: 70 actions\\connue depuis mercredi 10~h~00};
+\draw[black,thick,dashed] (4.2,0) -- (4.2,4.2);
+\draw[black,thick,dashed] (0,1.68) -- (12,1.68);
+\fill (4.2,1.68) circle (2.2pt) node[below right,font=\scriptsize,fill=white,inner sep=1pt]{tel qu'il était~: mar.~18~h / mar.~18~h};
+\fill (11.6,1.68) circle (2.2pt) node[above left,font=\scriptsize,fill=white,inner sep=1pt]{corrigé~: mar.~18~h / ven.~20~h};
+\end{tikzpicture}
+
+\omcaption{Une transaction corrigée dans les deux temps~: exécutée le lundi à 12~h~00, saisie pour 700 actions, corrigée à 70 le mercredi à 10~h~00.
+Chaque version est un rectangle, vraie à partir du lundi en temps de validité (en ordonnée) et courante sur un \omterm{def:pl:time-series-databases-and-the-alternatives:bucket}{intervalle de temps} système (en abscisse). Le rapport du mardi tel qu'il était
+lit le point (valide le mardi 18~h~00, système le mardi 18~h~00) et trouve 700~; le rapport corrigé lit (mardi 18~h~00, vendredi) et trouve
+70.}\label{fig:pl:databases-and-sql:bitemporal}
+\end{omfigure}
+
+\omcode{code/firm/tradedb/firm_tradedb.py}{102}{118}{Requête temporelle~: les transactions valables à \texttt{:v} telles que tenues à \texttt{:s}, et les
+positions qui en sont calculées.}\label{lst:pl:databases-and-sql:asof}
+
+La semaine du modèle compte 500\,008 transactions. Le mercredi à 10~h~00, les opérations corrigent 30 quantités saisies dix fois trop grandes, annulent 10 transactions
+qui n'ont jamais eu lieu et enregistrent 8 transactions du mardi qui avaient été oubliées~; la table contient alors 500\,048 versions de lignes, quarante de plus que de transactions.
+Le rapport du mardi à 18~h~00, tel qu'il était, lit le temps de validité mardi 18~h~00 au \omterm{def:pl:databases-and-sql:system}{temps système} mardi 18~h~00~; le rapport corrigé lit le même temps de validité
+au \omterm{def:pl:databases-and-sql:system}{temps système} vendredi soir. Les deux diffèrent sur 48 des 10\,000 positions par compte et instrument~--- une par correction
+(\cref{fig:pl:databases-and-sql:diff})~--- et le régulateur reçoit le premier, accompagné du second et de la table d'audit qui explique chaque écart.
+La table corrigée sur place ne peut produire que le second.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={les 48 positions qui diffèrent, triées},ylabel={corrigé moins tel que reporté (actions)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=49,ymin=-1000,ymax=1100,only marks,yticklabel style={/pgf/number format/1000 sep={\,}},
+  legend style={font=\small,at={(0.02,0.98)},anchor=north west,draw=none,fill=white}]
+\addplot[scatter,only marks,mark=*,mark size=1.8pt,point meta=explicit symbolic,
+  scatter/classes={qty={omThm},cancel={black},late={omDef}}]
+  table[x=rank,y=change,meta=kind]{figdata/platforms/25-databases-and-sql/report_diff.csv};
+\node[omThm,font=\scriptsize,anchor=west] at (axis cs:2,920) {$\bullet$ quantité corrigée (30)};
+\node[font=\scriptsize,anchor=west] at (axis cs:2,760) {$\bullet$ transaction annulée (10)};
+\node[omDef,font=\scriptsize,anchor=west] at (axis cs:2,600) {$\bullet$ transaction tardive enregistrée (8)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Rapport des positions du mardi à 18~h~00, corrigé moins tel qu'il avait été reporté, pour les 48 positions par compte et instrument qui diffèrent~:
+les corrections de quantité (rouge) retirent neuf dixièmes de la transaction de la position, les annulations (noir) la transaction entière, et les enregistrements tardifs
+(bleu) en ajoutent une. Les 9\,952 autres positions concordent. Données~: \texttt{fig\_tradedb.py}.}\label{fig:pl:databases-and-sql:diff}
+\end{omfigure}
+
+\section{Charges transactionnelles et analytiques}
+
+\begin{definition}[Traitement transactionnel en ligne, traitement analytique en ligne]\label{def:pl:databases-and-sql:oltp}
+Le \emph{traitement transactionnel en ligne}\index{traitement transactionnel en ligne} (OLTP) est une charge faite de nombreuses petites transactions qui lisent et écrivent
+quelques lignes chacune par clé~--- l'enregistrement (booking) des transactions, la mise à jour des positions. Le \emph{traitement analytique en ligne}\index{traitement analytique en ligne} (OLAP)
+est une charge faite de peu de requêtes volumineuses qui lisent beaucoup de lignes et peu de colonnes pour les agréger~--- valeur échangée par instrument, P\&L par desk sur une
+année.
+\end{definition}
+
+SQLite est un moteur orienté lignes conçu pour le premier~; DuckDB, la base embarquée du chapitre~\ref{ch:pl:time-series-databases-and-the-alternatives},
+est un moteur en colonnes à exécution vectorisée conçu pour le second. Sur le même SQL et les mêmes données~--- le chapitre vérifie que chaque
+réponse est identique~--- DuckDB exécute le rapport en 9.8~ms contre 150 pour SQLite, et la requête analytique en 2.8~ms contre 148, avec un seul fil et sans
+index. SQLite avec le bon index gagne toutefois très nettement la requête ponctuelle (0.01~ms contre 1.0). La société conserve ses transactions dans un
+magasin transactionnel, où se trouvent les clés, les transactions et le \omterm{def:pl:databases-and-sql:system}{temps système}, et confie à la recherche et au reporting une copie en colonnes, rafraîchie
+à partir de la version transactionnelle et jamais écrite par quiconque d'autre.
+
+\begin{dated}{2026-09}{Isolation dans SQLite et SQL temporel}\label{dat:pl:databases-and-sql:temporal}
+La documentation de SQLite affirme que ses transactions sont sérialisables, obtenues en sérialisant les écritures (sauf pour les connexions à cache partagé
+avec \texttt{read\_uncommitted}), et qu'en mode \omterm{def:pl:databases-and-sql:isolation}{journal d'écriture anticipée} (write-ahead log) les modifications sont ajoutées à un fichier WAL séparé pendant que le fichier de base conserve
+le contenu d'origine. Le standard SQL~:2011 fournit le temps de transaction par les tables à versionnement système et le temps de validité par les tables à
+périodes de temps applicatif, comme le décrivent Kulkarni et Michels (2012).
+\end{dated}
+
+\section{Tutoriel~: mardi à 18~h~00}\label{tut:pl:databases-and-sql:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Stocker une semaine de transactions de façon bitemporelle, les corriger, reproduire un rapport passé et mesurer ce que changent les index et les moteurs.
+\textbf{État final~:} \cref{fig:pl:databases-and-sql:diff,fig:pl:databases-and-sql:queries}.
+\begin{tutsteps}
+\item \textbf{Schéma}~: \texttt{firm\_tradedb.connect()} et \texttt{migrate}~; essayer d'insérer une transaction pour un compte inconnu.
+\item \textbf{La semaine}~: \texttt{pl\_tradedb.load(conn)}~; les corrections du mercredi à 10~h~00.
+\item \textbf{Rapports}~: \texttt{positions(conn, TUE\_18, TUE\_18)} et \texttt{positions(conn, TUE\_18, NOW)}~; les lignes qui diffèrent.
+\item \textbf{Mises à jour perdues}~: \texttt{lost\_updates(mode)} pour les trois modes.
+\item \textbf{Plans et temps}~: \texttt{plan} et \texttt{advise} pour chaque requête~; \texttt{bench\_tradedb.py}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter un index sur (valid\_from, account\_id) et relire le plan du rapport~; copier les tables vers DuckDB avec un
+filtre sur le \omterm{def:pl:databases-and-sql:system}{temps système} afin que la copie en colonnes puisse elle aussi voyager dans le temps.
+\end{tutorial}
+
+\section{Construction~: la base de données des transactions}\label{bld:pl:databases-and-sql:tradedb}
+
+\begin{build}
+\bfield{Rôle} Un magasin transactionnel unique pour les transactions de la société, qui fait respecter ses clés, ne perd jamais une mise à jour
+et peut reproduire tout rapport tel qu'il a été produit.
+\bfield{Interface} \texttt{connect}, \texttt{migrate}, \texttt{book}, \texttt{correct}, \texttt{cancel}, \texttt{as\_of},
+\texttt{positions}, \texttt{transact}, \texttt{plan}, \texttt{advise}, \texttt{to\_duckdb}.
+\bfield{Règles} \omterm{def:pl:databases-and-sql:relational}{Clés étrangères} activées~; schéma modifié uniquement par des migrations~; les corrections ferment l'ancienne version et en insèrent une nouvelle, sans jamais mettre à jour les valeurs~; chaque correction
+est auditée~; la lecture-modification-écriture n'a lieu qu'à l'intérieur d'une transaction, ou sous la forme d'une seule instruction~; les index sont choisis à partir des plans et de mesures.
+\bfield{Tests d'acceptation} \texttt{code/firm/tradedb/tests/}~: les clés sont respectées~; une correction, une annulation et un enregistrement tardif sont vus tels qu'ils étaient
+et tels qu'ils ont été corrigés~; un écrivain bloqué est relancé et une transaction en échec est annulée~; le conseiller avant et après un index~; la même réponse dans
+DuckDB.
+\bfield{Pour aller plus loin} Corrections en temps de validité qui découpent l'intervalle d'une ligne~; tables à version système dans une base qui les gère~; une copie en colonnes
+rafraîchie par capture des changements.
+\end{build}
+
+\begin{omsources}
+\item E.~F.~Codd, \emph{A Relational Model of Data for Large Shared Data Banks}, Communications of the ACM 13(6), 1970.
+\item H.~Berenson, P.~Bernstein, J.~Gray, J.~Melton, E.~O'Neil et P.~O'Neil, \emph{A Critique of ANSI SQL Isolation Levels}, SIGMOD 1995.
+\item K.~Kulkarni et J.-E.~Michels, \emph{Temporal Features in SQL:2011}, SIGMOD Record 41(3), 2012.
+\item Documentation SQLite~: \emph{Isolation in SQLite}~; \emph{Write-Ahead Logging}.
+\item One Quant Book~7, chapitre~3 (temps de validité, temps de connaissance, données bitemporelles).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:1}
+Pourquoi les positions sont-elles une requête sur les transactions plutôt qu'une table qui leur est propre~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:2}
+Pourquoi la \omterm{def:pl:databases-and-sql:relational}{clé primaire} de la table des transactions est-elle (identifiant de transaction, début du \omterm{def:pl:databases-and-sql:system}{temps système}) et non le seul identifiant de transaction~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:databases-and-sql:3}
+Combien de versions de lignes la table contient-elle après le mercredi, et pourquoi quarante de plus que de transactions~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:4}
+Pourquoi l'application qui lit puis écrit perd-elle une mise à jour dans environ deux tiers des entrelacements~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:5}
+Pourquoi l'index sur le temps de validité aide-t-il à peine le rapport des positions~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:databases-and-sql:6}
+Une transaction tardive pour le mardi est enregistrée le mercredi. Lequel des deux rapports du mardi la montre, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:databases-and-sql:7}
+\emph{Programmation.} Écrire la requête qui liste chaque transaction dont la version du mardi à 18~h~00 diffère de sa version courante, avec les deux valeurs.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:databases-and-sql:8}
+\emph{Trouver la faille.} «~Nous tenons une table d'audit de chaque modification, donc nous pouvons toujours reconstituer ce que la table des positions indiquait à n'importe quel
+jour.~»
+\end{exercise}
+
+\section{Problème~: mardi à 18~h~00}
+
+\begin{problem}[{Problème du week-end --- mardi à 18~h~00}]\label{pb:pl:databases-and-sql:1}
+La semaine de transactions du chapitre, ses corrections, ses écrivains et ses requêtes.
+
+\medskip\noindent\textbf{Partie I --- Le schéma.}
+\begin{enumerate}
+\item Que garantissent les \omterm{def:pl:databases-and-sql:relational}{clés primaires} et étrangères du schéma~?
+\item Que la \omterm{def:pl:databases-and-sql:normal}{forme normale} écarte-t-elle de la table des transactions~?
+\item Pourquoi les changements de schéma sont-ils des migrations~?
+\item Que porte chaque ligne de la table des transactions, au-delà de la transaction~?
+\item Comment une transaction est-elle corrigée, et comment est-elle annulée~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Concurrence.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qu'une mise à jour perdue, selon les termes de la critique de 1995~?
+\item Pourquoi l'isolation sérialisable de SQLite ne l'empêche-t-elle pas pour l'application qui lit puis écrit~?
+\item Combien de mises à jour sont perdues dans 1\,000 entrelacements selon chaque mode~?
+\item Que change \texttt{BEGIN IMMEDIATE}~?
+\item Quand une seule instruction suffit-elle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Plans et moteurs.}
+\begin{enumerate}[resume]
+\item Que montre le plan de chaque requête sans index~?
+\item Que fait chaque index à chaque requête~?
+\item Comment SQLite et DuckDB se comparent-ils sur chaque requête~?
+\item Pourquoi un index coûte-t-il quelque chose même lorsqu'il n'est pas utilisé~?
+\item Quel magasin doit servir aux requêtes de recherche~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le rapport des positions reproduit tel qu'il se présentait à 18~h~00 le mardi, comparé au rapport corrigé, les
+lignes qui diffèrent et le gain de temps de requête apporté par chaque index.
+\item En quoi le \omterm{def:pl:databases-and-sql:system}{temps système} diffère-t-il du temps de connaissance du livre~7~?
+\item Que perd la table corrigée sur place~?
+\item Que faudrait-il exiger de toute table à partir de laquelle un rapport est produit~?
+\item En une phrase~: que doit retenir une base de données, outre la bonne réponse~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:databases-and-sql:1}
+Qu'est-ce qu'une transaction, et que signifient les quatre lettres d'ACID~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:databases-and-sql:2}
+Deux services mettent à jour la même position au même moment. Comment une mise à jour peut-elle être perdue, et comment l'empêchez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:databases-and-sql:3}
+Une requête est lente. Comment décidez-vous si un index va aider~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:databases-and-sql:4}
+Un régulateur demande un rapport exactement tel que vous l'avez produit il y a trois mois. Comment concevez-vous cela~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:databases-and-sql:5}
+Concevez le stockage des transactions et des positions d'une société de trading pour l'enregistrement, le reporting et la recherche.
+\end{interviewq}

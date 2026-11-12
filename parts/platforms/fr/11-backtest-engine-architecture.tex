@@ -1,0 +1,386 @@
+\chapter{Architecture du moteur de backtest}\label{ch:pl:backtest-engine-architecture}
+
+Une stratégie de cotation avait fière allure dans le backtest sur barres, paraissait neutre dans le rejeu du carnet d'ordres, et perdait de l'argent dans le simulateur. La société disposait de
+quatre backtesters, écrits par quatre équipes dans quatre styles, chacun avec sa propre notion de stratégie, d'horloge, d'ordre et de résultat~; la stratégie avait été portée
+à la main dans chacun d'eux. Il a fallu une semaine pour être certain que les trois réponses différaient parce que les marchés différaient
+--- des barres contre des files, des files contre un marché qui réagit --- et non parce que les quatre portages de la stratégie différaient. Ce chapitre
+construit le moteur qui transforme cette question en requête~: un seul objet stratégie, un seul \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements}, une seule \omterm{def:pl:backtest-engine-architecture:dal}{couche d'accès aux données} et une seule \omterm{def:pl:backtest-engine-architecture:results}{base de résultats}
+sur les quatre niveaux de fidélité du livre~7 (chapitre~16), le quatrième étant une \omterm{def:pl:backtest-engine-architecture:reactive}{simulation réactive} sur le simulateur de bourse
+du livre~10.
+
+\section{Un moteur, quatre niveaux}
+
+\begin{definition}[Moteur de backtest]\label{def:pl:backtest-engine-architecture:engine}
+Un \emph{moteur de backtest}\index{moteur de backtest} est le composant de la plateforme qui exécute une stratégie sur des marchés historiques ou simulés
+à un niveau de fidélité choisi, au moyen d'une interface de stratégie unique~; il lit ses données par l'intermédiaire d'une \omterm{def:pl:backtest-engine-architecture:dal}{couche d'accès aux données}, enregistre ce que la stratégie a vu et fait
+dans un \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements} unique, et conserve chaque exécution avec l'identité de son code, de ses données, de ses paramètres et de sa graine.
+\end{definition}
+
+Les backtesters de la société existent déjà~: le backtester vectorisé du livre~7 (\texttt{firm.vecbt}, niveau~1), son backtester événementiel
+sur barres (\texttt{firm.evbt}, niveau~2) et son rejeu du carnet d'ordres avec positions dans la file (\texttt{firm.lobreplay}, niveau~3), ainsi que le simulateur de bourse du livre~10
+(\texttt{firm.exchsim}). Le livre~7 définissait le niveau~4 comme le trading en direct à petite taille ou le trading simulé (paper trading), et, dans son chapitre~19, laissait un agent négocier
+dans le marché synthétique en guise de substitut au direct~; ici, c'est le simulateur de bourse qui joue ce rôle, avec
+la même séance rejouée sous forme d'ordres réels, contre lesquels les ordres propres de la stratégie reposent et s'exécutent. Le moteur ne réécrit aucun de
+ces backtesters. Chaque niveau dispose d'un adaptateur qui traduit l'objet stratégie unique en ce que le backtester attend, et qui traduit ce que le backtester rapporte
+en événements du moteur (\cref{fig:pl:backtest-engine-architecture:arch}).
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,box/.style={draw,rounded corners=2pt,align=center,minimum height=0.75cm,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=omMeth!15,minimum width=3.2cm] (s) at (0,2.6) {objet stratégie\\ \texttt{QuoteStrategy} ou \texttt{TargetStrategy}};
+\node[box,fill=omDef!15,minimum width=10.6cm] (e) at (2.6,1.2) {\texttt{Engine(level, strategy, data, config).run()}~: un seul contexte\\
+(\texttt{send}, \texttt{cancel}, \texttt{working}, \texttt{position}), un seul journal d'événements};
+\foreach \x/\l/\c in {-2.1/{niveau 1\\ \texttt{firm.vecbt}}/1,0.9/{niveau 2\\ \texttt{firm.evbt}}/2,3.9/{niveau 3\\
+  \texttt{firm.lobreplay}}/3,6.9/{niveau 4\\ \texttt{firm.exchsim}}/4} {
+  \node[box,fill=omThm!10,minimum width=2.5cm] (b\c) at (\x,-0.4) {\l};
+  \draw[<->] (b\c.north) -- (b\c.north|-e.south);}
+\node[font=\scriptsize\itshape] at (2.4,-1.1) {adaptateurs~: un par niveau, backtesters inchangés};
+\node[box,fill=gray!10,minimum width=4.4cm] (d) at (0.2,-2.0) {couche d'accès aux données\\ jeux de données nommés,\\ empreintes de contenu};
+\node[box,fill=gray!10,minimum width=4.4cm] (r) at (5.4,-2.0) {base de résultats\\ manifeste, exécutions,\\ événements par exécution};
+\draw[->] (d.west) -| ([xshift=-4mm]e.west) -- (e.west);
+\draw[->] (s.south) -- (s.south|-e.north);
+\draw[->] (e.east) -| ++(0.5,-3.2) -- (r.east);
+\end{tikzpicture}
+
+\omcaption{Architecture du moteur. Un seul objet stratégie s'exécute à tous les niveaux~; l'adaptateur de chaque niveau traduit entre le contexte du moteur
+et l'un des backtesters de la société, qui sont encapsulés et non modifiés. Les données arrivent par la \omterm{def:pl:backtest-engine-architecture:dal}{couche d'accès aux données} avec une empreinte de contenu,
+et chaque exécution est versée dans la \omterm{def:pl:backtest-engine-architecture:results}{base de résultats} avec son manifeste.}\label{fig:pl:backtest-engine-architecture:arch}
+\end{omfigure}
+
+L'interface de stratégie prend deux formes, car les niveaux diffèrent par ce qu'est une stratégie. Au niveau~1, il n'existe aucun ordre~: une stratégie est une règle qui associe aux clôtures une position cible,
+exécutée sur toutes les dates à la fois. Aux niveaux~2 à~4, une stratégie réagit au marché et à ses propres exécutions
+en envoyant et en annulant des ordres. Un \texttt{TargetStrategy} énonce sa règle une seule fois, \texttt{target(close, i)}, et le moteur
+l'exécute de façon vectorisée au niveau~1 et barre par barre au niveau~2~; une \texttt{QuoteStrategy} possède deux rappels, \texttt{on\_market} et \texttt{on\_fill},
+et s'exécute aux niveaux~2 à~4. Demander une stratégie de cotation au niveau~1 est une erreur, et non un backtest vide sans avertissement.
+
+\omcode{code/platforms/11-backtest-engine-architecture/python/pl_btengine.py}{28}{51}{La stratégie de cotation du chapitre, écrite une seule fois
+contre le contexte du moteur~: un lot au meilleur cours acheteur et au meilleur cours vendeur, recotée lorsque le meilleur cours bouge, avec une limite d'inventaire
+de trois lots.}\label{lst:pl:backtest-engine-architecture:quoter}
+
+\omcode{code/firm/btengine/firm_btengine.py}{254}{278}{Le moteur~: le niveau détermine l'adaptateur, et chaque exécution renvoie le même
+\texttt{Run} avec son manifeste.}\label{lst:pl:backtest-engine-architecture:engine}
+
+\section{Le modèle d'événements et l'horloge}
+
+\begin{definition}[Modèle d'événements]\label{def:pl:backtest-engine-architecture:event}
+Un \emph{modèle d'événements}\index{modèle d'événements} est l'ensemble des classes d'événements qu'un \omterm{def:pl:backtest-engine-architecture:engine}{moteur de backtest} enregistre, ainsi que l'ordre total selon lequel il les traite et les conserve~:
+ici, chaque événement porte une heure, une classe et un numéro de séquence, et les événements sont ordonnés par heure, puis par un rang fixe de leur classe,
+puis par numéro de séquence.
+\end{definition}
+
+Quatre classes suffisent pour les stratégies du chapitre, dans cet ordre de rang~: \emph{marché} (le haut du carnet que la stratégie a vu), \emph{exécution}
+(ce que le marché a fait de ses ordres), \emph{ordre} et \emph{annulation} (ce que la stratégie a fait en réponse). Le rang tranche la question
+que tout moteur événementiel doit trancher et que la plupart tranchent par hasard~: lorsqu'une mise à jour de cotation et une exécution portent la même heure, laquelle la stratégie voit-elle en premier~?
+Une réponse fixe rend deux exécutions des mêmes entrées identiques et deux niveaux comparables~; le numéro de séquence départage les égalités restantes
+dans l'ordre d'arrivée.
+
+\omcode{code/firm/btengine/firm_btengine.py}{55}{78}{Le modèle d'événements~: un ordre total sur (heure, rang de classe, séquence), et le journal que chaque
+niveau écrit.}\label{lst:pl:backtest-engine-architecture:events}
+
+L'horloge est l'horloge simulée du livre~7 (chapitre~17)~: le temps avance d'un événement à l'autre, jamais au rythme de la machine. Chaque backtester tient
+sa propre horloge en interne --- fin de barre au niveau~2, heures des messages au niveau~3, nanosecondes de la journée simulée au niveau~4 --- et les adaptateurs
+convertissent toutes ces horloges en secondes depuis le début de la séance, afin que les événements de niveaux différents puissent être mis côte à côte.
+
+\section{Accès aux données}
+
+\begin{definition}[Couche d'accès aux données]\label{def:pl:backtest-engine-architecture:dal}
+Une \emph{couche d'accès aux données}\index{couche d'accès aux données} est le composant par lequel chaque backtest lit ses données~: elle résout un nom de jeu de données
+en données stockées et renvoie, avec les données, une identité de leur contenu (une empreinte) que l'exécution enregistre.
+\end{definition}
+
+La couche du chapitre stocke des jeux de données nommés au format Parquet (chapitres~3 et~4) et conserve une empreinte de contenu dans les métadonnées de chaque fichier~: un
+\texttt{firm.tape} de séance du livre~7 (les messages ordre par ordre d'une heure synthétique), et des barres journalières. L'empreinte est ce qui rend «~les mêmes données~» vérifiable~: deux exécutions
+qui lisent des jeux de données aux empreintes égales lisent les mêmes octets, quel que soit le nom des fichiers, et le manifeste d'une exécution
+nomme l'empreinte et non le chemin. Dans la société, la même interface donne accès à la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} du chapitre~4 et aux données de référence du
+chapitre~6~; une stratégie n'ouvre jamais un fichier.
+
+\section{La base de résultats}
+
+\begin{definition}[Base de résultats]\label{def:pl:backtest-engine-architecture:results}
+Une \emph{base de résultats}\index{base de résultats} conserve chaque exécution de backtest avec son manifeste --- empreintes du code du niveau, de la stratégie et du moteur, empreintes des données,
+paramètres et graine --- ainsi que ses sorties (exécutions, événements, P\&L),
+sous un identifiant dérivé du manifeste, et répond à des requêtes sur les exécutions.
+\end{definition}
+
+L'identifiant d'une exécution est l'empreinte de son manifeste (\cref{lst:pl:backtest-engine-architecture:save})~: le même code de stratégie, le même code de moteur,
+les mêmes données, les mêmes paramètres et la même graine donnent le même identifiant, de sorte qu'une relance est reconnue au lieu d'être stockée deux fois,
+et qu'une ligne modifiée de la stratégie donne un identifiant nouveau. La base répond aux questions auxquelles la semaine de l'accroche du chapitre a été consacrée~: quelles exécutions de cette stratégie existent,
+à quels niveaux, sur quelles données, avec quel code~; et, pour deux exécutions, à quel endroit leurs événements divergent pour la première fois.
+
+\omcode{code/firm/btengine/firm_btengine.py}{429}{439}{Enregistrement d'une exécution~: son manifeste, ses exécutions et ses événements sous l'empreinte du
+manifeste.}\label{lst:pl:backtest-engine-architecture:save}
+
+\begin{dated}{2026-09}{Moteurs open source avec une seule stratégie pour plusieurs environnements}\label{dat:pl:backtest-engine-architecture:oss}
+Les plateformes de trading open source poursuivent le même objectif de conception. La documentation de NautilusTrader le décrit comme «~un moteur open source, de qualité production, natif Rust,
+pour des systèmes de trading multi-actifs et multi-plateformes~», dans lequel «~le même code de stratégie et d'algorithme d'exécution peut
+tourner sur les systèmes de backtest comme sur les systèmes en production~», avec un noyau commun utilisé par ses contextes de backtest, de bac à sable et de production, et un bus de messages
+entre les composants.
+\end{dated}
+
+\section{Ajouter un niveau~: la simulation réactive}
+
+\begin{definition}[Simulation réactive]\label{def:pl:backtest-engine-architecture:reactive}
+Une \emph{simulation réactive}\index{simulation réactive} est un backtest dans lequel les ordres de la stratégie sont de vrais ordres dans un
+marché simulé~: ils reposent dans ses files, s'échangent contre les ordres des autres participants et modifient ensuite les contreparties auxquelles ces ordres s'exécutent,
+de sorte que le marché que rencontre la stratégie dépend de sa présence. La société l'utilise comme niveau de fidélité~4, le simulateur de bourse
+qui tient lieu de la plateforme de négociation.
+\end{definition}
+
+Au niveau~3, les ordres de la stratégie sont des ombres (livre~7, chapitre~18)~: ils prennent place dans la file rejouée et s'exécutent lorsque
+les exécutions enregistrées les atteignent, mais le rejeu ne change pas~: un ordre au marché qui a exécuté une ombre exécute aussi, dans l'enregistrement, les ordres
+qu'il a exécutés ce jour-là. Au niveau~4, la même session \texttt{firm.tape} est rejouée par le simulateur du livre~10 comme de vrais ordres~: chaque
+ajout enregistré devient un ordre à cours limité, chaque annulation une annulation, chaque transaction un ordre au marché de même taille. Les ordres de la stratégie y figurent.
+Un ordre au marché qui rencontre l'ordre de la stratégie s'exécute contre lui et non contre l'ordre placé derrière, qui reste alors plus longtemps au repos et s'exécute plus tard
+contre une autre contrepartie~; lorsque les ordres au meilleur cours quittent le carnet, l'ordre de la stratégie reste seul en tête, visible de tous, là où
+l'ombre du rejeu aurait disparu avec le niveau dans lequel elle se dissimulait.
+
+\omcode{code/firm/btengine/firm_btengine.py}{378}{410}{Niveau~4~: la session du jeu de données comme flux de fond du simulateur, la stratégie
+branchée sur \texttt{ReplayStrategyAdapter} du livre~10, exécutions et événements enregistrés comme à tous les autres
+niveaux.}\label{lst:pl:backtest-engine-architecture:level4}
+
+Le niveau~4 rend concret l'impact contrefactuel du livre~7 (chapitre~18), avec ses limites~: le flux de fond est un enregistrement, de sorte que ses
+ordres à cours limité ne se recotent pas autour de la stratégie, et ses traders informés ne changent pas d'avis. Il mesure la part mécanique de
+la présence de la stratégie --- les files et l'appariement --- et non la part stratégique, qui exige des agents (\texttt{firm.agentmkt} du livre~10).
+
+\section{L'échelle du P\&L}
+
+L'expérience du chapitre fait tourner la stratégie de cotation (le \cref{lst:pl:backtest-engine-architecture:quoter}) sur vingt sessions d'une heure de
+\texttt{firm.tape} (graines 1 à 20), aux niveaux~2, 3 et~4, avec 20~$\mu$s de latence sur les données et sur la saisie des ordres, et sans frais à aucun niveau. Au niveau~2
+la stratégie voit le meilleur cours à la fin de chaque barre d'une seconde comportant des transactions, et une cotation s'exécute intégralement lorsque la barre traite à son prix
+(l'exécution au contact du livre~7, chapitre~17)~; au niveau~3 elle prend sa place au fond de la file~; au niveau~4 elle est dans la file.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ybar,bar width=26pt,ylabel={P\&L par heure (\$)},ymin=-150,ymax=300,ytick={-100,0,100,200,300},
+  xtick={2,3,4},xticklabels={{niveau 2~: barres},{niveau 3~: rejeu},{niveau 4~: réactif}},enlarge x limits=0.3,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  extra y ticks={0},extra y tick style={grid style={black,thin}}]
+\addplot[fill=omDef!45,draw=omDef,error bars/.cd,y dir=both,y explicit]
+  table[x=level,y=pnl,y error=se]{figdata/platforms/11-backtest-engine-architecture/ladder.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le P\&L par heure de la stratégie de cotation à trois niveaux de fidélité, moyenne sur vingt sessions d'une heure avec une erreur type.
+Les exécutions au contact sur barres la rendent riche, la file du rejeu la laisse à plat, et un marché où ses ordres sont réels la fait perdre. Données~:
+\texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:ladder}
+\end{omfigure}
+
+La \Cref{fig:pl:backtest-engine-architecture:ladder} est l'échelle. Au niveau~2, la stratégie gagne 228~\$ par heure ($\pm 29$, une
+erreur type sur les sessions), pour 841 exécutions~: une cotation qui s'exécute dès que la barre traite à son prix n'attend jamais dans une file.
+Au niveau~3, elle perd 12~\$ par heure ($\pm 13$, indiscernable de zéro) sur 333 exécutions~: placée derrière la file, elle s'exécute moins et surtout lorsque le prix
+est sur le point de la traverser. Au niveau~4, elle perd 102~\$ par heure ($\pm 18$) sur 434 exécutions. Ce dernier palier n'est pas du bruit~: le niveau~4 est inférieur
+au niveau~3 dans chacune des vingt sessions (la \cref{fig:pl:backtest-engine-architecture:sessions}), de 90~\$ par heure en moyenne ($\pm 7.4$).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=8.4cm,height=7cm,xlabel={niveau 3 (rejeu)~: P\&L par heure (\$)},ylabel={niveau 4 (réactif)~: P\&L par heure (\$)},
+  xmin=-260,xmax=110,ymin=-260,ymax=110,grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},
+  table/col sep=comma,legend style={font=\footnotesize,at={(0.03,0.97)},anchor=north west}]
+\addplot[only marks,mark=*,mark size=1.8pt,omDef] table[x=pnl3,y=pnl4]{figdata/platforms/11-backtest-engine-architecture/sessions.csv};
+\addlegendentry{une session}
+\addplot[black,dashed,domain=-260:110] {x};
+\addlegendentry{P\&L identique}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Chacune des vingt sessions aux niveaux~3 et~4. Chaque point se trouve sous la diagonale~: la même stratégie sur la même
+heure enregistrée fait moins bien lorsque ses ordres font partie du marché. Données~: \texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:sessions}
+\end{omfigure}
+
+Comme l'objet stratégie reste le même à chaque niveau, l'écart entre deux exécutions est celui du marché~; les
+journaux d'événements du moteur indiquent où il commence. \texttt{first\_divergence} compare les exécutions des backtests de niveau~3 et de niveau~4 de chaque session~: ils
+divergent dès les cinq premières exécutions dans les vingt sessions, à une médiane de 11~secondes dans l'heure. Dès lors, les deux backtests sont des histoires différentes de
+la même session.
+
+\section{D'où vient l'écart}
+
+Quelles exécutions font la différence~? Chaque exécution de niveau~4 a soit un équivalent au niveau~3 --- une exécution du même côté dans la milliseconde ---
+ou n'existe que parce que l'ordre de la stratégie se trouvait dans le carnet. Symétriquement, certaines exécutions du rejeu n'ont pas d'équivalent réactif. Le
+markout à 10~s de chaque exécution (le mid dix secondes plus tard, par rapport au prix d'exécution, signé) mesure ce que l'exécution a rapporté avant que
+l'inventaire qu'elle a créé ne soit valorisé~; la \cref{fig:pl:backtest-engine-architecture:decomposition} répartit les markouts des deux backtests en trois
+groupes, à la manière de la décomposition des écarts du livre~7 (chapitre~19).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ybar,bar width=16pt,ylabel={markout à 10~s par heure (\$)},ymin=-80,ymax=30,ytick={-75,-50,-25,0,25},
+  xtick=data,symbolic x coords={shared fills,replay-only fills,reactive-only fills},xticklabels={exécutions communes,propres au rejeu,propres au niveau~4},enlarge x limits=0.25,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.03,0.05)},anchor=south west},extra y ticks={0},extra y tick style={grid style={black,thin}}]
+\addplot[fill=omMeth!45,draw=omMeth] table[x=part,y=replay]{figdata/platforms/11-backtest-engine-architecture/decomposition.csv};
+\addlegendentry{niveau 3 (rejeu)}
+\addplot[fill=omThm!45,draw=omThm] table[x=part,y=reactive]{figdata/platforms/11-backtest-engine-architecture/decomposition.csv};
+\addlegendentry{niveau 4 (réactif)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Markouts à 10~s des exécutions des deux backtests, par heure, moyennés sur les vingt sessions, répartis entre les exécutions communes aux deux backtests,
+les exécutions propres au rejeu, et celles qui n'existent qu'au niveau~4. Les exécutions communes rapportent autant dans les deux cas~; celles propres au rejeu ne rapportent rien~;
+les exécutions propres au niveau~4 perdent. Données~: \texttt{fig\_btengine.py}.}\label{fig:pl:backtest-engine-architecture:decomposition}
+\end{omfigure}
+
+\begin{example}[Quatre moteurs de backtest, une stratégie]\label{ex:pl:backtest-engine-architecture:gap}
+Par session, 193 exécutions sont communes aux deux backtests~; elles rapportent 17.5~\$ de markout à 10~s au niveau~3 et 18.3~\$ au niveau~4, soit le même
+montant à bruit près --- le contrôle que la classification apparie des cas semblables. Le rejeu compte 140 exécutions qui lui sont propres, lesquelles rapportent 0.03~\$~; le
+backtest réactif en compte 241 qui lui sont propres, lesquelles perdent 69.2~\$. L'écart de markout entre les deux backtests vaut 68.4~\$ par heure, et les exécutions propres au niveau~4 expliquent
+à elles seules 101~\% de celui-ci~: la perte est faite de transactions qui n'ont lieu que parce que les ordres de la stratégie étaient là~: un ordre qui absorbe un ordre agressif que
+l'enregistrement avait confié à quelqu'un d'autre, ou qui reste au meilleur cours, visible, après le départ des ordres qui l'entourent. Les 22~\$ restants de l'écart de 90~\$
+en P\&L sont l'inventaire que laissent ces exécutions, valorisé au-delà de dix secondes.
+\end{example}
+
+\begin{remark}[Ce que le moteur a tranché]\label{rem:pl:backtest-engine-architecture:settled}
+Avec quatre backtesters et quatre portages de la stratégie, l'écart entre deux niveaux avait trois causes possibles~: le marché, le portage et les
+conventions du backtester (ce que voit la stratégie, et quand une exécution est signalée). Le moteur élimine la deuxième par construction et rend la
+troisième explicite dans les adaptateurs. Ce qui reste, c'est à quoi servent les niveaux.
+\end{remark}
+
+\section{Une règle aux niveaux 1 et 2}
+
+Le même moteur fait tourner une règle quotidienne --- position longue lorsque le cours de clôture est supérieur à son niveau de cinquante jours plus tôt, courte lorsqu'il est inférieur --- sur mille jours de
+barres synthétiques au niveau~1 (\texttt{firm.vecbt}, le poids de la règle rapporté à partir de la clôture suivante) et au niveau~2 (\texttt{firm.evbt}, ordres au marché
+exécutés à l'ouverture suivante). Le niveau~1 rapporte $-26.5~\%$ sur la période et le niveau~2 $-31.5~\%$~; les cinq points sont les mouvements de nuit
+survenus les jours où la position change, encaissés par l'ancienne position au niveau~2 et par la nouvelle au niveau~1, qui négocie à un cours de clôture
+qu'elle vient à peine de voir. La règle n'est écrite qu'une fois~; les deux exécutions figurent côte à côte dans la \omterm{def:pl:backtest-engine-architecture:results}{base de résultats} sous des identifiants différents.
+
+\section{Tutoriel~: une stratégie à travers quatre backtesters}\label{tut:pl:backtest-engine-architecture:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Faire tourner un objet stratégie à chaque niveau dans un même moteur, enregistrer chaque exécution et repérer l'endroit où deux niveaux divergent.
+\textbf{État final~:} les \cref{fig:pl:backtest-engine-architecture:ladder,fig:pl:backtest-engine-architecture:decomposition} et une \omterm{def:pl:backtest-engine-architecture:results}{base de résultats}
+contenant soixante exécutions.
+\begin{tutsteps}
+\item \textbf{Données}~: \texttt{DataAccess.tape(3600, seed)} enregistre une session avec son hash~; \texttt{daily()} enregistre les barres quotidiennes.
+\item \textbf{Une session}~: \texttt{pl\_btengine.one\_session} fait tourner les niveaux~2, 3 et~4 et enregistre chaque exécution.
+\item \textbf{L'échelle}~: \texttt{ladder()} sur les graines 1 à 20, \texttt{summary(rows)}.
+\item \textbf{L'écart}~: \texttt{classify\_fills}, \texttt{markouts} et \texttt{first\_divergence} sur les exécutions des niveaux~3 et~4.
+\item \textbf{Identité}~: \texttt{rerun\_is\_identical()}~: mêmes entrées, même identifiant d'exécution, mêmes événements.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter à la stratégie une condition de fourchette d'un tick (ne coter que lorsque la fourchette vaut un tick) et voir quel
+niveau voit son verdict changer~; faire tourner le niveau~4 avec la population d'agents du livre~10 au lieu de la session enregistrée.
+\end{tutorial}
+
+\section{Construction~: le moteur de backtest}\label{bld:pl:backtest-engine-architecture:btengine}
+
+\begin{build}
+\bfield{Rôle} Un seul moteur couvrant les quatre niveaux de fidélité de la firme, de sorte qu'une stratégie soit écrite une fois, tourne sur n'importe quel niveau de l'échelle, et
+chaque exécution puisse être retrouvée, comparée et reproduite. Le chapitre~12 accueille les mêmes objets stratégie dans des environnements de type production.
+\bfield{Interface} \texttt{Engine(level, strategy, data, config).run() -> Run}~; \texttt{TargetStrategy}, \texttt{QuoteStrategy}~;
+\texttt{Event}, \texttt{EventLog}~; \texttt{DataAccess(root)} avec \texttt{put}, \texttt{get}, \texttt{hash}, \texttt{tape},
+\texttt{daily}~; \texttt{ResultsStore(root)} avec \texttt{save}, \texttt{load}, \texttt{query}~; \texttt{first\_divergence},
+\texttt{classify\_fills}, \texttt{markouts}.
+\bfield{Règles} Les backtesters du livre~7 et le simulateur du livre~10 sont encapsulés, jamais modifiés~; les événements suivent l'ordre total (temps, rang de classe,
+numéro de séquence)~; l'identifiant d'une exécution est le hash de son manifeste~; une stratégie n'ouvre jamais de fichier~; aucun niveau n'accepte sans broncher une stratégie qu'il ne peut pas exécuter.
+\bfield{Tests d'acceptation} \texttt{code/firm/btengine/tests/}~: l'ordre des événements simultanés~; les hashes de contenu~; le niveau~1 égal à
+\texttt{firm.vecbt} appelé directement, le niveau~3 à \texttt{firm.lobreplay}, le niveau~4 à \texttt{firm.exchsim} avec l'adaptateur~; identifiants d'exécution égaux
+pour des entrées égales et différents pour un paramètre modifié~; les requêtes~; la classification des exécutions et les markouts sur un cas travaillé.
+\bfield{Pour aller plus loin} Exécutions parallèles sur les graines (chapitre~13)~; un arrière-plan de population d'agents au niveau~4~; une exécution de niveau~3 issue du
+flux enregistré de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} (tick store) du chapitre~4.
+\end{build}
+
+\begin{omsources}
+\item One Quant Book~7, chapitres 16--19 (niveaux de fidélité, backtests événementiels, rejeu du carnet d'ordres, simulation face au trading réel)~; One Quant
+Book~10, chapitre~26 (le simulateur de bourse).
+\item Documentation de NautilusTrader, «~Overview~» et «~Architecture~».
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:1}
+Ordonner ces événements simultanés selon le \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements} du moteur~: un ordre envoyé à $t = 3$, une mise à jour de cotation à $t = 3$, une exécution à $t = 3$, une
+annulation à $t = 2$.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:2}
+Pourquoi le moteur refuse-t-il une stratégie de cotation au niveau~1 au lieu de la faire tourner sans aucune exécution~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:backtest-engine-architecture:3}
+Deux exécutions ont le même code de stratégie, les mêmes hashes de données et la même graine, mais des identifiants d'exécution différents. Qu'est-ce qui peut différer~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:4}
+D'après l'échelle, la perte de 12~\$ par heure au niveau~3 ($\pm 13$) est-elle une preuve que la stratégie perd en rejeu~? L'écart
+entre le niveau~3 et le niveau~4 est-il une preuve de quoi que ce soit~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:5}
+Expliquer pourquoi les exécutions partagées devraient dégager le même markout aux niveaux~3 et~4, et ce que cela signifierait si ce n'était pas le cas.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:backtest-engine-architecture:6}
+Que ne capture pas le niveau~4, tel qu'il est construit ici, de l'effet de la stratégie sur le marché, et quel composant l'ajouterait~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:backtest-engine-architecture:7}
+\emph{Programmation.} Faire tourner \texttt{one\_session} pour la graine~3 avec la limite d'inventaire relevée de trois lots à dix. Comment évoluent les
+P\&L des trois niveaux, et la part de l'écart imputable aux seules exécutions réactives varie-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:backtest-engine-architecture:8}
+\emph{Trouver la faille.} «~Nous avons comparé la stratégie dans notre backtester de rejeu et dans le nouveau simulateur, et le simulateur a fait moins bien, donc le
+moteur d'appariement du simulateur a un bug. Nous avons porté la stratégie avec soin dans les deux.~»
+\end{exercise}
+
+\section{Problème~: Quatre backtesters, une stratégie}
+
+\begin{problem}[{Problème du week-end --- l'échelle et son écart}]\label{pb:pl:backtest-engine-architecture:1}
+La stratégie de cotation du \cref{lst:pl:backtest-engine-architecture:quoter}, vingt sessions d'une heure, niveaux~2 à~4.
+
+\medskip\noindent\textbf{Partie~I --- Le moteur.}
+\begin{enumerate}
+\item Que doit prendre en charge un \omterm{def:pl:backtest-engine-architecture:engine}{moteur de backtest} et que chaque backtester ne prend pas en charge~?
+\item Pourquoi deux formes de stratégie, et quels niveaux fait tourner chacune~?
+\item Que tranche le rang de classe du \omterm{def:pl:backtest-engine-architecture:event}{modèle d'événements}~?
+\item Que contient le manifeste d'une exécution, et pourquoi son identifiant est-il son hash~?
+\item Pourquoi la \omterm{def:pl:backtest-engine-architecture:dal}{couche d'accès aux données} renvoie-t-elle un hash avec les données~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~II --- Les niveaux.}
+\begin{enumerate}[resume]
+\item Que voit la stratégie, et quand une cotation est-elle exécutée, au niveau~2~?
+\item En quoi un ordre fantôme de niveau~3 diffère-t-il d'un ordre de niveau~4~?
+\item Que rejoue le niveau~4 à partir de la session, et sous quelle forme~?
+\item Que ne capture pas le niveau~4~?
+\item Comment le niveau~4 du livre~7 est-il représenté ici~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~III --- L'échelle.}
+\begin{enumerate}[resume]
+\item Quels sont le P\&L par heure et les exécutions à chaque niveau~?
+\item Quels écarts sont statistiquement nets~?
+\item Dans combien de sessions le niveau~4 est-il inférieur au niveau~3, et de combien en moyenne~?
+\item Quand les runs de niveau~3 et de niveau~4 divergent-ils pour la première fois~?
+\item Pourquoi les exécutions de niveau~2 sont-elles si nombreuses~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~IV --- L'écart.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le P\&L par heure à chaque niveau et la part de l'écart entre rejeu et réactif expliquée par les exécutions
+qui n'existent que parce que la stratégie était dans le carnet.
+\item Quelles exécutions perdent-elles, et pourquoi~?
+\item Quelle part de l'écart ne figure pas dans les markouts à dix secondes~?
+\item Quelle conclusion tirer au sujet de la stratégie~?
+\item En une phrase~: que rend possible le moteur que quatre backtesters ne permettaient pas~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur}]\label{iq:pl:backtest-engine-architecture:1}
+Votre stratégie est rentable dans le backtest sur barres et perd dans la simulation du carnet d'ordres. Où regardez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:backtest-engine-architecture:2}
+Deux événements de votre backtest événementiel ont le même horodatage. Comment le moteur doit-il les ordonner~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:backtest-engine-architecture:3}
+Comment rendriez-vous chaque backtest reproductible et retrouvable un an plus tard~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:backtest-engine-architecture:4}
+Que manque-t-il au rejeu du carnet d'ordres pour une stratégie passive, et comment le mesureriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:backtest-engine-architecture:5}
+Concevez un \omterm{def:pl:backtest-engine-architecture:engine}{moteur de backtest} qui couvre les backtests vectorisés, les backtests événementiels et un simulateur de marché, avec une seule API de stratégie.
+\end{interviewq}

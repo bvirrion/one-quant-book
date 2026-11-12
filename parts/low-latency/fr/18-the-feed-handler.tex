@@ -1,0 +1,351 @@
+\chapter{Le feed handler}\label{ch:ll:the-feed-handler}
+
+À l'ouverture, le débit de messages bondit~: sur l'instrument actif du simulateur de ce chapitre, on passe d'environ 570 messages par seconde à
+midi à plus de 9\,000 dans les premières secondes~; sur le flux consolidé des options américaines, OPRA a publié un pic de 63.9
+millions de messages en une seconde en juillet 2026, et 350\,000 dans sa milliseconde la plus chargée. Un \omterm{def:ll:the-feed-handler:handler}{feed handler} qui prend du retard laisse son
+tampon de socket se remplir~; le noyau jette ce qui ne tient pas~; la ligne A perd un paquet que la ligne B a perdu aussi~; et le carnet de la société
+reste périmé tant que le \omterm{def:ll:the-feed-handler:handler}{feed handler} ne s'est pas rétabli, par retransmission si le trou est petit et récent, à partir du prochain instantané sinon.
+Ce chapitre construit le premier composant du système de trading de la partie~IV, le \omterm{def:ll:the-feed-handler:handler}{feed handler}~: il décode et arbitre les deux
+lignes du chapitre~16, détecte les trous et s'en remet, normalise chaque message en enregistrement d'événement de la société et le publie
+sur les anneaux du chapitre~12, et indique à chaque instant si le carnet qu'il alimente peut être tenu pour fiable.
+
+\section{Décoder et arbitrer}
+
+\begin{definition}[Feed handler]\label{def:ll:the-feed-handler:handler}
+Un \emph{feed handler}\index{feed handler} est le processus qui reçoit le flux de données de marché d'une plateforme (livre~1,
+chapitre~4) et le transforme en événements internes de la société~: il lit les lignes redondantes, les arbitre en un flux unique
+ordonné, détecte et récupère les messages perdus, normalise chaque message dans l'enregistrement propre de la société (livre~1, chapitre~28), et
+publie les enregistrements à destination des composants qui construisent les carnets et prennent les décisions.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=gray!10] (a) at (0,0.6) {ligne A};
+\node[box,fill=gray!10] (b) at (0,-0.6) {ligne B};
+\node[box,fill=omDef!20,minimum width=2.1cm] (arb) at (2.6,0) {arbitrer par\\ numéro de séquence};
+\node[box,fill=omThm!15,minimum width=2.2cm] (gap) at (5.4,0) {trou~? attendre\\ l'autre ligne\\ \qty{0.5}{\milli\second}};
+\node[box,fill=omDef!20,minimum width=2.1cm] (norm) at (8.3,0) {normaliser\\ (événement\\ de 48~octets)};
+\node[box,fill=omMeth!20] (ring) at (10.9,0) {firm.ring\\ (chapitre~12)};
+\node[box,fill=omThm!8] (retx) at (5.4,-2.0) {serveur de\\ retransmission};
+\node[box,fill=omThm!8] (snap) at (8.3,-2.0) {canal d'instantanés\\ (snapshot)};
+\node[box,fill=gray!8,align=left] (flag) at (5.4,1.7) {indicateur de carnet périmé, compteurs,\\ intervalles de péremption};
+\draw[->] (a) -- (arb);
+\draw[->] (b) -- (arb);
+\draw[->] (arb) -- (gap);
+\draw[->] (gap) -- (norm);
+\draw[->] (norm) -- (ring);
+\draw[->,omThm] (gap) -- node[left,font=\scriptsize]{demande} (retx);
+\draw[->,omThm,dashed] (retx.east) -- node[below,font=\scriptsize]{} ++(0.4,0) |- ([yshift=-0.2cm]gap.east);
+\draw[->,omThm] (snap) -- node[right,font=\scriptsize]{si le serveur ne peut pas} (norm);
+\draw[gray,dashed] (gap) -- (flag);
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:ll:the-feed-handler:handler}{feed handler} de la construction. Les paquets des deux lignes sont fusionnés par numéro de séquence~; un trou retient les messages suivants et
+attend brièvement l'autre ligne, puis interroge le serveur de retransmission, puis se replie sur le prochain instantané~; chaque message
+sort sous la forme d'un événement de taille fixe sur l'anneau de la société. Tant qu'un trou est ouvert, l'\omterm{def:ll:the-feed-handler:stale}{indicateur de carnet périmé} est levé.}\label{fig:ll:the-feed-handler:design}
+\end{omfigure}
+
+Le \omterm{def:ll:the-feed-handler:handler}{feed handler} de la construction est écrit d'abord en Python, comme référence, puis en C++20 et en Rust, et les trois publient exactement
+les mêmes événements (comparés par un condensat de 64~bits de leurs enregistrements de 48~octets) sur les mêmes entrées. Son temps est l'heure d'arrivée enregistrée
+avec chaque paquet, de sorte qu'une journée enregistrée se rejoue à l'identique~: mêmes entrées, mêmes événements, mêmes intervalles de péremption
+et mêmes compteurs. L'arbitrage est celui du chapitre~16~; ce que le \omterm{def:ll:the-feed-handler:handler}{feed handler} ajoute, c'est la conduite à tenir pendant qu'un numéro de séquence manque.
+
+\section{Détecter les trous et s'en remettre}
+
+Un numéro de séquence manquant n'est en général pas perdu, seulement en retard~: il est en route sur l'autre ligne, ou il a été réordonné par un commutateur.
+Le \omterm{def:ll:the-feed-handler:handler}{feed handler} retient donc les messages qui arrivent après lui et attend un court instant, ici \qty{0.5}{\milli\second}, les
+messages manquants. S'ils arrivent, les messages retenus sont libérés dans l'ordre. Sinon, le \omterm{def:ll:the-feed-handler:handler}{feed handler} demande au serveur de retransmission
+la plage concernée (chapitre~16~; le simulateur répond à hauteur de 1\,000 messages par requête, à partir de ses 100\,000 derniers), et applique la réponse
+à son arrivée, un aller-retour plus tard. Si le serveur ne peut pas aider, parce que le trou est plus ancien que sa fenêtre ou que le serveur est
+injoignable, le \omterm{def:ll:the-feed-handler:handler}{feed handler} attend le prochain instantané de l'instrument, le charge, écarte les messages retenus qu'il reflète déjà
+et reprend à partir du numéro de séquence que cet instantané donne, procédure que prennent en charge les messages d'instantané du CME avec leur dernier
+numéro de séquence incrémental traité.
+
+\omcode{code/firm/feedhandler/cpp/firm_feedhandler.hpp}{213}{237}{Chaque paquet~: le rejeter si tous ses messages sont anciens, délivrer le
+message attendu suivant, retenir les autres~; un message retenu ouvre un trou et lance sa minuterie.}\label{lst:ll:the-feed-handler:incremental}
+
+Le chemin de l'instantané est le plus délicat~: l'instantané doit être au moins aussi récent que le carnet, les messages retenus qu'il reflète déjà
+doivent disparaître, et un trou qui le suit doit être de nouveau détecté.
+
+\omcode{code/firm/feedhandler/firm_feedhandler.py}{190}{204}{Chargement d'un instantané dans la référence Python.}\label{lst:ll:the-feed-handler:snapshot}
+
+\begin{definition}[Indicateur de carnet périmé, latence de reprise]\label{def:ll:the-feed-handler:stale}
+L'\emph{indicateur de carnet périmé}\index{indicateur de carnet périmé} est la déclaration publique du \omterm{def:ll:the-feed-handler:handler}{feed handler} selon laquelle le carnet construit à partir de ses événements peut
+différer de celui de la plateforme~; il est levé lorsqu'un trou est détecté et baissé lorsqu'il est comblé. La
+\emph{latence de reprise}\index{latence de reprise} d'un trou est le temps écoulé entre sa détection et le moment où le carnet redevient exact~: le retard de l'autre ligne,
+un aller-retour de retransmission, ou l'attente et le chargement d'un instantané.
+\end{definition}
+
+La \Cref{fig:ll:the-feed-handler:minute} montre le \omterm{def:ll:the-feed-handler:handler}{feed handler} à l'œuvre sur une minute simulée depuis l'ouverture, les deux lignes étant dégradées~: 0.2~\% des paquets
+perdus indépendamment sur chaque ligne, des rafales de pertes, une \omterm{def:ll:where-latency-comes-from:tail}{gigue} (jitter) qui réordonne les paquets, et une coupure sur chaque ligne
+se chevauchant pendant 15 millisecondes à 40 secondes. Sur 4\,232 trous, 4\,224 sont comblés par l'autre ligne
+dans la demi-milliseconde~; le serveur de retransmission referme les huit autres en \qty{2.7}{\milli\second}. Sans le serveur, sept trous
+exigent un instantané, et avec un instantané toutes les secondes le carnet reste périmé de 0.3 à 1 seconde à chaque fois, soit cinq
+secondes de la minute au total. La péremption n'est alors pas une propriété du réseau, mais celle du chemin de reprise.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=1 by 2,vertical sep=0.6cm,xlabels at=edge bottom},width=12cm,xmin=0,xmax=60,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\nextgroupplot[height=3.6cm,ymin=0,ymax=1000,ylabel={msg / 100 ms},xticklabels={}]
+\addplot[omDef,const plot,fill=omDef!25,draw=omDef] table[x=t_s,y=messages]{figdata/low-latency/18-the-feed-handler/rate.csv} \closedcycle;
+\nextgroupplot[height=3.2cm,ymin=0.4,ymax=2.6,ytick={1,2},yticklabels={{instantané seul},{avec retrans.}},
+  xlabel={secondes après l'ouverture},unbounded coords=jump]
+\addplot[omMeth,line width=6pt,mark=|,mark size=4pt,mark options={line width=1.2pt}] table[x=t_s,y=retx]{figdata/low-latency/18-the-feed-handler/stale_bars.csv};
+\addplot[omThm,line width=6pt] table[x=t_s,y=snapshot]{figdata/low-latency/18-the-feed-handler/stale_bars.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Une minute simulée depuis l'ouverture. En haut~: messages publiés par tranche de 100~ms, seize fois plus nombreux à
+l'ouverture qu'à midi. En bas~: les trous que l'autre ligne n'a pas pu combler, avec le serveur de retransmission (chacun refermé en moins de
+\qty{3}{\milli\second}~: une graduation) et avec la seule reprise par instantané (un instantané par seconde~: une barre entre la détection et la reprise)~; les
+4\,224 trous comblés par l'autre ligne sont trop courts pour être dessinés. Données~: \texttt{fig\_stale.py} (déterministe~: le simulateur et le \omterm{def:ll:the-feed-handler:handler}{feed handler}
+le sont).}\label{fig:ll:the-feed-handler:minute}
+\end{omfigure}
+
+\section{Normaliser et publier}
+
+Chaque message sort du \omterm{def:ll:the-feed-handler:handler}{feed handler} sous la forme d'un événement de 48~octets~: son genre, son côté, son instrument, son numéro de séquence, son horodatage, sa référence d'ordre,
+une seconde référence (la nouvelle référence d'un remplacement, le numéro de correspondance d'une exécution, le numéro de séquence d'un instantané), son prix et sa quantité.
+Un enregistrement normalisé présente trois qualités en aval. Sa taille est fixe, ce qui le fait tenir dans un emplacement d'anneau
+(chapitre~12) et permet à un consommateur de le lire sans le décoder. Il est le même pour chaque plateforme que la société lit, de sorte que le constructeur de carnet
+(chapitre~19) et les stratégies (chapitre~20) ne soient écrits qu'une fois. Et il porte le numéro de séquence de la plateforme, si bien qu'un consommateur peut
+savoir exactement quels événements il a vus, et les événements d'un instantané peuvent indiquer quel numéro de séquence ils reflètent.
+Le test de la construction publie une exécution complète sur un anneau SPSC d'emplacements de 64~octets et la relit, condensat par condensat.
+
+Sur le portable, le gestionnaire C++ prend environ \qty{39}{\nano\second} par paquet à la médiane, \qty{160}{\nano\second} au p99
+et \qty{290}{\nano\second} au p99.9, mesurés sur la minute de la \cref{fig:ll:the-feed-handler:minute} avec l'horloge lue
+autour de chaque entrée~; les rares cas lents sont les trous, dont les messages retenus passent par une table ordonnée, et les réponses de retransmission.
+À 9\,000 messages par seconde, le gestionnaire est occupé environ 0.04~\% du temps~: la rafale de cet instrument simulé n'est rien
+pour lui. Les vraies rafales sont celles de l'\cref{dat:ll:the-feed-handler:opra}.
+
+\begin{dated}{2026-09}{Dans quelle mesure un flux est-il sujet aux rafales~?}\label{dat:ll:the-feed-handler:opra}
+Selon les métriques opérationnelles publiées par OPRA pour le flux consolidé d'options des États-Unis (rapport d'août 2026), on relève pour juillet 2026 un pic de
+63.9 millions de messages en une seconde, 7.9 millions en 100 millisecondes, 0.89 million en 10 millisecondes et 0.35 million en
+une milliseconde~: la milliseconde la plus chargée atteint 350 millions par seconde, soit cinq fois et demie le débit de la seconde la plus chargée. L'avis de capacité d'OPRA
+explique pourquoi les abonnés prévoient des pics sur 10 millisecondes («~reflètent l'utilisation du système lors de rafales de trafic~»), et
+que la prise en compte des deux flux redondants double la bande passante.
+\end{dated}
+
+\section{Rafales, tampons et consommateurs lents}
+
+\begin{definition}[Rafale de messages, débordement du tampon de réception]\label{def:ll:the-feed-handler:burst}
+Une \emph{rafale de messages}\index{rafale de messages} est une période pendant laquelle le débit d'un flux dépasse le débit que son récepteur peut soutenir. Un
+\emph{débordement du tampon de réception}\index{débordement du tampon de réception} est la perte des datagrammes qui arrivent alors que le tampon de réception de la
+socket est plein~: le noyau les jette sans bruit, et le gestionnaire ne voit qu'un trou.
+\end{definition}
+
+Pendant une rafale, l'écart entre le débit d'arrivée et le débit de service du gestionnaire s'accumule dans le tampon de réception de la socket,
+la file M/M/1 du livre~4, chapitre~8, avec une limite stricte~: ce qui ne tient pas est jeté. La taille du tampon
+se règle avec \texttt{SO\_RCVBUF}, et deux détails de Linux déterminent ce qu'il contient. Le noyau «~double cette valeur (pour
+laisser de la place aux frais de gestion)~» et renvoie la valeur doublée (socket(7)), plafonnée par \texttt{net.core.rmem\_max},
+soit 4~MiB sur le portable, de sorte que demander 4~MiB en obtient 8. Et le tampon est décompté pour l'empreinte mémoire totale de chaque datagramme,
+et non pour sa charge utile. La \Cref{fig:ll:the-feed-handler:rcvbuf} mesure ce qu'un lecteur à l'arrêt conserve~: 50\,000 datagrammes envoyés sur
+la boucle locale pendant que personne ne lit, puis la socket vidée. Chaque datagramme de 64~octets coûte 960~octets de tampon et chaque datagramme de 1\,000~octets
+en coûte 2\,305~: le plus grand tampon que le portable accorde retient 8\,738 petits datagrammes, soit un quarantième des messages de
+la milliseconde la plus chargée d'OPRA.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log basis x=2,xmin=20000,xmax=12000000,ymin=8,ymax=20000,
+  xlabel={tampon accordé par le noyau (octets, échelle log~; double de la taille demandée)},ylabel={datagrammes conservés},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  xtick={32768,131072,524288,2097152,8388608},xticklabels={32~KiB,128~KiB,512~KiB,2~MiB,8~MiB},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.4pt] table[x=granted,y=held,restrict expr to domain={\thisrow{payload}}{0:100}]{figdata/low-latency/18-the-feed-handler/measured_rcvbuf.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.4pt] table[x=granted,y=held,restrict expr to domain={\thisrow{payload}}{500:2000}]{figdata/low-latency/18-the-feed-handler/measured_rcvbuf.csv};
+\legend{datagrammes de 64~octets,datagrammes de 1\,000~octets}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Nombre de datagrammes qu'une socket UDP conserve pour un lecteur qui ne lit pas, selon la taille du tampon de réception~: 50\,000 datagrammes
+envoyés sur la boucle locale pendant l'arrêt. Le noyau accorde le double de la taille demandée et décompte à chaque datagramme son
+empreinte mémoire complète. Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2 (noyau 6.18)~; \texttt{rmem\_max} 4~MiB. Données~:
+\texttt{bench\_feed.py}.}\label{fig:ll:the-feed-handler:rcvbuf}
+\end{omfigure}
+
+Le gestionnaire est à son tour un producteur. Ses consommateurs lisent l'anneau à leur propre rythme, et un consommateur plus lent que le flux (un
+\omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{consommateur lent}, chapitre~12) ne doit pas ralentir le gestionnaire~: l'anneau de diffusion n'attend jamais, et un consommateur dépassé
+se resynchronise. Les deux défenses contre les rafales sont donc les mêmes aux deux extrémités du gestionnaire~: un tampon suffisant pour la
+rafale que les données laissent prévoir, et un moyen de reprendre lorsque même cela ne suffit pas.
+
+\section{Surveiller un flux}
+
+Un gestionnaire qui se trompe en silence est pire qu'un gestionnaire qui s'arrête. La construction compte les paquets, les messages, les doublons, les trous, les trous
+comblés par l'autre ligne, les demandes de retransmission et les reprises par instantané, et conserve chaque intervalle de péremption avec son début
+et sa fin. Quatre de ces chiffres méritent des alertes~: le taux de trous sur chaque ligne (une ligne qui se dégrade, tandis que l'autre la masque), les trous
+comblés par aucune des deux lignes (une cause commune, chapitre~16), toute reprise par instantané (un carnet faux pendant jusqu'à un
+intervalle d'instantané), et la marque de pic de la file de réception (une rafale plus proche du tampon que prévu). L'\omterm{def:ll:the-feed-handler:stale}{indicateur de carnet périmé} lui-même est transmis à
+chaque consommateur avec chaque événement, de sorte qu'une stratégie ne cote jamais sur un carnet que son gestionnaire sait faux.
+
+\section{Tutoriel~: le gestionnaire sur des lignes dégradées}\label{tut:ll:the-feed-handler:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Exécuter le gestionnaire dans trois langages sur les mêmes lignes dégradées, reprendre par retransmission puis par instantané, et
+vérifier le résultat par rapport à une exécution propre. \textbf{État final~:} les \cref{fig:ll:the-feed-handler:minute,fig:ll:the-feed-handler:rcvbuf},
+les quantiles de temps de traitement et des tests au vert en Python, C++ et Rust.
+\begin{tutsteps}
+\item \textbf{Construire le jeu de données.} \texttt{make\_feed\_fixtures.py} exécute le simulateur du livre~10 pendant trois secondes avec les deux lignes
+dégradées et écrit les lignes, le flux sans perte (que le serveur de retransmission conserve) et le \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{canal d'instantanés}.
+\item \textbf{Trois exécutions, trois langages.} Exécution propre, exécution dégradée avec le serveur, exécution dégradée sans lui~: la référence Python écrit
+les compteurs, condensats et péremptions attendus, et les tests C++ et Rust les reproduisent à l'identique.
+\item \textbf{Vérifier ce que la reprise signifie.} Avec la retransmission, l'exécution dégradée publie exactement les événements de l'exécution propre. Avec
+un instantané, elle publie l'instantané à la place des messages perdus, puis exactement les événements de l'exécution propre qui suivent, et le carnet
+à la fin de l'exécution est le même.
+\item \textbf{Mesurer} avec \texttt{python bench\_feed.py}~: la minute de la \cref{fig:ll:the-feed-handler:minute} traitée par le
+gestionnaire C++ avec l'horloge lue autour de chaque entrée (le script vérifie qu'il publie ce que publie la référence), et
+l'expérience du lecteur à l'arrêt de la \cref{fig:ll:the-feed-handler:rcvbuf}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Réduire l'attente de l'autre ligne à \qty{50}{\micro\second} et compter les demandes de retransmission
+qui en découlent~; allonger l'intervalle d'instantané à cinq secondes et relire la péremption.
+\end{tutorial}
+
+\section{Construction~: le feed handler}\label{bld:ll:the-feed-handler:feedhandler}
+
+\begin{build}
+\bfield{Rôle} La première étape du système de trading~: des lignes de la plateforme aux événements de la société. Le constructeur de carnet du
+chapitre~19 consomme ses événements, le moteur de stratégies du chapitre~20 son \omterm{def:ll:the-feed-handler:stale}{indicateur de carnet périmé}, et la surveillance du chapitre~24 ses
+compteurs.
+\bfield{Interface} Référence Python \texttt{firm\_feedhandler}~: \texttt{Handler(retx, gap\_timeout\_ns, rtt\_ns).run(events)},
+\texttt{.events}, \texttt{.hash}, \texttt{.stale}, \texttt{.counters}~; \texttt{RetxServer}, \texttt{merge}, \texttt{recorded},
+\texttt{normalise}, \texttt{book}. C++20 \texttt{firm::feed2::Handler(retx, timeout, rtt)} avec \texttt{run(a, b, snapshots)},
+\texttt{on\_event}, \texttt{hash}, \texttt{stale}, compteurs et points d'accroche de mesure du temps facultatifs~; \texttt{RetxServer}~; \texttt{recorded}.
+Rust \texttt{firm\_feedhandler::Handler} avec les mêmes éléments.
+\bfield{Règles} Chaque numéro de séquence est publié une seule fois, dans l'ordre~; les messages retenus ne sont libérés que dans l'ordre~; un trou attend l'autre
+ligne, puis la retransmission (une demande par trou, réponses plafonnées par le serveur), puis un instantané~; le gestionnaire est
+une fonction de ses entrées horodatées~; l'\omterm{def:ll:the-feed-handler:stale}{indicateur de carnet périmé} est levé exactement pendant qu'un trou est ouvert~; aucune allocation par paquet sans
+trou.
+\bfield{Tests d'acceptation} \texttt{code/firm/feedhandler/}~: sur le jeu de données commun, exécution propre, exécution avec retransmission et exécution avec instantané, avec
+nombres d'événements, condensats, intervalles de péremption et compteurs identiques en Python, C++ et Rust~; l'exécution avec retransmission égale à
+l'exécution propre, événement par événement~; l'exécution avec instantané égale l'exécution propre après l'instantané et dans son carnet final~; publication sur
+\texttt{firm.ring} relue condensat par condensat~; arbitrage sur des paquets scénarisés.
+\bfield{Pour aller plus loin} Une seule demande pour tous les trous d'un même trou~; reprise par instrument sur un flux multi-instruments~; lecture des lignes
+depuis des sockets (\omterm{def:ll:linux-tuning:polling}{attente active} du chapitre~13) avec la marque de pic de la file de réception comme compteur.
+\end{build}
+
+\begin{omsources}
+\item Page de manuel Linux \texttt{socket(7)} (\texttt{SO\_RCVBUF})~; Linux kernel documentation, ``Documentation for
+/proc/sys/net/'' (\texttt{rmem\_max}, \texttt{rmem\_default}, \texttt{netdev\_max\_backlog}).
+\item OPRA, \emph{Key Operating Metrics of U.S. Options Securities Information Processor} (août 2026)~; SIAC, \emph{Revised
+OPRA Capacity Projections} (septembre 2025).
+\item CME Group Client Systems Wiki, MDP~3.0: ``Market Data Snapshot -- Full Recovery''.
+\item Les protocoles et services du simulateur, \path{code/firm/exchsim/PROTOCOL.md} (livre~10, chapitre~26).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:1}
+Le gestionnaire attend le numéro de séquence 1\,000 et reçoit des paquets commençant à 1\,003 (3 messages) sur la ligne A, puis 1\,000 (3
+messages) sur la ligne B. Que publie-t-il, dans quel ordre, et quel est l'intervalle de péremption si le second paquet arrive
+\qty{40}{\micro\second} après le premier~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:2}
+Un gestionnaire demande un tampon de réception de 256~KiB. Que renvoie \texttt{getsockopt}, et combien de datagrammes de 64~octets le
+tampon peut-il contenir, selon la mesure de la \cref{fig:ll:the-feed-handler:rcvbuf}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-feed-handler:3}
+Avec des instantanés toutes les 500 millisecondes et un instantané dont la réception prend 5 millisecondes, quelles sont les \omterm{def:ll:the-feed-handler:stale}{latences de reprise}
+moyenne et au pire d'un trou non récupérable~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:4}
+Pourquoi le gestionnaire attend-il l'autre ligne avant de demander une retransmission~? Que coûte une attente plus courte, et une
+attente plus longue~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:5}
+Une rafale arrive à 2 millions de datagrammes par seconde pendant 30 millisecondes~; le gestionnaire en traite 1.2 million par seconde. Combien de
+datagrammes se mettent en file d'attente, et quel tampon de réception (demandé) les contient s'il est facturé 960 octets par datagramme~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-feed-handler:6}
+Après une reprise par instantané, le flux d'événements du gestionnaire diffère de celui de l'exécution propre. En quel sens la sortie est-elle néanmoins
+«~identique une fois reprise~», et comment la construction le teste-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-feed-handler:7}
+\emph{Programmation.} Faire demander au gestionnaire tous les trous d'un même trou en une seule demande (une liste d'intervalles), dans la référence Python et
+le gestionnaire C++, et vérifier sur la minute de la \cref{fig:ll:the-feed-handler:minute} que la péremption maximale des retransmissions baisse.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-feed-handler:8}
+\emph{Trouver la faille.} «~Quand notre gestionnaire détecte un trou, il abandonne tout ce qu'il détient et attend le prochain instantané~; ainsi
+le carnet est toujours cohérent.~»
+\end{exercise}
+
+\section{Problème~: Le pic d'ouverture}
+
+\begin{problem}[{Problème du week-end --- tampons pour l'ouverture, péremption quand ils cèdent}]\label{pb:ll:the-feed-handler:1}
+Un gestionnaire lit une seule ligne d'un flux dont la rafale d'ouverture atteint 1.5 million de datagrammes par seconde pendant 20 millisecondes, un
+message par datagramme~; le gestionnaire traite un datagramme en \qty{2}{\micro\second} (décodage, mise à jour du carnet, publication). Prendre la
+charge du noyau par datagramme de 64~octets et son doublement de \texttt{SO\_RCVBUF} tirés de la \cref{fig:ll:the-feed-handler:rcvbuf}, un
+\texttt{rmem\_max} maximal de 4~MiB, et un instantané chaque seconde.
+
+\medskip\noindent\textbf{Partie I --- La file.}
+\begin{enumerate}
+\item Quel est le débit de service du gestionnaire, et quel est son taux d'utilisation pendant la rafale~?
+\item Combien de datagrammes sont en file à la fin de la rafale~?
+\item Combien de temps après la rafale la file met-elle à se vider si le débit tombe à 200\,000 par seconde~?
+\item Quel est le délai de file d'attente du dernier datagramme de la rafale~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le tampon.}
+\begin{enumerate}[resume]
+\item Combien d'octets de tampon de réception le noyau doit-il accorder pour contenir la file~?
+\item Que faut-il demander avec \texttt{SO\_RCVBUF}, et cela est-il permis sur cette machine~?
+\item Avec le plus grand tampon autorisé, combien de datagrammes sont perdus~?
+\item Qu'est-ce qui d'autre pourrait contenir la rafale~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Quand cela échoue.}
+\begin{enumerate}[resume]
+\item Le serveur de retransmission peut-il combler la perte~?
+\item Si non, quelle péremption en découle, en moyenne et au pire~?
+\item Pendant cette péremption, combien de datagrammes arrivent et doivent être retenus~?
+\item Que doit faire la stratégie dans l'intervalle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le tampon de réception qui absorbe la rafale sans perte, et la péremption qu'implique
+un intervalle d'instantanés lorsqu'il y a perte.
+\item De combien le gestionnaire devrait-il être plus rapide pour n'avoir besoin d'aucune file~?
+\item Pourquoi lire les deux lignes double-t-il le problème~?
+\item Que dit le pic à la milliseconde de l'OPRA d'un gestionnaire mono-fil pour un flux d'options complet~?
+\item Que mesurerait-on en production pour dimensionner le tampon~?
+\item Quel compteur indique qu'une rafale a approché la limite~?
+\item Pourquoi l'intervalle d'instantanés est-il une décision commerciale de la plateforme, avec un coût de latence pour la société de gestion~?
+\item En une phrase~: que fait un \omterm{def:ll:the-feed-handler:handler}{feed handler} lorsqu'il ne peut pas suivre~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:the-feed-handler:1}
+Que fait un \omterm{def:ll:the-feed-handler:handler}{feed handler} de données de marché, de la carte réseau à la stratégie~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-feed-handler:2}
+Un trou apparaît sur la ligne A. Décrivez ce que fait le gestionnaire jusqu'à ce que le carnet soit de nouveau correct.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-feed-handler:3}
+Comment dimensionneriez-vous le tampon de réception d'un socket UDP pour un flux~? Que fait le noyau de la valeur que vous fixez~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-feed-handler:4}
+Comment savez-vous, en aval, que le carnet que vous lisez est périmé~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-feed-handler:5}
+Pourquoi normaliser les messages de chaque plateforme en un seul enregistrement interne~? Que coûte cette normalisation~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:the-feed-handler:6}
+Comment testeriez-vous les chemins de reprise d'un \omterm{def:ll:the-feed-handler:handler}{feed handler} avant la production, et prouveriez-vous qu'il retrouve le bon carnet~?
+\end{interviewq}

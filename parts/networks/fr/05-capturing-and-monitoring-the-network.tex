@@ -1,0 +1,360 @@
+\chapter{Capturer et surveiller le réseau}\label{ch:nw:capturing-and-monitoring-the-network}
+
+Dans la cage simulée de ce chapitre, le journal propre de la stratégie totalise, à la médiane, \qty{1.5}{\micro\second} entre le décodage
+d'un paquet et la remise à la \omterm{def:nw:networking-for-trading:frame}{carte réseau} de l'ordre qu'il a provoqué. La capture prélevée aux prises de la cage indique que la trame
+de l'ordre quitte le point de remise des ordres \qty{4.4}{\micro\second} après que le premier octet du \omterm{def:nw:capturing-and-monitoring-the-network:trigger}{paquet déclencheur} a atteint le
+point de remise des données de marché. L'écart correspond à la portion du chemin que le programme ne voit pas~: la fibre et les
+équipements de couche~1, le chemin de réception de la carte vers la mémoire, puis son chemin d'émission. Au 99\up{e}~centile, la capture indique \qty{38}{\micro\second}, et aucun journal écrit par le programme ne pourrait
+dire quelle portion du chemin en est responsable.
+
+Ce chapitre traite de l'entreprise qui observe son propre trafic de l'extérieur. Elle copie chaque trame aux points de remise (les
+prises du chapitre~2), l'horodate à l'aide des horloges du chapitre~4, la stocke, et répond à partir de la seule capture aux questions que l'entreprise se pose chaque
+jour~: combien de temps avons-nous mis, qu'avons-nous perdu, quand le port s'est-il saturé.
+
+\section{Prises, boîtiers de capture et fichiers de capture}
+
+\begin{definition}[Capture de paquets, boîtier de capture]\label{def:nw:capturing-and-monitoring-the-network:capture}
+Une \emph{capture de paquets}\index{capture de paquets} est un enregistrement des trames qui ont traversé un point d'un réseau, chacune accompagnée
+de l'instant de son passage. Un \emph{boîtier de capture}\index{boîtier de capture} est un équipement dédié qui reçoit des copies du trafic issues des prises,
+horodate chaque trame à l'aide d'une horloge disciplinée, et écrit les trames sur un support de stockage au \omterm{def:nw:networking-for-trading:ser}{débit de ligne} de ses entrées sans
+en perdre aucune.
+\end{definition}
+
+\begin{definition}[Fichier de capture de paquets, suffixe d'horodatage]\label{def:nw:capturing-and-monitoring-the-network:trailer}
+Un \emph{fichier de capture de paquets}\index{fichier de capture de paquets} conserve une capture sous la forme d'une suite d'enregistrements, chacun composé
+d'un horodatage, d'une longueur et des octets de la trame~; le format libpcap et son successeur pcapng sont les plus répandus, avec des horodatages en nanosecondes dans leurs variantes récentes.
+Un \emph{suffixe d'horodatage}\index{suffixe d'horodatage} (timestamp trailer) est un bloc d'octets qu'un équipement de prise ou de commutation ajoute à la fin d'une trame copiée~;
+il porte l'instant auquel l'équipement a vu la trame et l'endroit où il l'a vue (équipement et port), de sorte que l'horodatage
+voyage avec la trame jusqu'à l'endroit où elle est stockée.
+\end{definition}
+
+L'horodatage qui compte est celui pris à l'endroit où la trame a traversé la prise, et non celui que le serveur de stockage écrit lorsque la
+copie l'atteint~: entre les deux se trouvent un commutateur d'agrégation, une file d'attente et la carte propre du serveur. Un suffixe y remédie. Il est pris sur le
+fil, dans les premiers octets de la trame, et il accompagne la copie à travers toute agrégation ultérieure~; le serveur de stockage le conserve et peut ignorer
+sa propre heure. L'\Cref{dat:nw:capturing-and-monitoring-the-network:trailers} décrit une disposition publiée par un constructeur~; le
+\texttt{firm.wirecap} du livre utilise un suffixe de 16~octets qui lui est propre, dans le même esprit.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (A) at (0,1.6) {point A};
+\node[b,fill=gray!10] (B) at (0,0.5) {point B};
+\node[b,fill=gray!10] (O) at (0,-0.6) {remise des ordres};
+\foreach \n/\y in {tA/1.6,tB/0.5,tO/-0.6} {\node[b,fill=omExo!15] (\n) at (2.5,\y) {tap};}
+\node[b,fill=omDef!15,minimum height=1.2cm] (cage) at (6.2,0.5) {équipements de la cage\\ et serveurs};
+\node[b,fill=omMeth!20,minimum height=1.0cm,minimum width=2.4cm] (agg) at (3.9,-2.6) {horodatage\\ et agrégation};
+\node[b,fill=omThm!12,minimum height=1.0cm] (app) at (9.6,-2.6) {boîtier de capture~:\\ stockage, analyse};
+\node[b,fill=gray!8] (gm) at (9.6,-0.9) {grand maître\\ (chapitre~4)};
+\foreach \a/\b in {A/tA,B/tB,O/tO} {\draw[thick] (\a) -- (\b);}
+\foreach \a in {tA,tB,tO} {\draw[thick] (\a.east) -- (cage.west);}
+\foreach \a/\x in {tA/3.3,tB/3.55,tO/3.8} {\draw[->,gray,dashed] (\a.south) -- ++(0,-0.25) -| (\x,-2.1);}
+\draw[->,thick] (agg) -- node[above,font=\scriptsize]{copies avec suffixes} (app);
+\draw[->,gray] (gm) -- node[right,font=\scriptsize]{heure} (app);
+\draw[->,gray] (gm.west) -| (4.8,-2.1);
+\end{tikzpicture}
+
+\omcaption{Observer une cage de l'extérieur. Des prises sur chaque point de remise copient les deux sens~; un équipement d'horodatage ajoute un suffixe à chaque copie
+(instant, équipement, port) par rapport à l'heure du grand maître, puis agrège les copies~; le \omterm{def:nw:capturing-and-monitoring-the-network:capture}{boîtier de capture} les stocke et les analyse. Aucun
+programme de la cage n'intervient.}\label{fig:nw:capturing-and-monitoring-the-network:taps}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw,minimum height=0.8cm,align=center,inner sep=1pt}]
+\node[f,fill=omDef!12,minimum width=4.2cm] (fr) at (0,0) {trame d'origine (telle que sur le fil)};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (d) at (fr.east) {équipement\\ 2 octets};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (p) at (d.east) {port\\ 2 octets};
+\node[f,fill=omMeth!20,minimum width=1.4cm,anchor=west] (fl) at (p.east) {indicateurs\\ 4 octets};
+\node[f,fill=omThm!20,minimum width=1.5cm,anchor=west] (s) at (fl.east) {secondes\\ 4 octets};
+\node[f,fill=omThm!20,minimum width=1.7cm,anchor=west] (n) at (s.east) {nanosecondes\\ 4 octets};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror}] (d.south west) -- (n.south east)
+  node[midway,below=5pt] {suffixe de 16~octets ajouté par l'équipement de prise (la disposition du livre)};
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:nw:capturing-and-monitoring-the-network:trailer}{suffixe d'horodatage} de \texttt{firm.wirecap}~: l'équipement et le port qui ont vu la trame, ainsi que l'heure UTC complète en secondes et
+en nanosecondes, ajoutés après la trame. Les suffixes des constructeurs portent la même information dans leurs propres dispositions.}\label{fig:nw:capturing-and-monitoring-the-network:trailer}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Un suffixe publié}\label{dat:nw:capturing-and-monitoring-the-network:trailers}
+Arista indique que ses équipements 7130 insèrent un en-tête d'horodatage autonome de 16~octets à la fin de chaque \omterm{def:nw:networking-for-trading:frame}{trame Ethernet}
+copiée, recalculent sa séquence de contrôle et portent 64~bits de secondes et de nanosecondes, de sorte que «~l'heure UTC complète~» ne nécessite aucune trame-clé~; l'en-tête
+désigne l'équipement et le port, et un indicateur précise si la séquence de contrôle de la trame d'origine était valide. Les horodatages sont pris «~sur le premier
+octet d'un paquet au port d'entrée~», le délai de la face avant étant retiré, et le document annonce une précision de $\pm$75~picosecondes lorsque l'équipement est synchronisé
+par une impulsion par seconde. D'autres équipements écrasent un champ de la trame par un horodatage plus court et envoient périodiquement
+des trames-clés pour le rattacher à l'UTC.
+\end{dated}
+
+\omcode{code/firm/wirecap/firm_wirecap.py}{75}{92}{Écriture et lecture d'un fichier pcap en nanosecondes~: un en-tête de fichier de 24~octets, puis pour chaque trame
+un en-tête d'enregistrement de 16~octets et les octets.}\label{lst:nw:capturing-and-monitoring-the-network:pcap}
+
+\section{Mesurer la latence wire-to-wire}
+
+La latence wire-to-wire (livre~13, chapitre~1) se mesure sur le fil~: du premier octet d'une trame de données de marché au point
+de remise de l'entreprise jusqu'au premier octet de l'ordre qu'elle a provoqué au point de remise des ordres. À partir d'une capture, il s'agit d'une soustraction, une fois que chaque ordre a été
+apparié à sa cause.
+
+\begin{definition}[Paquet déclencheur]\label{def:nw:capturing-and-monitoring-the-network:trigger}
+Le \emph{paquet déclencheur}\index{paquet déclencheur} d'un ordre est le paquet de données de marché dont le contenu a conduit
+l'entreprise à l'envoyer. Son instant de capture marque le début de la latence wire-to-wire de l'ordre.
+\end{definition}
+
+L'appariement est la partie difficile. Une capture voit deux flux de paquets, et rien sur le fil n'indique quel paquet a causé quel ordre.
+La règle naïve, «~le dernier paquet contenant un message déclencheur avant l'ordre~», fonctionne lorsque les déclencheurs sont rares et que l'entreprise est rapide~;
+elle échoue précisément là où la latence vaut la peine d'être mesurée, en rafales, lorsque plusieurs déclencheurs précèdent un ordre de moins que la latence propre de l'entreprise.
+La règle fiable consiste à porter la cause dans l'ordre~: l'entreprise place le numéro de séquence du \omterm{def:nw:capturing-and-monitoring-the-network:trigger}{paquet déclencheur} (ou un haché de celui-ci) dans un champ
+de l'ordre qu'elle envoie, en général son identifiant d'ordre client, et la capture le relit.
+
+\begin{method}[Wire-to-wire à partir d'une capture]\label{met:nw:capturing-and-monitoring-the-network:w2w}
+\begin{enumerate}
+\item Prendre des prises sur les deux lignes de données de marché et sur le point de remise des ordres~; horodater les trois à l'aide de la même horloge, sur le fil.
+\item Pour chaque paquet de données de marché, conserver l'instant de la première copie vue sur l'une ou l'autre ligne~: la stratégie a agi sur celle qui est arrivée la première.
+\item Faire porter à la stratégie le numéro de séquence du déclencheur dans chaque ordre~; pour chaque ordre, retrancher de son propre instant celui de son déclencheur.
+\item Présenter la distribution, et non la moyenne, et la ventiler selon le budget de latence des étapes du chemin, afin qu'un centile lent puisse être
+  imputé à une étape.
+\end{enumerate}
+\end{method}
+
+Le tutoriel du chapitre exécute cette méthode sur une seconde simulée~: 99\,055 paquets de données de marché sur deux lignes, chaque copie étant perdue indépendamment
+avec une probabilité de 0.2~\%, et une stratégie qui répond par un ordre à 30~\% des paquets portant un message de transaction, soit 9\,558 ordres au total. Le
+calendrier des ordres est tiré de \texttt{firm.wirepath}, l'extension au fil du chemin tick-to-trade du livre~13
+(\cref{fig:nw:capturing-and-monitoring-the-network:budget}). La capture retrouve exactement la latence de chaque ordre grâce au numéro de séquence qu'il porte,
+la règle naïve associe 47~\% d'entre eux au mauvais paquet.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar=0pt,width=11.5cm,height=6.6cm,bar width=5pt,xmode=log,xmin=20,xmax=60000,
+  ytick=data,yticklabels={réseau entrant,réception carte,décodage,anneau,carnet,stratégie,risque,passerelle,émission carte,réseau sortant,wire-to-wire},
+  y dir=reverse,xlabel={nanosecondes (échelle logarithmique)},tick label style={font=\small},label style={font=\small},
+  xtick={100,1000,10000},xticklabels={100,1\,000,10\,000},
+  grid=major,grid style={gray!25},legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,
+  fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=p50_ns]{figdata/networks/05-capturing-and-monitoring-the-network/budget.csv};
+\addplot[fill=omThm!40,draw=omThm] table[y expr=\coordindex,x=p99_ns]{figdata/networks/05-capturing-and-monitoring-the-network/budget.csv};
+\legend{médiane,centile 99}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Budget fil à fil de \texttt{firm.wirepath}~: la cage de couche~1 du chapitre~2 (réseau entrant et sortant), les chemins de réception et
+d'émission de la carte (valeurs de modèle), et les six étapes internes au processus mesurées par le livre~13 sur un ordinateur portable (Intel Core Ultra 7 155H, WSL2).
+La dernière barre est leur composition, une simulation. Données~: \texttt{fig\_capture.py}.}\label{fig:nw:capturing-and-monitoring-the-network:budget}
+\end{omfigure}
+
+Le budget indique où part le temps. À la médiane, les deux passages de la carte (\qty{0.8}{\micro\second} chacun, valeurs de modèle) et l'anneau
+entre le feed handler et la stratégie (\qty{0.76}{\micro\second}, mesuré) sont les étapes les plus longues~; la fibre et les équipements de la cage
+totalisent ensemble \qty{0.56}{\micro\second}. Au centile 99, c'est l'anneau qui domine, à \qty{32}{\micro\second}~: sur l'ordinateur portable où il a été mesuré,
+un consommateur qui s'endort ou qui est désordonnancé se réveille en retard. Composées, les étapes donnent une latence médiane fil à fil de \qty{4.4}{\micro\second} et un centile 99
+de \qty{35}{\micro\second}~; la capture de la session simulée mesure \qty{4.4}{\micro\second} et \qty{38}{\micro\second}, la différence
+tenant à l'échantillon.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.0cm,xmode=log,xmin=2,xmax=100,ymin=0,ymax=0.16,
+  xlabel={latence fil à fil issue de la capture (\unit{\micro\second}, échelle logarithmique)},ylabel={part des ordres},
+  ytick={0,0.05,0.1,0.15},yticklabels={0,0.05,0.10,0.15},
+  xtick={2,5,10,20,50,100},xticklabels={2,5,10,20,50,100},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},table/col sep=comma]
+\addplot[ybar,bar width=3pt,fill=omDef!55,draw=omDef] table[x=mid_us,y=share]{figdata/networks/05-capturing-and-monitoring-the-network/w2w_hist.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: latence fil à fil de 9\,558 ordres mesurée à partir de la capture d'une seconde simulée, selon la séquence de déclenchement
+que porte chaque ordre (classes de même largeur en échelle logarithmique). La distribution présente la longue queue droite de son étape la plus lente. Données~:
+\texttt{fig\_capture.py}.}\label{fig:nw:capturing-and-monitoring-the-network:hist}
+\end{omfigure}
+
+\omcode{code/networks/05-capturing-and-monitoring-the-network/python/nw_capture.py}{74}{95}{Lecture de la capture~: le temps de chaque trame
+issu de son suffixe, la première copie de chaque paquet de données de marché sur l'une ou l'autre ligne, et la séquence de déclenchement de chaque
+ordre.}\label{lst:nw:capturing-and-monitoring-the-network:analyse}
+
+\section{Détecter les trous, les pertes et les micro-rafales à partir d'une capture}
+
+La même capture répond aux questions que le feed handler du livre~13 traite de l'intérieur, et à certaines qu'il ne peut pas traiter. Un trou est un numéro de
+séquence manquant sur une ligne~; un trou sur les deux lignes correspond à un message que la firme n'a jamais reçu, et la capture indique s'il a été perdu
+avant la remise (absent à la prise) ou après (présent à la prise, absent des compteurs du handler). Dans la seconde simulée,
+la ligne~A présente 158 trous et la ligne~B 198, et aucun message n'est absent des deux lignes~: le handler a tout récupéré sur l'autre ligne. Les rafales
+se lisent dans les mêmes horodatages~: les 100 microsecondes les plus chargées de la ligne~A ont transporté \qty{1.24}{\giga\bit\per\second}, soit neuf fois sa moyenne de
+\qty{0.14}{\giga\bit\per\second}, la même forme que les flux du chapitre~1 à plus petite échelle.
+
+Une capture est la preuve de la firme autant que son instrument. Elle montre ce que la firme a effectivement envoyé et quand, ce sur quoi une plateforme, un client ou un
+régulateur interroge après un incident~; les règles européennes demandent aux firmes d'identifier le point exact où chaque horodatage est appliqué, et une prise sur la
+remise est le seul point qu'aucune modification logicielle ne peut déplacer.
+
+\section{Surveiller en production~: compteurs, télémétrie et alarmes}
+
+\begin{definition}[Télémétrie en flux]\label{def:nw:capturing-and-monitoring-the-network:telemetry}
+La \emph{télémétrie en flux}\index{télémétrie en flux} (streaming telemetry) est l'export continu, par les équipements réseau, de leurs compteurs et de leur état
+(trafic par port, rejets, occupation des files, niveaux optiques, état de l'horloge) vers un collecteur, poussé à un intervalle choisi ou à chaque changement,
+au lieu d'être interrogé par le collecteur.
+\end{definition}
+
+Une capture est détaillée et coûteuse~: elle conserve chaque trame, et une cage chargée remplit des disques en quelques heures. La surveillance fonctionne en continu
+sur des synthèses~: les compteurs de chaque équipement, diffusés chaque seconde ou à chaque changement~; les rejets de socket et d'anneau de chaque serveur~; les compteurs
+de trous et d'obsolescence de chaque handler~; le décalage de chaque horloge. Les alarmes qui comptent dans un réseau de trading sont peu nombreuses et précises~:
+\begin{itemize}
+\item \textbf{rejets sur une \omterm{def:nw:networking-for-trading:egress}{file de sortie}}, que seules les \omterm{def:nw:networking-for-trading:burst}{micro-rafales} provoquent sur une liaison sous-utilisée (chapitre~1)~;
+\item \textbf{trous sur une ligne} qui persistent, une ligne qui se dégrade pendant que l'autre la masque~;
+\item \textbf{trous sur les deux lignes}, cause commune, et toute reprise par instantané (snapshot)~;
+\item \textbf{une horloge hors verrouillage ou en maintien}, et des décalages qui approchent le budget (chapitre~4)~;
+\item \textbf{centiles fil à fil} qui s'écartent de la référence, calculés à partir de la capture toutes les minutes.
+\end{itemize}
+Chaque alarme désigne un point du chemin, et la capture des minutes qui l'entourent est conservée pour l'enquête.
+
+\section{Tutoriel~: une seconde de la cage, depuis les prises}\label{tut:nw:capturing-and-monitoring-the-network:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Capturer une seconde simulée aux prises de la cage, l'écrire sous forme de fichier pcap, et mesurer à partir de lui seul ce que
+les programmes de la firme ne peuvent pas voir. \textbf{État final~:} \cref{fig:nw:capturing-and-monitoring-the-network:budget,fig:nw:capturing-and-monitoring-the-network:hist},
+l'erreur d'appariement de la règle naïve, et les comptes de trous et de rafales cités dans le texte.
+\begin{tutsteps}
+\item \textbf{Le budget.} \texttt{nw\_capture.stages()} prend la cage du chapitre~2, les étapes de modèle de la carte et les étapes mesurées du livre~13~;
+  \texttt{budget\_rows()} les compose avec \texttt{firm.wirepath}.
+\item \textbf{La session.} \texttt{session()} construit les trames du flux sur les deux lignes avec des pertes indépendantes, les ordres avec leur
+  séquence de déclenchement, et ajoute un suffixe à chaque copie.
+\item \textbf{Le fichier.} \texttt{firm.wirecap.write\_pcap(path, records)} l'écrit (\cref{lst:nw:capturing-and-monitoring-the-network:pcap})~;
+  tout outil qui lit les fichiers pcap à la nanoseconde peut l'ouvrir.
+\item \textbf{L'analyse.} \texttt{analyse(read\_pcap(path))} apparie les ordres à leurs déclencheurs, compte les trous par ligne et les messages perdus sur
+  les deux lignes, et repère la fenêtre la plus chargée (\cref{lst:nw:capturing-and-monitoring-the-network:analyse})~; \texttt{python fig\_capture.py} écrit les
+  données des graphiques.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Porter la perte à 5~\% par ligne et compter les messages perdus sur les deux lignes~; rendre la stratégie quatre fois plus rapide et
+mesurer comment l'erreur de la règle naïve évolue.
+\end{tutorial}
+
+\section{Construction~: outils de capture et chemin fil à fil}\label{bld:nw:capturing-and-monitoring-the-network:wirecap}
+
+\begin{build}
+\bfield{Rôle} Deux composants~: \texttt{firm.wirecap}, la boîte à outils de capture de la firme, et \texttt{firm.wirepath}, le chemin tick-to-trade du
+livre~13 étendu au fil, que les chapitres~7 et~29 utilisent pour leurs tableaux de latence.
+\bfield{Interface} \texttt{firm\_wirecap}~: \texttt{udp\_frame}, \texttt{tcp\_frame}, \texttt{add\_trailer}, \texttt{strip\_trailer},
+\texttt{write\_pcap}, \texttt{read\_pcap}, \texttt{write\_pcapng}, \texttt{read\_pcapng}, \texttt{parse}, \texttt{mold}, \texttt{ORDER},
+\texttt{match\_orders}, \texttt{match\_nearest}, \texttt{gaps}, \texttt{bursts}~; lecteur C++20 \texttt{cpp/firm\_wirecap.hpp}.
+\texttt{firm\_wirepath}~: \texttt{Stage(name, p50, p99, kind)}, \texttt{book13\_software()}, \texttt{wire\_stages(cage, \dots)},
+\texttt{card\_stages}, \texttt{hardware\_stage(cycles, mhz)}, \texttt{compose}, \texttt{report}, composé avec \texttt{firm.latbudget}.
+\bfield{Règles} Les horodatages sont des entiers de nanosecondes depuis minuit UTC~; l'heure du suffixe l'emporte sur toute heure de stockage~; la somme de contrôle IPv4 est
+correcte~; un ordre n'est apparié que par la séquence qu'il porte~; les mesures du livre~13 sont lues, jamais recopiées ni modifiées.
+\bfield{Tests d'acceptation} \texttt{code/firm/wirecap/tests/}~: les trames se relisent à l'identique, les sommes de contrôle tiennent, les suffixes font l'aller-retour, les fichiers pcap et pcapng
+font l'aller-retour, un mauvais numéro magique est refusé, l'appariement, les trous et les rafales sur des données fabriquées à la main, et le jeu de données partagé se lit de la même façon en Python et
+en C++. \texttt{code/firm/wirepath/tests/}~: l'ajustement log-normal retrouve sa médiane et son centile 99, les étapes du livre~13 sont lues, le chemin d'une cage
+donne l'étape réseau, et les lignes du rapport.
+\bfield{Pour aller plus loin} Détection des rafales par port, avec le tampon du commutateur comme seuil~; reconstruction du carnet d'ordres à partir de la capture, comparée,
+message par message, à celle du handler.
+\end{build}
+
+\begin{omsources}
+\item \texttt{pcap-savefile(5)} (tcpdump/libpcap)~; IETF, \emph{PCAP Now Generic (pcapng) Capture File Format},
+draft-ietf-opsawg-pcapng-04.
+\item Arista, \emph{An Overview of Arista Ethernet Capture Timestamps}~; OpenConfig, \emph{gNMI specification}.
+\item Commission Delegated Regulation (EU) 2017/574 (RTS~25), article 4.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:1}
+Un en-tête d'enregistrement pcap en nanosecondes donne 34\,200 secondes et 1\,500\,000\,321 nanosecondes. Vérifier si cet enregistrement est valide,
+et déterminer l'heure de la journée que doit indiquer le lecteur.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:2}
+Un \omterm{def:nw:capturing-and-monitoring-the-network:trigger}{paquet déclencheur} atteint le tap sur la ligne~A à 09:30:00.000\,012\,345 et sur la ligne~B \qty{3}{\micro\second} plus tard~; l'ordre part à
+09:30:00.000\,016\,771. Calculer la latence wire-to-wire. Si la copie de la ligne~A avait été perdue, à partir de quelle copie faudrait-il mesurer
+et préciser ce qui changerait.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:capturing-and-monitoring-the-network:3}
+Une liaison à 10~Gb/s est tappée dans les deux sens et écrite sur disque avec ses \omterm{def:nw:capturing-and-monitoring-the-network:trailer}{suffixes d'horodatage}~; chaque trame est stockée avec un en-tête d'enregistrement de 16~octets et
+son suffixe de 16~octets. Calculer, à un débit soutenu de \qty{4}{\giga\bit\per\second} dans chaque sens et avec des trames de 200~octets, le nombre d'octets par seconde écrits sur disque.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:4}
+Expliquer pourquoi la règle naïve d'appariement échoue d'autant plus souvent que les déclencheurs sont fréquents et que la firme est lente.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:5}
+La ligne~A présente 158 lacunes et la ligne~B 198 dans la seconde du tutoriel, et aucune n'est commune aux deux. Avec une perte indépendante de 0.2~\% par copie et 99\,055
+paquets, calculer le nombre de paquets qu'on attend de perdre sur les deux lignes.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:6}
+Dans la \cref{fig:nw:capturing-and-monitoring-the-network:budget}, indiquer quelle étape attaquer en premier pour réduire la médiane, et laquelle pour réduire le
+99\up{e}~centile. Préciser le coût de chacune.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:7}
+\emph{Programmation.} Rendre chaque étape de \texttt{firm.wirepath} quatre fois plus rapide, sauf celle du réseau, relancer la session et mesurer
+l'erreur d'appariement de la règle naïve, puis expliquer le sens de la variation.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:capturing-and-monitoring-the-network:8}
+\emph{Trouver la faille.} «~Nous mesurons notre latence wire-to-wire en horodatant le paquet de données de marché dans le handler avec
+l'horodatage matériel de la carte, et l'ordre avec l'horodatage d'émission de la carte. C'est aussi bon qu'un tap.~»
+\end{exercise}
+
+\section{Problème~: Les deux microsecondes que personne n'a journalisées}
+
+\begin{problem}[{Problème du week-end --- un budget de latence lu sur les taps}]\label{pb:nw:capturing-and-monitoring-the-network:1}
+La stratégie de la firme journalise son temps de traitement interne et annonce une médiane de \qty{1.5}{\micro\second}. La capture aux taps (la
+seconde simulée du chapitre) donne une médiane wire-to-wire de \qty{4.4}{\micro\second} et un 99\up{e}~centile de \qty{38}{\micro\second}. Utiliser les
+médianes et les 99\up{e}~centiles par étape de la \cref{fig:nw:capturing-and-monitoring-the-network:budget}~: réseau entrant 263 et sortant 295~ns~; réception carte 798
+(p99 1\,997) et émission 801 (p99 2\,000)~; les six étapes logicielles 437, 756, 158, 97, 47 et 33~ns à la médiane.
+
+\medskip\noindent\textbf{Partie~I --- Médianes.}
+\begin{enumerate}
+\item Calculer la somme des médianes des étapes logicielles.
+\item Calculer la somme des médianes de toutes les étapes.
+\item Expliquer pourquoi la somme des médianes n'est pas la médiane de la somme.
+\item Déterminer la part de la médiane wire-to-wire située hors du programme.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~II --- La queue de distribution.}
+\begin{enumerate}[resume]
+\item Le 99\up{e}~centile du ring est de \qty{31.9}{\micro\second}. Déterminer la part qu'il représente dans le 99\up{e}~centile wire-to-wire.
+\item Expliquer pourquoi une seule étape lente peut dominer la queue de distribution.
+\item Indiquer ce que le livre~13 a trouvé pour la queue du ring sur l'ordinateur portable.
+\item Indiquer ce qu'une machine de production modifierait.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~III --- La capture.}
+\begin{enumerate}[resume]
+\item Expliquer pourquoi l'horodatage du tap est le bon point de départ de la latence, plutôt que celui de la carte.
+\item La règle naïve a mal apparié 47~\% des ordres. Indiquer à quoi aurait ressemblé le 99\up{e}~centile avec elle.
+\item Indiquer le champ à utiliser pour transporter le déclencheur dans l'ordre.
+\item Indiquer quelle alarme aurait signalé à la firme que sa queue avait bougé.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie~IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la médiane et le 99\up{e}~centile wire-to-wire, la part hors du programme et l'étape qui domine la
+  queue.
+\item Calculer de combien baisserait la médiane si les chemins des cartes étaient divisés par deux.
+\item Déterminer quelle étape dominerait le 99\up{e}~centile si la queue du ring était supprimée entièrement.
+\item Indiquer ce qu'il faudrait mesurer pour évaluer les étapes des cartes au lieu de les supposer.
+\item Expliquer pourquoi la capture fait partie des preuves de la firme autant que de ses outils.
+\item Calculer l'espace disque occupé par une heure de cette capture, aux débits du tutoriel.
+\item Indiquer ce qu'il faudrait garder un mois, et ce qu'il faudrait garder un jour.
+\item En une phrase~: dire ce que voit un tap et que ne voit pas un journal.
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:capturing-and-monitoring-the-network:1}
+Comment mesureriez-vous la latence wire-to-wire~? De quoi auriez-vous besoin en plus des journaux propres au programme~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:capturing-and-monitoring-the-network:2}
+Où prendriez-vous l'horodatage d'une capture, et pourquoi cela a-t-il de l'importance~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:capturing-and-monitoring-the-network:3}
+Comment appariez-vous chaque ordre au paquet de données de marché qui l'a déclenché~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:capturing-and-monitoring-the-network:4}
+Quelles alarmes réseau mettriez-vous en place pour une cage de trading, et pourquoi celles-là~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:capturing-and-monitoring-the-network:5}
+Votre 99\up{e}~centile wire-to-wire a doublé pendant la nuit, alors qu'aucun déploiement n'a eu lieu. Comment en trouveriez-vous la cause~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:capturing-and-monitoring-the-network:6}
+À quoi utiliseriez-vous une capture, en dehors de la latence~?
+\end{interviewq}

@@ -34,6 +34,17 @@ $out_dir = 'build';
     'one_quant_book_08_strategies_1_fr.tex',
     'one_quant_book_09_strategies_2_fr.tex',
     'one_quant_book_10_microstructure_fr.tex',
+    # French pilot editions (2026-11-11/12, two sessions)
+    'one_quant_book_11_hft_fr.tex',
+    'one_quant_book_12_ml_fr.tex',
+    'one_quant_book_13_low_latency_fr.tex',
+    'one_quant_book_14_networks_fr.tex',
+    'one_quant_book_15_platforms_fr.tex',
+    'one_quant_book_16_desk_fr.tex',
+    'one_quant_book_17_industry_fr.tex',
+    'one_quant_book_18_interviews_1_fr.tex',
+    'one_quant_book_19_interviews_2_fr.tex',
+    'one_quant_book_20_interviews_3_fr.tex',
 );
 # Many TikZ/pgfplots figures exceed pdfTeX's default main memory.
 $pdflatex = 'pdflatex -cnf-line=main_memory=12000000 -cnf-line=extra_mem_top=6000000 -cnf-line=extra_mem_bot=6000000 -interaction=nonstopmode -halt-on-error %O %S';

@@ -1,0 +1,488 @@
+\section*{Chapitre \ref{ch:iv3:sql-and-data} --- SQL et données}
+\markboth{\protect\omTocMark{}{Réponses~: SQL et données}}{\protect\omTocMark{}{Réponses~: SQL et données}}
+
+\begin{solution}{iq:iv3:sql-and-data:1}
+Le \Cref{lst:iv3:sq:vwap} regroupe par symbole et par jour, puis filtre les groupes avec \texttt{HAVING}. Elle renvoie une seule ligne, AAA le 2 mars à 100.75. Seul ce couple symbole-jour compte plus de 2 transactions.
+\omcode{code/interviews-3/07-sql-and-data/sql/vwap.sql}{1}{4}{Prix moyen pondéré par les volumes, par symbole et par jour.\protect\hfil\protect\break}\label{lst:iv3:sq:vwap}
+\begin{center}\small
+\begin{tabular}{llr}
+symbole & jour & vwap\\\hline
+AAA & 2026-03-02 & 100.75
+\end{tabular}
+\end{center}
+La somme des prix multipliés par les quantités vaut $20\,000 + 10\,200 + 10\,100 = 40\,300$, et la somme des quantités vaut 400, donc le résultat est 100.75. \texttt{WHERE} s'exécute sur les lignes avant le regroupement, il ne peut donc pas voir un comptage, et SQLite comme DuckDB rejettent \texttt{COUNT(*)} à cet endroit. \texttt{HAVING} s'exécute sur les groupes.
+
+\iqwrong{\texttt{AVG(price)}. Cela donne 101 ici, parce que la transaction de 200 actions compte autant que les transactions de 100 actions.}
+\iqfollow{Que se passe-t-il si les quantités d'un couple symbole-jour peuvent totaliser zéro, par exemple à cause d'une correction~?}{On écrit \texttt{SUM(price * qty) / NULLIF(SUM(qty), 0)}, qui renvoie NULL dans ce cas. Sans cela, SQLite renvoie NULL, DuckDB renvoie l'infini, ou NaN si le numérateur vaut aussi zéro, comme avec une correction au même prix, et PostgreSQL lève une erreur qui interrompt toute la requête. Trois moteurs, trois comportements.}
+\iqfollow{Et si \texttt{price} était un nombre entier de ticks~?}{On vérifie la division~: sur SQLite, la division entière tronque, et le résultat serait 100.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:2}
+La requête A ne renvoie qu'une seule ligne, l'ordre 1 avec 100. La requête B renvoie les trois ordres, et c'est celle qu'il faut retenir.
+\begin{center}\small
+\begin{tabular}{rr}
+order\_id & qty\\\hline
+1 & 100\\
+2 & NULL\\
+3 & NULL
+\end{tabular}
+\end{center}
+Une jointure à gauche conserve chaque ligne de la table de gauche, en complétant le côté droit par des NULL lorsqu'aucune correspondance n'existe, puis \texttt{WHERE} s'applique au résultat. Pour les ordres 2 et 3, \texttt{f.venue} vaut NULL ou Y, et \texttt{NULL = \textquotesingle{}X\textquotesingle{}} n'est pas vrai~: ces lignes sont donc écartées, et le \texttt{WHERE} a discrètement transformé la jointure externe en jointure interne. Dans la requête B, le test sur la plateforme fait partie de la correspondance~: il décide quelles exécutions se rattachent à l'ordre, mais il ne peut pas supprimer un ordre. L'ordre 2 garde sa ligne avec NULL, car sa seule exécution a eu lieu sur Y.
+
+La règle est qu'une condition portant sur la table de droite d'une jointure à gauche appartient à \texttt{ON}.
+
+\iqwrong{Ajouter \texttt{OR f.venue IS NULL} à la requête A. Cela fait revenir l'ordre 3, qui n'a aucune exécution, et cela perd toujours l'ordre 2, car la ligne issue de la jointure indique Y et non NULL. La requête paraît corrigée, mais elle est fausse précisément pour les ordres exécutés ailleurs.}
+\iqwhy{Ce bogue fausse un total sans aucune erreur. Un rapport d'exécutions qui omet les ordres traités sur d'autres plateformes ressemble à un chiffre plus petit, mais plausible.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:3}
+La requête ne renvoie aucune ligne, parce que \texttt{blocked} contient un NULL. Le \Cref{lst:iv3:sq:notexists} est la correction~: elle renvoie les ordres 1 et 3. Savoir si l'ordre 3 doit figurer dépend de ce que l'on entend par là~: son trader est inconnu, donc on ne sait pas qu'il est bloqué, et il faut trancher et le dire.
+\omcode{code/interviews-3/07-sql-and-data/sql/not_exists.sql}{1}{3}{L'antijointure que les NULL ne peuvent pas faire échouer.}\label{lst:iv3:sq:notexists}
+
+La logique SQL comporte trois valeurs. \texttt{\textquotesingle{}ann\textquotesingle{} NOT IN (\textquotesingle{}bob\textquotesingle{}, NULL)} signifie que ann n'est pas bob, et que ann n'est pas NULL. La première partie est vraie, et la seconde est inconnue, puisque personne ne sait ce que représente NULL. Vrai et inconnu donne inconnu, et \texttt{WHERE} ne conserve que les lignes vraies. Un seul NULL dans la liste supprime donc toutes les lignes. SQLite et DuckDB renvoient bien ce NULL, ce que l'on vérifie en sélectionnant l'expression.
+
+\texttt{NOT EXISTS} demande si une ligne correspondante existe, et la réponse est toujours oui ou non. Pour l'ordre 3, \texttt{b.trader = o.trader} n'est jamais vrai, donc aucune ligne n'existe et l'ordre est conservé. L'ordre 1 est conservé de la même façon, et l'ordre 2 trouve bob et est écarté. Pour exclure aussi les traders inconnus, il suffit d'ajouter \texttt{AND o.trader IS NOT NULL}. Filtrer la sous-requête avec \texttt{WHERE trader IS NOT NULL} à la place laisse \texttt{NOT IN} fonctionner, et ne renvoie alors que l'ordre 1.
+
+\iqwrong{«~La requête renvoie l'ordre 1.~» C'est ce que l'auteur attendait. Le NULL de la liste des blocages est ce qui l'en empêche, et il peut apparaître en production bien après que la requête a été testée.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:4}
+La première instruction renvoie 5, 3, 2, 50, 16.67, 10, et la seconde renvoie 0. La cinquième colonne, \texttt{AVG(bid)}, est la moyenne des cours acheteurs connus, soit 16.67. La sixième traite les cours acheteurs inconnus comme des zéros, et savoir si c'est juste dépend de ce que signifie un NULL ici.
+
+\texttt{COUNT(*)} compte les lignes. \texttt{COUNT(bid)} compte les valeurs non NULL, et \texttt{COUNT(DISTINCT bid)} compte les valeurs non NULL différentes~: 10 et 20. \texttt{SUM} et \texttt{AVG} ignorent aussi les NULL, donc la somme vaut 50 et la moyenne vaut $50 / 3$, alors que \texttt{SUM(bid) / COUNT(*)} vaut $50 / 5$. \texttt{AVG(COALESCE(bid, 0))} donne également 10, et il affiche clairement qu'un NULL compte pour zéro.
+
+La seconde instruction compte les lignes où \texttt{bid = NULL}. Cette comparaison est inconnue pour chaque ligne, y compris les lignes NULL, donc aucune n'est retenue. Le test d'une valeur manquante est \texttt{bid IS NULL}, qui compte 2.
+
+\iqwrong{«~\texttt{COUNT(DISTINCT bid)} vaut 3, en comptant NULL comme une valeur.~» Les agrégats ignorent les NULL, alors que \texttt{SELECT DISTINCT} et \texttt{GROUP BY} traitent tous les NULL comme une seule valeur. Cette différence piège souvent.}
+\iqfollow{Que renvoie \texttt{SUM} sur une table sans lignes, ou ne contenant que des NULL~?}{NULL, et non 0, donc un rapport a besoin de \texttt{COALESCE(SUM(x), 0)}. \texttt{COUNT} renvoie 0.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:5}
+SQLite et PostgreSQL renvoient 0. DuckDB renvoie 0.5. Le \Cref{lst:iv3:sq:ratiofixed} renvoie 0.5 sur les trois, et le transtypage en double donne le même résultat.
+\omcode{code/interviews-3/07-sql-and-data/sql/fill_ratio_fixed.sql}{1}{1}{Le même ratio, avec un non-entier dans le calcul.\protect\hfil\protect\break}\label{lst:iv3:sq:ratiofixed}
+
+Les sommes valent 75 et 150, toutes deux entières. Dans SQLite et PostgreSQL, une division entière par un entier tronque, donc $75 / 150$ vaut 0~: la documentation de PostgreSQL donne \texttt{5 / 2} égal à 2. L'opérateur \texttt{/} de DuckDB effectue une division en virgule flottante, et son \texttt{//} est la division entière, si bien que \texttt{7 / 2} vaut 3.5 là-bas, alors que SQLite donne 3. Les résultats de SQLite et de DuckDB ont été vérifiés en les exécutant, et celui de PostgreSQL provient de son manuel.
+
+Multiplier d'abord par \texttt{1.0} rend le numérateur non entier, et l'ordre compte~: \texttt{1.0 * (a / b)} a déjà tronqué. Une requête transférée d'un moteur à l'autre continue de tourner et change silencieusement sa réponse, si bien que la bonne habitude est un transtypage explicite dans chaque ratio.
+
+\iqwrong{«~SQL n'a qu'une seule règle pour la division.~» Chaque moteur a la sienne. C'est la raison classique pour laquelle une requête donne un autre chiffre après une migration.}
+\iqwhy{Un taux d'exécution de 0 pour tous les ordres sauf ceux entièrement exécutés semble un fait d'activité étrange, et il peut falloir des jours pour remonter au type d'une colonne.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:6}
+Les identifiants 2 et 3 se répètent. Les copies de 2 concordent, celles de 3 non. En gardant la version la plus récente, les totaux sont AAA 300 et BBB 130. \texttt{SELECT DISTINCT} donnerait BBB 180, parce qu'il conserve les deux versions de la transaction 3. Le \Cref{lst:iv3:sq:dup} contient les deux requêtes.
+\omcode{code/interviews-3/07-sql-and-data/sql/duplicates.sql}{1}{17}{Repérer les doublons, puis garder le plus récent.}\label{lst:iv3:sq:dup}
+\begin{center}\small
+\begin{tabular}{rrr}
+trade\_id & copies & versions\\\hline
+2 & 2 & 1\\
+3 & 2 & 2
+\end{tabular}\qquad
+\begin{tabular}{lr}
+symbole & total\\\hline
+AAA & 300\\
+BBB & 130
+\end{tabular}
+\end{center}
+\texttt{COUNT(DISTINCT qty)} est la colonne utile en plus~: une valeur de 1 signale un rejeu sans conséquence, et une valeur supérieure à 1 signale une correction ou une erreur de données. \texttt{DISTINCT} ne supprime que les lignes identiques sur toutes les colonnes sélectionnées, il traite donc le rejeu et non la correction. \texttt{ROW\_NUMBER} sur chaque identifiant, par ordre d'arrivée décroissant, conserve exactement une ligne par identifiant~: BBB vaut alors $60 + 70$.
+
+\iqwrong{Garder la première copie, ou \texttt{MAX(qty)}. Une correction peut aller dans un sens comme dans l'autre, donc seul l'ordre d'arrivée permet de savoir laquelle est la version courante.}
+\iqfollow{Et s'il n'existe aucune colonne d'arrivée~?}{Alors la table ne permet pas de le savoir. Les lignes en SQL n'ont pas d'ordre propre, donc il faut revenir à la source, ou signaler le désaccord plutôt que d'en choisir une.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:7}
+SQLite renvoie par hasard les bons prix, DuckDB rejette la requête, et PostgreSQL aussi. Le \Cref{lst:iv3:sq:latest} est correct sur les trois.
+\omcode{code/interviews-3/07-sql-and-data/sql/latest_portable.sql}{1}{9}{La dernière ligne de chaque groupe, avec une fenêtre.\protect\hfil\protect\break}\label{lst:iv3:sq:latest}
+\begin{center}\small
+\begin{tabular}{lrr}
+symbole & ts & price\\\hline
+AAA & 3 & 101.0\\
+BBB & 5 & 50.0
+\end{tabular}
+\end{center}
+En SQL standard, une colonne sélectionnée doit être regroupée ou agrégée. \texttt{price} n'est ni l'un ni l'autre, c'est donc une colonne nue~: de quelle ligne doit-elle provenir~? DuckDB échoue avec une erreur de liaison, et la documentation de PostgreSQL indique qu'il la refuse aussi. SQLite possède un cas particulier documenté~: avec un seul \texttt{MIN} ou \texttt{MAX}, les colonnes nues proviennent de la ligne qui porte cet extrême, ce qui explique pourquoi il a raison ici. Avec deux agrégats de ce type, il ne dit plus de quelle ligne il s'agit. La requête fonctionne donc ici grâce à une règle propre à un seul moteur, tout en ayant l'allure d'une requête portable.
+
+La version à fenêtre exprime ce que l'on veut dire. Si deux lignes sont à égalité sur la date la plus récente, \texttt{ROW\_NUMBER} en choisit une au hasard, donc il faut ajouter une seconde clé de tri si cela compte. DuckDB propose aussi des formes plus courtes~: \texttt{arg\_max(price, ts)}, et \texttt{QUALIFY} pour filtrer directement sur une fenêtre. Les deux donnent le même résultat ici.
+
+\iqwrong{«~Il prend le prix d'une ligne quelconque sur chaque moteur.~» Pas sur SQLite avec un seul \texttt{MAX}. C'est une règle réelle là-bas, mais il ne faut pas s'y fier.}
+\iqfollow{Et une jointure avec une sous-requête sur \texttt{MAX(ts)} par symbole~?}{Elle est tout aussi correcte et portable. Elle renvoie les deux lignes en cas d'égalité, ce qui est parfois ce qu'on souhaite.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:8}
+Les trois fonctions ne diffèrent que sur les égalités, et ce sont les égalités qui décident qui est conservé. Le \Cref{lst:iv3:sq:ranks} les présente côte à côte. Un filtre «~2 ou moins~» conserve deux traders par desk avec \texttt{ROW\_NUMBER}, ajoute gus avec \texttt{RANK}, et ajoute gus et cid avec \texttt{DENSE\_RANK}.
+\omcode{code/interviews-3/07-sql-and-data/sql/ranks.sql}{1}{6}{Trois classements.}\label{lst:iv3:sq:ranks}
+\begin{center}\small
+\begin{tabular}{llrrrr}
+desk & trader & pnl & row\_num & rnk & dense\\\hline
+fx & eve & 70 & 1 & 1 & 1\\
+fx & fay & 60 & 2 & 2 & 2\\
+fx & gus & 60 & 3 & 2 & 2\\
+rates & ann & 50 & 1 & 1 & 1\\
+rates & bob & 50 & 2 & 1 & 1\\
+rates & cid & 40 & 3 & 3 & 2\\
+rates & dan & 30 & 4 & 4 & 3
+\end{tabular}
+\end{center}
+\texttt{ROW\_NUMBER} ne répète jamais de numéro. Il doit départager les égalités d'une manière ou d'une autre~: si l'ordre ne les tranche pas, le choix est arbitraire et peut changer d'une exécution à l'autre, c'est pourquoi le listing trie aussi sur \texttt{trader}. \texttt{RANK} attribue le même numéro aux ex æquo et laisse un trou après eux, tandis que \texttt{DENSE\_RANK} ne laisse aucun trou, si bien qu'une égalité en tête fait entrer une troisième personne.
+
+Que faut-il demander d'abord~? Que signifie «~top~2~» lorsque deux personnes sont à égalité~: exactement deux lignes, ou toutes les personnes occupant les deux premières places, ou les deux premières valeurs distinctes~? Pour une liste de primes, on ne retirerait guère gus sur un tirage à pile ou face, donc \texttt{RANK} est la lecture naturelle. Pour une page qui affiche deux lignes, c'est \texttt{ROW\_NUMBER}, avec un départage annoncé.
+
+\iqwrong{Utiliser \texttt{ROW\_NUMBER} sans départage. Le résultat semble correct, et il n'est pas reproductible.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:9}
+La requête affiche les positions 100, 50, 50, 0, elle ne voit donc pas le dépassement~: la position réelle après la deuxième exécution est $-50$. Le \Cref{lst:iv3:sq:posfixed} corrige cela en ordonnant aussi sur \texttt{seq}.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/position_fixed.sql}{1}{4}{Un cumul, ligne par ligne.}\label{lst:iv3:sq:posfixed}
+\begin{center}\small
+\begin{tabular}{rrr}
+seq & affiché par la requête & position réelle\\\hline
+1 & 100 & 100\\
+2 & 50 & $-50$\\
+3 & 50 & 50\\
+4 & 0 & 0
+\end{tabular}
+\end{center}
+Avec \texttt{ORDER BY} et sans cadre, la valeur par défaut est \texttt{RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW}, et un cadre \texttt{RANGE} inclut tous les pairs de la ligne courante, c'est-à-dire toutes les lignes ayant le même \texttt{ts}. Les deux exécutions à l'instant 20 sont donc additionnées ensemble avant que l'une ou l'autre ne soit affichée, et le creux qui les sépare disparaît. Trier sur une clé unique, ici \texttt{ts, seq}, ne laisse aucun pair. Écrire \texttt{ROWS} l'indique explicitement, et évite en outre au moteur de chercher des pairs.
+
+\iqwrong{Trier la sortie par \texttt{seq} et croire que cela suffit. Le \texttt{ORDER BY} final ne fait qu'ordonner le résultat. C'est le \texttt{ORDER BY} propre à la fenêtre qui décide de ce que chaque somme inclut.}
+\iqfollow{Et si la table n'a pas de \texttt{seq}, et que deux exécutions partagent une même heure~?}{Alors l'ordre ne figure pas dans les données, et aucune requête ne peut le retrouver. Un contrôle de position a besoin d'un numéro de séquence fourni par la source des exécutions.}
+\iqwhy{Une limite dépassée pendant un instant reste dépassée. Deux exécutions dans la même milliseconde sont normales sur un marché rapide, donc le cas se présente.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:10}
+La requête affiche fx 200 et 150, puis rates 200 et 100. Les quantités exécutées sont justes. La quantité commandée des rates est fausse~: elle devrait valoir 150, et l'erreur vient de deux causes distinctes. Le \Cref{lst:iv3:sq:fanoutfixed} corrige les deux.
+\begin{center}\small
+\begin{tabular}{lrr}
+desk & commandé & exécuté\\\hline
+fx & 200 & 150\\
+rates & 200 & 100
+\end{tabular}
+\end{center}
+Une jointure produit une ligne par couple correspondant. L'ordre 1 a deux exécutions, si bien que sa quantité de 100 apparaît deux fois et est additionnée pour donner 200. C'est le fan-out\index{fan-out}. L'ordre 2 n'a aucune exécution, la jointure interne le fait donc disparaître, et ses 50 sont perdus. Deux erreurs se compensent donc ici, et $100 + 100$ n'a que l'apparence d'un total plausible. Sur d'autres données, elles pourraient se compenser en partie, ce qui est pire.
+\omcode{code/interviews-3/07-sql-and-data/sql/fanout_fixed.sql}{1}{9}{Agréger d'abord, puis joindre.}\label{lst:iv3:sq:fanoutfixed}
+\begin{center}\small
+\begin{tabular}{lrr}
+desk & commandé & exécuté\\\hline
+fx & 200 & 150\\
+rates & 150 & 100
+\end{tabular}
+\end{center}
+Le remède consiste à ramener chaque table au grain de la question avant de joindre. Avec une ligne par ordre de chaque côté, la jointure ne peut rien multiplier. \texttt{LEFT JOIN} conserve les ordres non exécutés, et \texttt{COALESCE} transforme leurs exécutions manquantes en 0.
+
+\iqwrong{\texttt{SUM(DISTINCT o.qty)}. Cela donnerait $100 + 50$ pour rates seulement si l'ordre 2 apparaissait, et sur des données où deux ordres ont la même quantité, il en supprimerait un.}
+\iqfollow{Comment repère-t-on rapidement un fan-out~?}{Comparer \texttt{COUNT(*)} avant et après une jointure, et vérifier que la clé est unique du côté attendu.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:11}
+Les colonnes diffèrent à partir de la première ligne après le trou, comme le montre le tableau. \texttt{by\_rows} fait la moyenne des trois dernières observations et \texttt{by\_range} celle des trois derniers jours calendaires, si bien que \texttt{by\_range} est la moyenne sur trois jours au sens courant. Sur le week-end, \texttt{by\_rows} est une moyenne sur trois jours de cotation.
+\begin{center}\small
+\begin{tabular}{rrrr}
+jour & prix & by\_rows & by\_range\\\hline
+1 & 10.0 & 10.00 & 10.00\\
+2 & 20.0 & 15.00 & 15.00\\
+3 & 30.0 & 20.00 & 20.00\\
+6 & 60.0 & 36.67 & 60.00\\
+7 & 90.0 & 60.00 & 75.00
+\end{tabular}
+\end{center}
+Un cadre \texttt{ROWS} compte des lignes, quels que soient leurs jours. Le jour 6, il prend les jours 2, 3 et 6, et donne donc $(20 + 30 + 60) / 3$. Un cadre \texttt{RANGE} avec un décalage numérique travaille sur la valeur de la clé de tri~: il retient $\text{jour} - 2 \le d \le \text{jour}$. Le jour 6, cela correspond aux jours 4 à 6, donc une seule ligne est retenue~; le jour 7, aux jours 5 à 7, d'où $(60 + 90)/2$.
+
+Aucune des deux n'est fausse, mais elles répondent à des questions différentes. Les moyennes sur des jours de cotation utilisent \texttt{ROWS} sur un calendrier propre. Une fenêtre temporelle, comme les 300 dernières secondes, demande \texttt{RANGE}. Dans les deux cas, les premières lignes font la moyenne de moins de trois valeurs, il faut donc décider si on les affiche, ou exiger une fenêtre complète avec \texttt{COUNT(*) OVER (\dots)}.
+
+\iqwrong{«~Trois lignes précédentes, cela fait trois jours.~» Une ligne manquante, qu'il s'agisse d'un jour férié ou d'une erreur de données, allonge en silence une fenêtre \texttt{ROWS} vers le passé.}
+\iqfollow{Un \texttt{RANGE} avec décalage peut-il avoir plusieurs clés de tri~?}{Non. Le décalage s'applique à une seule valeur numérique ou temporelle, et le manuel de SQLite énonce cette exigence d'un seul terme.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:12}
+Elle renvoie cinq lignes, et non deux, une par tick. Le cadre s'arrête à la ligne courante, donc \texttt{LAST\_VALUE}, \texttt{MAX} et \texttt{MIN} ne voient que les ticks jusqu'ici. Le \Cref{lst:iv3:sq:barsfixed} renvoie les deux barres.
+\begin{center}\small
+\begin{tabular}{rrrrr}
+minute & ouverture & haut & bas & clôture\\\hline
+1 & 100.0 & 100.0 & 100.0 & 100.0\\
+1 & 100.0 & 103.0 & 100.0 & 101.0\\
+1 & 100.0 & 103.0 & 100.0 & 103.0\\
+2 & 102.0 & 102.0 & 99.0 & 99.0\\
+2 & 102.0 & 102.0 & 102.0 & 102.0
+\end{tabular}
+\end{center}
+Avec \texttt{ORDER BY} dans une fenêtre et sans cadre, le cadre par défaut va du début de la partition jusqu'à la ligne courante. Ainsi \texttt{LAST\_VALUE} renvoie le cours de la ligne courante, ce que personne ne souhaite en général, et le plus haut et le plus bas courants changent à mesure qu'on avance. Chaque ligne diffère alors, et \texttt{DISTINCT} ne supprime rien. \texttt{FIRST\_VALUE} est juste par chance, puisque le cadre commence toujours au début.
+\omcode{code/interviews-3/07-sql-and-data/sql/bars_fixed.sql}{1}{9}{La partition entière dans le cadre.}\label{lst:iv3:sq:barsfixed}
+\begin{center}\small
+\begin{tabular}{rrrrr}
+minute & ouverture & haut & bas & clôture\\\hline
+1 & 100.0 & 103.0 & 100.0 & 101.0\\
+2 & 102.0 & 102.0 & 99.0 & 99.0
+\end{tabular}
+\end{center}
+Un plan plus simple pour les barres consiste en un \texttt{GROUP BY minute} avec \texttt{MIN} et \texttt{MAX}, l'ouverture et la clôture étant obtenues par \texttt{ROW\_NUMBER} dans chaque sens, ou par \texttt{arg\_min} et \texttt{arg\_max} sur DuckDB.
+
+\iqwrong{«~Elle renvoie deux lignes, car \texttt{DISTINCT} regroupe chaque minute.~» \texttt{DISTINCT} compare des lignes entières, une fois les fenêtres calculées.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:13}
+\Cref{lst:iv3:sq:asofc} trouve, pour chaque transaction, l'heure de la cotation la plus récente dans la fenêtre autorisée, puis effectue une jointure pour récupérer cette cotation. La transaction 1 n'a pas encore de cotation, la transaction 2 utilise la cotation de l'instant 3, la transaction 3 celle de l'instant 12, et la transaction 4 aucune, car 12 est trop ancien. Sans index, le coût est en $O(nm)$ pour $n$ transactions et $m$ cotations~; avec un index, il devient $O(n \log m)$.
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_correlated.sql}{1}{9}{Une recherche as-of avec une limite de péremption.\protect\hfil\protect\break}\label{lst:iv3:sq:asofc}
+\begin{center}\small
+\begin{tabular}{rrrr}
+trade\_id & quote\_ts & bid & ask\\\hline
+1 & NULL & NULL & NULL\\
+2 & 3 & 99.9 & 100.1\\
+3 & 12 & 100.4 & 100.7\\
+4 & NULL & NULL & NULL
+\end{tabular}
+\end{center}
+Il s'agit d'une jointure as-of\index{jointure as-of}~: chaque ligne retient la ligne correspondante la plus récente, située à l'instant de la transaction ou avant. Trois cas limites méritent d'être signalés. Une cotation à l'instant exact de la transaction compte, comme pour la transaction 3. La jointure externe gauche conserve les transactions sans cotation exploitable, au lieu de les supprimer. Enfin, une limite de péremption empêche qu'une transaction à 30 soit valorisée à partir d'une cotation vieille de 18 secondes, ce que ferait la version sans limite. Notons aussi qu'une cotation à la même seconde peut en réalité être arrivée après la transaction~: les données ne peuvent dire que ce que disent les horodatages.
+
+Le coût vient de la sous-requête, exécutée pour chaque transaction. Sans index, le plan de SQLite affiche un simple \texttt{SEARCH q} pour la sous-requête, qui lit toutes les cotations à chaque transaction, et il construit un index automatique pour la jointure vers \texttt{quotes}. Avec un index sur \texttt{ts}, le plan de la sous-requête indique \texttt{USING COVERING INDEX} avec \texttt{(ts>? AND ts<?)}.
+
+\iqwrong{Joindre sur \texttt{q.ts <= t.ts} et prendre \texttt{MAX(q.bid)}. Cela donne le cours acheteur le plus haut du passé, et non le plus récent.}
+\iqfollow{Plusieurs cotations partagent-elles un même instant~?}{Alors la jointure renvoie plusieurs lignes par transaction, et il faut départager les cotations, par exemple par un numéro de séquence.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:14}
+\Cref{lst:iv3:sq:gaps} compare chaque numéro à son suivant et renvoie les intervalles 4 à 5 et 8 à 10. Le seul comptage dit que 5 numéros manquent, mais non où, et c'est pourtant ce qu'il faut demander pour un rejeu. Aucune requête ne peut voir un trou au début ou à la fin, puisque ces numéros ne laissent aucune trace dans la table.
+\omcode{code/interviews-3/07-sql-and-data/sql/seq_gaps.sql}{1}{4}{Intervalles manquants, à partir du successeur de chaque ligne.}\label{lst:iv3:sq:gaps}
+\begin{center}\small
+\begin{tabular}{rr}
+premier\_manquant & dernier\_manquant\\\hline
+4 & 5\\
+8 & 10
+\end{tabular}
+\end{center}
+\texttt{LEAD} donne à chaque ligne la valeur suivante dans l'ordre, et un trou est un endroit où l'écart dépasse 1. La dernière ligne a un successeur NULL, et \texttt{NULL > x} n'est pas vrai, donc elle disparaît. Le coût de la requête se réduit à un tri, et les numéros de séquence sont en général déjà ordonnés.
+
+La formule par comptage présente un second défaut~: les doublons masquent les trous. Sur les lignes 1, 2, 2, 3, 6, elle donne 1, alors que la vérité est 2, car la ligne en trop annule l'un des numéros manquants. \texttt{COUNT(DISTINCT seq)} corrige le comptage. La requête \texttt{LEAD} donne toujours le bon intervalle sur cet exemple, car un écart de 0 n'est pas supérieur à 1.
+
+\iqwrong{Générer chaque numéro du plus petit au plus grand, puis faire une anti-jointure. Cela fonctionne, mais le coût en mémoire est proportionnel à l'intervalle, et sur un flux d'un milliard de messages, c'est un problème.}
+\iqfollow{Comment trouver un trou à la fin~?}{Depuis l'extérieur de la table~: le heartbeat du flux ou le message de fin de session indique le dernier numéro de séquence émis. On compare à cette valeur.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:15}
+Les lignes 3 à 7 sont renvoyées, pour les raisons données dans le tableau ci-dessous. La ligne 7 est une bonne cotation, signalée seulement parce qu'elle revient après l'aberration de la ligne 6. Pour l'éviter, il faut comparer chaque milieu à la médiane des lignes précédentes plutôt qu'à la ligne immédiatement avant.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/bad_ticks.sql}{1}{16}{Une raison par ligne suspecte.}\label{lst:iv3:sq:ticks}
+\begin{center}\small
+\begin{tabular}{rl}
+seq & problème\\\hline
+3 & croisée\\
+4 & taille\\
+5 & temps\\
+6 & saut\\
+7 & saut
+\end{tabular}
+\end{center}
+\texttt{CASE} renvoie la première branche vraie, ce qui fixe l'ordre des contrôles. \texttt{LAG} exige une sous-requête, car une fonction de fenêtre ne peut pas figurer dans \texttt{WHERE}. Un NULL renvoyé par \texttt{LAG} sur la première ligne rend ces comparaisons inconnues, donc la ligne passe~: la première ligne n'a rien à laquelle se comparer. La ligne 5 est signalée pour le temps, car son 4 n'est pas supérieur au 4 de la ligne 4.
+
+Les lignes sont comparées à tout ce qui précède, bonnes ou mauvaises. La ligne 3 est croisée, mais son milieu entre tout de même dans la comparaison de la ligne 4, ce qui peut peser si une cotation croisée est éloignée. La médiane règle les deux points~: une seule valeur aberrante ne peut pas déplacer la médiane de cinq éléments. Ainsi, sur DuckDB, où une médiane en fenêtre existe, seule la ligne 6 est signalée pour un saut, tandis que les lignes 3, 4 et 5 gardent leurs autres raisons. SQLite 3.37 ne dispose pas d'une telle fonction.
+
+\iqwrong{Supprimer automatiquement chaque ligne signalée. La ligne 7 est réelle, et un véritable écart lors d'une annonce peut ressembler à la ligne 6~: il faut donc examiner les sauts, ou les vérifier auprès d'une autre source, avant de les supprimer.}
+\iqwhy{Une stratégie entraînée sur des données contenant une seule cotation croisée ou une seule mauvaise transaction peut apprendre à trader dessus, et le backtest affichera un profit que personne ne peut réaliser.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:16}
+\texttt{quantile\_disc} renvoie 80 et \texttt{quantile\_cont} renvoie 92, à l'arrondi près~: DuckDB 1.5.5 affiche 91.99999999999996. Le \Cref{lst:iv3:sq:rank} donne la valeur du rang le plus proche sur SQLite~: 80. Pour la latence, il faut rapporter une valeur qui a réellement été observée, selon une règle énoncée, car un nombre interpolé peut tomber là où aucune requête n'a jamais eu lieu.
+\omcode{code/interviews-3/07-sql-and-data/sql/nearest_rank.sql}{1}{6}{La règle du rang le plus proche.}\label{lst:iv3:sq:rank}
+
+La forme discrète renvoie une valeur réelle~: la plus petite qui laisse au moins 90~\% des lignes à son niveau ou en dessous, soit le 9\up{e} sur 10. La forme continue traite les valeurs triées comme des points entre lesquels interpoler. Sa position vaut $0.9 \times (10 - 1) = 8.1$, comptée à partir de 0, ce qui correspond à un dixième du chemin de 80 à 200, donc $80 + 0.1 \times 120 = 92$. Aucune requête n'a duré 92 microsecondes~: l'intervalle entre 80 et 200 est précisément la zone où la distribution ne contient rien.
+
+Dans le listing, le test \texttt{pos * 10 >= n * 9} garde le calcul en entiers, ce qui est exact, et il évite \texttt{CEIL}, que toutes les versions de SQLite ne fournissent pas. Il donne le même 80 sur les deux moteurs.
+
+La queue de distribution est là où cela compte le plus. Avec dix lignes, le 90\up{e}~centile et le maximum ne sont séparés que par une observation. Un échantillon aussi petit ne permet rien d'affirmer avec certitude sur la queue, et le 99\up{e}~centile de dix lignes n'est tout simplement que le maximum.
+
+\iqwrong{Moyenner des centiles entre plateformes ou entre jours. Un centile ne se moyenne pas. Pour les combiner, il faut fusionner les données brutes ou les histogrammes, puis lire le centile.}
+\iqfollow{\texttt{NTILE(10)}~?}{Il répartit les lignes en dix groupes presque égaux, et peut placer des valeurs égales dans des groupes différents, si bien que la frontière n'est pas un centile propre.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:17}
+La requête A cherche sur les deux colonnes, sans tri. La requête B parcourt la table. La requête C cherche sur \texttt{symbol}, et l'index fournit l'ordre, donc elle n'a pas besoin de tri. La requête D cherche sur \texttt{symbol} mais nécessite un tri. La requête E parcourt la table. La règle est qu'un index sur \texttt{(symbol, ts)} est trié par symbole, puis par instant~; il n'aide donc qu'à partir de sa colonne la plus à gauche, et seulement sur les colonnes elles-mêmes.
+
+L'\texttt{EXPLAIN QUERY PLAN} de SQLite, tel que lu par le test, donne~:
+\begin{itemize}
+\item A~: \texttt{SEARCH trades USING INDEX by\_symbol\_ts (symbol=? AND ts>?)}.
+\item B~: \texttt{SCAN trades}. Les instants ne sont triés qu'à l'intérieur de chaque symbole, si bien qu'une condition sur \texttt{ts} seul n'a pas de point de départ unique.
+\item C~: \texttt{SEARCH} avec \texttt{(symbol=?)}, et pas d'étape de tri, car les lignes d'un même symbole sortent dans l'ordre des instants.
+\item D~: la même recherche, puis \texttt{USE TEMP B-TREE FOR ORDER BY}.
+\item E~: \texttt{SCAN trades}. Une fonction appliquée à une colonne masque celle-ci à l'index, même lorsque le préfixe est fixé. \texttt{symbol >= \textquotesingle{}A\textquotesingle{} AND symbol < \textquotesingle{}B\textquotesingle{}} peut l'utiliser.
+\end{itemize}
+
+Il faut donc écrire l'index avec la colonne d'égalité en premier, puis la colonne de l'intervalle ou du tri. SQLite peut parfois utiliser un index sans sa première colonne, par un skip-scan, mais seulement avec les statistiques de \texttt{ANALYZE} et peu de valeurs distinctes en première position, si bien qu'il ne faut pas compter dessus.
+
+\iqfollow{La requête ne lit que \texttt{ts} et \texttt{price}, et elle est critique. Que pouvez-vous faire d'autre~?}{Ajouter \texttt{price} à l'index, sous la forme \texttt{(symbol, ts, price)}~: le plan indique alors \texttt{COVERING INDEX}, puisque la table n'est jamais consultée. Chaque index supplémentaire ralentit chaque écriture.}
+\iqfollow{L'ajouteriez-vous sur une colonne d'un stockage en colonnes comme DuckDB~?}{En général pas au départ. Il lit des blocs de colonne et les saute grâce au minimum et au maximum de chaque bloc, si bien que trier les données au chargement permet souvent d'obtenir ce que donnerait l'index.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:18}
+\Cref{lst:iv3:sq:islands} renvoie les jours 6 à 8, une série de 3. C'est la méthode des gaps-and-islands\index{gaps and islands}~: la position d'une ligne dans toute la table, moins sa position parmi les lignes gagnantes, reste la même pour chaque ligne d'une série.
+\omcode{code/interviews-3/07-sql-and-data/sql/islands.sql}{1}{14}{Îlots, à partir de la différence des numéros de ligne.}\label{lst:iv3:sq:islands}
+
+On numérote toutes les lignes par jour pour obtenir \texttt{pos}. On garde ensuite les gagnantes et on les renumérote. Le long d'une série de gagnantes, les deux numéros augmentent de 1 par ligne, donc leur différence reste fixe. Chaque ligne perdante sautée fait croître \texttt{pos} mais non le second numéro, si bien que la différence saute d'une série à l'autre. Ici, les gagnantes sont aux positions 1, 2, 4, 5, 6, 8, le second numéro va de 1 à 6, et les différences valent 0, 0, 1, 1, 1, 2~: trois îlots, de tailles 2, 3 et 1.
+
+\texttt{pos} doit provenir d'une première étape portant sur toutes les lignes. Utiliser \texttt{day} lui-même compterait un jour manquant comme une rupture, alors que la question porte sur des lignes consécutives, et les jours 4 et 5 n'existent tout simplement pas dans cette table. Le test compare le résultat à une boucle Python simple sur 100 tables aléatoires avec des trous dans les jours.
+
+La règle de départage s'écrit dans le \texttt{ORDER BY} final, et \texttt{LIMIT 1} prend le premier. Notons que \texttt{LIMIT} n'existe pas dans tous les dialectes, certains moteurs utilisant \texttt{FETCH FIRST}.
+
+\iqwrong{Utiliser \texttt{LAG} seul. Il indique où une série commence, mais non sa longueur. Il faut encore un compteur cumulé des débuts, ce qui est la méthode qui consiste à marquer les débuts puis à les sommer, sous une autre forme.}
+\iqfollow{La plus longue série de pertes~?}{Changer le filtre. La même numérotation de toute la table s'applique.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:19}
+\Cref{lst:iv3:sq:sessions} marque chaque événement qui débute une session, puis prend la somme cumulée des marques comme numéro de session. Il renvoie trois sessions pour ann et deux pour bob. Un écart de exactement 300 est le cas à tester, car la règle dit que «~300 ou moins~» prolonge une session, et les deux derniers événements de bob testent précisément ce point.
+\omcode{code/interviews-3/07-sql-and-data/sql/sessions.sql}{1}{15}{Marquer les débuts, puis les sommer.}\label{lst:iv3:sq:sessions}
+\begin{center}\small
+\begin{tabular}{lrrrr}
+trader & session & premier\_ts & dernier\_ts & n\\\hline
+ann & 1 & 100 & 200 & 2\\
+ann & 2 & 700 & 800 & 2\\
+ann & 3 & 1500 & 1500 & 1\\
+bob & 1 & 150 & 150 & 1\\
+bob & 2 & 460 & 760 & 2
+\end{tabular}
+\end{center}
+Ce motif mérite d'être retenu~: une condition sur des lignes voisines se transforme en une colonne de 0 ou de 1, et une somme cumulée en fait un numéro de groupe. Les partitions séparent les deux traders, si bien que le dernier événement de ann n'a aucun effet sur le premier de bob. Un premier événement n'a pas de prédécesseur, donc \texttt{LAG} donne NULL, la comparaison est inconnue, et \texttt{CASE} tombe sur \texttt{ELSE 1}, ce qui ouvre correctement une session.
+
+Les écarts de bob sont de 310 et 300. Le premier ouvre une nouvelle session, et le second en prolonge une. Écrire \texttt{< 300} couperait cette dernière paire, et seul un test sur la frontière le remarquerait.
+
+\iqwrong{Regroupement sur \texttt{ts / 300}. Des compartiments fixes sont simples, mais deux événements séparés d'une seconde peuvent tomber dans des compartiments différents, et une longue session est coupée à chaque multiple de 300.}
+\iqfollow{Pourriez-vous lancer cette requête toutes les heures sur de nouvelles données~?}{Oui, mais une session peut chevaucher la frontière, si bien qu'il faut retraiter la dernière session ouverte de chaque trader plutôt que repartir de zéro.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:20}
+Le \Cref{lst:iv3:sq:ffill} crée un groupe pour chaque prix connu et étale ce prix sur son groupe. Il renvoie NULL, 10, 10, 10, 12, 12. Sur DuckDB, une seule ligne suffit~: \texttt{LAST\_VALUE(price IGNORE NULLS) OVER (ORDER BY day)}. Remplir à rebours ferait remonter dans le passé un prix venu du futur, ce qui, dans un backtest, relève du look-ahead.
+\omcode{code/interviews-3/07-sql-and-data/sql/ffill.sql}{1}{7}{Remplissage vers l'avant avec un compteur cumulé.}\label{lst:iv3:sq:ffill}
+\begin{center}\small
+\begin{tabular}{rr}
+day & filled\\\hline
+1 & NULL\\
+2 & 10.0\\
+3 & 10.0\\
+4 & 10.0\\
+5 & 12.0\\
+6 & 12.0
+\end{tabular}
+\end{center}
+\texttt{COUNT(price)} ignore les NULL, donc sa valeur cumulée ne progresse qu'à un prix connu. Les groupes par jour valent 0, 1, 1, 1, 2, 2. Chaque groupe contient au plus un prix non NULL, donc \texttt{MAX} sur le groupe renvoie exactement ce prix. Le groupe 0 n'en a aucun, si bien que le jour 1 reste NULL, comme le demande la question.
+
+SQLite rejette la syntaxe \texttt{IGNORE NULLS}, et le test le confirme, d'où le recours à cette astuce sur ce moteur.
+
+\iqwrong{\texttt{COALESCE(price, LAG(price) OVER (ORDER BY day))}. Elle ne remplit qu'un pas~: la valeur précédente du jour 4 est elle-même NULL, si bien qu'elle reste NULL.}
+\iqfollow{Limiteriez-vous le remplissage à un jour au plus, pour qu'un prix périmé ne soit pas reporté indéfiniment~?}{On garde aussi \texttt{MAX(CASE WHEN price IS NOT NULL THEN day END) OVER (ORDER BY day)}, le dernier jour avec un prix, et l'on ne remplit que si \texttt{day} moins ce jour vaut au plus 1. Ici, le jour 4 reste alors NULL.}
+\iqwhy{Un prix rempli est un prix périmé~: un rendement calculé à travers un remplissage vaut 0, puis un saut. Pour la volatilité et la corrélation, cela peut peser plus que le trou lui-même.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:21}
+Sur DuckDB, on utilise \texttt{ASOF LEFT JOIN} (\cref{lst:iv3:sq:asofd}). L'autre requête fusionne les deux tables et recourt à l'astuce du compteur cumulé (\cref{lst:iv3:sq:asofu}). Chacune effectue un tri, soit un coût d'environ $O((n + m) \log(n + m))$, alors qu'une recherche corrélée sans index coûte $O(nm)$.
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_duckdb.sql}{1}{4}{Une jointure as-of sur DuckDB.}\label{lst:iv3:sq:asofd}
+\omcode{code/interviews-3/07-sql-and-data/sql/asof_union.sql}{1}{17}{La même avec un flux fusionné.}\label{lst:iv3:sq:asofu}
+\begin{center}\small
+\begin{tabular}{lrr}
+symbol & ts & mid\\\hline
+AAA & 5 & 100.0\\
+AAA & 12 & 101.0\\
+BBB & 1 & NULL\\
+BBB & 7 & 50.0
+\end{tabular}
+\end{center}
+On place les cotations et les transactions dans un même flux, trié par symbole, par instant et par \texttt{kind}. Au sein d'un symbole, \texttt{COUNT(mid)} progresse à chaque cotation et reste inchangé à chaque transaction. Ainsi, une transaction partage un groupe avec exactement la dernière cotation qui la précède, et \texttt{MAX(mid)} sur ce groupe est le mid de cette cotation. La dernière étape ne garde que les transactions, par \texttt{kind = 1}.
+
+C'est dans \texttt{kind} que se loge la règle de départage. Les cotations valent 0 et les transactions 1, si bien qu'à instants égaux une cotation passe en premier, comme le demande la question. Pour exclure une cotation au même instant, il suffit de les échanger.
+
+Les tests comparent les deux requêtes à une recherche par force brute sur 100 tables aléatoires. Les cotations y ont des instants uniques par symbole. Avec des doublons, cette requête a besoin d'une clé de tri supplémentaire, car rien ne dit alors laquelle des deux cotations compte en dernier, et le résultat dépend de l'ordre dans lequel le moteur les lit effectivement.
+
+\iqwrong{«~Un index réglerait le problème.~» Il ramènerait chaque recherche à $O(\log m)$, mais la question n'en a pas, et la fusion n'en a pas besoin.}
+\iqfollow{Lequel des deux côtés est le côté externe~?}{Dans le listing DuckDB, les transactions sont à gauche, de sorte qu'une transaction sans cotation antérieure est conservée, avec NULL. Un \texttt{ASOF JOIN} simple l'aurait éliminée.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:22}
+Elle renvoie cinq lignes pour trois transactions. La transaction ABC du 2024-05-01 apparaît deux fois, car \texttt{BETWEEN} inclut les deux bornes, ce qui est un défaut de la requête. La transaction XYZ apparaît deux fois, car les instruments 3 et 4 se chevauchent dans \texttt{master}, ce qui est un défaut des données. Le \Cref{lst:iv3:sq:pitfixed} corrige le premier, et \cref{lst:iv3:sq:overlaps} repère le second.
+\begin{center}\small
+\begin{tabular}{llrr}
+ticker & day & qty & inst\_id\\\hline
+XYZ & 2022-07-01 & 30 & 3\\
+XYZ & 2022-07-01 & 30 & 4\\
+ABC & 2024-04-30 & 10 & 1\\
+ABC & 2024-05-01 & 20 & 1\\
+ABC & 2024-05-01 & 20 & 2
+\end{tabular}
+\end{center}
+\omcode{code/interviews-3/07-sql-and-data/sql/pit_fixed.sql}{1}{4}{Une jointure sur intervalles semi-ouverts.}\label{lst:iv3:sq:pitfixed}
+\omcode{code/interviews-3/07-sql-and-data/sql/pit_overlaps.sql}{1}{4}{Lignes de master qui se chevauchent.}\label{lst:iv3:sq:overlaps}
+
+Les dates désignent un intervalle semi-ouvert, allant de \texttt{valid\_from} jusqu'à \texttt{valid\_to} exclu, alors que \texttt{BETWEEN} est fermé aux deux bornes. Le jour de la bascule, les deux lignes ABC correspondent toutes deux, si bien qu'une jointure interne multiplie la transaction, et qu'un rapport de volumes la compte deux fois. La requête corrigée n'affecte cette transaction qu'à l'instrument 2.
+
+Aucune correction de requête ne peut trancher pour XYZ, puisque la table master elle-même revendique deux propriétaires de juin à décembre 2022. Deux intervalles semi-ouverts se chevauchent exactement lorsque chacun commence avant la fin de l'autre, et cette seule ligne constitue le contrôle. Elle renvoie (3, 4), et elle doit être exécutée comme test chaque fois que \texttt{master} est chargée.
+
+Les dates ISO en texte se comparent correctement comme des chaînes, ce qui explique que les comparaisons fonctionnent ici, sur SQLite comme sur DuckDB. Les autres formats de date ne le font pas.
+
+\iqwrong{«~Utilisez \texttt{DISTINCT} pour supprimer les doublons.~» Cela masque la double correspondance, et laisse dans le résultat un instrument erroné.}
+\iqfollow{Pourquoi ne pas joindre sur le ticker du jour pour chaque instrument~?}{L'historique obtient alors la mauvaise société, ou aucune pour une société radiée, ce qui exclut les entreprises défaillantes. Ce biais de survie explique pourquoi la master data porte des dates.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:23}
+Le \Cref{lst:iv3:sq:rvwap} utilise un cadre \texttt{RANGE} sur \texttt{ts} et renvoie le tableau ci-dessous. Les deux transactions à 420 se voient bien l'une l'autre, car \texttt{RANGE} inclut les pairs, si bien qu'elles reçoivent la même valeur. Avec un \texttt{ts} de type double, le raccourci entier pour la borne ouverte ne fonctionne plus.
+\omcode{code/interviews-3/07-sql-and-data/sql/rolling_vwap.sql}{1}{4}{Une fenêtre de cinq minutes, définie en temps.}\label{lst:iv3:sq:rvwap}
+\begin{center}\small
+\begin{tabular}{rr}
+ts & vwap\\\hline
+0 & 100.000\\
+120 & 100.500\\
+299 & 101.250\\
+300 & 102.000\\
+420 & 100.571\\
+420 & 100.571
+\end{tabular}
+\end{center}
+La fenêtre doit être ouverte en $t - 300$ et fermée en $t$, et un cadre \texttt{RANGE} est fermé aux deux bornes. Avec des secondes entières, 299 preceding revient exactement à la borne ouverte en 300~: une transaction à 0 est hors de la fenêtre pour la transaction à 300, comme l'indique la valeur 102.000. Cela vaut $(1010 + 2040 + 1030) / 40$, à partir des transactions à 120, 299 et 300. À 420, la somme porte sur les transactions à 299, 300 et sur les deux à 420~: $7040 / 70 \approx 100.571$.
+
+Une fenêtre glissante revient à un seul parcours des lignes triées, en ajoutant et en retirant au fil du déplacement du cadre~; un bon moteur y parvient donc en $O(n \log n)$, surtout pour le tri. On compare l'auto-jointure, dont le coût croît avec le nombre de paires à l'intérieur de la fenêtre.
+
+Avec des instants en double, aucun décalage fini ne donne une borne ouverte exactement, et retrancher une petite tolérance relève du bricolage. On convertit d'abord le temps en microsecondes ou en nanosecondes entières, et la même requête devient exacte. C'est aussi ainsi qu'il faut stocker les temps.
+
+\iqwrong{\texttt{ROWS BETWEEN 299 PRECEDING AND CURRENT ROW}. Cela compte 300 transactions, et non 300 secondes. Un jour calme, la fenêtre remonte sur des heures~; un jour chargé, elle ne couvre qu'une fraction de seconde.}
+\iqfollow{Pourquoi divisez-vous deux sommes de fenêtre plutôt que de calculer une moyenne~?}{La moyenne du prix sur une fenêtre pondère chaque transaction de la même façon, alors que le VWAP pondère par la quantité. Une clause \texttt{WINDOW} montre que les deux sommes utilisent le même cadre.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:24}
+On porte toutes les actions achetées sur une droite numérique, et toutes les actions vendues sur une autre~: premier entré, premier sorti signifie que la $k$-ième action vendue est la $k$-ième action achetée. Chaque exécution est donc un intervalle, et la quantité appariée est le recouvrement, comme dans le \cref{lst:iv3:sq:fifo}. Le profit total vaut ici 4000, et la requête reste correcte lorsque la position passe en vente à découvert.
+\omcode{code/interviews-3/07-sql-and-data/sql/fifo.sql}{1}{16}{Premier entré, premier sorti, sous forme d'intervalles qui se recouvrent.}\label{lst:iv3:sq:fifo}
+\begin{center}\small
+\begin{tabular}{rrrr}
+buy\_seq & sell\_seq & qty & pnl\\\hline
+1 & 3 & 100 & 2000\\
+2 & 3 & 20 & 200\\
+2 & 5 & 30 & 600\\
+4 & 5 & 30 & 1200
+\end{tabular}
+\end{center}
+Une somme cumulée par côté donne à chaque exécution son intervalle~: les achats couvrent $[0, 100)$, $[100, 150)$ et $[150, 180)$, et les ventes couvrent $[0, 120)$ et $[120, 180)$. Deux intervalles semi-ouverts se chevauchent lorsque chacun commence avant la fin de l'autre, et la longueur commune est la plus petite fin moins la plus grande origine. C'est ce que fait \texttt{CASE}, car le \texttt{MIN} à deux arguments de SQLite a un autre sens sur DuckDB, où il renvoie une liste, et \texttt{LEAST} n'existe pas dans SQLite 3.37. Le profit par paire vaut $(\text{vente} - \text{achat}) \times \text{qté}$. Le test compare avec une boucle en Python fondée sur une file, sur 150 historiques aléatoires.
+
+Pour les ventes à découvert, le même raisonnement tient. Quel que soit le sens dans lequel la position traverse zéro, le premier entré premier sorti des deux côtés apparie toujours la $k$-ième action achetée avec la $k$-ième action vendue. Le test le confirme sur des historiques aléatoires qui passent effectivement à découvert. Seule change la lecture d'une ligne~: lorsque \texttt{sell\_seq} précède \texttt{buy\_seq}, il s'agit d'une vente à découvert et de sa couverture ultérieure.
+
+Les actions achetées mais pas encore vendues n'ont aucun intervalle correspondant~; elles n'apparaissent donc dans aucune ligne. Cela constitue la position ouverte, évaluée par la valorisation au prix du marché, et non ici. Avec plusieurs symboles, il faut ajouter le symbole à la partition et à la jointure.
+
+\iqwrong{«~SQL a besoin d'un curseur ou d'une récursion, car les lots sont consommés un par un.~» Penser aux positions comme à des intervalles sur une droite numérique supprime complètement cet état. La même astuce ne fonctionne pas pour le dernier entré premier sorti, où l'appariement dépend réellement du chemin suivi.}
+\iqfollow{Et le coût~?}{La auto-jointure sur des inégalités peut examiner beaucoup de paires sans un moteur qui gère bien ce type de jointure. Un parcours à deux pointeurs écrit en code est en $O(n)$~; il faut donc l'utiliser pour un rapport plutôt que sur un chemin critique.}
+\end{solution}
+
+\begin{solution}{iq:iv3:sql-and-data:25}
+\Cref{lst:iv3:sq:best} transforme l'historique en versions de chaque niveau de prix, chacune valable d'une étape jusqu'au changement suivant à ce prix, et retient à chaque étape le niveau vivant le plus élevé. Il renvoie le tableau ci-dessous. Sur SQLite, son coût est en $O(n^2)$ pour $n$ événements~; je ne le lancerais donc pas sur une journée de données~: il vaut mieux rejouer les événements en code.
+\enlargethispage{-3\baselineskip}%
+\omcode{code/interviews-3/07-sql-and-data/sql/best_bid.sql}{1}{15}{Le meilleur cours acheteur à chaque étape.}\label{lst:iv3:sq:best}
+\begin{center}\small
+\begin{tabular}{rrr}
+seq & price & qty\\\hline
+1 & 100 & 50\\
+2 & 101 & 20\\
+3 & 101 & 20\\
+4 & 100 & 80\\
+5 & 100 & 80\\
+6 & 99 & 40
+\end{tabular}
+\end{center}
+Par prix, le \texttt{SUM(delta)} cumulé donne la quantité du niveau après chacun de ses changements, et \texttt{LEAD(seq)} indique quand cette version prend fin. Une version est donc vivante sur l'intervalle semi-ouvert allant de son \texttt{seq} jusqu'au suivant, ou jusqu'à la fin si le suivant vaut NULL. En joignant chaque étape aux versions vivantes à cet instant, avec une quantité positive, on obtient le carnet à cette étape. \texttt{ROW\_NUMBER} par prix décroissant retient le meilleur. La jointure externe à gauche ramène une étape où le côté est vide, avec des NULL. Les tests comparent avec une relecture par dictionnaire sur 100 historiques aléatoires.
+
+Le problème vient de la jointure. Sa sortie compte environ $n \times L$ lignes, pour $L$ niveaux vivants, et sur SQLite, sans index pour l'inégalité, la recherche compare chaque étape à chaque version, soit $O(n^2)$. Un autre moteur saura peut-être mieux planifier cette jointure, mais une relecture en code avec une table ordonnée coûte $O(n \log L)$ et se lit en flux depuis le disque. Sur un instrument très actif, avec des millions d'événements et des centaines de niveaux, l'une est une requête que l'on lance sur un échantillon d'une matinée, l'autre est ce que l'on déploie.
+
+\iqwrong{Prendre \texttt{MAX(price)} des événements à \texttt{delta} positif jusqu'à présent. Cela oublie qu'un niveau peut se vider, de sorte qu'après l'étape 4 il afficherait encore 101.}
+\iqfollow{Comment réduire la jointure~?}{Un niveau ne compte que s'il reste proche du sommet, donc il faut filtrer sur les prix situés à quelques ticks du meilleur cours observé jusqu'alors. Ou bien lancer la requête sur une petite tranche temporelle, par lot. Les deux aident, mais une relecture est plus simple.}
+\end{solution}

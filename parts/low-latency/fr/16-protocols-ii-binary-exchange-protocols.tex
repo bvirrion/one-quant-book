@@ -1,0 +1,392 @@
+\chapter{Protocoles II~: protocoles d'échange binaires}\label{ch:ll:protocols-ii-binary-exchange-protocols}
+
+Une bourse de contrats à terme envoie chaque paquet de ses données de marché deux fois, sur deux réseaux distincts, sous forme de messages binaires à décalages fixes
+que lit un programme sans analyse syntaxique. La documentation de CME Group demande à ses clients de «~traiter à la fois le flux Incremental
+Feed A et le flux Incremental Feed B en raison de la nature peu fiable du transport UDP~», et de retenir chaque numéro de séquence
+depuis la ligne qui le livre en premier, et de traiter comme une perte sur les deux lignes tout numéro de séquence qu'aucune des deux n'a livré, ce qui appelle
+une reprise. Le feed handler a donc pour premier travail non pas de comprendre le marché, mais de garder la première copie de tout
+et d'oublier la seconde. Ce chapitre examine les protocoles binaires du simulateur de bourse du livre~10, qui suivent
+les spécifications publiques de Nasdaq~: messages ordre par ordre à décalages fixes, paquets portant des numéros de séquence sur le
+\omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast}, canaux d'instantanés (snapshot) et de retransmission pour la reprise, et saisie des ordres sur une session séquencée. Il génère les
+codecs à partir d'un schéma au lieu de les écrire à la main, arbitre deux lignes sujettes aux pertes, et mesure le coût du décodage.
+
+\section{Flux ordre par ordre et leurs messages}
+
+Le flux direct d'une plateforme de négociation (livre~1, chapitre~9) publie chaque événement de son carnet~: un ordre ajouté, exécuté, réduit,
+supprimé, remplacé, une transaction contre une liquidité cachée, le croisement d'une enchère. C'est la vue market-by-order du
+livre~1, chapitre~19, à partir de laquelle un abonné reconstruit le carnet à toute profondeur. Le TotalView-ITCH de Nasdaq est le modèle que
+suit le simulateur~: chaque message commence par un type d'un octet, puis des champs à décalages fixes, avec «~tous les champs entiers \dots\
+big-endian (ordre d'octets du réseau)~». Un Add Order fait 36 octets~: le type au décalage 0, un code locate sur deux octets au décalage 1 (un petit entier
+«~employé dans l'intention de servir d'indice de tableau~»), un numéro de suivi au décalage 3, un horodatage de six octets en
+nanosecondes depuis minuit au décalage 5, la référence de l'ordre au décalage 11, le sens au décalage 19, le nombre d'actions au décalage 20, le symbole au décalage 24 et le prix
+au décalage 32, un entier en dix-millièmes (voir la \cref{fig:ll:protocols-ii-binary-exchange-protocols:layout}). Il n'y a rien à chercher~: le prix
+d'un Add Order est toujours les quatre octets au décalage 32.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,b/.style={draw=gray!70,minimum height=0.55cm,inner sep=1pt,anchor=west,align=center}]
+\def\u{0.33}
+\node[anchor=west,font=\footnotesize\bfseries] at (0,1.0) {paquet MoldUDP64};
+\node[b,fill=gray!12,minimum width=10*\u cm] (s) at (0,0.35) {session (10)};
+\node[b,fill=omDef!25,minimum width=8*\u cm] (q) at (s.east) {numéro de séquence (8)};
+\node[b,fill=omDef!12,minimum width=2*\u cm] (c) at (q.east) {nombre};
+\node[b,fill=gray!12,minimum width=2*\u cm] (l) at (c.east) {long.};
+\node[b,fill=omThm!15,minimum width=7*\u cm] (m) at (l.east) {message 1};
+\node[b,fill=gray!12,minimum width=2*\u cm] (l2) at (m.east) {long.};
+\node[anchor=west,font=\footnotesize\bfseries] at (0,-0.55) {message Add Order (36 octets)};
+\foreach \w/\c/\t [count=\k] in {1/omThm!35/A,2/gray!12/loc,2/gray!12/trk,6/omMeth!20/temps (ns),8/omDef!20/référence,
+  1/omThm!35/B,4/omMeth!20/quantité,8/gray!12/titre,4/omDef!20/prix} {
+  \ifnum\k=1 \node[b,fill=\c,minimum width=\w*\u cm,font=\tiny] (f\k) at (0,-1.2) {\t};
+  \else \pgfmathtruncatemacro{\j}{\k-1}\node[b,fill=\c,minimum width=\w*\u cm,font=\tiny] (f\k) at (f\j.east) {\t}; \fi
+}
+\foreach \k/\o in {1/0,2/1,3/3,4/5,5/11,6/19,7/20,8/24,9/32} {
+  \node[font=\tiny,anchor=north] at ([yshift=-0.02cm]f\k.south west) {\o};
+}
+\node[font=\tiny,anchor=north] at ([yshift=-0.02cm]f9.south east) {36};
+\node[anchor=west,font=\scriptsize] at (0,-2.2) {décalages en octets sous chaque champ~; entiers big-endian~; prix en 1/10\,000};
+\end{tikzpicture}
+
+\omcaption{Un paquet MoldUDP64 (session, numéro de séquence de son premier message, nombre de messages, puis blocs de messages
+précédés de leur longueur) et le message Add Order de 36 octets qu'il transporte, avec le décalage de chaque champ. La disposition est celle des
+spécifications de Nasdaq, que suit le simulateur du livre~10.}\label{fig:ll:protocols-ii-binary-exchange-protocols:layout}
+\end{omfigure}
+
+\begin{definition}[Codec flyweight]\label{def:ll:protocols-ii-binary-exchange-protocols:flyweight}
+Un \emph{codec flyweight}\index{codec flyweight} (flyweight codec) lit et écrit un message sur place~: un petit objet qui ne contient qu'un
+pointeur vers les octets du message et décode un champ à partir de son décalage fixe au moment où on le demande, de sorte que décoder
+un message ne recopie rien et ne coûte rien pour les champs non lus.
+\end{definition}
+
+La construction génère un \omterm{def:ll:protocols-ii-binary-exchange-protocols:flyweight}{codec flyweight} par message à partir du schéma lisible par machine du livre~10, un décodeur et un encodeur, et un répartiteur
+qui appelle un visiteur de type adéquat selon le premier octet d'un message (voir le \cref{lst:ll:protocols-ii-binary-exchange-protocols:flyweight}).
+Le décodeur du livre~1, chapitre~28, faisait l'inverse~: il recopiait chaque message dans une structure commune et appelait un
+\texttt{std::function} pour chaque message. Les deux sont corrects~; la \cref{fig:ll:protocols-ii-binary-exchange-protocols:decode} mesure la
+différence.
+
+\omcode{code/firm/wirecodec/cpp/firm_wirecodec.hpp}{39}{51}{Le codec flyweight généré du message Add Order~: un pointeur, et
+une inversion des octets à un décalage fixe pour chaque champ lu.}\label{lst:ll:protocols-ii-binary-exchange-protocols:flyweight}
+
+\section{Paquets, numéros de séquence et multicast}
+
+\begin{definition}[Multicast, trou de séquence]\label{def:ll:protocols-ii-binary-exchange-protocols:multicast}
+Le \emph{multicast}\index{multicast} est la distribution IP d'un paquet vers chaque hôte ayant rejoint une adresse de groupe~: l'émetteur
+l'envoie une seule fois, et le réseau copie le paquet vers chaque abonné. Un \emph{trou de séquence}\index{trou de séquence} (message gap) est une plage
+de numéros de séquence qu'un récepteur n'a pas reçus quand un numéro ultérieur arrive.
+\end{definition}
+
+Les données de marché sont publiées en \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast} UDP parce qu'un seul paquet atteint alors chaque abonné au même moment, quel que soit leur
+nombre~: MoldUDP64, le protocole de paquets du flux du simulateur, est décrit par sa spécification comme une «~couche
+de protocole légère construite au-dessus d'UDP~» dans laquelle «~chaque paquet sortant n'est transmis qu'une seule fois, quel que soit le nombre
+d'auditeurs~». UDP livre sans accusé de réception, sans retransmission ni ordre, si bien que le protocole placé au-dessus transporte ce dont le
+récepteur a besoin pour remarquer une perte~: l'en-tête de chaque paquet donne le numéro de séquence de son premier message et le nombre
+de messages qu'il transporte (voir la \cref{fig:ll:protocols-ii-binary-exchange-protocols:layout}). Un paquet dont le premier numéro dépasse le
+numéro attendu suivant révèle un trou de la taille de l'écart. Lorsqu'il n'y a pas de données, l'éditeur envoie des \omterm{def:ll:protocols-i-fix:session}{heartbeats}, des paquets dont le nombre
+de messages égal à zéro et portant le numéro de séquence suivant, «~typiquement \dots\ une fois par seconde~», de sorte qu'une perte soit remarquée même sur un marché calme
+marché~; un nombre de messages de 65\,535 marque la fin de la session. Les numéros de séquence sont ceux du livre~1, chapitre~28, tels
+qu'ils circulent sur le réseau.
+
+\section{Canaux incrémentaux et d'instantanés, retransmission et reprise}
+
+\begin{definition}[Canal incrémental, canal d'instantanés]\label{def:ll:protocols-ii-binary-exchange-protocols:channels}
+Un \emph{canal incrémental}\index{canal incrémental} (incremental channel) transporte les messages du flux, chacun étant une modification du carnet, dans l'ordre de la séquence.
+Un \emph{canal d'instantanés}\index{canal d'instantanés} (snapshot channel) publie à intervalle régulier l'état complet du carnet de chaque instrument
+accompagné du numéro de séquence incrémental qu'il reflète, de sorte qu'un récepteur qui a perdu des messages ou vient de démarrer puisse
+reconstruire le carnet sans rejouer la journée.
+\end{definition}
+
+Un trou laisse au récepteur deux moyens de rattrapage. Une demande de retransmission est adressée à un serveur pour les numéros de séquence manquants~: MoldUDP64 prévoit un
+paquet de demande à cet effet~: le simulateur répond jusqu'à 1\,000 messages par demande à partir d'une fenêtre de ses 100\,000 derniers messages, et
+un petit trou est comblé en un aller-retour. Un trou au-delà de la fenêtre, ou un récepteur qui démarre en pleine journée, a besoin du
+\omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{canal d'instantanés}~: le simulateur publie, pour chaque instrument, une balise de début avec le numéro de séquence incrémental que
+reflète l'instantané, l'état de négociation, chaque ordre affiché dans l'ordre de priorité, et une balise de fin accompagnée d'une somme de contrôle. Le
+récepteur continue de mettre en mémoire tampon les messages incrémentaux, attend l'instantané suivant, le charge, écarte les messages tamponnés
+que l'instantané reflète déjà et applique le reste (le motif snapshot-and-delta du livre~3, chapitre~26, et la
+reprise par instantané (snapshot) du livre~10, chapitre~26). Les messages d'instantané de CME portent le même champ de synchronisation,
+\emph{LastMsgSeqNumProcessed}, «~utilisé pour synchroniser la boucle d'instantanés avec le flux temps réel~». Le délai de reprise est fixé
+par l'intervalle entre instantanés, et la \cref{prop:ll:protocols-ii-binary-exchange-protocols:both} précise à quelle fréquence on en a besoin.
+
+\section{Arbitrage des lignes redondantes}
+
+\begin{definition}[Arbitrage de lignes]\label{def:ll:protocols-ii-binary-exchange-protocols:arbitration}
+L'\emph{arbitrage de lignes}\index{arbitrage de lignes} (line arbitration) fusionne les paquets identiques des lignes de flux redondantes (livre~10,
+chapitre~26) en un seul flux~: chaque numéro de séquence est traité depuis celle des deux lignes qui le livre en premier et écarté lorsque l'autre
+ligne le livre de nouveau, et un trou n'est déclaré que lorsqu'un numéro de séquence ultérieur arrive avant qu'aucune ligne n'ait livré les
+numéros manquants.
+\end{definition}
+
+\omcode{code/low-latency/16-protocols-ii-binary-exchange-protocols/cpp/ll_arb.hpp}{39}{57}{L'arbitre~: un doublon est
+écarté, un saut vers l'avant est un trou perdu sur les deux lignes, tout le reste est nouveau.}\label{lst:ll:protocols-ii-binary-exchange-protocols:arb}
+
+La redondance ne multiplie les probabilités que lorsque les lignes tombent en panne de façon indépendante, ce qui est précisément l'intérêt de les faire passer par des
+réseaux distincts, et la raison pour laquelle le simulateur tire les pertes de chaque ligne dans son propre flux aléatoire.
+
+\begin{proposition}[Perte d'un paquet sur les deux lignes]\label{prop:ll:protocols-ii-binary-exchange-protocols:both}
+Supposons que chaque ligne perde un paquet donné avec la probabilité $p$, indépendamment de l'autre, et qu'une cause commune (un commutateur partagé,
+l'éditeur lui-même) le perde sur les deux avec la probabilité $c$, indépendamment des pertes propres aux lignes. Le flux arbitré
+perd le paquet avec la probabilité $c + (1 - c)p^2$. Si les pertes de chaque ligne suivent un processus de Gilbert--Elliott à deux états, qui passe
+de l'état bon à l'état mauvais avec la probabilité $g$ par paquet, revient avec la probabilité $h$, et perd un paquet avec la probabilité $\ell$
+dans l'état mauvais et aucun dans l'état bon, le taux de perte stationnaire d'une ligne vaut $p = \ell\, g/(g+h)$.
+\end{proposition}
+
+\begin{proof}
+Le paquet est perdu dans le flux arbitré si la cause commune frappe, ou si elle ne frappe pas et que les deux lignes le perdent~; ces derniers
+événements sont indépendants, de probabilité $p^2$. Pour la chaîne à deux états, la probabilité stationnaire $\pi$ de l'état mauvais
+équilibre les flux entre les états, $\pi h = (1-\pi) g$, donc $\pi = g/(g+h)$, et un paquet est perdu avec la probabilité $\ell\pi$.
+\end{proof}
+
+Les rafales ne modifient pas le taux de perte moyen d'une ligne, mais elles changent ce que voit le récepteur~: les pertes arrivent par séries,
+plusieurs paquets à la fois, trop pour une retransmission rapide au pire moment. Et une cause commune, aussi rare soit-elle, domine~:
+à $p = 10^{-4}$, des pertes indépendantes sur les deux lignes coûtent $10^{-8}$ par paquet, et une défaillance partagée de $10^{-6}$ est
+cent fois plus.
+
+La \Cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps} fait les calculs sur le simulateur. Soixante secondes d'un instrument très actif
+soit environ 32\,000 paquets, chaque ligne perdant 0.1~\% des paquets de façon indépendante, plus des rafales de Gilbert--Elliott, et une
+coupure de 60 millisecondes sur chaque ligne, les deux se chevauchant sur 25 millisecondes. La ligne A présente 56 trous et 160 messages manquants, la ligne B
+65 trous et 186~; le flux arbitré n'en présente que deux~: les 17 messages publiés pendant que les deux lignes étaient coupées, et un paquet perdu sur
+la ligne B pendant que la ligne A était hors service.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=4.8cm,xmin=0,xmax=61,ymin=0.4,ymax=3.6,ytick={1,2,3},
+  yticklabels={arbitré,ligne B,ligne A},xlabel={secondes après l'ouverture},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!25},
+  scatter/classes={1={omThm},2={omDef},3={omDef}},table/col sep=comma]
+\addplot[only marks,mark=|,mark size=4pt,omDef,thick] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_A.csv};
+\addplot[only marks,mark=|,mark size=4pt,omMeth,thick] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_B.csv};
+\addplot[only marks,mark=*,mark size=2.5pt,omThm] table[x=t_s,y=y]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/gaps_events_arb.csv};
+\draw[omThm,dashed] (axis cs:10.03,0.5) -- (axis cs:10.03,3.5);
+\node[anchor=west,font=\scriptsize,omThm] at (axis cs:10.6,1.35) {les deux lignes hors service~: 17 messages, et 1 de plus};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Trous sur chaque ligne et sur le flux arbitré pendant 60 secondes du flux du simulateur (environ 32\,000 paquets), avec
+0.1~\% de perte indépendante par ligne, rafales de Gilbert--Elliott, et coupures de 60 millisecondes sur chaque ligne, se chevauchant sur 25 millisecondes.
+Chaque marque correspond à un trou. Données~: \texttt{fig\_gaps.py} (déterministe~: le simulateur est initialisé par une graine).}\label{fig:ll:protocols-ii-binary-exchange-protocols:gaps}
+\end{omfigure}
+
+L'arbitrage coûte peu~: l'arbitre de la construction traite un paquet en environ \qty{1.3}{\nano\second}, soit une comparaison de deux
+numéros de séquence. Ce qui coûte, c'est la conception qui l'entoure~: deux interfaces réseau, deux chemins à travers deux ensembles de commutateurs, et un
+feed handler qui lit les deux sans laisser le retard d'une ligne retenir l'autre (chapitre~18).
+
+\begin{dated}{2026-09}{Données de marché du CME}\label{dat:ll:protocols-ii-binary-exchange-protocols:cme}
+Les données de marché MDP~3.0 du CME Group (documentation des systèmes clients, consultée en septembre 2026) sont envoyées sur les Incremental Feeds A et B
+en UDP, et le CME «~recommande fortement aux systèmes clients de traiter les deux~»~; tout paquet «~peut arriver en premier sur l'un ou l'autre flux~».
+Ses messages utilisent le \omterm{def:ll:protocols-ii-binary-exchange-protocols:sbe}{Simple Binary Encoding}, en little-endian, «~optimisé pour une faible latence de codage et de décodage~»~; la reprise s'appuie sur
+des boucles d'instantanés (snapshot) dont les messages portent le dernier numéro de séquence incrémental traité.
+\end{dated}
+
+\section{Saisie binaire des ordres et Simple Binary Encoding}
+
+\begin{definition}[Simple Binary Encoding]\label{def:ll:protocols-ii-binary-exchange-protocols:sbe}
+Le \emph{Simple Binary Encoding}\index{Simple Binary Encoding} (SBE) est la norme de la FIX Trading Community pour les messages binaires~:
+des champs de types binaires natifs à positions fixes, décrits par un schéma XML de messages, chaque message étant précédé d'un court en-tête
+qui indique la longueur de son bloc fixe, un identifiant de modèle, l'identifiant du schéma et sa version~; l'ordre des octets est une
+propriété du schéma, little-endian par défaut.
+\end{definition}
+
+Sur la plupart des plateformes où la vitesse compte, la saisie des ordres est elle aussi binaire. Le protocole de saisie des ordres du simulateur (livre~10,
+chapitre~26) repose sur SoupBinTCP, que la spécification de Nasdaq décrit comme «~un protocole point à point léger, bâti au-dessus de
+sockets TCP/IP~» qui livre dans l'ordre les messages séquencés du serveur «~même en cas de coupure des
+connexions TCP/IP sous-jacentes~»~: ses messages séquencés ne portent aucun numéro explicite, les deux parties les comptent, et un client qui se reconnecte
+demande le numéro suivant qu'il souhaite recevoir. Il joue le rôle de la \omterm{def:ll:protocols-i-fix:session}{session FIX} du chapitre~15 à une fraction du coût~: un nouvel ordre est un
+message de 38 octets dont les champs se trouvent à des décalages fixes.
+
+Le SBE est la réponse du FIX Trading Community aux mêmes besoins, normalisé en 2016~: sa spécification affirme une «~préférence
+pour des positions fixes et des champs de longueur fixe, permettant un accès direct aux données~». La construction dérive un schéma de type SBE pour
+les messages de flux du simulateur à partir du même schéma JSON, en little-endian, avec un en-tête de message de huit octets et des tailles de champs naturelles
+(l'horodatage de six octets élargi à huit), et génère un second jeu de flyweights à partir du seul XML.
+
+\omcode{code/firm/wirecodec/sbe/feed_sbe.xml}{14}{23}{Le message Add Order dans le schéma de type SBE généré.}\label{lst:ll:protocols-ii-binary-exchange-protocols:sbe}
+
+La \Cref{fig:ll:protocols-ii-binary-exchange-protocols:decode} compare les décodeurs sur 60 secondes de la ligne A. Le décodeur du livre~1,
+qui copie chaque message et appelle un \texttt{std::function}, prend environ \qty{11}{\nano\second} par message~; les flyweights générés
+coûtent environ \qty{5}{\nano\second}, quel que soit l'ordre des octets~: un échange d'octets est une seule instruction et ne coûte rien
+de mesurable ici, alors que la copie et l'appel indirect coûtent la moitié du temps. Découper des paquets complets et distribuer chaque message coûte
+environ \qty{7}{\nano\second} par message en C++ et \qty{8}{\nano\second} en Rust. À un million de messages par seconde, le décodage est
+moins de 1~\% d'un cœur~: le protocole a été conçu pour cela.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ybar,bar width=16pt,ymin=0,ymax=14,
+  symbolic x coords={book1,flyweight,sbe,packets,rust},xtick=data,
+  xticklabels={{Livre~1\\ décodeur},{flyweight,\\ big-endian},{de type SBE,\\ little-endian},{paquets,\\ C++},{paquets,\\ Rust}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.12,ylabel={ns par message},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},point meta=explicit symbolic,
+  table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=key,y=ns_per_msg,meta=ns_per_msg]{figdata/low-latency/16-protocols-ii-binary-exchange-protocols/measured_decode.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Décodage des messages d'ordres de 60 secondes de la ligne A du simulateur (environ 32\,000 messages), médiane de 21 passes~:
+décodeur du livre~1 (une copie et un appel de \texttt{std::function} par message), les flyweights générés dans les deux ordres des octets et,
+dans les deux dernières barres, chaque paquet découpé et chaque message distribué. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2,
+sans cœurs isolés~; GCC~11 à \texttt{-O2}, Rust 1.97 en release. Données~: \texttt{bench\_wire.py}.}\label{fig:ll:protocols-ii-binary-exchange-protocols:decode}
+\end{omfigure}
+
+\section{Tutoriel~: codecs générés et deux lignes à pertes}\label{tut:ll:protocols-ii-binary-exchange-protocols:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Générer les codecs à partir du schéma du simulateur, les confronter aux messages de référence du livre~10, enregistrer deux lignes à
+pertes, les arbitrer et les mesurer. \textbf{État final~:}
+les \cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps,fig:ll:protocols-ii-binary-exchange-protocols:decode}, et
+des tests verts en Python, C++ et Rust.
+\begin{tutsteps}
+\item \textbf{Générer} avec \texttt{python gen\_wirecodec.py}~: les flyweights C++ et Rust à partir de
+\path{code/firm/exchsim/schema.json}, le schéma XML de type SBE, et les flyweights en little-endian issus de ce XML. Le test relance
+le générateur et exige qu'il n'y ait aucune différence.
+\item \textbf{Vérifier par rapport aux messages de référence.} Le test C++ décode chaque message des jeux de référence du livre~10 (flux,
+saisie d'ordres dans les deux sens, contrôle), compare chacun à sa ligne dans les fichiers CSV de référence, le réencode avec le writer
+puis compare les octets, et fait passer chaque message de flux par la disposition de type SBE puis le ramène~; le test Rust décode les mêmes
+messages et les paquets MoldUDP64 enregistrés.
+\item \textbf{Enregistrer deux lignes à pertes.} \texttt{ll\_lines.record(60, dir)} lance le simulateur avec les pertes de la
+\cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps} et écrit les deux lignes dans le format de fichier enregistré.
+\item \textbf{Arbitrer} avec le \cref{lst:ll:protocols-ii-binary-exchange-protocols:arb}~; \texttt{bench\_wire.py} vérifie les comptages C++
+par rapport à la référence Python, puis mesure les décodeurs.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Supprimer le chevauchement des pannes et vérifier que le flux arbitré ne présente aucun \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{trou de séquence}~; placer les deux lignes
+derrière un même commutateur simulé (la même panne sur les deux) et observer chaque \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{trou de séquence} traverser le commutateur.
+\end{tutorial}
+
+\section{Construction~: les codecs filaires}\label{bld:ll:protocols-ii-binary-exchange-protocols:wirecodec}
+
+\begin{build}
+\bfield{Rôle} Chaque octet que la firme lit dans le simulateur ou y écrit~: le feed handler (chapitre~18) décode le flux
+avec lui, la passerelle d'ordres (chapitre~21) encode et décode la saisie des ordres, et les outils de capture (chapitre~23) lisent les
+fichiers enregistrés.
+\bfield{Interface} Généré par \texttt{gen\_wirecodec.py} à partir de \path{code/firm/exchsim/schema.json}~: C++20
+\texttt{firm::wire} avec un lecteur \texttt{Feed<T>}, \texttt{In<T>}, \texttt{Out<T>}, \texttt{Ctl<T>} et un writer
+\texttt{Writer} par message (\texttt{FeedAWriter} et ainsi de suite), \texttt{dispatch\_feed}, \texttt{dispatch\_in}, \texttt{dispatch\_out},
+\texttt{dispatch\_ctl}, \texttt{MoldHeader}, \texttt{for\_each\_block}, \texttt{csv} et \texttt{rewrite}~; les
+lecteurs et écrivains \texttt{firm::sbe} de type SBE, \texttt{to\_sbe}~; en Rust \texttt{firm\_wirecodec} avec les mêmes
+lecteurs, \texttt{csv\_feed}, \texttt{csv\_in}, \texttt{csv\_out}, \texttt{csv\_ctl}, \texttt{MoldHeader} et \texttt{for\_each\_block}.
+\bfield{Règles} Aucune disposition écrite à la main~: chaque décalage vient du schéma~; les fichiers générés sont versionnés et régénérés
+sans différence~; les lecteurs ne copient ni n'allouent rien~; un message dont la longueur ne correspond pas à son type est refusé par
+le répartiteur.
+\bfield{Tests d'acceptation} \texttt{code/firm/wirecodec/}~: chaque message des jeux de référence du livre~10 décodé à ses
+valeurs de référence et réencodé aux mêmes octets en C++, décodé en Rust~; chaque message de flux fait l'aller-retour par la disposition de type SBE~;
+le fichier de test MoldUDP64 enregistré découpé en trames~; le générateur déterministe et ses sorties à jour.
+\bfield{Pour aller plus loin} Générer les trames SoupBinTCP et une demande de retransmission MoldUDP64~; générer à partir du schéma XML en Rust
+aussi~; un codec pour le schéma publié d'une plateforme de négociation réelle.
+\end{build}
+
+\begin{omsources}
+\item Spécifications de Nasdaq, \emph{TotalView-ITCH 5.0}, \emph{MoldUDP64} et \emph{SoupBinTCP}.
+\item CME Group Client Systems Wiki, MDP~3.0~: «~Incremental Feed Arbitration~», «~Simple Binary Encoding~», «~Market Data
+Snapshot -- Full Recovery~».
+\item FIX Trading Community, \emph{Simple Binary Encoding}, version 1.0 (GitHub).
+\item E.~N.~Gilbert, «~Capacity of a burst-noise channel~», \emph{Bell System Technical Journal} 39(5), 1960~; E.~O.~Elliott,
+«~Estimates of error rates for codes on burst-noise channels~», \emph{Bell System Technical Journal} 42(5), 1963.
+\item La description du protocole du simulateur, \path{code/firm/exchsim/PROTOCOL.md} (livre~10, chapitre~26).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:1}
+Un paquet MoldUDP64 a pour numéro de séquence 1\,000 et contient 3 messages~; le paquet suivant de la même ligne a pour numéro de séquence 1\,007. Quels
+messages manquent-ils, et qu'indique alors un \omterm{def:ll:protocols-i-fix:session}{heartbeat} de numéro de séquence 1\,010~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:2}
+Décoder à la main le prix d'un Add Order dont les octets 32--35 valent \texttt{00 0F 42 A4}. Quelle est sa valeur en unités monétaires~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:3}
+Chaque ligne perd 0.2~\% des paquets, de façon indépendante. Quelle fraction des paquets le flux arbitré perd-il~? Et si les deux lignes passent par
+un même commutateur qui élimine 0.01~\% des paquets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:4}
+Calculer le taux de perte stationnaire des paramètres de Gilbert--Elliott du simulateur (passage de bon à mauvais 0.0005, de mauvais à bon 0.1, 80~\%
+perdus dans l'état mauvais) et la longueur moyenne d'une période mauvaise en paquets. Pourquoi le caractère par rafales des pertes importe-t-il pour la retransmission~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:5}
+Pourquoi les données de marché sont-elles envoyées en \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast} UDP plutôt qu'en TCP, et à quoi un abonné renonce-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:6}
+La disposition de type SBE élargit l'horodatage de six octets à huit octets. Combien d'octets cela coûte-t-il pour un Add Order, et
+ce qu'elle permet d'économiser~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:7}
+\emph{Programmation.} Étendre \texttt{gen\_wirecodec.py} pour générer les trames SoupBinTCP des protocoles \texttt{soup\_client} et
+\texttt{soup\_server} du schéma, et les tester sur le fichier \texttt{fixture\_soup.bin} du livre~10.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-ii-binary-exchange-protocols:8}
+\emph{Trouver la faille.} «~Notre feed handler lit la ligne A~; s'il voit un \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{trou de séquence}, il bascule sur la ligne B jusqu'au trou suivant.~»
+\end{exercise}
+
+\section{Problème~: deux copies de tout}
+
+\begin{problem}[{Problème du week-end --- à quelle fréquence la redondance échoue, et ce que coûte la reprise}]\label{pb:ll:protocols-ii-binary-exchange-protocols:1}
+Un flux publie 50\,000 paquets par seconde pendant une session de 6.5 heures sur deux lignes. Supposer que chaque ligne perd un paquet avec une probabilité
+$10^{-4}$, indépendamment~; la retransmission comble les trous allant jusqu'à 1\,000 messages en un aller-retour de \qty{0.5}{\milli\second}~; un
+instantané de l'instrument arrive chaque seconde et prend \qty{20}{\milli\second} à être reçu~; appliquer un message mis en tampon coûte
+\qty{8}{\nano\second} (un peu plus que le coût mesuré du découpage et de la distribution d'un message).
+
+\medskip\noindent\textbf{Partie I --- Pertes indépendantes.}
+\begin{enumerate}
+\item Combien de paquets une session transporte-t-elle, et combien en perd une ligne~?
+\item Quelle est la probabilité que le flux arbitré perde un paquet, et combien de pertes cela représente-t-il par session~?
+\item Dans la simulation de la \cref{fig:ll:protocols-ii-binary-exchange-protocols:gaps}, pourquoi le flux arbitré présente-t-il encore des trous~?
+\item Que coûte chaque perte arbitrée avec la retransmission~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Corrélation.}
+\begin{enumerate}[resume]
+\item Un commutateur partagé perd $10^{-6}$ des paquets sur les deux lignes. Quel est désormais le taux de perte arbitré (\cref{prop:ll:protocols-ii-binary-exchange-protocols:both}), et combien de pertes par session cela représente-t-il~?
+\item Quel taux de perte stationnaire les paramètres de rafale du simulateur donnent-ils à chaque ligne, et quel taux arbitré obtient-on si les lignes sont
+indépendantes~?
+\item Pourquoi les rafales rendent-elles la retransmission moins utile, même lorsque le taux de perte moyen ne change pas~?
+\item Citer trois causes fréquentes qu'une société peut supprimer, et une qu'elle ne peut pas supprimer.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Reprise.}
+\begin{enumerate}[resume]
+\item Quand la retransmission ne suffit-elle pas~?
+\item Combien de temps la reprise à partir du \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{canal d'instantanés} prend-elle en moyenne, et au pire~?
+\item Combien de messages incrémentaux arrivent entre-temps, et combien de temps leur application prend-elle~?
+\item Quels messages mis en tampon doivent être écartés après l'instantané, et comment le gestionnaire le sait-il~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la probabilité de perte arbitrée avec des pertes indépendantes et avec des pertes corrélées, et
+le temps de reprise à partir du \omterm{def:ll:protocols-ii-binary-exchange-protocols:channels}{canal d'instantanés}.
+\item Que doit faire une stratégie de sa vision du carnet pendant une reprise~?
+\item Un instantané toutes les 100 millisecondes aiderait-il~? Que coûte-t-il à la plateforme et à l'abonné~?
+\item Pourquoi l'arbitre ne doit-il jamais attendre la ligne la plus lente~?
+\item Comment tester le chemin de reprise avant la mise en production~?
+\item Que faut-il journaliser pour chaque trou~?
+\item Que dit le coût mesuré du décodage sur l'endroit où se situe la latence d'un feed handler~?
+\item En une phrase~: que rapporte une seconde ligne~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:1}
+Pourquoi les bourses publient-elles les données de marché en \omterm{def:ll:protocols-ii-binary-exchange-protocols:multicast}{multicast} UDP, et comment un récepteur détecte-t-il un paquet perdu~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:2}
+Implémentez l'\omterm{def:ll:protocols-ii-binary-exchange-protocols:arbitration}{arbitrage de lignes} A/B. Quel état conserve-t-on, et que fait-on en cas de trou~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:3}
+Qu'est-ce qu'un décodeur flyweight, et pourquoi est-il plus rapide qu'un décodage vers des structures~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:4}
+Vous rejoignez le flux au milieu de la journée. Comment construire un carnet correct~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:5}
+Big-endian ou little-endian sur le fil~: cela influe-t-il sur la latence~? Qu'est-ce qui influe~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:protocols-ii-binary-exchange-protocols:6}
+Vos deux lignes sont «~redondantes~», mais vous observez plusieurs fois par jour des trous simultanés sur les deux. Que vérifiez-vous~?
+\end{interviewq}

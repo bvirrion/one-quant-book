@@ -36,7 +36,8 @@ check_year_lang() {
   for f in "$dir"/[0-9]*.tex; do
     b=$(basename "$f")
     [ -f "$tdir/$b" ]  || bad "chapter missing"   "$tdir/$b"
-    [ -f "$tsdir/$b" ] || bad "solutions missing" "$tsdir/$b"
+    # (an interview book's ch. 1 has no answers, so no English solutions file: none expected then)
+    [ ! -f "$sdir/$b" ] || [ -f "$tsdir/$b" ] || bad "solutions missing" "$tsdir/$b"
   done
   for f in "$tdir"/[0-9]*.tex; do
     [ -e "$f" ] || continue

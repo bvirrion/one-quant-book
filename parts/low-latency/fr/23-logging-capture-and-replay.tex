@@ -1,0 +1,357 @@
+\chapter{Journalisation, capture et rejeu}\label{ch:ll:logging-capture-and-replay}
+
+Un régulateur demande pourquoi un ordre est parti à 09:30:00.012345678 avec ce prix et cette taille. Il y a deux façons de répondre. L'une
+consiste à chercher dans les journaux les lignes proches de cet instant et à reconstituer, à partir de ce que les programmeurs ont choisi d'afficher, ce que la stratégie
+a probablement vu. L'autre consiste à prendre les entrées que le processus de trading a reçues ce matin-là, chacune avec l'instant de sa réception,
+à les fournir au même binaire sur un poste de travail, et à s'arrêter sur l'ordre~: le carnet, les paramètres en vigueur et chaque valeur utilisée par la
+décision sont là, exactement tels qu'ils étaient, parce que le programme est déterministe (chapitre~20) et que ses entrées ont été conservées.
+Ce chapitre construit la seconde réponse et la machinerie dont elle a besoin~: un journal qui coûte quelques nanosecondes sur le hot path parce
+qu'il écrit des nombres bruts et les formate plus tard, un \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées} qui enregistre ce qui est arrivé et quand, et un pilote de rejeu qui
+fait d'une journée de production une expérience reproductible.
+
+\section{Pourquoi la journalisation formatée n'a pas sa place sur le hot path}
+
+Une ligne de journal formatée effectue un travail surprenant~: elle analyse une chaîne de format, convertit chaque nombre en texte décimal,
+recopie le résultat dans un tampon et, selon la bibliothèque, prend un verrou et effectue un appel système. Sur l'ordinateur portable, une ligne
+de quatre nombres coûte environ \qty{100}{\nano\second} en médiane avec \texttt{snprintf} vers un tampon, à peu près autant
+avec \texttt{fprintf} vers un fichier entièrement bufferisé, et \qty{210}{\nano\second} avec un flux de chaîne
+(la \cref{fig:ll:logging-capture-and-replay:calls})~; et sa queue de distribution est longue, parce que le tampon du fichier se remplit et est écrit, et
+parce que le flux alloue de la mémoire. Un moteur de stratégie qui traite un événement en \qty{50}{\nano\second} (chapitre~20) ne peut pas se permettre une
+telle ligne par événement, et un système dont la journalisation est désactivée en production pour gagner ce temps n'a rien à examiner quand
+quelque chose tourne mal.
+
+La réponse n'est pas de journaliser moins, mais de faire moins en journalisant. Tout ce que contient une ligne de journal est connu à la compilation
+du programme, sauf les nombres~: le texte, la position des arguments et leurs types. Le hot path peut donc n'écrire que les nombres,
+avec un identifiant de l'instruction, et laisser le formatage à un programme qui s'exécute plus tard, ailleurs, quand quelqu'un lit
+le journal. La bibliothèque standard \texttt{C++} du compilateur utilisé ici (g++ 11) ne fournit même pas \texttt{std::format}~; cela ne
+changerait pas la conclusion, puisque c'est précisément le formatage dont on supprime le coût.
+
+\section{Journalisation binaire et formatage différé}
+
+\begin{definition}[Journal binaire, formatage différé]\label{def:ll:logging-capture-and-replay:binlog}
+Un \emph{journal binaire}\index{journal binaire} est un journal dont les enregistrements contiennent un identifiant d'instruction, un horodatage et les valeurs brutes des
+arguments de l'instruction, et non du texte~; les chaînes de format des instructions sont stockées une seule fois, dans l'en-tête du journal ou à côté du binaire.
+Le \emph{formatage différé}\index{formatage différé} est la pratique qui consiste à ne transformer ces enregistrements en texte qu'au moment où le journal est
+lu, par un programme distinct, de sorte que le programme qui écrit le journal ne convertit jamais un nombre en texte.
+\end{definition}
+
+L'idée est établie~: NanoLog, présenté à l'USENIX Annual Technical Conference de 2018, extrait à la compilation les parties statiques des instructions
+de journalisation, écrit à l'exécution un \omterm{def:ll:logging-capture-and-replay:binlog}{journal binaire} compacté qu'il redéploie hors ligne, et annonce un coût
+d'appel de 8 nanosecondes en \omterm{def:ll:cpu-microarchitecture:ubench}{microbenchmarks} et de 18 en application. Le \texttt{firm.binlog} de la construction fait de même avec le
+seul langage. Une instruction s'écrit \texttt{log.log<\textquotedbl{}fill \{\} of \{\} at \{\}, position \{\}\textquotedbl{}>(ts, id, qty, price, pos)}~: la chaîne
+de format et les types des arguments sont des arguments de template, de sorte que l'identifiant de l'instruction est calculé à la compilation, comme un hachage des deux
+(\cref{lst:ll:logging-capture-and-replay:id}), et que l'instruction enregistre son format dans une table pendant l'initialisation statique,
+avant que \texttt{main} ne s'exécute. À l'exécution, un appel écrit l'identifiant, l'horodatage et les octets des arguments dans un emplacement d'un
+anneau à producteur unique (chapitre~12), puis rend la main (\cref{lst:ll:logging-capture-and-replay:log}). Si l'anneau est plein, l'enregistrement
+est abandonné et compté~: le hot path n'attend jamais le journal.
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{62}{70}{L'identifiant d'une instruction, calculé par le compilateur à partir de son format et
+des types de ses arguments.}\label{lst:ll:logging-capture-and-replay:id}
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{125}{141}{Le hot path d'un appel de journalisation~: encoder les arguments bruts derrière un
+en-tête de 16 octets et écrire l'enregistrement dans l'anneau, ou l'abandonner.}\label{lst:ll:logging-capture-and-replay:log}
+
+Un thread d'écriture, sur un autre cœur, vide l'anneau dans un fichier. Le fichier commence par un en-tête qui liste chaque instruction
+(identifiant, types des arguments, format), triées par identifiant, puis les enregistrements dans l'ordre où ils sont sortis de l'anneau~; le décodeur Python
+lit l'en-tête, décode chaque enregistrement avec les types de son instruction et le formate. Le format est assez simple pour être écrit par
+trois implémentations~: l'encodeur de référence Python écrit le journal d'exemple de la fixture, et le logger C++, par son anneau et
+par son thread d'écriture, ainsi que le logger Rust écrivent chacun les mêmes instructions avec les mêmes octets. Un test compte aussi les allocations
+sur le tas pendant la journalisation et n'en trouve aucune, et remplit volontairement un petit anneau pour vérifier que le débordement est abandonné et compté.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,minimum height=0.75cm,align=center,
+  inner sep=3pt,fill=omDef!12}]
+\node[box] (hot) at (0,0) {hot path\\ \texttt{log<\textquotedbl{}fill \{\} of \{\}\textquotedbl{}>}};
+\node[box,fill=omMeth!15,minimum width=2.4cm] (ring) at (3.8,0) {anneau (SPSC)\\ id $|$ len $|$ ts $|$\\ arguments bruts};
+\node[box] (wr) at (7.1,0) {thread d'écriture\\ (autre cœur)};
+\node[box,fill=gray!10] (file) at (10.3,0) {fichier~:\\ en-tête des instructions\\ $+$ enregistrements};
+\node[box,fill=omThm!15] (dec) at (10.3,-1.9) {décodeur (Python)~:\\ texte, hors ligne};
+\node[box] (feed) at (0,-1.9) {entrées telles\\ que reçues (flux,\\ comptes rendus,\\ paramètres)};
+\node[box,fill=gray!10] (jr) at (3.5,-1.9) {journal des entrées\\ recv ts $|$ événement};
+\node[box,fill=omThm!15] (rep) at (6.3,-1.9) {rejeu~: même\\ binaire, mêmes\\ entrées};
+\draw[->,thick] (hot) -- node[above]{\qty{5}{\nano\second}} (ring);
+\draw[->] (ring) -- (wr);
+\draw[->] (wr) -- (file);
+\draw[->] (file) -- (dec);
+\draw[->] (feed) -- (jr);
+\draw[->] (jr) -- (rep);
+\draw[<->,dashed] (rep) -- node[above=1pt,pos=0.45]{comparer} (dec);
+\end{tikzpicture}
+
+\omcaption{Journalisation, capture et rejeu. Le hot path écrit des enregistrements bruts dans un anneau et rend la main~; un thread d'écriture les vide
+dans un fichier dont l'en-tête contient le format de chaque instruction~; le formatage a lieu hors ligne. Les entrées sont journalisées à leur arrivée,
+et un rejeu du journal par le même binaire produit le même journal.}\label{fig:ll:logging-capture-and-replay:flow}
+\end{omfigure}
+
+La \cref{fig:ll:logging-capture-and-replay:calls} en donne le résultat~: environ \qty{5}{\nano\second} par appel en médiane, vingt
+fois moins que \texttt{snprintf}, avec une queue au 99\up{e}~centile quand le thread d'écriture vide l'anneau et que les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} qu'il
+lit passent d'un cœur à l'autre. Les manières du thread d'écriture comptent. La première version interrogeait l'anneau sans pause, et chaque appel de journalisation
+payait les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} que le thread d'écriture ne cessait de lui reprendre~; celui de la construction vide par lots et dort
+\qty{100}{\micro\second} quand il y a peu à vider (\cref{lst:ll:logging-capture-and-replay:writer}). Le prix n'est payé par
+personne sur le hot path~: le journal atteint le fichier une fraction de milliseconde plus tard.
+
+\omcode{code/firm/binlog/cpp/firm_binlog.hpp}{206}{212}{La boucle du thread d'écriture~: vider par lots, dormir quand il y a peu à
+vider.}\label{lst:ll:logging-capture-and-replay:writer}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=10.5cm,height=5.6cm,ybar,bar width=12pt,ymode=log,ymin=1,ymax=2000,log origin=infty,
+  xmin=-0.6,xmax=3.6,xtick={0,1,2,3},xticklabels={firm.binlog,snprintf,fprintf,ostringstream},
+  ylabel={ns par appel},tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x expr={floor(\coordindex/3)},y=ns,
+  restrict expr to domain={mod(\coordindex,3)}{0:0}]{figdata/low-latency/23-logging-capture-and-replay/measured_logcall.csv};
+\addlegendentry{médiane}
+\addplot[fill=omMeth!40,draw=omMeth] table[x expr={floor(\coordindex/3)},y=ns,
+  restrict expr to domain={mod(\coordindex,3)}{1:1}]{figdata/low-latency/23-logging-capture-and-replay/measured_logcall.csv};
+\addlegendentry{99\up{e}~centile}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le coût d'un appel de journalisation portant quatre nombres, selon la méthode (chronométrage au TSC, 200\,000 appels chacune)~: le \omterm{def:ll:logging-capture-and-replay:binlog}{journal binaire} avec
+son thread d'écriture vidant l'anneau sur un autre cœur, \texttt{snprintf} vers un tampon, \texttt{fprintf} vers un
+fichier entièrement tamponné, et un flux de chaînes. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2. Données~:
+\texttt{bench\_log.py}.}\label{fig:ll:logging-capture-and-replay:calls}
+\end{omfigure}
+
+\section{Capture~: entrées, sorties et temps}
+
+\begin{definition}[Journal des entrées]\label{def:ll:logging-capture-and-replay:journal}
+Un \emph{journal des entrées}\index{journal des entrées} est l'enregistrement, tenu par un processus, de chaque entrée reçue, dans l'ordre
+où il les a reçues, chacune avec l'heure de sa réception~: événements de marché, comptes rendus d'ordres, déclenchements de minuteries dépendant de l'horloge,
+changements de paramètres et messages de contrôle. Avec la version du programme, il suffit pour reproduire tout ce que le
+processus a calculé.
+\end{definition}
+
+Un journal des décisions dit ce que le programme a fait~; seul un \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées} dit pourquoi, parce qu'il permet de refaire la décision.
+Le journal de la construction est volontairement austère~: un court en-tête, puis des enregistrements fixes de 56~octets, chacun formé de l'heure de réception suivie de
+l'événement de 48~octets du \omterm{def:ll:the-feed-handler:handler}{feed handler} (chapitre~18). Il est écrit par le thread qui reçoit les entrées, au point où elles
+entrent dans le moteur, de sorte que son ordre soit celui du moteur. Deux pièges sont faciles à commettre. Le journal doit contenir ce que le
+processus a reçu, et non ce que la bourse a envoyé~: l'enregistrement de la bourse ne présente ni trous, ni retransmissions, ni horodatages d'arrivée
+locaux, et un rejeu de celui-ci répond à une autre question. Les horodatages doivent être ceux du processus lui-même, pris une seule fois, à la réception,
+avec l'horloge du chapitre~5, car ce sont aussi des entrées~: une stratégie qui tient compte de l'âge de ses cotations les lit. L'horodatage de la
+bourse et l'horodatage de réception du livre~1 (chapitre~28) sont conservés tous deux, l'un à l'intérieur de l'événement, l'autre devant lui.
+
+\begin{dated}{2026-09}{Durée et précision de conservation des enregistrements}\label{dat:ll:logging-capture-and-replay:records}
+Dans l'Union européenne (consulté en septembre 2026), la Commission Delegated Regulation (EU) 2017/589 oblige les sociétés qui se livrent
+au trading algorithmique à haute fréquence à enregistrer leurs ordres et à conserver ces enregistrements pendant cinq ans à compter de la soumission de chaque
+ordre (article 28). La Commission Delegated Regulation (EU) 2017/574 oblige les membres d'une plateforme de négociation qui recourent à une technique de trading algorithmique à haute fréquence
+à conserver leurs horloges internes à moins de 100~microsecondes de l'UTC, avec une granularité des
+horodatages d'une microseconde ou mieux, et à réviser leur traçabilité à l'UTC au moins une fois par an.
+\end{dated}
+
+Les journaux se compressent bien, car des événements consécutifs partagent l'essentiel de leurs octets~: le même instrument, des prix et des horodatages voisins,
+des numéros de séquence qui progressent de un en un. Le \Cref{tab:ll:logging-capture-and-replay:journal} mesure cette compression sur les deux flux de
+la construction~: environ 3.8 pour 1 avec le compresseur généraliste zlib à son niveau par défaut, soit environ 15~octets par événement.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+flux & événements & durée & journal & compressé & taux \\
+\midrule
+grand tick (l'ouverture du simulateur) & 189\,875 & \qty{120}{\second} & 10.6~Mo & 2.8~Mo & 3.76 \\
+petit tick (synthétique) & 6\,000 & \qty{6}{\milli\second} & 0.34~Mo & 0.08~Mo & 3.96 \\
+\bottomrule
+\end{tabular}
+\caption{Le \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées} de deux flux d'événements~: 56~octets par événement brut, environ 15 après compression avec zlib au niveau 6. Données~:
+\texttt{fig\_journal.py} (déterministe).}\label{tab:ll:logging-capture-and-replay:journal}
+\end{table}
+
+\section{Rejeu déterministe d'une journée de production}
+
+\begin{definition}[Rejeu déterministe]\label{def:ll:logging-capture-and-replay:replay}
+Un \emph{rejeu déterministe}\index{rejeu déterministe} exécute un programme sur un \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées}, dans l'ordre du journal, avec le temps
+pris dans le journal, et produit bit à bit les sorties que le programme a produites lorsque le journal a été enregistré~; il
+exige que le programme soit déterministe (chapitre~20) et que le journal soit complet.
+\end{definition}
+
+Le pilote de rejeu lit le journal, reconstruit les événements et les remet au moteur de stratégie avec l'horloge simulée~: le test de la
+construction consigne dans un journal la journée à petit tick, la rejoue et obtient l'empreinte de sortie enregistrée au chapitre~20. Un rejeu est aussi
+rapide, car rien n'attend le marché~: sur l'ordinateur portable, le moteur rejoue les deux minutes les plus actives du simulateur autour de l'ouverture,
+189\,875 événements, lecture du journal comprise, en moins de \qty{50}{\milli\second}, environ 2\,800 fois plus vite qu'ils ne se sont produits. Une journée
+se rejoue en quelques secondes, ce qui change ce qu'on peut en faire~: toute modification du code peut être rejouée sur la semaine précédente, et
+chaque incident peut être rejoué autant de fois que nécessaire, avec un débogueur attaché.
+
+Lorsque deux exécutions qui devraient concorder ne concordent pas, les journaux disent où. Chaque exécution journalise ses actions~; les deux journaux sont comparés enregistrement par
+enregistrement (le \cref{lst:ll:logging-capture-and-replay:diff}), et le premier enregistrement qui diffère désigne le premier événement dont le traitement
+a différé. Le test de la construction introduit une différence, un changement de paramètre à l'événement 3\,000 que la seconde exécution reçoit et la première non,
+comme le ferait une valeur lue hors du journal~; la comparaison trouve la première action qui diffère,
+numéro 540 sur 1\,084, juste après l'événement introduit, et rien avant lui. C'est la procédure du problème du week-end du chapitre~20,
+mécanisée~: le journal indique où regarder, et le rejeu permet de regarder autant de fois que nécessaire.
+
+\omcode{code/firm/binlog/firm_binlog.py}{99}{107}{Hors ligne~: mise en forme des enregistrements, et recherche du premier enregistrement où deux journaux
+diffèrent.}\label{lst:ll:logging-capture-and-replay:diff}
+
+\section{Ce qu'il faut conserver, et pendant combien de temps}
+
+Trois choses sont conservées. Le \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées}, car c'est le seul enregistrement à partir duquel tout le reste peut être recalculé~; le
+journal des décisions, car il répond à la plupart des questions sans rejeu et vérifie le rejeu lorsqu'on en fait un~; et le programme~:
+le binaire exact, sa configuration et les instantanés des paramètres, car un journal rejoué avec une autre construction ne répond
+à rien. Les horloges et les durées de conservation du régulateur (l'encadré daté) fixent le minimum~: des horodatages traçables à l'UTC avec
+la granularité requise, et cinq ans de registres d'ordres. Le stockage est modeste au regard des données qu'une firme quantitative
+conserve de toute façon, comme le calcule le problème du week-end, et le coût de ne pas le conserver est la première phrase de ce chapitre.
+
+\section{Tutoriel~: journal, journal des entrées, rejeu, bissection}\label{tut:ll:logging-capture-and-replay:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Journaliser depuis le chemin critique (hot path) en quelques nanosecondes par appel, consigner les entrées d'une journée, les rejouer bit à bit, et trouver une
+différence introduite entre deux exécutions. \textbf{État final~:} la \cref{fig:ll:logging-capture-and-replay:calls}, le tableau du journal,
+la vitesse du rejeu, et des tests au vert dans trois langages.
+\begin{tutsteps}
+\item \textbf{Journalisation.} Le test C++ journalise les énoncés du jeu d'essai par l'anneau et par le thread d'écriture, et compare les
+octets avec \texttt{data/sample.blog}, écrit par la référence Python~; le test Rust écrit les mêmes octets~; les fonctions \texttt{read} et \texttt{text} du décodeur Python les transforment en
+\texttt{data/sample.txt}.
+\item \textbf{Mesure.} \texttt{python bench\_log.py} chronomètre un appel de journalisation selon chaque méthode, ainsi que le rejeu du journal de l'ouverture.
+\item \textbf{Journal et rejeu.} Le test consigne dans un journal la journée à petit tick, la rejoue au moyen de \texttt{firm.stratengine}, et
+vérifie l'empreinte enregistrée.
+\item \textbf{Bissection.} \texttt{ll\_bisect\_test.cpp} exécute deux fois le moteur, introduit une modification dans la seconde exécution, journalise les deux, et
+trouve le premier enregistrement qui diffère.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer le changement de paramètre introduit par une lecture de l'horloge murale (le défaut du chapitre~20), et observer la
+première différence se déplacer d'une exécution à l'autre~; compresser le journal au fur et à mesure de son écriture, dans le thread d'écriture.
+\end{tutorial}
+
+\section{Construction~: le journal binaire et le journal des entrées}\label{bld:ll:logging-capture-and-replay:binlog}
+
+\begin{build}
+\bfield{Rôle} Chaque composant du chemin de trading journalise par lui~: les trous du \omterm{def:ll:the-feed-handler:handler}{feed handler} (chapitre~18), les actions du
+moteur (chapitre~20), les messages de la passerelle (chapitre~21), les décisions de la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} (chapitre~22)~; son journal est ce que
+l'architecture résiliente du chapitre~24 réplique et ce que les tests du chapitre~25 rejouent.
+\bfield{Interface} C++20 \texttt{firm::binlog}~: \texttt{Logger(capacity)} avec \texttt{log<\textquotedbl{}format\textquotedbl{}>(ts, arguments)},
+\texttt{drain}, \texttt{dropped}~; \texttt{Writer(logger, path)}~; \texttt{header()}~; \texttt{Journal} avec \texttt{add} et
+\texttt{records}. Python \texttt{firm\_binlog}~: \texttt{site\_id}, \texttt{Writer}, \texttt{read}, \texttt{text},
+\texttt{first\_difference}, \texttt{journal\_write}, \texttt{journal\_read}. Rust \texttt{firm\_binlog}~: \texttt{Logger},
+\texttt{read}, \texttt{text}, \texttt{site\_id}.
+\bfield{Règles} Aucune mise en forme, aucun verrou, aucun appel système ni allocation sur le chemin critique (hot path)~; un anneau plein rejette et compte~; les énoncés
+identifiants issus du format et des types~; le journal est écrit là où les entrées entrent dans le moteur, avec les horodatages de réception~; les
+mêmes octets issus des trois implémentations.
+\bfield{Tests d'acceptation} \texttt{code/firm/binlog/}~: le jeu d'essai écrit octet pour octet par Python, C++ (anneau et thread d'écriture)
+et Rust, et décodé jusqu'à son texte~; énoncés aléatoires soumis à un aller-retour~; identifiants qui dépendent des types, et collisions
+refusées~; zéro allocation pendant la journalisation, et débordement compté~; un journal rejoué par le moteur de stratégie jusqu'à l'empreinte
+enregistrée~; la première différence entre deux journaux est trouvée.
+\bfield{Pour aller plus loin} Compression dans le thread d'écriture~; un énoncé par composant avec une sévérité filtrée à la compilation~;
+horodatages issus du TSC avec des enregistrements de calibration dans le journal, convertis hors ligne~; un journal des comptes rendus de la passerelle à côté de
+les données de marché.
+\end{build}
+
+\begin{omsources}
+\item S.~Yang, S.~J.~Park et J.~Ousterhout, ``NanoLog: a nanosecond scale logging system'', \emph{USENIX Annual Technical
+Conference}, 2018.
+\item Commission Delegated Regulation (EU) 2017/589 (RTS 6), article 28.
+\item Commission Delegated Regulation (EU) 2017/574 (RTS 25), article 4 et annexe.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:1}
+Combien d'octets occupe un enregistrement de l'énoncé \texttt{\textquotedbl{}fill \{\} of \{\} at \{\}, position \{\}\textquotedbl{}} avec quatre arguments de 64~bits,
+et combien occupe sa ligne formatée pour les valeurs 40, 100, 999\,900 et $-200$ avec un horodatage de 14~chiffres~? Quelle quantité
+le \omterm{def:ll:logging-capture-and-replay:binlog}{journal binaire} économise-t-il alors~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:2}
+Pourquoi l'identifiant de l'énoncé dépend-il des types de ses arguments et pas seulement de son format~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:logging-capture-and-replay:3}
+Le journal de l'ouverture compte 189\,875 enregistrements de 56~octets plus un en-tête de 12~octets. Vérifiez sa taille, et les octets par événement
+après compression, à partir du \cref{tab:ll:logging-capture-and-replay:journal}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:4}
+Un composant journalise 2 millions d'enregistrements par seconde pendant une rafale~; le thread d'écriture est bloqué pendant \qty{20}{\milli\second} par
+un disque lent. Combien d'emplacements d'anneau faut-il pour qu'aucun enregistrement ne soit perdu, et quelle mémoire cela représente-t-il avec des emplacements de 64~octets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:5}
+Le chemin critique (hot path) horodate les enregistrements avec le TSC plutôt qu'avec \texttt{clock\_gettime}. Que doit contenir en plus le journal pour que les
+horodatages puissent être convertis en UTC hors ligne avec une granularité de la microseconde~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:logging-capture-and-replay:6}
+Un moteur traite un événement en \qty{50}{\nano\second} et journalise cinq lignes par événement. Que coûte la journalisation par événement avec le
+\omterm{def:ll:logging-capture-and-replay:binlog}{journal binaire} et avec \texttt{snprintf}, aux médianes de la \cref{fig:ll:logging-capture-and-replay:calls}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:logging-capture-and-replay:7}
+\emph{Programmation.} Journalisez les décisions de la \omterm{def:ll:pre-trade-risk-and-kill-switches:gate}{barrière de risque} (risk gate, chapitre~22) avec un énoncé portant l'identifiant de l'ordre, le code et le
+masque~; rejouez le jeu d'essai de la barrière, et décodez le journal en un compte des refus par motif qui correspond à \texttt{expected.txt}.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:logging-capture-and-replay:8}
+\emph{Trouver la faille.} «~Nous n'avons pas besoin de \omterm{def:ll:logging-capture-and-replay:journal}{journal des entrées}. Nous journalisons chaque décision avec son motif, et pour rejouer une journée nous faisons tourner la
+stratégie sur l'enregistrement propre de la bourse des données de marché.~»
+\end{exercise}
+
+\section{Problème~: jusqu'à la nanoseconde}
+
+\begin{problem}[{Problème du week-end --- ce qu'il en coûte pour pouvoir répondre}]\label{pb:ll:logging-capture-and-replay:1}
+Une entreprise journalise les entrées de ses processus de trading et doit pouvoir rejouer tout ordre des cinq dernières années. Utilisez le
+\cref{tab:ll:logging-capture-and-replay:journal} et la vitesse de rejeu mesurée.
+
+\medskip\noindent\textbf{Partie I --- Le débit.}
+\begin{enumerate}
+\item Quel est le débit moyen d'événements du flux de l'ouverture~?
+\item À ce débit moyen, combien d'événements contient une journée de négociation de 6.5~heures~?
+\item Quelle est la taille brute de ce journal en octets, et compressé au taux mesuré~?
+\item Pourquoi une moyenne prise sur une ouverture chargée est-elle une estimation pessimiste pour une journée entière, et pourquoi reste-t-elle néanmoins celle qu'il faut retenir
+pour planifier~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Cinq ans.}
+\begin{enumerate}[resume]
+\item Avec 252 jours de négociation par an, quel volume occupent cinq ans de tels journaux, compressés~?
+\item L'entreprise négocie 200 instruments aux flux similaires. Passer la réponse à l'échelle.
+\item Que faut-il encore conserver pour qu'un journal puisse être rejoué cinq ans plus tard~?
+\item Pourquoi le journal des décisions, bien que plus petit, ne suffit-il pas~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Le rejeu.}
+\begin{enumerate}[resume]
+\item À la vitesse mesurée, combien de temps dure le rejeu de la journée d'un instrument~?
+\item Et celui des 200 instruments, les uns après les autres, sur un seul cœur~?
+\item Qu'est-ce qui limite la vitesse de rejeu, et qu'est-ce qui ne la limite pas~?
+\item Pourquoi le rejeu doit-il lire le temps dans le journal plutôt que dans la machine~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le volume de stockage du journal par jour au débit et au taux de compression mesurés, et la vitesse de rejeu
+par rapport au temps réel.
+\item Que coûte un appel de journalisation avec \omterm{def:ll:logging-capture-and-replay:binlog}{formatage différé}, et avec \texttt{snprintf}~?
+\item Que doit reproduire le rejeu pour répondre à la question du régulateur, et comment vérifier qu'il l'a fait~?
+\item Que devient la rejouabilité lorsqu'un composant lit l'horloge murale~?
+\item À quel endroit du processus le journal doit-il être écrit, et pourquoi là~?
+\item Que démontre le test de différence plantée, et que faudrait-il pour trouver une vraie différence~?
+\item Quelle précision d'horodatage exige l'encadré daté, et un journal horodaté au TSC la satisfait-il~?
+\item En une phrase~: qu'est-ce qui rend un ordre explicable des années plus tard~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:logging-capture-and-replay:1}
+Pourquoi la journalisation de style \texttt{printf} pose-t-elle un problème sur le chemin critique (hot path), et que faites-vous à la place~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:logging-capture-and-replay:2}
+Concevez un journaliseur dont l'appel coûte moins de dix nanosecondes. Que se passe-t-il lorsque son tampon est plein~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:logging-capture-and-replay:3}
+Qu'enregistreriez-vous pour pouvoir rejouer exactement une journée de négociation, et à quel endroit du processus l'enregistreriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:logging-capture-and-replay:4}
+Deux rejeux de la même journée ne concordent pas. Comment trouvez-vous où~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:ll:logging-capture-and-replay:5}
+Un régulateur demande pourquoi un ordre a été envoyé il y a trois ans. De quoi avez-vous besoin pour répondre, et combien de temps cela prend-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:logging-capture-and-replay:6}
+Concevez la capture et le rejeu pour une entreprise qui compte des dizaines de processus de trading sur plusieurs plateformes. Que journalise-t-on, où, dans quel
+format, pendant combien de temps, et comment teste-t-on le rejeu~?
+\end{interviewq}

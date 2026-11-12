@@ -1,0 +1,362 @@
+\chapter{Calcul distribué et ordonnanceurs}\label{ch:pl:distributed-compute-and-schedulers}
+
+Un \omterm{def:pl:distributed-compute-and-schedulers:sweep}{balayage de paramètres} de dix mille backtests a été soumis à 18~h un vendredi et s'est terminé à 13~h~47 le samedi. À partir de 10~h~20 ce matin-là,
+moins d'un dixième des cœurs de la grappe étaient occupés. Quarante des tâches duraient trente fois plus que la médiane, et elles avaient
+été soumises en dernier~: la grappe les a atteintes après douze heures, puis a attendu encore sept heures et demie. Rien n'avait échoué~; l'ordonnanceur avait fait
+exactement ce qu'on lui avait demandé. Ce chapitre porte sur ce qu'il faut lui demander~: comment un balayage devient un \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphe de tâches}, comment les ordonnanceurs ordonnent ce graphe sur
+une grappe, pourquoi les dernières tâches décident de la fin d'un balayage, et ce que coûtent et permettent la mise en cache, les nouvelles tentatives et les copies de secours.
+
+\section{Grappes de calcul et leur usage}
+
+\begin{definition}[Grappe de calcul, ordonnanceur de tâches]\label{def:pl:distributed-compute-and-schedulers:cluster}
+Une \emph{grappe de calcul}\index{grappe de calcul} est un ensemble de machines (nœuds), chacune dotée de cœurs, de mémoire et parfois d'accélérateurs, gérées
+comme un seul réservoir de capacité. Un \emph{ordonnanceur de tâches}\index{ordonnanceur de tâches} décide quel travail soumis s'exécute sur quelle partie du réservoir et à quel moment,
+selon une politique, les ressources que demande chaque travail et les priorités des utilisateurs qui l'ont soumis.
+\end{definition}
+
+Une plateforme de recherche utilise sa grappe pour des travaux volumineux, répétitifs et surtout indépendants~: \omterm{def:pl:distributed-compute-and-schedulers:sweep}{balayages de paramètres}, recalibrages walk-forward
+(livre~7, chapitre~20), simulations sur des graines (chapitres~11 et~12), scénarios de risque (chapitres~18 et~20), entraînement de modèles (livre~12). La plupart de ces travaux
+relèvent de la forme de parallélisme la plus simple qui soit.
+
+\begin{definition}[Charge trivialement parallèle, balayage de paramètres]\label{def:pl:distributed-compute-and-schedulers:sweep}
+Une charge de travail est \emph{trivialement parallèle}\index{charge trivialement parallèle} lorsqu'elle se découpe en tâches qui ne communiquent pas
+pendant leur exécution. Un \emph{balayage de paramètres}\index{balayage de paramètres} est une telle charge~: le même calcul, typiquement un backtest, exécuté une fois
+pour chaque point d'une grille de paramètres, de tranches de données ou de graines.
+\end{definition}
+
+Être \omterm{def:pl:distributed-compute-and-schedulers:sweep}{trivialement parallèle} ne signifie pas être trivial à terminer à temps. Les tâches d'un balayage ont des durées inégales --- une fenêtre d'historique plus longue, un marché plus actif,
+une tranche de données plus lente --- et le balayage ne se termine qu'avec sa dernière tâche.
+
+\begin{definition}[Durée totale, traînard]\label{def:pl:distributed-compute-and-schedulers:makespan}
+La \emph{durée totale}\index{durée totale} d'un ensemble de tâches est le temps écoulé entre le début de la première et la fin de la dernière. Un
+\emph{traînard}\index{traînard} est une tâche qui se termine bien après la plupart de ses pairs, parce qu'elle est intrinsèquement longue, parce qu'elle tourne
+sur une machine lente ou surchargée, ou parce qu'elle a échoué puis a été relancée.
+\end{definition}
+
+\section{Ordonnanceurs et files d'attente}
+
+L'ordonnanceur le plus simple tient une seule file d'attente et confie le cœur libre suivant à la tâche en tête~: premier entré, premier sorti. Graham (1969) a analysé cet
+\emph{list scheduling} et en a borné la performance~: quel que soit l'ordre, la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} sur $m$ cœurs identiques est au plus $2 - 1/m$ fois la durée optimale,
+et si l'on prend les tâches les plus longues en premier --- \emph{longest processing time}, LPT --- la borne se resserre à $4/3 - 1/(3m)$. Ces bornes reposent sur une
+observation simple, qui sert aussi d'étalon de mesure à ce chapitre.
+
+\begin{proposition}[Borne inférieure de la durée totale]\label{prop:pl:distributed-compute-and-schedulers:bound}
+Aucun ordonnancement de tâches de durées $d_i$ sur $m$ cœurs ne se termine avant $\max\bigl(\sum_i d_i / m,\ \max_i d_i,\ L\bigr)$, où $L$ est la
+plus longue chaîne de tâches dépendantes~: le travail doit être effectué par $m$ cœurs, la tâche la plus longue tourne sur un seul cœur, et une chaîne s'exécute en séquence.
+\end{proposition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{279}{292}{La borne inférieure de la \cref{prop:pl:distributed-compute-and-schedulers:bound}, avec la
+plus longue chaîne calculée sur le graphe de tâches.}\label{lst:pl:distributed-compute-and-schedulers:bound}
+
+LPT suppose de savoir quelles tâches sont longues. Un ordonnanceur ne connaît pas les durées, seulement des estimations --- à partir des paramètres (une fenêtre plus longue, un historique plus long), de
+précédentes exécutions du même code, ou de l'utilisateur. Les estimations du chapitre sont justes à un facteur $e^{0.3z}$ près, avec
+$z$ de loi normale centrée réduite, une dispersion typique pour un modèle de temps d'exécution.
+
+\begin{definition}[Ordonnancement à parts équitables]\label{def:pl:distributed-compute-and-schedulers:fairshare}
+L'\emph{ordonnancement à parts équitables}\index{ordonnancement à parts équitables} (fair share) attribue à chaque utilisateur ou équipe une part cible de la grappe et ordonne la file pour que
+ceux qui consomment moins que leur part soient servis en premier~; une équipe qui soumet dix mille tâches n'empêche pas une équipe qui en soumet cinq cents
+une heure plus tard d'obtenir des cœurs.
+\end{definition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{109}{129}{Partage équitable sous sa forme la plus simple~: la tâche suivante vient de l'équipe qui utilise le moins
+de cœurs par unité de sa cible.}\label{lst:pl:distributed-compute-and-schedulers:fairshare}
+
+\begin{dated}{2026-09}{Partage équitable dans un ordonnanceur de production}\label{dat:pl:distributed-compute-and-schedulers:slurm}
+Slurm, un gestionnaire de charge de travail libre et largement utilisé, calcule un facteur de partage équitable à partir de parts normalisées $S$ et d'usages normalisés $U$
+(«~Fair Tree~», par défaut depuis Slurm 19.05)~: le partage équitable de niveau d'une association vaut $S/U$, supérieur à 1 lorsqu'elle est sous-servie,
+et les utilisateurs sont classés de sorte que les enfants d'un compte mieux servi se classent toujours derrière ceux d'un compte moins bien servi.
+\end{dated}
+
+\begin{definition}[Vol de tâches]\label{def:pl:distributed-compute-and-schedulers:stealing}
+Le \emph{vol de tâches}\index{vol de tâches} (work stealing) est une politique d'ordonnancement décentralisée~: chaque travailleur tient sa propre file de tâches et prend dans sa
+tête~; un travailleur dont la file est vide prend une tâche à l'autre extrémité de la file d'un autre travailleur. Blumofe et Leiserson (1999) l'ont analysé
+pour des calculs multithreadés~; il équilibre la charge sans file centrale.
+\end{definition}
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{132}{154}{Vol de tâches~: tâches réparties à tour de rôle entre des files par cœur, un cœur inactif volant
+dans la plus pleine.}\label{lst:pl:distributed-compute-and-schedulers:stealing}
+
+\section{Graphes de tâches}
+
+\begin{definition}[Graphe de tâches]\label{def:pl:distributed-compute-and-schedulers:graph}
+Un \emph{graphe de tâches}\index{graphe de tâches} est un graphe orienté sans cycle dont les nœuds sont des tâches, chacune avec une demande de ressources et une
+durée estimée, et dont les arêtes indiquent quelle sortie une tâche lit d'une autre~; une tâche est prête lorsque tous ses prédécesseurs se sont terminés.
+\end{definition}
+
+Un balayage n'est presque jamais une liste plate. Ses backtests lisent des variables~; les variables lisent les données nettoyées~; les données ont été construites une fois pour de nombreux balayages.
+Écrite sous forme de graphe, chaque étape partagée devient une tâche dont dépendent de nombreux backtests, et sa sortie peut être mise en cache sous la clé de contenu du
+flux de recherche du livre~7 (chapitre~29)~: le hachage de son code, de ses paramètres et de ses entrées. Le balayage suivant sur les mêmes données retrouve les variables
+dans le cache et n'exécute que les backtests.
+
+\section{Balayages de paramètres et traînards}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \i/\l in {0/{étape de variables 1},1/{étape de variables 2},2/{\dots},3/{étape de variables 100}} {
+  \node[draw,rounded corners=2pt,fill=omMeth!15,minimum width=2.2cm] (f\i) at (\i*3,1.4) {\l};}
+\foreach \i in {0,1,3} {\foreach \j in {-1,0,1} {\draw[->] (f\i.south) -- ++(\j*0.8,-0.8);}}
+\foreach \i in {0,1,3} {\node[font=\tiny] at (\i*3,0.1) {100 backtests};}
+\node[draw,rounded corners=2pt,fill=gray!10,align=center,minimum width=10cm] (c) at (4.5,-0.6) {grappe~: 24 nœuds $\times$ 16 cœurs~;
+un nœud quatre fois plus lent~; les travaux en cours échouent à 0.002 par cœur-heure};
+\end{tikzpicture}
+
+\omcaption{Le \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphe de tâches} et la grappe du chapitre. Cent étapes de variables de vingt minutes chacune, lues chacune par cent backtests~; la durée de chaque backtest est tirée
+de la dispersion mesurée, quarante d'entre eux valant trente fois la médiane dans le balayage à plat. Les étapes de variables sont mises en cache
+par clé de contenu.}\label{fig:pl:distributed-compute-and-schedulers:graph}
+\end{omfigure}
+
+La grappe du chapitre est simulée (\texttt{firm.jobgraph})~; ses tâches ne sont pas inventées. Vingt-quatre petits backtests du chapitre~11 ---
+rejeux de niveau~3 de sessions de cinq minutes de \texttt{firm.tape} --- ont été exécutés sur cet ordinateur portable par la même interface d'ordonnancement, avec un seul
+travailleur~: leur médiane valait 0.089~seconde, la dispersion de leurs logarithmes de durées 0.76, et la plus longue a pris 8.0 fois la médiane. Le balayage simulé
+conserve cette dispersion et ramène la médiane à quinze minutes~: 10\,000 backtests, quarante d'entre eux valant trente fois la médiane (sept heures et demie,
+une longue fenêtre sur un long historique) soumis en dernier, comme un balayage sur une grille soumet naturellement ses plus grands paramètres. Le travail
+représente 3\,649 cœur-heures sur 384 cœurs, soit une borne inférieure de 9.50~heures.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,xlabel={heures après la soumission},ylabel={cœurs occupés (échelle log)},xmin=0,xmax=21,
+  ymode=log,ymin=0.7,ymax=600,unbounded coords=jump,
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma]
+\addplot[color=omThm,very thick,const plot] table[x=t_h,y=busy]{figdata/platforms/13-distributed-compute-and-schedulers/profile_fifo.csv};
+\addplot[color=omDef,thick,densely dashed,const plot] table[x=t_h,y=busy]{figdata/platforms/13-distributed-compute-and-schedulers/profile_lpt.csv};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:14,45) {premier entré, premier sorti};
+\node[omDef,font=\scriptsize,anchor=north east,align=left] at (axis cs:19.8,500) {plus long d'abord,\\avec copies de secours~:\\se termine à 10.0};
+\draw[black,dotted] (axis cs:9.50,0.7) -- (axis cs:9.50,600) node[pos=0.3,right,font=\scriptsize]{borne inférieure};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Cœurs occupés au fil du temps pour le même balayage selon deux ordonnancements, relevés toutes les dix minutes, en échelle logarithmique. Le premier entré, premier sorti garde la grappe pleine
+pendant environ neuf heures, n'atteint les quarante tâches longues qu'après douze heures, et les exécute sur une grappe presque vide jusqu'à ce que la dernière se termine, à 19.8~heures~; le plus long d'abord, avec copies de secours, se termine à 10.0~heures.
+Données~: \texttt{fig\_jobgraph.py}.}\label{fig:pl:distributed-compute-and-schedulers:profile}
+\end{omfigure}
+
+La \Cref{tab:pl:distributed-compute-and-schedulers:policies} donne le balayage sous chaque politique. Le premier entré, premier sorti n'atteint la dernière des quarante
+tâches longues qu'après douze heures, et le balayage se termine à 19.8~heures~--- 475.0 heures-nœud d'une grappe réservée pour un travail qui demandait 3\,649
+cœur-heures. Le plus long d'abord lance les tâches longues dès le début et se termine à 11.8~heures.
+Le \omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} (work stealing), qui équilibre la charge sans la réordonner, se termine à 16.3.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.2cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}>{\centering\arraybackslash}p{2.3cm}@{}}
+\toprule
+politique & \multicolumn{2}{c}{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} (makespan, heures)} & \multicolumn{2}{c}{heures-nœud} & copies de secours \\
+ & simple & avec copies de secours & simple & avec copies de secours & \\
+\midrule
+premier entré, premier sorti & 19.79 & 20.32 & 475.0 & 487.6 & 152 \\
+le plus long d'abord & 11.80 & 10.02 & 283.3 & 240.4 & 105 \\
+\omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} & 16.33 & 16.40 & 391.9 & 393.5 & 145 \\
+le plus long d'abord, sans nœud lent & 10.32 & --- & 247.6 & --- & --- \\
+\midrule
+borne inférieure & \multicolumn{2}{c}{9.50} & & & \\
+\bottomrule
+\end{tabular}
+\caption{Le balayage de 10\,000 tâches sur 384 cœurs sous chaque politique, sans et avec copies de secours spéculatives (une copie de secours lancée après 2.5 fois l'estimation),
+et le plus long d'abord sur une grappe sans le nœud lent. Les heures-nœud sont les 24 nœuds de la grappe réservés pendant la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale}.}
+\label{tab:pl:distributed-compute-and-schedulers:policies}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.4cm,ybar,bar width=12pt,ylabel={durée totale (heures)},ymin=0,ymax=26,
+  symbolic x coords={FIFO,LPT,work stealing},xtick=data,xticklabels={FIFO,LPT,vol de tâches},enlarge x limits=0.25,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},table/col sep=comma,
+  legend style={font=\footnotesize,at={(0.5,1.03)},anchor=south,legend columns=2},nodes near coords,
+  nodes near coords style={font=\scriptsize,rotate=90,anchor=west,/pgf/number format/fixed,/pgf/number format/fixed zerofill,/pgf/number format/precision=2},point meta=y,ybar=4pt]
+\addplot[fill=omThm!45,draw=omThm] table[x=policy,y=plain]{figdata/platforms/13-distributed-compute-and-schedulers/makespans.csv};
+\addlegendentry{simple}
+\addplot[fill=omDef!45,draw=omDef] table[x=policy,y=backups]{figdata/platforms/13-distributed-compute-and-schedulers/makespans.csv};
+\addlegendentry{avec copies de secours}
+\draw[black,dashed] ({rel axis cs:0,0}|-{axis cs:FIFO,9.50}) -- ({rel axis cs:1,0}|-{axis cs:FIFO,9.50})
+  node[pos=0.335,below,font=\tiny]{borne inférieure 9.50};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:pl:distributed-compute-and-schedulers:makespan}{Durée totale} du balayage par politique, sans et avec copies de secours spéculatives (après 2.5 fois l'estimation), comparée à la borne inférieure.
+Le premier entré, premier sorti (FIFO) et le \omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} exécutent les tâches longues en dernier~; le plus long d'abord (LPT) les exécute en premier. Données~:
+\texttt{fig\_jobgraph.py}.}\label{fig:pl:distributed-compute-and-schedulers:makespans}
+\end{omfigure}
+
+\begin{definition}[Exécution spéculative]\label{def:pl:distributed-compute-and-schedulers:spec}
+L'\emph{exécution spéculative}\index{exécution spéculative} lance une seconde copie d'une tâche qui tourne bien plus longtemps que prévu, sur
+une autre machine~; la première copie à se terminer est conservée, et l'autre est interrompue.
+\end{definition}
+
+L'article MapReduce de Google a nommé le problème et son remède~: un \omterm{def:pl:distributed-compute-and-schedulers:makespan}{traînard} (straggler) peut être une machine dont le disque défaillant voit son débit de lecture tomber de 30 à
+1~Mo/s, et lorsqu'un travail approche de son terme, le maître planifie des exécutions de secours pour les tâches restantes encore en cours~; leur tri a duré
+44~\% de plus sans copies de secours. Le seuil compte. Les copies de secours du chapitre démarrent quand une tâche a tourné 2.5 fois son estimation~: avec
+des estimations justes à $e^{0.3z}$ près, une tâche normale dépasse ce point avec une probabilité de 0.11~\% ($z > 3.05$), si bien que les copies de secours visent surtout les tâches
+sur le nœud lent. Le plus long d'abord gagne 1.8~heures grâce à elles~; le premier entré, premier sorti en perd 0.5, car ses tâches longues tardent à démarrer, et non
+à s'exécuter lentement, et les copies de secours ne font que prendre des cœurs~; le travail gaspillé --- copies interrompues, tentatives échouées puis relancées --- est de 91 à 130
+cœur-heures, soit 2.5 à 3.6~\% du balayage.
+
+\omcode{code/firm/jobgraph/firm_jobgraph.py}{206}{227}{Exécution spéculative dans le simulateur~: la copie de secours d'une tâche en retard est placée sur un cœur libre situé
+sur un autre nœud, avant que la file ne soit servie.}\label{lst:pl:distributed-compute-and-schedulers:spec}
+
+\begin{example}[Le balayage terminé le samedi]\label{ex:pl:distributed-compute-and-schedulers:sweep}
+Le plus long d'abord avec copies de secours se termine à 10.02~heures, 5.5~\% au-dessus de la borne inférieure de 9.50~heures. Sans le nœud lent, mais aussi sans copies de secours,
+il se termine à 10.32~: les copies de secours rattrapent plus que ce que coûte le nœud lent, car elles sauvent aussi les tâches dont les estimations étaient
+fausses et celles qui ont échoué. Le premier entré, premier sorti sur la même grappe se termine à 19.79~heures, soit deux fois plus longtemps, et occupe 475 heures-nœud contre
+240 heures-nœud. La grappe est restée presque vide pendant trois heures et demie~: à partir de 16.3~heures après la soumission, moins d'un dixième de ses cœurs étaient
+occupés.
+\end{example}
+
+\section{Parts équitables entre équipes}
+
+Une deuxième équipe soumet 500 backtests une heure après le balayage de la première. Sous premier entré, premier sorti, ils attendent derrière les 10\,000 tâches~: la moitié
+d'entre eux est terminée 8.28~heures après la soumission, et la dernière 11.4~heures après. Avec un partage équitable à cibles égales, chaque cœur libéré revient à la deuxième équipe
+jusqu'à ce qu'elle occupe la moitié de la grappe~: la moitié de ses tâches sont terminées en 0.59~heures et toutes en 2.64, tandis que le balayage de la première équipe se termine à
+16.68~heures au lieu de 19.79 --- plus tôt, et non plus tard, car l'entrelacement des tâches de la deuxième équipe modifie où et quand s'exécutent les tâches longues de la première
+équipe, et c'est cela, et non les 5~\% de travail supplémentaire, qui fixe sa fin.
+
+\section{Mise en cache, pannes et coût}
+
+Lorsque chaque backtest recalcule ses variables (vingt minutes chacune), le balayage demande 6\,922 cœur-heures et 19.3~heures~; écrit sous forme de \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphe de tâches}
+avec cent étapes de variables, il demande 3\,514 cœur-heures et 11.4~heures~; le balayage suivant sur les mêmes données trouve les cent étapes dans le
+cache et demande 3\,475 cœur-heures et 10.3~heures. Les pannes coûtent ce qui a été perdu~: une tentative échouée est reprise depuis son début, si bien qu'une panne
+d'une tâche de sept heures coûte jusqu'à sept heures, ce qui explique que les tâches longues écrivent des points de reprise (livre~12, chapitre~23). Le coût d'un balayage est la capacité qu'il occupe~:
+sur une grappe louée à l'heure-nœud, l'écart entre premier entré, premier sorti et le plus long d'abord avec copies de secours est de 235 heures-nœud pour
+les mêmes résultats.
+
+\section{Tutoriel~: un balayage sur une grappe simulée}\label{tut:pl:distributed-compute-and-schedulers:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Calibrer un balayage sur de vrais backtests, l'ordonnancer selon quatre politiques sur une grappe simulée, et mesurer ce que changent les copies de secours,
+les parts équitables et la mise en cache. \textbf{État final~:} le \cref{tab:pl:distributed-compute-and-schedulers:policies} et
+la \cref{fig:pl:distributed-compute-and-schedulers:profile}.
+\begin{tutsteps}
+\item \textbf{Calibrer}~: \texttt{bench\_jobgraph.py} exécute 24 petits backtests via \texttt{LocalExecutor} avec un seul travailleur~;
+\texttt{measured\_sigma()}.
+\item \textbf{Balayage}~: \texttt{sweep(sigma)}, \texttt{cluster()}, \texttt{lower\_bound}.
+\item \textbf{Politiques}~: \texttt{policies(sigma)}~; \texttt{profile(sigma)} pour les courbes de cœurs occupés.
+\item \textbf{Équipes}~: \texttt{fair\_share(sigma)}.
+\item \textbf{Mise en cache}~: \texttt{caching(sigma)} sur le \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphe de tâches}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Donner à l'ordonnanceur des estimations parfaites et voir à quelle distance de la borne arrive le plus long d'abord~; ne lui fournir aucune estimation
+(chaque tâche valant la médiane) et voir ce qui subsiste de son avantage.
+\end{tutorial}
+
+\section{Construction~: le graphe de tâches}\label{bld:pl:distributed-compute-and-schedulers:jobgraph}
+
+\begin{build}
+\bfield{Rôle} Une bibliothèque de \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphes de tâches} et d'ordonnancement que la plateforme utilise pour planifier et exécuter les balayages, et un simulateur pour choisir les politiques
+avant de dépenser des heures-nœud.
+\bfield{Interface} \texttt{Task}, \texttt{Cluster}, \texttt{simulate(tasks, cluster, policy, spec, cache) -> Schedule}~;
+\texttt{FIFO}, \texttt{LPT}, \texttt{FairShare}, \texttt{WorkStealing}~; \texttt{lower\_bound}~; \texttt{utilisation}~;
+\texttt{LocalExecutor}.
+\bfield{Règles} L'ordonnanceur ne voit que des estimations, jamais les durées~; une tentative échouée ou préemptée est relancée depuis son début~; une copie de secours s'exécute sur
+un autre nœud, la copie perdante est interrompue et comptée comme gaspillage~; un succès de cache ne prend aucun temps~; tout est initialisé par une graine.
+\bfield{Tests d'acceptation} \texttt{code/firm/jobgraph/tests/}~: l'exemple de Graham ($3,3,2,2,2$ sur deux cœurs~: 7 contre un optimum de 6)~; premier
+entré, premier sorti face au plus long d'abord~; dépendances et borne de la chaîne~; partage équitable des cœurs~; \omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} sur une répartition initiale déséquilibrée~;
+les copies de secours sauvant un nœud lent~; les relances~; les succès de cache~; l'ordre de l'exécuteur local.
+\bfield{Pour aller plus loin} Classes de mémoire et tâches multicœurs avec backfilling~; capacité préemptible (spot) à prix réduit~; consommation qui s'estompe au fil du temps
+dans l'\omterm{def:pl:distributed-compute-and-schedulers:fairshare}{ordonnancement à parts équitables}.
+\end{build}
+
+\begin{omsources}
+\item R.~L. Graham, ``Bounds on multiprocessing timing anomalies'', \emph{SIAM Journal on Applied Mathematics} 17(2), 1969.
+\item J.~Dean et S.~Ghemawat, ``MapReduce: simplified data processing on large clusters'', OSDI 2004.
+\item J.~Dean et L.~A. Barroso, ``The tail at scale'', \emph{Communications of the ACM} 56(2), 2013.
+\item R.~D. Blumofe and C.~E. Leiserson, ``Scheduling multithreaded computations by work stealing'', \emph{Journal of the ACM} 46(5), 1999.
+\item Documentation de Slurm, ``Fair Tree Fairshare Algorithm''.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:1}
+Cinq tâches de durées 3, 3, 2, 2, 2 s'exécutent sur deux cœurs. Calculer la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} (makespan) avec le plus long d'abord, puis la meilleure durée possible.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:2}
+La tâche médiane du balayage dure quinze minutes. Calculer la durée des quarante tâches longues sur un nœud normal, puis sur le nœud lent.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:distributed-compute-and-schedulers:3}
+Expliquer pourquoi la borne inférieure du balayage du chapitre est le travail total divisé par le nombre de cœurs, et non la tâche la plus longue.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:4}
+Expliquer pourquoi le seuil de copie de secours, égal à 2.5 fois l'estimation, se déclenche rarement pour une tâche saine, et ce que produirait un seuil de 1.5.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:5}
+Expliquer pourquoi le \omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} se termine plus tard que le plus long d'abord, alors qu'aucun cœur n'est inactif tant qu'il reste du travail en file d'attente.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:distributed-compute-and-schedulers:6}
+Le partage équitable permet à la seconde équipe de finir plus tôt~; expliquer ce qu'il change pour la fin de la première équipe, et pourquoi.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:distributed-compute-and-schedulers:7}
+\emph{Programmation.} Lancer \texttt{policies} avec les tâches longues soumises en premier plutôt qu'en dernier, et expliquer ce qui arrive au premier entré, premier sorti et au plus long d'abord.
+le plus long d'abord~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:distributed-compute-and-schedulers:8}
+\emph{Trouver la faille.} «~Le balayage a tourné toute la nuit sur une grappe de 384 cœurs et n'a consommé que 3\,649 heures-cœur, donc la grappe est trop grande~: nous
+allons la réduire de moitié.~»
+\end{exercise}
+
+\section{Problème~: le balayage terminé le samedi}
+
+\begin{problem}[{Problème du week-end --- dix mille backtests et un nœud lent}]\label{pb:pl:distributed-compute-and-schedulers:1}
+Le balayage, la \omterm{def:pl:distributed-compute-and-schedulers:cluster}{grappe de calcul} et les politiques du chapitre.
+
+\medskip\noindent\textbf{Partie I --- La charge de travail.}
+\begin{enumerate}
+\item Pourquoi un \omterm{def:pl:distributed-compute-and-schedulers:sweep}{balayage de paramètres} est-il \omterm{def:pl:distributed-compute-and-schedulers:sweep}{trivialement parallèle} (embarrassingly parallel)~?
+\item Comment a-t-on obtenu la dispersion des durées des tâches~?
+\item Quel est le travail total, et quelle est la borne inférieure sur 384 cœurs~?
+\item À quel rang de soumission se trouvent les quarante tâches longues, et pourquoi~?
+\item Qu'est-ce qui fait d'une tâche un \omterm{def:pl:distributed-compute-and-schedulers:makespan}{traînard} (straggler) ici, de trois façons~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Politiques.}
+\begin{enumerate}[resume]
+\item Que garantit l'analyse de Graham pour l'ordonnancement en liste et pour le plus long d'abord~?
+\item De quoi le plus long d'abord a-t-il besoin que le premier entré, premier sorti n'exige pas~?
+\item Pourquoi le \omterm{def:pl:distributed-compute-and-schedulers:stealing}{vol de tâches} ne corrige-t-il pas les tâches longues~?
+\item Que change le partage équitable entre deux équipes~?
+\item Quand l'\omterm{def:pl:distributed-compute-and-schedulers:spec}{exécution spéculative} aide-t-elle, et quand gaspille-t-elle~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les chiffres.}
+\begin{enumerate}[resume]
+\item Donner la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} de chaque politique avec et sans copies de secours.
+\item Pendant combien de temps la grappe est-elle restée presque inactive avec le premier entré, premier sorti~?
+\item À quelle distance de la borne inférieure se trouve le meilleur ordonnancement, et pourquoi~?
+\item Que fait le partage équitable pour la première moitié des tâches de la seconde équipe~?
+\item Qu'est-ce que le \omterm{def:pl:distributed-compute-and-schedulers:graph}{graphe de tâches} et le cache permettent d'économiser~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la \omterm{def:pl:distributed-compute-and-schedulers:makespan}{durée totale} et les heures-nœud du balayage sous chaque politique, le gain de l'\omterm{def:pl:distributed-compute-and-schedulers:spec}{exécution spéculative}, et
+la distance du meilleur ordonnancement à la borne inférieure.
+\item Quelles modifications apporter à l'ordonnancement par défaut des balayages de la plateforme~?
+\item Quelles informations demander aux utilisateurs pour chaque balayage~?
+\item Comment dimensionner la grappe~?
+\item En une phrase~: qu'est-ce qui détermine la fin d'un balayage~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:distributed-compute-and-schedulers:1}
+La dernière fraction de 1~\% des tâches de votre balayage prend autant de temps que les 99~\% premières. Que faites-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:distributed-compute-and-schedulers:2}
+Qu'est-ce que l'\omterm{def:pl:distributed-compute-and-schedulers:spec}{exécution spéculative}, et quand est-ce une mauvaise idée~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:distributed-compute-and-schedulers:3}
+Deux équipes partagent une grappe~; l'une soumet d'énormes balayages. Comment faites-vous pour que l'autre reste productive~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:distributed-compute-and-schedulers:4}
+Comment structureriez-vous dix mille backtests qui partagent des calculs de variables coûteux~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:distributed-compute-and-schedulers:5}
+Concevez la couche d'ordonnancement de la \omterm{def:pl:distributed-compute-and-schedulers:cluster}{grappe de calcul} d'une plateforme de recherche.
+\end{interviewq}

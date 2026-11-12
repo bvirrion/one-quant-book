@@ -1,0 +1,328 @@
+\chapter{Hiérarchie de la mémoire et caches}\label{ch:ll:memory-hierarchy-and-caches}
+
+Sur le portable de ce livre, la lecture d'un niveau de prix d'un carnet d'ordres coûte environ une nanoseconde lorsque le niveau se trouve dans le
+cache de premier niveau du cœur, trois ou quatre nanosecondes lorsqu'il se trouve au deuxième niveau, et environ 150~nanosecondes lorsqu'il
+doit être lu en mémoire~: un facteur supérieur à cent pour une même instruction. Le carnet jouet du chapitre~1, bâti sur des arbres équilibrés,
+dont les nœuds sont dispersés dans le tas, passait l'essentiel de son temps à attendre ce genre de lecture. La plus grande part de l'écart
+entre un carnet d'ordres rapide et un carnet lent ne tient pas à l'algorithme mais à l'endroit où vivent ses octets, et ce chapitre porte sur cela~:
+les niveaux de la hiérarchie et leur coût, ce qui se passe lorsque deux cœurs partagent une ligne, la manière dont les adresses virtuelles
+sont traduites, et ce que le matériel fait pour masquer tout cela.
+
+\section{Niveaux de cache, lignes et associativité}
+
+\begin{definition}[Ligne de cache, cache associatif par ensembles]\label{def:ll:memory-hierarchy-and-caches:line}
+Les données circulent entre les niveaux de la hiérarchie par blocs de taille fixe appelés \emph{lignes de cache}\index{ligne de cache} (cache lines), de 64~octets
+sur les processeurs x86 actuels. Dans un \emph{cache associatif par ensembles}\index{cache associatif par ensembles} (set-associative cache) à $S$ ensembles de $W$ voies, une
+ligne ne peut être stockée que dans l'ensemble désigné par les bits de son adresse, dans l'un quelconque des $W$ emplacements de cet ensemble~; le cache contient
+$S \cdot W$ lignes.
+\end{definition}
+
+\begin{definition}[Défaut de cache, ensemble de travail]\label{def:ll:memory-hierarchy-and-caches:miss}
+Un \emph{défaut de cache}\index{défaut de cache} (cache miss) est un accès à une ligne absente d'un niveau donné, qu'il faut alors
+aller chercher au niveau inférieur. L'\emph{ensemble de travail}\index{ensemble de travail} (working set) d'un morceau de code sur un intervalle est l'ensemble des
+lignes qu'il touche sur cet intervalle~; le niveau dont la capacité peut l'accueillir fixe sa vitesse.
+\end{definition}
+
+Une adresse se décompose en trois champs (\cref{fig:ll:memory-hierarchy-and-caches:split})~: les 6 bits de poids faible donnent le décalage
+dans la ligne de 64~octets~; les $\log_2 S$ bits suivants choisissent l'ensemble~; le reste, l'étiquette, identifie la ligne parmi celles qui
+correspondent à l'ensemble. Deux conséquences pour l'organisation des données. Une structure à cheval sur deux lignes coûte deux défauts là où un seul
+suffirait. Et des adresses qui diffèrent d'un multiple de $S \times 64$ octets se disputent les mêmes $W$ emplacements~: un programme qui parcourt
+plusieurs tableaux dont les pas sont ce multiple (une puissance de deux, typiquement 4\,KiB) peut subir des défauts dans un cache
+presque vide.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\draw[fill=gray!10] (0,0) rectangle (6.4,0.6); \node at (3.2,0.3) {étiquette};
+\draw[fill=omDef!15] (6.4,0) rectangle (8.8,0.6); \node[font=\scriptsize] at (7.6,0.3) {indice d'ensemble};
+\draw[fill=omThm!12] (8.8,0) rectangle (10.8,0.6); \node at (9.8,0.3) {décalage};
+\node[anchor=south,align=center] at (3.2,0.65) {bits restants de l'adresse};
+\node[anchor=south,align=center] at (7.6,0.65) {bits 6--11\\ (64 ensembles)};
+\node[anchor=south,align=center] at (9.8,0.65) {bits 0--5\\ (64 octets)};
+\draw[-Stealth,thick,omDef] (7.6,0) -- (7.6,-0.75);
+\foreach \w in {0,...,11} \draw[draw=omDef,fill=omDef!6] (4.6+0.5*\w,-0.8) rectangle (5.05+0.5*\w,-1.3);
+\node[anchor=north,align=center] at (7.35,-1.4) {l'ensemble choisi~: 12 voies, dont chacune peut contenir une ligne portant cet indice};
+\end{tikzpicture}
+
+\omcaption{Comment une adresse désigne son emplacement dans un \omterm{def:ll:memory-hierarchy-and-caches:line}{cache associatif par ensembles}. Un cache de 48~KiB à 12 voies, aux lignes de 64~octets, compte 64
+ensembles~; les bits 6 à 11 de l'adresse désignent l'ensemble, si bien que deux adresses distantes de 4\,KiB partagent un même ensemble.}\label{fig:ll:memory-hierarchy-and-caches:split}
+\end{omfigure}
+
+\begin{example}[Géométrie d'un cache de premier niveau]\label{ex:ll:memory-hierarchy-and-caches:geometry}
+Un cache de 48~KiB à 12 voies, aux lignes de 64~octets, compte $48 \times 1024 / (64 \times 12) = 64$ ensembles. L'indice d'ensemble est formé des bits 6 à
+11~; des adresses égales modulo $64 \times 64 = 4\,096$ octets tombent dans le même ensemble. Treize structures très sollicitées placées
+au même décalage de treize pages de 4~KiB ne peuvent toutes rester dans ce cache, alors qu'elles n'occupent ensemble que 832 octets.
+\end{example}
+
+La \Cref{fig:ll:memory-hierarchy-and-caches:stairs} mesure la hiérarchie par un parcours de pointeurs~: un tampon de $n$ emplacements, un par
+\omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}, disposé en un unique cycle aléatoire, chaque emplacement contenant l'adresse du suivant. L'adresse de chaque lecture est
+le résultat de la lecture précédente, si bien que deux lectures ne se recouvrent jamais et que le temps par étape est la latence du niveau dans lequel le
+tampon tient. L'escalier montre le premier niveau jusqu'à 48~KiB, à environ \qty{1.1}{\nano\second} (cinq cycles), le deuxième
+niveau jusqu'à environ un mégaoctet et demi, à environ \qty{3.5}{\nano\second}, le troisième niveau, d'environ trois à huit
+mégaoctets, entre 15 et \qty{23}{\nano\second}, proche de sa latence publiée de 75 cycles ou plus (environ
+\qty{20}{\nano\second}), et la mémoire à partir d'environ douze mégaoctets, entre 100 et \qty{175}{\nano\second}~: la
+mémoire basse consommation d'un portable, qu'une mesure publiée situe entre 150 et 175 nanosecondes pour ce processeur. Le
+troisième niveau fait 24~MiB, partagé par tous les cœurs~; un parcours aléatoire dans les pages d'une machine virtuelle commence à manquer dans ce
+niveau bien avant sa taille nominale.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=6cm,xmode=log,ymode=log,log basis x=2,xmin=4096,xmax=268435456,ymin=0.8,ymax=500,
+  xtick={4096,32768,262144,2097152,16777216,134217728},xticklabels={4 KiB,32 KiB,256 KiB,2 MiB,16 MiB,128 MiB},
+  ytick={1,2,5,10,20,50,100,200},yticklabels={1,2,5,10,20,50,100,200},
+  xlabel={ensemble de travail (échelle log)},ylabel={ns par lecture (échelle log)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick,mark=*,mark size=1.2pt] table[x=bytes,y=random_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\addplot[omThm,thick,mark=square*,mark size=1.2pt] table[x=bytes,y=random_huge_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\addplot[omMeth,thick,dashed,mark=triangle*,mark size=1.2pt] table[x=bytes,y=sequential_ns]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_stairs.csv};
+\legend{ordre aléatoire,{ordre aléatoire, grandes pages},ordre des adresses}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'escalier de la mémoire~: temps par lecture dépendante à travers un tampon d'un emplacement par \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}, en fonction de la
+taille du tampon. Dans l'ordre des adresses, le \omterm{def:ll:memory-hierarchy-and-caches:prefetch}{préchargement matériel} masque presque tout. Mesuré sur un portable (Intel Core Ultra 7 155H)
+sous WSL2, sans cœurs isolés, fixé à un seul CPU, la machine étant par ailleurs inactive. Données~: \texttt{bench\_mem.py}.}\label{fig:ll:memory-hierarchy-and-caches:stairs}
+\end{omfigure}
+
+\section{Cohérence et faux partage}
+
+\begin{definition}[Cohérence de cache]\label{def:ll:memory-hierarchy-and-caches:coherence}
+La \emph{cohérence de cache}\index{cohérence de cache} (cache coherence) est le protocole par lequel les caches privés de plusieurs cœurs gardent une
+vision commune de chaque ligne~: avant qu'un cœur n'écrive dans une ligne, il doit l'obtenir en état exclusif, en invalidant la copie de tous les autres
+cœurs~; une lecture ultérieure par un autre cœur doit aller chercher la ligne modifiée auprès de son auteur. Dans la famille MESI, chacune des lignes
+de chaque cache est modifiée, exclusive, partagée ou invalide.
+\end{definition}
+
+\begin{definition}[Faux partage]\label{def:ll:memory-hierarchy-and-caches:false}
+Le \emph{faux partage}\index{faux partage} (false sharing) survient lorsque deux cœurs écrivent à plusieurs reprises des variables différentes situées dans la
+même \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}~: aucun des deux ne partage de données avec l'autre, et pourtant chaque écriture invalide la copie de l'autre cœur, et la ligne
+circule entre eux.
+\end{definition}
+
+Un thread de données de marché qui met à jour un compteur de séquence, et un thread de stratégie qui met à jour ses propres statistiques, placés
+côte à côte dans une même structure, paient le prix du déplacement de la ligne d'un cœur à l'autre à chaque mise à jour, sans que
+la moindre donnée soit partagée. La \Cref{fig:ll:memory-hierarchy-and-caches:false} le mesure~: un thread qui incrémente un compteur paie environ
+\qty{4}{\nano\second} par incrémentation atomique~; deux threads qui incrémentent chacun leur propre compteur sur des lignes distinctes paient environ
+la même chose~; deux threads dont les compteurs partagent une même ligne paient environ cinq fois plus. Le remède tient à la disposition~: donner à chaque
+variable écrite indépendamment sa propre ligne (\texttt{CachePadded}, ci-dessous), et garder ensemble les variables écrites par un même thread
+à l'écart de celles qu'écrit un autre.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=9cm,height=5cm,xbar,bar width=12pt,xmin=0,enlarge x limits={upper,value=0.15},
+  symbolic y coords={same line,padded,one thread},ytick=data,yticklabels={un seul thread,avec remplissage,même ligne},enlarge y limits=0.3,
+  xlabel={ns par incrémentation atomique},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},nodes near coords,nodes near coords style={font=\footnotesize},
+  every node near coord/.append style={/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[y=layout,x=ns_per_increment]{figdata/low-latency/03-memory-hierarchy-and-caches/measured_false.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:memory-hierarchy-and-caches:false}{Faux partage}~: deux threads épinglés sur deux CPU, incrémentant chacun son propre compteur atomique 20 millions de fois,
+avec les compteurs sur une même \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} ou sur deux. Mesures effectuées sur un portable (Intel Core Ultra 7 155H) sous WSL2, sans
+cœurs isolés. Données~: \texttt{bench\_mem.py}.}\label{fig:ll:memory-hierarchy-and-caches:false}
+\end{omfigure}
+
+\section{Tampons de traduction d'adresses et grandes pages}
+
+\begin{definition}[Tampon de traduction d'adresses, grande page]\label{def:ll:memory-hierarchy-and-caches:tlb}
+Les programmes utilisent des adresses virtuelles, traduites en adresses physiques par les tables de pages. Le \emph{tampon de traduction
+d'adresses}\index{tampon de traduction d'adresses} (translation lookaside buffer, TLB) conserve les traductions récentes~; un défaut de TLB oblige le processeur à parcourir les
+tables de pages, plusieurs accès mémoire dépendants. Une \emph{grande page}\index{grande page} (huge page) est une page plus grande que la page
+de base de 4~KiB (2~MiB ou 1~GiB sur x86-64), couverte par une seule entrée du TLB.
+\end{definition}
+
+La portée du TLB est son nombre d'entrées multiplié par la taille de page. Un TLB de second niveau de 2\,048 entrées couvre 8~MiB de
+pages de 4~KiB et 4~GiB de pages de 2~MiB~; un carnet d'ordres, une table de symboles et quelques anneaux d'un processus de trading peuvent facilement
+dépasser le premier et jamais le second. Linux propose les \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} de deux façons~: des pages réservées dans un pool, et les \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} transparentes,
+que le noyau constitue de lui-même~; en mode par défaut \texttt{madvise}, il ne le fait que pour les régions que le
+programme a marqué avec \texttt{madvise(MADV\_HUGEPAGE)}. La documentation du noyau note que le gain est plus important
+sous virtualisation, où chaque parcours passe par deux niveaux de tables de pages, celui de l'invité et celui de l'hyperviseur. Sur
+ce portable, qui est virtualisé, un parcours aléatoire sur 256~MiB coûte environ \qty{180}{\nano\second} par pas avec des pages
+de 4~KiB et environ \qty{150}{\nano\second} avec les \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} (\texttt{measured\_huge.csv})~: la différence tient
+au parcours des tables de pages.
+
+
+\section{Préchargement et schémas d'accès}
+
+\begin{definition}[Préchargement matériel]\label{def:ll:memory-hierarchy-and-caches:prefetch}
+Le \emph{préchargement matériel}\index{préchargement matériel} (hardware prefetching) est le chargement, par le processeur, de lignes avant leur demande,
+en reconnaissant des régularités dans les \omterm{def:ll:memory-hierarchy-and-caches:miss}{défauts de cache} récents~: lignes consécutives, pas constants.
+\end{definition}
+
+La courbe en tirets de la \cref{fig:ll:memory-hierarchy-and-caches:stairs} reprend le même parcours, avec les emplacements visités dans
+l'ordre des adresses~: le préchargeur reconnaît le flux et les chargements coûtent moins de \qty{2}{\nano\second} tant que le tampon quitte le
+second niveau, et de quatre ou cinq nanosecondes depuis la mémoire, soit une trentaine de fois moins que le parcours aléatoire. Rien n'a changé que
+l'ordre. Les règles pratiques en découlent~: ranger ensemble, dans des tableaux contigus, ce que lit le chemin critique (hot path), et non dans des nœuds
+liés par des pointeurs~; itérer dans l'ordre des adresses~; garder les données chaudes d'un message (prix, quantité, côté) dans la première ligne de sa
+structure~; et lorsque l'accès est réellement aléatoire, comme une recherche par identifiant d'ordre, rendre la table assez petite pour rester dans le cache
+(chapitre~19).
+
+\section{Tutoriel~: mesurer l'escalier}\label{tut:ll:memory-hierarchy-and-caches:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Mesurer la latence de chaque niveau de la hiérarchie, le coût du \omterm{def:ll:memory-hierarchy-and-caches:false}{faux partage} (false sharing) et l'effet des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes
+pages}. \textbf{État final~:} les \cref{fig:ll:memory-hierarchy-and-caches:stairs,fig:ll:memory-hierarchy-and-caches:false} et
+le tableau des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages}.
+\begin{tutsteps}
+\item \textbf{Un anneau de pointeurs.} Mélanger l'ordre des emplacements avec Fisher--Yates, puis stocker dans chaque emplacement l'adresse de la
+suivante~: un cycle unique parcourant toutes les lignes, que nul préchargeur ne peut prévoir.
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{52}{72}{Construction et parcours d'un anneau de pointeurs.}\label{lst:ll:memory-hierarchy-and-caches:chase}
+\item \textbf{\omterm{def:ll:memory-hierarchy-and-caches:tlb}{Grandes pages} sur demande.} \texttt{Buffer} associe une mémoire anonyme, demande des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} transparentes avec
+\texttt{madvise}, et écrit chaque page une fois pour qu'aucun défaut de page ne survienne plus tard sur le chemin critique (chapitre~6).
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{27}{36}{Un tampon avec grandes pages et pré-chargement des pages (pre-faulting).}\label{lst:ll:memory-hierarchy-and-caches:buffer}
+\item \textbf{Un compteur par ligne.} \texttt{CachePadded} aligne sa valeur sur une ligne qui lui est propre~; deux threads incrémentent
+leurs compteurs par additions atomiques relâchées, une fois avec remplissage, une fois regroupés dans une même structure.
+\omcode{code/firm/memkit/cpp/firm_memkit.hpp}{22}{26}{Une valeur seule sur sa ligne de cache.}\label{lst:ll:memory-hierarchy-and-caches:padded}
+\item \textbf{Lancer} \texttt{python bench\_mem.py} (une minute environ)~: l'escalier avec des pages de 4~KiB et des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages}, et dans l'ordre des
+adresses, la comparaison des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} sur 256~MiB, et le test de \omterm{def:ll:memory-hierarchy-and-caches:false}{faux partage} sur les CPU 2 et 4.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Utiliser un pas de 4\,096 octets au lieu de 64 dans le parcours et trouver l'\omterm{def:ll:memory-hierarchy-and-caches:miss}{ensemble de travail} (working set) pour lequel
+le premier niveau ne suffit plus, bien plus tôt que 48~KiB~; épingler les deux threads de \omterm{def:ll:memory-hierarchy-and-caches:false}{faux partage} sur un même CPU et expliquer le résultat.
+\end{tutorial}
+
+\section{Construction~: outils de placement en mémoire}\label{bld:ll:memory-hierarchy-and-caches:memkit}
+
+\begin{build}
+\bfield{Rôle} Les primitives de disposition qu'utilise chaque composant ultérieur~: compteurs et numéros de séquence écrits par des threads différents
+(anneaux, chapitre~12~; statistiques du feed handler, chapitre~18) et tampons qui ne doivent provoquer ni défaut de page ni défaut de TLB
+sur le chemin critique (carnets d'ordres, journaux).
+\bfield{Interface} C++20 \texttt{firm::memkit}~: \texttt{kLine}, \texttt{CachePadded<T>},
+\texttt{Buffer(bytes, huge)} avec \texttt{data()}, \texttt{size()}, \texttt{huge\_requested()},
+\texttt{chase\_ring(base, n, stride, random, seed)}, \texttt{chase(start, steps)}. Rust \texttt{firm\_memkit}~: \texttt{CachePadded<T>}, \texttt{chase\_ring},
+\texttt{chase} sur un tampon d'octets.
+\bfield{Règles} Les valeurs avec remplissage occupent des lignes entières~; les tampons sont alignés sur les pages, arrondis à la taille de page demandée, et
+pré-chargées à la construction~; une demande de \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grande page} échouée se replie sur les pages de base et le signale.
+\bfield{Tests d'acceptation} \texttt{code/firm/memkit/}~: tailles et alignements des valeurs avec remplissage, valeurs voisines avec
+remplissage à une ligne d'écart, un tampon de \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} arrondi à 2~MiB, et l'anneau formant un cycle unique dans les deux ordres, en C++ et en Rust.
+\bfield{Pour aller plus loin} Signaler les \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} effectivement obtenues, à partir de \texttt{/proc/self/smaps}~; allouer depuis des pages réservées de 1~GiB
+lorsque l'hôte en dispose.
+\end{build}
+
+\begin{omsources}
+\item U.~Drepper, ``What every programmer should know about memory'', LWN.net, 2007.
+\item M.~Papamarcos et J.~Patel, ``A low-overhead coherence solution for multiprocessors with private cache memories'',
+ISCA 1984.
+\item Documentation du noyau Linux, ``Transparent hugepage support''.
+\item Chips and Cheese, ``Intel's Redwood Cove: baby steps are still steps'' (2024) and ``Update on Meteor Lake DRAM
+latency measurements'' (2024).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:1}
+Dans un cache dont les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} font 64~octets et qui compte 64 ensembles, à quel ensemble correspond l'adresse \texttt{0x7f3a12345e48}, et quel est son décalage
+au sein de sa \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:2}
+Un cache de 2~MiB à 16 voies, dont les \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} font 64~octets. Combien d'ensembles possède-t-il, et à quel pas les adresses tombent-elles dans le
+même ensemble~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:memory-hierarchy-and-caches:3}
+Un processus utilise 600~MiB de données chaudes. Combien d'entrées de TLB lui faut-il avec des pages de 4~KiB, et avec des pages de 2~MiB~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:4}
+Une structure de message contient un numéro de séquence de 8~octets, écrit par le thread de flux, et un compteur de 4~octets
+écrit par le thread de stratégie, côte à côte avec lui. Que se passe-t-il, et comment y remédier, au prix de combien d'octets supplémentaires~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:5}
+D'après la \cref{fig:ll:memory-hierarchy-and-caches:stairs}, combien de temps prend une mise à jour du carnet d'ordres qui effectue quatre lectures aléatoires dépendantes
+lorsque ses données tiennent dans le deuxième niveau, puis lorsqu'elles proviennent de la mémoire~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:memory-hierarchy-and-caches:6}
+Pourquoi le parcours dans l'ordre des adresses reste-t-il rapide bien au-delà du deuxième niveau, alors que le parcours aléatoire ne l'est pas~? Que
+cela implique-t-il pour les listes chaînées et les arbres équilibrés sur le chemin critique~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:memory-hierarchy-and-caches:7}
+\emph{Programmation.} Réécrire le \texttt{chase} en Rust de \texttt{firm\_memkit} avec des pointeurs bruts et \texttt{unsafe}, comme le fait le C++,
+puis comparer les deux versions à la version à indices sur un anneau de 64~MiB. La vérification des bornes est-elle visible dans le temps par pas~? Pourquoi,
+ou pourquoi pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:memory-hierarchy-and-caches:8}
+\emph{Trouver la faille.} «~Nous avons mesuré la mise à jour de notre carnet d'ordres à \qty{20}{\nano\second} en appliquant les mêmes messages d'ajout et
+de suppression à un seul instrument dix millions de fois, dans une boucle.~»
+\end{exercise}
+
+\section{Problème~: l'escalier}
+
+\begin{problem}[{Problème du week-end --- combien de carnets tiennent}]\label{pb:ll:memory-hierarchy-and-caches:1}
+Un processus de market making cote un ensemble d'instruments. Pour chacun, il conserve une échelle de prix dense de 256 niveaux par côté,
+chaque niveau occupant 32~octets (prix, quantité, nombre d'ordres, indicateurs), plus 4~KiB d'état par instrument. L'équipe veut que
+les données chaudes de chaque instrument tiennent dans le cache de deuxième niveau du cœur qui exécute la stratégie.
+
+\medskip\noindent\textbf{Partie I --- La mesure.}
+\begin{enumerate}
+\item Lire la latence du premier niveau, celle du deuxième niveau et celle de la mémoire à partir de
+la \cref{fig:ll:memory-hierarchy-and-caches:stairs}.
+\item Où se trouvent les marches, et quelles capacités suggèrent-elles~?
+\item Pourquoi la marche du troisième niveau se termine-t-elle vers huit mégaoctets, et non à 24~MiB~?
+\item Qu'est-ce qui fixe la hauteur de la marche entre le deuxième niveau et la mémoire~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La disposition.}
+\begin{enumerate}[resume]
+\item Combien d'octets occupent les données chaudes d'un instrument~?
+\item Combien de \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} cela représente-t-il~?
+\item Si les trois quarts d'un deuxième niveau de 2~MiB sont disponibles pour les carnets, combien d'instruments peuvent tenir~?
+\item Combien en tiennent, au maximum, dans un premier niveau de 48~KiB~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Quand elles ne tiennent pas.}
+\begin{enumerate}[resume]
+\item Le desk veut 300 instruments. Quelle fraction des mises à jour manquera le deuxième niveau si les instruments sont mis à jour
+uniformément au hasard, et si le deuxième niveau contient les plus récents~?
+\item Si une mise à jour effectue trois lectures dépendantes, quel est son temps mémoire moyen avec ce taux de défaut, en prenant les
+latences du deuxième niveau et de la mémoire de la partie~I~?
+\item Qu'est-ce que les \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages} changeraient, et pourquoi particulièrement ici~?
+\item Citer deux changements de disposition qui réduisent les données chaudes.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la latence de chaque niveau sur ce portable et le nombre d'instruments dont le carnet
+tient dans le deuxième niveau.
+\item Pourquoi 32~octets est-il une bonne taille pour un niveau, et 48 une mauvaise~?
+\item L'échelle doit-elle stocker les niveaux sous forme de structures à quatre champs ou de quatre tableaux d'un seul champ~? Quand chacune l'emporte-t-elle~?
+\item Que mesure le parcours que masque un benchmark séquentiel~?
+\item Pourquoi le benchmark doit-il visiter chaque ligne une fois par tour~?
+\item Quel est le coût, par mise à jour, d'un compteur en \omterm{def:ll:memory-hierarchy-and-caches:false}{faux partage} dans le carnet~?
+\item Comment confirmeriez-vous, sur l'hôte de production, que les carnets restent dans le deuxième niveau~?
+\item En une phrase~: qu'est-ce qui détermine la vitesse d'un carnet d'ordres~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:1}
+Pourquoi parcourir un \texttt{std::vector} est-il plus rapide que parcourir une \texttt{std::list} contenant les mêmes éléments~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:2}
+Qu'est-ce que le \omterm{def:ll:memory-hierarchy-and-caches:false}{faux partage}~? Comment le détecteriez-vous et comment le corrigeriez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:3}
+Qu'est-ce qu'un TLB, et pourquoi les systèmes de trading utilisent-ils des \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:4}
+Comment mesureriez-vous la latence de chaque niveau de la hiérarchie de caches d'une machine~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:5}
+Deux tableaux de 4\,096 doubles sont parcourus élément par élément en même temps, et la boucle est étonnamment lente. Que peut-il
+se passer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:memory-hierarchy-and-caches:6}
+Concevez la disposition mémoire d'une table de correspondance identifiant d'ordre vers ordre pour un flux comptant un million d'ordres vivants, avec la latence p99 la plus basse possible.
+\end{interviewq}

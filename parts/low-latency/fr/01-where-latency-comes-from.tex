@@ -1,0 +1,451 @@
+\chapter{D'où vient la latence}\label{ch:ll:where-latency-comes-from}
+
+Une étude des données de messages d'une grande bourse d'actions a établi que les courses pour trader sur une cotation périmée, ou pour l'annuler,
+avant qu'un autre n'y trade, surviennent environ une fois par minute dans chacune des plus grandes actions et représentent environ un
+cinquième du volume de la journée, et se décident en général en cinq à dix millionièmes de seconde (Aquilina, Budish et
+O'Neill, 2022). Dans ces courses, la microseconde est une unité de compétition. Ce livre porte sur le logiciel de part et d'autre
+de cette frontière~: où va chaque microseconde d'un système de trading, comment la mesurer et comment la récupérer. Ce premier chapitre
+fixe le vocabulaire~: le chemin qu'un événement de marché suit à travers un système de trading, pourquoi sa durée est une
+distribution plutôt qu'un nombre, comment établir un budget pour cette durée et quelles stratégies paient pour quelle partie de celle-ci.
+
+\section{Le chemin tick-to-trade}
+
+\begin{definition}[Latence]\label{def:ll:where-latency-comes-from:latency}
+La \emph{latence}\index{latence} d'un système entre deux événements est le temps écoulé entre le premier événement
+(l'arrivée d'un paquet, l'appel d'une fonction) et le second (le départ d'un ordre, le retour de la fonction), mesuré pour une occurrence donnée.
+C'est une variable aléatoire~: chaque message a la sienne.
+\end{definition}
+
+Le livre~7, chapitre~18, utilisait deux \omterm{def:ll:where-latency-comes-from:latency}{latences} d'une société de trading tout entière, la \omterm{def:ll:where-latency-comes-from:latency}{latence} des données de marché et
+la \omterm{def:ll:where-latency-comes-from:latency}{latence} de saisie des ordres, pour modéliser ce que voit une stratégie et le moment où ses ordres agissent. Ce livre les décompose.
+
+\begin{definition}[Latence tick-to-trade et latence wire-to-wire]\label{def:ll:where-latency-comes-from:t2t}
+La \emph{latence tick-to-trade}\index{latence tick-to-trade} d'un système de trading est le temps écoulé entre l'arrivée du message
+de données de marché qui déclenche une décision et le départ de l'ordre que cette décision envoie. Il s'agit d'une
+\emph{latence wire-to-wire}\index{latence wire-to-wire} lorsque les deux instants sont relevés
+sur le câble réseau (le dernier bit du paquet entrant, le premier bit du paquet sortant), par un dispositif placé hors du serveur~;
+c'est une \omterm{def:ll:where-latency-comes-from:latency}{latence} tick-to-trade logicielle lorsqu'ils sont relevés à l'intérieur du programme
+(le paquet remis à l'application, l'ordre remis à la pile réseau).
+\end{definition}
+
+La différence compte. Le chiffre wire-to-wire inclut la carte réseau, le chemin de réception du système d'exploitation et
+le chemin d'émission de la carte~; le chiffre logiciel, qu'un programme peut mesurer lui-même avec l'horloge du processeur
+(chapitre~5), les exclut. Un fournisseur qui annonce une \omterm{def:ll:where-latency-comes-from:latency}{latence} sans préciser entre quels deux instants
+elle est mesurée n'a pas réellement annoncé de \omterm{def:ll:where-latency-comes-from:latency}{latence}.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,
+  st/.style={draw=omDef,fill=omDef!8,rounded corners=2pt,minimum height=0.9cm,text width=1.3cm,align=center},
+  hw/.style={draw=gray,fill=gray!10,rounded corners=2pt,minimum height=0.9cm,text width=1.1cm,align=center}]
+\node[hw] (nic1) at (0,0) {carte réseau};
+\node[hw] (os) at (1.5,0) {noyau ou contournement};
+\node[st] (dec) at (3.2,0) {décodage, arbitrage};
+\node[st] (book) at (4.9,0) {carnet};
+\node[st] (strat) at (6.6,0) {stratégie};
+\node[st] (risk) at (8.3,0) {contrôles de risque};
+\node[st] (gw) at (10.0,0) {encodage, envoi};
+\node[hw] (nic2) at (11.6,0) {carte réseau};
+\draw[-Stealth,thick] (nic1) -- (os); \draw[-Stealth,thick] (os) -- (dec); \draw[-Stealth,thick] (dec) -- (book); \draw[-Stealth,thick] (book) -- (strat); \draw[-Stealth,thick] (strat) -- (risk); \draw[-Stealth,thick] (risk) -- (gw); \draw[-Stealth,thick] (gw) -- (nic2);
+\draw[-Stealth,thick] (-1.1,0) node[left,align=right,font=\footnotesize]{paquet\\ entrant} -- (nic1);
+\draw[-Stealth,thick] (nic2) -- (12.7,0) node[right,align=left,font=\footnotesize]{ordre\\ sortant};
+\draw[decorate,decoration={brace,amplitude=5pt}] (2.5,0.6) -- (10.7,0.6) node[midway,above=6pt]{tick-to-trade logiciel (le chemin critique)};
+\draw[decorate,decoration={brace,amplitude=5pt,mirror}] (-0.6,-0.6) -- (12.2,-0.6) node[midway,below=6pt]{wire-to-wire, horodaté par un dispositif de capture sur le câble};
+\end{tikzpicture}
+
+\omcaption{Le chemin tick-to-trade d'un serveur de trading. Les étapes logicielles (en bleu) sont le sujet de ce livre~;
+la carte réseau et les chemins de réception et d'émission du noyau (en gris) sont traités du côté du programme aux chapitres~4
+et~13, et du côté matériel dans le livre~14.}\label{fig:ll:where-latency-comes-from:path}
+\end{omfigure}
+
+\begin{definition}[Chemin critique]\label{def:ll:where-latency-comes-from:hot}
+Le \emph{chemin critique}\index{chemin critique} (hot path) d'un système de trading est la suite de code exécutée entre un événement de marché déclencheur
+et l'ordre qui en résulte~: le code dont la durée est la \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade}. Tout le reste (écriture de journaux sur disque, reporting, agrégation des risques, configuration)
+s'exécute hors du chemin critique, sur d'autres threads ou à d'autres moments.
+\end{definition}
+
+La \Cref{fig:ll:where-latency-comes-from:path} est la carte de la partie~IV de ce livre, où chaque étape est construite~:
+le feed handler qui décode et arbitre les paquets de la bourse (chapitre~18), le constructeur de carnet (chapitre~19),
+le moteur de stratégie (chapitre~20), la barrière de risque avant négociation (chapitre~22) et la passerelle d'ordres (chapitre~21).
+Les parties~I à~III fournissent de quoi est fait chaque étape~: le processeur et sa mémoire (chapitres~2 à~5), les langages
+(chapitres~6 à~14) et les protocoles (chapitres~15 à~17).
+
+Deux grandeurs physiques bornent le chemin par le bas et valent la peine d'être calculées une fois.
+
+\begin{example}[La lumière dans la fibre, les bits sur le fil]\label{ex:ll:where-latency-comes-from:physics}
+Une fibre monomode standard a un indice de groupe effectif d'environ 1.462 à une longueur d'onde de 1\,550~nm (fiche
+technique d'un fabricant)~: la lumière y parcourt un mètre en $1.462/c = \qty{4.88}{\nano\second}$, si bien que les 30 mètres
+de câble entre un serveur et le commutateur d'une bourse, à l'intérieur d'un même centre de données, coûtent environ \qty{146}{\nano\second} dans chaque sens.
+Placer une trame sur le fil prend sa longueur en bits divisée par le débit de la ligne, auquel s'ajoutent 20 octets de préambule,
+de délimiteur de début et d'intervalle inter-trames~: une trame minimale de 64 octets occupe une liaison à 10~Gb/s pendant
+$84 \times 8 / 10 = \qty{67.2}{\nano\second}$ et une liaison à 25~Gb/s pendant \qty{26.9}{\nano\second}. Un chemin logiciel
+de quelques microsecondes est donc dominé par le calcul et par le système d'exploitation, et non par la physique,
+tant qu'il n'est pas très bien optimisé.
+\end{example}
+
+\section{La latence est une distribution}
+
+La \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade} d'un message est un tirage. Sa médiane décrit le message ordinaire~;
+les messages qui coûtent de l'argent sont souvent les autres.
+
+\begin{definition}[Latence de queue, gigue]\label{def:ll:where-latency-comes-from:tail}
+La \emph{latence de queue}\index{latence de queue} (tail latency) d'un système est la partie haute de sa distribution de \omterm{def:ll:where-latency-comes-from:latency}{latence}, rapportée
+sous forme de centiles élevés~: le 99\up{e} (p99), le 99.9\up{e} (p99.9), le maximum sur une période. La \emph{gigue}\index{gigue} (jitter) est la variabilité
+de la \omterm{def:ll:where-latency-comes-from:latency}{latence} d'une occurrence à la suivante, rapportée sous forme d'étendue (p99 moins p50, ou un écart type)~; un système à faible gigue
+est un système dont la queue est proche de sa médiane.
+\end{definition}
+
+On note $X$ une \omterm{def:ll:where-latency-comes-from:latency}{latence}, $X_i$ la \omterm{def:ll:where-latency-comes-from:latency}{latence} de l'étape $i$ d'un chemin et $q_p(X)$ son quantile d'ordre $p$, de sorte que
+p99 vaut $q_{0.99}(X)$. La \omterm{def:ll:where-latency-comes-from:latency}{latence} de bout en bout d'un chemin est $X = \sum_i X_i$. Les moyennes s'additionnent~: $\E[X] = \sum_i \E[X_i]$.
+Les quantiles, eux, ne s'additionnent pas, et le sens de l'erreur n'est pas fixé.
+
+\begin{proposition}[Queues d'une somme]\label{prop:ll:where-latency-comes-from:union}
+Pour toutes variables aléatoires $X_1,\dots,X_n$, quelle que soit leur dépendance, et pour des niveaux $\alpha_i > 0$ avec $\sum_i \alpha_i < 1$,
+\[
+q_{1-\sum_i \alpha_i}\Big(\sum_i X_i\Big) \le \sum_i q_{1-\alpha_i}(X_i).
+\]
+En particulier, des cibles d'étape $b_i$ atteintes au niveau $1-(1-p)/n$ garantissent une cible de bout en bout $\sum_i b_i$ au
+niveau $p$.
+\end{proposition}
+
+\begin{proof}
+Posons $b_i = q_{1-\alpha_i}(X_i)$, de sorte que $\P(X_i > b_i) \le \alpha_i$. Si $\sum_i X_i > \sum_i b_i$, alors $X_i > b_i$ pour
+au moins un $i$~; donc $\P(\sum_i X_i > \sum_i b_i) \le \sum_i \P(X_i > b_i) \le \sum_i \alpha_i$, et le quantile d'ordre
+$(1-\sum_i\alpha_i)$ de la somme est au plus $\sum_i b_i$. Avec $\alpha_i = (1-p)/n$, le niveau est $p$.
+\end{proof}
+
+La proposition ne dit rien de $q_{0.99}(\sum X_i)$ face à $\sum q_{0.99}(X_i)$, et cette comparaison peut aller
+dans un sens ou dans l'autre. Elle échoue dans le sens qui compte lorsque chaque étape présente des blocages rares
+qu'aucun percentile des étapes ne voit.
+
+\begin{example}[Deux étapes saines, un chemin bloqué]\label{ex:ll:where-latency-comes-from:nonsub}
+Deux étapes indépendantes durent chacune \qty{1}{\micro\second}, sauf que chacune se bloque pendant \qty{100}{\micro\second} avec
+une probabilité de 0.9~\%. Le p99 de chaque étape vaut \qty{1}{\micro\second}~: ses blocages sont plus rares que 1~\%. Le chemin se bloque dès que
+l'une des deux étapes se bloque, avec une probabilité de $1-0.991^2 = 1.79~\%$, si bien que son p99 vaut \qty{101}{\micro\second}, soit cinquante fois la
+somme des p99 des étapes. (La même défaillance de l'additivité pour la valeur en risque explique pourquoi le livre~6 préfère
+l'expected shortfall pour agréger les risques.)
+\end{example}
+
+La \Cref{fig:ll:where-latency-comes-from:ccdf} montre le même effet sur un chemin synthétique à six étapes, chaque étape avec un
+corps lognormal et une probabilité de 0.3~\% de blocage d'une durée moyenne de \qty{8}{\micro\second}. Les médianes des étapes
+s'additionnent presque exactement jusqu'à la médiane du chemin (\qty{2.13}{\micro\second} contre \qty{2.17}{\micro\second}), et les moyennes
+s'additionnent exactement (\qty{2.32}{\micro\second}). Le chemin est bloqué avec une probabilité $1-0.997^6 \approx 1.8~\%$, si bien que son p99
+(\qty{6.56}{\micro\second}) se situe dans les blocages, alors que la somme des p99 des étapes (\qty{3.59}{\micro\second}) ne
+les voit pas. La borne de l'union au niveau $1-0.01/6 \approx 99.83~\%$ par étape donne \qty{28.7}{\micro\second}~: sûre,
+et quatre fois trop pessimiste. Seule la distribution de bout en bout, mesurée message par message, donne la réponse.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,xmode=log,ymode=log,log origin y=infty,xmin=1.5,xmax=60,ymin=1e-4,ymax=1.2,
+  xlabel={latence de bout en bout $x$ (\si{\micro\second}, échelle logarithmique)},ylabel={$\P(X > x)$ (échelle logarithmique)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  xtick={2,5,10,20,50},xticklabels={2,5,10,20,50},
+  legend image code/.code={\draw[#1] (0cm,0cm) -- (0.6cm,0cm);},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick] table[x=x_us,y=ccdf]{figdata/low-latency/01-where-latency-comes-from/ccdf.csv};
+\addplot[black!45,dashed,thin,domain=1.5:60,samples=2] {0.01};
+\addplot[omThm,very thick,ycomb] table[x=sum_p99,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\addplot[omMeth,very thick,ycomb] table[x=p99,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\addplot[omProp,very thick,dashed,ycomb] table[x=sum_union,y=top]{figdata/low-latency/01-where-latency-comes-from/marks.csv};
+\legend{queue de bout en bout,niveau de 1~\%,somme des p99 des étapes,p99 de bout en bout,{borne de l'union (étapes à 99.83~\%)}}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La queue d'un chemin synthétique à six étapes dont chaque étape se bloque pendant 0.3~\% du temps. La somme des
+p99 des étapes ne voit pas les blocages et sous-estime le p99 du chemin~; la borne de l'union
+de la \cref{prop:ll:where-latency-comes-from:union} la surestime. Données~: \texttt{ll\_budget.composition}, 400\,000
+messages simulés.}\label{fig:ll:where-latency-comes-from:ccdf}
+\end{omfigure}
+
+La même arithmétique vaut pour un chemin réel, mesuré. La \Cref{fig:ll:where-latency-comes-from:measured} chronomètre les quatre
+étapes d'un chemin jouet, le décodeur et le carnet du livre~1 avec une décision triviale et un encodeur d'ordres, message par message sur
+l'ordinateur portable de ce livre. Le carnet, construit sur des arbres équilibrés et une table de hachage, est l'étape la plus lente à la médiane~; le p99.9
+du décodeur, du carnet et de la décision vaut plusieurs fois leur p99, et le maximum vaut des centaines de fois la
+médiane~: une interruption du fil par le système d'exploitation, que cet ordinateur portable, sans cœurs isolés, ne
+empêche pas (chapitre~13).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,ybar,bar width=7pt,ymode=log,log origin y=infty,ymin=10,ymax=100000,
+  symbolic x coords={decode,book,decide,encode,total},xtick=data,xticklabels={décodage,carnet,décision,encodage,total},enlarge x limits=0.14,
+  ylabel={nanosecondes (échelle logarithmique)},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},
+  legend columns=5,legend style={font=\footnotesize,at={(0.5,-0.2)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=stage,y=p50]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=stage,y=p99]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=stage,y=p999]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\addplot[fill=gray!40,draw=gray] table[x=stage,y=max]{figdata/low-latency/01-where-latency-comes-from/measured_path.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{\omterm{def:ll:where-latency-comes-from:latency}{Latence} par message des étapes d'un chemin jouet de tick-to-trade (décoder un message, l'appliquer au carnet
+du livre~1, décider, encoder un ordre), sur 200 rejeux de l'échantillon de 2\,020 messages du livre~1, fixé à un seul CPU.
+Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés~; chaque chiffre inclut le coût propre de la mesure de temps, soit environ
+\qty{15}{\nano\second}. Données~: \texttt{bench\_path.py}.}\label{fig:ll:where-latency-comes-from:measured}
+\end{omfigure}
+
+\section{Budgets de latence wire-to-wire}
+
+\begin{definition}[Budget de latence]\label{def:ll:where-latency-comes-from:budget}
+Un \emph{budget de latence}\index{budget de latence} est une cible pour la \omterm{def:ll:where-latency-comes-from:latency}{latence} de bout en bout d'un chemin aux percentiles énoncés,
+réparti en cibles pour chaque étape, à l'aune desquelles chaque modification du système est mesurée.
+\end{definition}
+
+Un budget transforme «~aller plus vite~» en une liste de nombres qu'une étape respecte ou non. Il se rédige
+de l'extérieur vers l'intérieur~: ce dont la stratégie a besoin, ce que coûtent la physique et le matériel, et ce qui reste au logiciel.
+
+\begin{method}[Rédiger un budget de latence]\label{met:ll:where-latency-comes-from:budget}
+\begin{enumerate}
+\item Énoncer l'exigence du point de vue de la stratégie~: la \omterm{def:ll:where-latency-comes-from:latency}{latence} au-delà de laquelle son edge disparaît, et les
+percentiles qui comptent (la médiane pour les courses~; la queue pour l'exposition aux cotations périmées).
+\item Retrancher les coûts fixes~: longueurs de câble et de fibre, sérialisation, commutateurs, passerelle propre à la bourse.
+\item Répartir le reliquat entre les étapes logicielles proportionnellement à ce qu'elles doivent faire, à un niveau par étape plus strict
+que le niveau de bout en bout (la \cref{prop:ll:where-latency-comes-from:union}).
+\item Instrumenter chaque frontière d'étape (chapitre~26) et vérifier chaque version par rapport au budget, étape par étape et de bout
+en bout, sur les échantillons conjoints par message (chapitre~25).
+\end{enumerate}
+\end{method}
+
+\begin{dated}{2026-09}{Chiffres de tick-to-trade publiés}\label{dat:ll:where-latency-comes-from:published}
+À CppCon 2017, un ingénieur d'un grand teneur de marché électronique a donné «~environ \qty{2.5}{\micro\second}~» comme un très
+bon minimum de \omterm{def:ll:where-latency-comes-from:t2t}{latence wire-to-wire} pour un système de trading logiciel. L'indice de référence STAC-T0 mesure le temps écoulé depuis le
+dernier bit des données entrantes nécessaires à une décision jusqu'au premier bit de l'ordre sortant, avec UDP en entrée, TCP en sortie et
+pratiquement aucune logique de trading~; un rapport de juin 2024 sur une carte à matériel programmable donne un minimum de
+\qty{13.9}{\nano\second} pour des trames de 507~octets. Les deux chiffres encadrent le secteur~: le logiciel en microsecondes,
+le matériel en dizaines de nanosecondes (livre~14, chapitres~6 et~7).
+\end{dated}
+
+\begin{example}[Un budget de trois microsecondes]\label{ex:ll:where-latency-comes-from:budget}
+Un système logiciel doit répondre en \qty{3}{\micro\second} wire-to-wire à la médiane. La carte et le chemin de réception
+par contournement du noyau (kernel bypass) prennent environ \qty{0.9}{\micro\second} et le chemin d'émission \qty{0.8}{\micro\second} (les
+chiffres synthétiques de la \cref{fig:ll:where-latency-comes-from:ccdf}~)~; il reste \qty{1.3}{\micro\second} pour le décodage, le carnet, la stratégie,
+le risque et l'encodage. Répartir \qty{60}{\nano\second}, \qty{120}{\nano\second}, \qty{200}{\nano\second},
+\qty{50}{\nano\second} et le reste en réserve, cela tient~; le carnet jouet de la \cref{fig:ll:where-latency-comes-from:measured}
+seul, à environ \qty{80}{\nano\second} à la médiane mais proche d'une microseconde au p99.9, ne tient pas
+dans une cible sur la queue. Le chapitre~19 en construit une qui y tient.
+\end{example}
+
+\section{Quelles stratégies paient pour quelles microsecondes}
+
+Une course entre deux sociétés qui réagissent au même événement est gagnée par celle dont la \omterm{def:ll:where-latency-comes-from:latency}{latence} sur ce message est la plus faible. Avec
+notre \omterm{def:ll:where-latency-comes-from:latency}{latence} $X_A$ et celle du concurrent $X_B$, indépendantes,
+\[
+\P(\text{gain}) = \P(X_A < X_B),
+\]
+qui dépend entièrement des deux distributions, et non d'un seul nombre. La médiane décide de la plupart des courses~; la queue
+décide des autres.
+
+\begin{example}[Médiane contre queue dans une course]\label{ex:ll:where-latency-comes-from:race}
+Notre \omterm{def:ll:where-latency-comes-from:latency}{latence} a un corps lognormal de médiane \qty{2.0}{\micro\second} et une probabilité de 2~\% d'un blocage de
+\qty{30}{\micro\second} en moyenne~; la médiane du concurrent est de \qty{2.2}{\micro\second}, avec des blocages de même
+durée dans 0.5~\% des cas. Simulées sur un million de courses, nous gagnons 66.1~\%. Diviser notre médiane par deux nous fait gagner 98.0~\%. Diviser par deux notre
+taux de blocage, qui ramène notre p99 de \qty{23.6}{\micro\second} à \qty{3.5}{\micro\second}, nous fait gagner 66.7~\%~: une amélioration importante
+d'un centile que les courses voient à peine (\cref{fig:ll:where-latency-comes-from:race}).
+\end{example}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,xmin=1.6,xmax=2.8,ymin=0,ymax=1,ytick={0.2,0.4,0.6,0.8,1},
+  xlabel={latence médiane de notre société (\si{\micro\second})~; celle du concurrent est de 2.2},ylabel={$\P(\text{gain})$},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omDef,very thick] table[x=median_us,y=with_stalls]{figdata/low-latency/01-where-latency-comes-from/race.csv};
+\addplot[omThm,thick,dashed] table[x=median_us,y=no_stalls]{figdata/low-latency/01-where-latency-comes-from/race.csv};
+\legend{avec nos blocages de 2~\%,sans blocages}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Probabilité de gagner une course contre un concurrent de médiane \qty{2.2}{\micro\second} et 0.5~\% de blocages,
+à mesure que notre médiane varie. Supprimer tous nos blocages déplace la courbe d'environ un point~; déplacer notre médiane d'un dixième de
+microseconde la déplace d'environ huit. Données~: \texttt{ll\_budget.race\_curve}, 400\,000 courses simulées par
+point.}\label{fig:ll:where-latency-comes-from:race}
+\end{omfigure}
+
+La queue importe là où la question n'est pas de savoir qui arrive le premier, mais combien de temps une société reste exposée. Les cotations d'un teneur de marché
+restent dans le carnet pendant que sa vision du marché est périmée~; pendant la durée d'un blocage, elles peuvent être exécutées
+contre elles par quiconque a vu le nouveau prix. Le coût espéré d'un blocage est le taux d'arrivées informées multiplié
+par la durée du blocage et par la perte par exécution~: c'est la sélection adverse (livre~1, chapitre~1), amplifiée par la queue. Une
+stratégie d'arbitrage de \omterm{def:ll:where-latency-comes-from:latency}{latence} (livre~11, chapitre~9) paie pour sa médiane~; un teneur de marché paie pour les deux, et
+pour sa queue les pires jours, lorsque blocages et nouvelles surviennent ensemble. Une société qui exécute de gros ordres sur plusieurs heures
+ne paie ni l'un ni l'autre à l'échelle de la microseconde~: son \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} s'exprime en millisecondes, et le temps de ses ingénieurs est
+mieux employé ailleurs.
+
+\section{Tutoriel~: mesurer un chemin et composer son budget}\label{tut:ll:where-latency-comes-from:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Mesurer les étapes d'un chemin tick-to-trade jouet, message par message, puis composer et vérifier un budget avec
+\texttt{firm.latbudget}. \textbf{État final~:} \cref{fig:ll:where-latency-comes-from:measured,fig:ll:where-latency-comes-from:ccdf}
+et un rapport de budget.
+\begin{tutsteps}
+\item \textbf{Mesurer chaque étape.} Le banc d'essai rejoue l'échantillon du livre~1 et lit le compteur d'horodatage (TSC) du processeur
+entre les étapes (le chapitre~2 explique le compteur et le chapitre~5 sa calibration)~; la première passe réchauffe les caches et est
+écartée.
+\omcode{code/low-latency/01-where-latency-comes-from/cpp/ll_path_bench.cpp}{28}{48}{Chronométrage de quatre étapes par message avec le compteur d'horodatage.}\label{lst:ll:where-latency-comes-from:bench}
+\item \textbf{Exécution épinglée~:} \texttt{python bench\_path.py} compile le banc d'essai, l'exécute sur un seul processeur avec
+\texttt{taskset}, et écrit \texttt{measured\_path.csv} avec un fichier \texttt{.meta} qui consigne la machine, le
+compilateur, les options et la charge.
+\item \textbf{Vérifier un budget.} Les cibles par étape et les cibles de bout en bout sont des données~; la vérification compose les étapes conjointement,
+message par message.
+\omcode{code/firm/latbudget/firm_latbudget.py}{44}{54}{Un budget vérifié sur des échantillons alignés par étape.}\label{lst:ll:where-latency-comes-from:check}
+\item \textbf{Composer des étapes synthétiques} avec \texttt{ll\_budget.composition()} et comparer la somme des centiles par étape
+au centile de bout en bout.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Exécuter le banc d'essai sans \texttt{taskset} et à côté d'une compilation de ce livre, et
+comparer le p99.9~; remplacer les blocages indépendants de \texttt{ll\_budget} par des blocages qui touchent toutes les étapes d'un message
+en même temps, et observer quels centiles se déplacent.
+\end{tutorial}
+
+\section{Construction~: le budget de latence}\label{bld:ll:where-latency-comes-from:latbudget}
+
+\begin{build}
+\bfield{Rôle} Le contrat auquel chaque étape du \omterm{def:ll:where-latency-comes-from:hot}{chemin critique} (hot path) de la société est mesurée, de ce chapitre au
+chemin assemblé du chapitre~26.
+\bfield{Interface} \texttt{Stage(name, targets)}, \texttt{Budget(stages, end\_to\_end)},
+\texttt{Budget.check(samples)} renvoyant une ligne par étape et par niveau (cible, mesuré, ok),
+\texttt{compose\_joint}, \texttt{compose\_independent(samples, n, seed)}, \texttt{stage\_level(p, n)},
+\texttt{allocate(total, weights)}, \texttt{quantile(x, p)} (rang le plus proche).
+\bfield{Règles} Les échantillons sont en nanosecondes, un tableau par étape, alignés message par message lorsqu'ils proviennent d'une même exécution~;
+les chiffres de bout en bout sont composés conjointement à partir d'échantillons alignés, jamais en additionnant des centiles~; une cible par étape au niveau
+$p$ pour un niveau de bout en bout $p$ est signalée comme non fiable.
+\bfield{Tests d'acceptation} \texttt{code/firm/latbudget/tests/}~: la borne de l'union sur les paires indépendantes, comonotones et
+contramonotones~; le p99 non sous-additif de l'\cref{ex:ll:where-latency-comes-from:nonsub}~; un budget avec une
+étape en échec.
+\bfield{Pour aller plus loin} Intervalles de confiance sur chaque centile mesuré (bootstrap, livre~4, chapitre~13)~; un
+budget exprimé en cycles autant qu'en nanosecondes.
+\end{build}
+
+\begin{omsources}
+\item M.~Aquilina, E.~Budish et P.~O'Neill, ``Quantifying the high-frequency trading `arms race''', \emph{Quarterly
+Journal of Economics} 137(1), 2022, 493--564.
+\item C.~Cook, ``When a microsecond is an eternity: high performance trading systems in C++'', CppCon 2017.
+\item STAC, STAC-T0 benchmark reports (tick-to-trade network I/O), 2020--2024.
+\item Corning, SMF-28 ULL optical fibre, product information PI1470 (2020).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:1}
+Calculer le temps de propagation d'un serveur situé à 45~m de fibre du commutateur de la bourse, dans chaque sens, pour un indice de groupe de
+1.462~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:2}
+Combien de temps une trame de 128~octets occupe-t-elle une liaison de 10~Gb/s, en comptant 20~octets de préambule, de délimiteur et d'intervalle~? Et sur une
+liaison de 25~Gb/s~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:where-latency-comes-from:3}
+Quatre étapes ont des \omterm{def:ll:where-latency-comes-from:latency}{latences} moyennes de 300, 80, 150 et \qty{500}{\nano\second}. Quelle est la \omterm{def:ll:where-latency-comes-from:latency}{latence} moyenne de bout en bout, et
+que peut-on dire de sa médiane~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:4}
+Un chemin comporte cinq étapes indépendantes, chacune se bloquant avec une probabilité de 0.4~\% par message. Quelle est la probabilité qu'une
+message rencontre au moins un blocage~? Le p99 du chemin se situe-t-il dans les blocages~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:5}
+Une cible de p99.9 de bout en bout de \qty{10}{\micro\second} doit être garantie par des cibles sur quatre étapes. À quel
+centile chaque étape doit-elle respecter sa cible, et comment les cibles doivent-elles se combiner~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:where-latency-comes-from:6}
+Lire la \cref{fig:ll:where-latency-comes-from:race}. De combien notre médiane doit-elle baisser pour gagner autant que ce que rapporte la suppression de tous nos blocages
+à une médiane de \qty{2.0}{\micro\second}~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:where-latency-comes-from:7}
+\emph{Programmation.} Dans \texttt{ll\_budget}, rendre les blocages communs~: lorsque le chemin se bloque (probabilité de 1.8~\% par message),
+placer le blocage sur une étape tirée au hasard, et aucun sur les autres. Lesquelles des figures de
+la \cref{fig:ll:where-latency-comes-from:ccdf} changent~: les p99 par étape, le p99 de bout en bout~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:where-latency-comes-from:8}
+\emph{Trouver la faille.} «~Le p99 du feed handler est de \qty{400}{\nano\second}, celui de notre stratégie de \qty{600}{\nano\second}
+et celui de notre passerelle de \qty{300}{\nano\second}, mesurés séparément dans trois benchmarks~: notre p99 tick-to-trade est de
+\qty{1.3}{\micro\second}.~»
+\end{exercise}
+
+\section{Problème~: la microseconde qui a fait perdre la course}
+
+\begin{problem}[{Problème du week-end --- deux sociétés, une cotation périmée}]\label{pb:ll:where-latency-comes-from:1}
+Notre société et un concurrent se disputent les mêmes cotations périmées. Notre \omterm{def:ll:where-latency-comes-from:latency}{latence} a un corps lognormal (médiane
+\qty{2.0}{\micro\second}, dispersion 0.15) et une probabilité de 2~\% par message d'un blocage de durée exponentielle de moyenne
+\qty{30}{\micro\second}~; la médiane du concurrent est de \qty{2.2}{\micro\second} et il se bloque 0.5~\% du temps.
+
+\medskip\noindent\textbf{Partie I --- La course.}
+\begin{enumerate}
+\item Écrire la probabilité de gagner une course en fonction des deux lois de \omterm{def:ll:where-latency-comes-from:latency}{latence}. Que suppose-t-elle sur
+leur dépendance~?
+\item Sans blocages, les deux corps étant lognormaux de même dispersion, quelle est $\P(\text{gain})$ sous forme fermée~?
+L'évaluer.
+\item Quelle part des courses gagnons-nous avec les blocages (la simulation)~?
+\item Pourquoi la réponse est-elle inférieure à la réponse sans blocage d'une valeur moindre que notre taux de blocage~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Médiane ou queue.}
+\begin{enumerate}[resume]
+\item Quels sont nos p50 et p99 avec les blocages~?
+\item Que rapporte la division de notre médiane par deux~? Que rapporte la division de notre taux de blocage par deux, et que fait-elle à notre p99~?
+\item Supprimer tous les blocages rapporte combien~?
+\item Pour quoi la société devrait-elle payer, si elle ne fait que de la course~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Exposition.}
+\begin{enumerate}[resume]
+\item Nos cotations sont exposées pendant que nous sommes bloqués. Avec des blocages sur 2~\% des messages et une moyenne de
+\qty{30}{\micro\second}, quelle fraction du temps notre vision du marché est-elle périmée si un message arrive toutes les
+\qty{10}{\micro\second} en moyenne et que les blocages ne se chevauchent pas~?
+\item Si des preneurs informés arrivent à raison de 20 par seconde et que chaque exécution sur une cotation périmée coûte un demi-tick de 0.01~\$ sur 100
+actions, que coûte la péremption sur une journée de 6.5 heures~?
+\item Comment la division du taux de blocage modifie-t-elle ce coût~?
+\item De quelle partie de la distribution dépend l'exposition, et de quelle partie dépend la course~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le budget.}
+\begin{enumerate}[resume]
+\item La société veut $\P(\text{gain}) \ge 0.9$ face à ce concurrent. Lire sur la
+\cref{fig:ll:where-latency-comes-from:race} la médiane qu'il lui faut.
+\item Écrire cela comme un budget réparti sur cinq étapes logicielles à parts égales de ce qui reste après
+\qty{1.0}{\micro\second} de réseau et de noyau. Que reçoit chaque étape~?
+\item À quel niveau chaque étape doit-elle respecter sa cible pour garantir un p99 de bout en bout~?
+\item Énoncer le \emph{résultat nommé}~: notre probabilité de gain, et son gain à diviser la médiane par deux comparé à celui de la division par deux du
+taux de blocage.
+\item Pourquoi un seul chiffre («~notre \omterm{def:ll:where-latency-comes-from:latency}{latence} est de \qty{2}{\micro\second}~») ne décrit-il ni la course ni l'exposition~?
+\item Quelle mesure apprendrait à la société la distribution du concurrent~?
+\item Citer une stratégie pour laquelle ni la médiane ni la queue à la microseconde ne comptent.
+\item En une phrase~: que rapporte un \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} à une équipe d'ingénierie~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:where-latency-comes-from:1}
+Quelle est la différence entre la \omterm{def:ll:where-latency-comes-from:t2t}{latence tick-to-trade} et la \omterm{def:ll:where-latency-comes-from:t2t}{latence wire-to-wire}, et comment mesureriez-vous chacune~?
+\end{interviewq}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, trader}]\label{iq:ll:where-latency-comes-from:2}
+Pourquoi les sociétés de trading publient-elles des p99 et des p99.9 plutôt que la \omterm{def:ll:where-latency-comes-from:latency}{latence} moyenne~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:where-latency-comes-from:3}
+Trois composants ont des \omterm{def:ll:where-latency-comes-from:latency}{latences} p99 de 1, 2 et \qty{3}{\micro\second}. Que peut-on dire du p99 du
+pipeline~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:where-latency-comes-from:4}
+La lumière parcourt environ \qty{5}{\nano\second} par mètre dans la fibre. Où d'autre le temps passe-t-il entre l'arrivée d'un paquet
+sur un serveur et la sortie d'un ordre de celui-ci~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader, chercheur}]\label{iq:ll:where-latency-comes-from:5}
+Votre société remporte 60~\% des courses face à son principal concurrent. Doit-elle consacrer son prochain trimestre à la médiane ou
+à la queue de sa \omterm{def:ll:where-latency-comes-from:latency}{latence}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:where-latency-comes-from:6}
+Concevez la mesure qui vous permettrait d'écrire un \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} pour un système de trading existant que vous n'avez pas construit.
+\end{interviewq}

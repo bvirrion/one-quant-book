@@ -1,0 +1,309 @@
+\chapter{Infrastructure d'entraînement}\label{ch:ml:training-infrastructure}
+
+Le modèle à carnet d'ordres d'une équipe s'entraîne pendant une journée, et l'équipe en chiffre un second \omterm{def:ml:training-infrastructure:accelerator}{accélérateur}. Avant d'en acheter un, elle doit savoir
+où passe le temps. Sur la version réduite du problème du chapitre, mesurée sur un ordinateur portable, un tiers de chaque étape d'entraînement est
+consacré à l'assemblage du lot, et non au calcul~; changer le format de stockage ne change presque rien, et rassembler le lot en une seule
+lecture indexée plutôt que fenêtre par fenêtre ramène la part des données à un cinquième. Ce chapitre porte sur la mécanique qui se cache sous les
+modèles des parties I à IV~: \omterm{def:ml:training-infrastructure:accelerator}{accélérateurs} et où passe le temps d'entraînement, \omterm{def:ml:training-infrastructure:loader}{chargeurs de données} pour les données tick qui ne laissent jamais une fenêtre franchir
+une séance, l'arithmétique à précision réduite, l'entraînement sur plusieurs dispositifs, et des \omterm{def:ml:training-infrastructure:ckpt}{points de reprise d'entraînement} (checkpoints) qui permettent à une exécution interrompue de reprendre à l'identique.
+Tout tourne sur un seul thread CPU, sans processus workers~; les parties multi-dispositifs sont simulées dans un seul processus, ce qui
+suffit à vérifier leur arithmétique, et les temps sont ceux du portable de l'auteur, signalés comme tels.
+
+\section{Accélérateurs et où passe le temps}
+
+\begin{definition}[Accélérateur]\label{def:ml:training-infrastructure:accelerator}
+Un \emph{accélérateur}\index{accélérateur} (accelerator) est un processeur conçu pour l'algèbre linéaire dense des réseaux de neurones (processeur graphique
+ou processeur tensoriel dédié)~: des milliers d'unités arithmétiques, une mémoire à haute bande passante à leurs côtés, et
+des unités matricielles à faible précision qui font l'essentiel du travail.
+\end{definition}
+
+\begin{dated}{2026-09}{Un accélérateur de centre de données}\label{dat:ml:training-infrastructure:h100}
+La page de spécifications de NVIDIA pour le H100 indique 80~Go de mémoire avec 3.35~To/s de bande passante pour la version SXM (94~Go et
+3.9~To/s pour la version NVL), et 1\,979 téraflops d'arithmétique \omterm{def:ml:training-infrastructure:mixed}{bfloat16} sur cœurs tenseurs pour la version SXM, un chiffre que la page
+signale comme valeur avec sparsité.
+\end{dated}
+
+Des chiffres de ce genre expliquent le goulot d'étranglement habituel. Un \omterm{def:ml:training-infrastructure:accelerator}{accélérateur} peut consommer les données bien plus vite qu'un système de stockage, un
+décompresseur ou une boucle Python peut l'alimenter, si bien que la première question face à un entraînement lent est la part de chaque étape pendant laquelle
+le dispositif attend. L'étape se divise en chargement (lecture des données depuis le stockage), constitution des lots (découpe des fenêtres et leur stacking) et
+calcul (passe avant, passe arrière, mise à jour de l'optimiseur). Le chapitre mesure les trois sur sa propre tâche~: huit
+séances de dix minutes \texttt{firm.tape} du marché synthétique du livre, chacune une table de 1\,140 lignes d'une demi-seconde et de 41 colonnes (le
+prix milieu et le carnet à dix niveaux du chapitre~8), et un réseau à deux couches qui lit les vingt dernières lignes et prédit la
+variation du mid sur les dix lignes suivantes.
+
+\section{Chargeurs de données pour les données tick}
+
+\begin{definition}[Chargeur de données, jeu de données projeté en mémoire]\label{def:ml:training-infrastructure:loader}
+Un \emph{chargeur de données}\index{chargeur de données} (data loader) est le code qui transforme les données stockées en lots d'entraînement~: il lit, décode, échantillonne,
+découpe et empile les exemples, idéalement pendant que le dispositif calcule sur le lot précédent. Un \emph{jeu de données
+projeté en mémoire}\index{jeu de données projeté en mémoire} (memory-mapped dataset) stocke les données dans un seul fichier binaire que le système d'exploitation projette dans l'espace
+d'adressage du processus~: rien n'est lu tant qu'une tranche n'est pas touchée, le système met en cache ce qui est lu, et plusieurs processus peuvent
+partager une seule copie.
+\end{definition}
+
+Les données tick imposent une règle au chargeur~: une fenêtre d'entraînement ne doit pas franchir la frontière d'une séance, sans quoi une fenêtre contiendra la
+clôture d'une journée et l'ouverture de la suivante comme si elles étaient consécutives (et, avec des séances qui se chevauchent pour plusieurs instruments,
+elle fuit d'un instrument à l'autre). L'échantillonneur présenté dans le \cref{lst:ml:train:sampler} tire
+uniformément des couples (séance, début) parmi les fenêtres qui y tiennent, et son état aléatoire fait partie de ce qu'un \omterm{def:ml:training-infrastructure:ckpt}{point de reprise d'entraînement} enregistre.
+
+Les séances sont stockées de trois façons~: un fichier CSV par séance (2.21~Mo au total), un fichier NumPy par séance (1.50~Mo), et un
+fichier float32 projeté en mémoire, avec un petit index JSON (1.50~Mo). La \Cref{fig:ml:train:time} montre le coût mesuré d'une étape d'entraînement
+avec chacun, le chargement étant compté une fois par \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque} de 100 étapes. L'analyse syntaxique des fichiers CSV prend 12.5~ms par \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque} (176~Mo/s),
+la lecture des fichiers NumPy prend 0.83~ms (1.8~Go/s), et la projection du fichier unique 0.39~ms quelle que soit sa taille. Par étape, ces valeurs sont minimes
+face à la demi-milliseconde nécessaire pour découper 256 fenêtres une à une en Python et aux 1.1 à 1.2~ms de calcul~: la part des données dans
+l'étape est de 0.34, 0.31 et 0.39. Rassembler le lot entier depuis le fichier projeté en une seule lecture indexée
+(\cref{lst:ml:train:gather}) prend 0.27~ms et ramène la part à 0.20.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=6cm,ybar stacked,bar width=22pt,ymin=0,ymax=2.6,ylabel={millisecondes par étape d'entraînement},
+  area legend,xtick={0,1,2,3},xticklabels={{CSV},{NumPy},{projection\\en mémoire},{projection\\en mémoire,\\lecture groupée}},xticklabel style={align=center},
+  tick label style={font=\small},label style={font=\small},xmin=-0.6,xmax=3.6,grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,/tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[fill=omThm,draw=none] table[x=i,y expr=\thisrow{load_ms}/100]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\addplot[fill=omProp,draw=none] table[x=i,y=batch_ms]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\addplot[fill=omDef,draw=none] table[x=i,y=compute_ms]{figdata/ml/23-training-infrastructure/measured_loader.csv};
+\legend{chargement (par étape),constitution des lots,calcul}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Où passe le temps d'une étape d'entraînement, selon le format de stockage et la constitution des lots~: médianes de cinq \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époques} de 100 étapes de 256
+fenêtres. Mesures faites sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, un seul thread, sans cœurs isolés~; d'autres tâches ont pu tourner.
+Données~: \texttt{bench\_train.py}, \texttt{measured\_loader.csv}.}\label{fig:ml:train:time}
+\end{omfigure}
+
+À cette échelle, la leçon porte sur le code et non sur le stockage~: la boucle Python sur les fenêtres coûte plus cher que n'importe quel format. À l'échelle d'une
+année de données de carnet d'ordres, les formats divergent. Une année de la même table au pas d'une demi-seconde pour un instrument, 250 séances de six heures et
+demie, est d'environ 1.9~Go en float32 et 2.8~Go en texte~: aux débits mesurés, l'analyse du texte coûte environ 16~secondes par
+\omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque}, la lecture des fichiers binaires prend environ une seconde, et la projection ne coûte rien tant que les fenêtres ne sont pas lues, à partir du cache de pages après la première \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque}.
+Et au-delà de la mémoire de la machine, seul un format projeté en mémoire ou diffusé en flux continu fonctionne tout simplement.
+
+\section{Précision mixte}
+
+\begin{definition}[Entraînement en précision mixte, bfloat16]\label{def:ml:training-infrastructure:mixed}
+L'\emph{entraînement en précision mixte}\index{entraînement en précision mixte} (mixed-precision training) exécute les opérations coûteuses (produits matriciels, convolutions)
+dans un format de 16 bits tout en conservant les poids, la perte et l'état de l'optimiseur en 32 bits (Micikevicius et coauteurs,
+2018). \emph{bfloat16}\index{bfloat16} est un format flottant sur 16 bits, avec les huit bits d'exposant de float32 et sept bits
+de mantisse~: la même plage que float32, et un epsilon machine (livre~4, chapitre~25) de $2^{-7}\approx0.0078$ au lieu de $2^{-23}$, si bien qu'aucune
+mise à l'échelle de la perte n'est requise pour prévenir le sous-dépassement (Kalamkar et coauteurs, 2019).
+\end{definition}
+
+Sous l'autocast \omterm{def:ml:training-infrastructure:mixed}{bfloat16} du processeur, le réseau du chapitre s'entraîne au même point (la \cref{fig:ml:train:bf16})~: sur les 50 dernières
+étapes sur 300, la perte moyenne vaut 0.0525 contre 0.0527 en float32. Pas à pas, les deux exécutions diffèrent~: le plus grand écart
+entre leurs pertes sur l'exécution est de 0.0132, soit 22~\% de la perte float32 de cette étape, car l'arrondi modifie légèrement chaque mise à jour et les
+trajectoires s'écartent. Reproduire une exécution bit à bit d'une précision à l'autre n'est pas à espérer~; l'équivalence s'apprécie sur la
+métrique de validation, sur toute l'exécution.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xlabel={étape d'entraînement},ylabel={perte (moyenne sur 10 étapes)},tick label style={font=\small},
+  label style={font=\small},xmin=10,xmax=300,grid=major,grid style={gray!25},legend cell align=left,
+  legend style={font=\footnotesize,at={(0.98,0.98)},anchor=north east,fill=white,draw=none},table/col sep=comma]
+\addplot[omDef,very thick] table[x=step,y=fp32]{figdata/ml/23-training-infrastructure/losses.csv};
+\addplot[omThm,thick,dashed] table[x=step,y=bf16]{figdata/ml/23-training-infrastructure/losses.csv};
+\legend{float32,bfloat16 sous autocast}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Perte d'entraînement du même réseau, du même ordre des données et de la même initialisation, en float32 et sous autocast \omterm{def:ml:training-infrastructure:mixed}{bfloat16}.
+Données~: \texttt{ml\_train.run} (\texttt{fig\_train.py}).}\label{fig:ml:train:bf16}
+\end{omfigure}
+
+\section{Entraînement distribué}
+
+\begin{definition}[Accumulation de gradient, parallélisme de données, parallélisme de modèle, all-reduce]\label{def:ml:training-infrastructure:dist}
+L'\emph{accumulation de gradient}\index{accumulation de gradient} somme les gradients de plusieurs micro-lots avant une seule étape de l'optimiseur,
+ce qui équivaut à une étape sur leur union. Le \emph{parallélisme de données}\index{parallélisme de données} fait tourner une copie du modèle sur chaque dispositif,
+chacune sur sa propre part du lot, et moyenne leurs gradients avant chaque étape (Li et coauteurs, 2020)~; le \emph{parallélisme de
+modèle}\index{parallélisme de modèle} répartit les couches ou les matrices d'un même modèle entre plusieurs dispositifs lorsqu'il ne tient pas sur un seul
+(Shoeybi et coauteurs, 2019). Un \emph{all-reduce}\index{all-reduce} est l'opération collective qui laisse chaque dispositif avec
+la somme (ou la moyenne) de tous les tableaux des dispositifs.
+\end{definition}
+
+Les deux identités sont vérifiées dans le code du chapitre (\cref{lst:ml:train:loop}). Quatre micro-lots accumulés de 64 et un lot
+de 256 des mêmes fenêtres laissent des paramètres qui diffèrent d'au plus $1.4\times10^{-7}$ après 20 étapes, l'arrondi intervenant
+dans un ordre de sommation différent. La moyenne des gradients de deux travailleurs sur les moitiés d'un lot diffère du gradient du lot
+entier d'au plus $1.5\times10^{-8}$, pour des gradients de taille 0.12~: un \omterm{def:ml:training-infrastructure:dist}{all-reduce} calcule exactement le gradient du grand lot, et le
+\omterm{def:ml:training-infrastructure:dist}{parallélisme de données} est une \omterm{def:ml:training-infrastructure:dist}{accumulation de gradient} répartie sur plusieurs dispositifs. Ce qui change avec un lot effectif plus grand,
+c'est l'optimisation~: le \omterm{def:ml:trees-and-boosting:boosting}{taux d'apprentissage} et sa phase de montée doivent être remis à l'échelle (Goyal et coauteurs, 2017), et pour les
+petits modèles bruités du trading, des lots plus grands aident rarement.
+
+\section{Points de reprise et reprise déterministe}
+
+\begin{definition}[Point de reprise d'entraînement]\label{def:ml:training-infrastructure:ckpt}
+Un \emph{point de reprise d'entraînement}\index{point de reprise d'entraînement} est un état sauvegardé à partir duquel un calcul peut reprendre comme s'il ne s'était jamais arrêté~:
+les paramètres du modèle, l'état de l'optimiseur (estimations des moments, nombres de pas), la position et l'état aléatoire de l'échantillonneur de données,
+les états des générateurs aléatoires et le nombre de pas.
+\end{definition}
+
+Un calcul de 200 étapes et un calcul interrompu à l'étape 100, sauvegardé en point de reprise (\cref{lst:ml:train:ckpt}), puis repris dans des
+objets nouvellement construits avec une initialisation différente, se terminent avec des paramètres identiques bit à bit et des pertes identiques
+étape par étape~; le point de reprise pèse 693~ko. Ne sauvegarder que les poids du modèle, le raccourci habituel, réinitialise les estimations
+des moments d'\omterm{def:ml:neural-networks-for-noisy-tabular-data:adam}{Adam} et rejoue les premières fenêtres de l'échantillonneur~; le calcul repris finit avec des paramètres éloignés d'au plus 0.039 de
+ceux du calcul non interrompu. Pour la recherche qui doit être reproduite (chapitre~25) et pour les travaux sur des machines qui peuvent être
+préemptées, le point de reprise complet fait la différence entre reprendre et recommencer avec un calcul différent.
+
+\begin{method}[Avant d'acheter un accélérateur]\label{met:ml:train:method}
+\begin{enumerate}
+\item Mesurer la charge, la taille des lots et le temps de calcul par étape~; si les données prennent plus qu'une petite part, corriger d'abord le
+chargeur (stockage binaire ou projeté en mémoire, regroupement des lots en une seule lecture, préchargement).
+\item Essayer l'autocast \omterm{def:ml:training-infrastructure:mixed}{bfloat16} et le juger sur la métrique de validation au fil du calcul.
+\item Agrandir le lot par accumulation avant d'agrandir le matériel~; remettre à l'échelle le \omterm{def:ml:trees-and-boosting:boosting}{taux d'apprentissage} et vérifier que le modèle s'améliore.
+\item Sauvegarder tout ce qui détermine l'avenir du calcul, et tester la reprise bit à bit.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: où part le temps}\label{tut:ml:training-infrastructure:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Stocker les sessions de cotations de trois façons, mesurer le budget temps d'une étape, entraîner en \omterm{def:ml:training-infrastructure:mixed}{bfloat16}, vérifier l'accumulation et le
+\omterm{def:ml:training-infrastructure:dist}{parallélisme de données}, et reprendre un calcul bit à bit. \textbf{État final~:} \cref{fig:ml:train:time,fig:ml:train:bf16}.
+\begin{tutsteps}
+\item \textbf{Un échantillonneur de fenêtres conscient des sessions, avec un état sauvegardable.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{78}{96}{Fenêtres qui ne franchissent jamais une frontière de session.}\label{lst:ml:train:sampler}
+\item \textbf{Une seule collecte pour un lot entier.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{110}{116}{Un lot tiré du jeu de données projeté en mémoire en une seule lecture indexée.}\label{lst:ml:train:gather}
+\item \textbf{Accumulation et autocast \omterm{def:ml:training-infrastructure:mixed}{bfloat16}.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{119}{141}{La boucle d'entraînement.}\label{lst:ml:train:loop}
+\item \textbf{Points de reprise.}
+\omcode{code/firm/mltrain/firm_mltrain.py}{156}{167}{Sauvegarde et restauration de tout ce dont dépend l'avenir du calcul.}\label{lst:ml:train:ckpt}
+\item \textbf{Exécuter} \texttt{ml\_train.precision()}, \texttt{accumulation()}, \texttt{data\_parallel()}, \texttt{resume()},
+\texttt{naive\_resume()}, \texttt{fig\_train.py}~; et, une fois, \texttt{bench\_train.py} sous \texttt{nice}.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Précharger le lot suivant dans un thread d'arrière-plan et mesurer le recouvrement~; ajouter un second instrument
+et vérifier que les fenêtres ne mélangent jamais les instruments.
+\end{tutorial}
+
+\section{Construction~: la boîte à outils d'entraînement}\label{bld:ml:training-infrastructure:mltrain}
+
+\begin{build}
+\bfield{Rôle} Des calculs d'entraînement rapides là où cela compte, corrects aux frontières de session, et reprenables exactement.
+\bfield{Interface} \texttt{write\_shards(sessions, root, fmt)}, \texttt{Shards(root, fmt)},
+\texttt{WindowSampler(lengths, T, horizon, batch, seed)} avec \texttt{state}/\texttt{set\_state}, \texttt{make\_batch}, \texttt{make\_batch\_vec},
+\texttt{train(model, shards, sampler, steps, lr, accumulate, bf16)}, \texttt{data\_parallel\_grads}, \texttt{save\_checkpoint},
+\texttt{load\_checkpoint}.
+\bfield{Règles} Les fenêtres ne franchissent jamais les sessions~; les durées sont mesurées, étiquetées avec la machine, et jamais affirmées~; tout ce qui
+détermine la suite d'un calcul entre dans son point de reprise.
+\bfield{Tests d'acceptation} \texttt{code/firm/mltrain/tests/}~: les trois formats renvoient des fenêtres identiques~; aucune fenêtre échantillonnée ne franchit
+une frontière~; le lot collecté égale le lot bouclé~; l'accumulation égale un lot plus grand~; les gradients moyens des fragments égalent le
+gradient complet~; la reprise est bit à bit.
+\bfield{Pour aller plus loin} \omterm{def:ml:training-infrastructure:dist}{Parallélisme de données} réel à deux processus avec le backend gloo lorsque la machine le permet~; diffusion en flux depuis des
+fragments compressés~; préchargement.
+\end{build}
+
+\begin{omsources}
+\item P.~Micikevicius et coauteurs, ``Mixed precision training'', arXiv:1710.03740, 2018.
+\item D.~Kalamkar et coauteurs, ``A study of BFLOAT16 for deep learning training'', arXiv:1905.12322, 2019.
+\item S.~Li et coauteurs, ``PyTorch distributed: experiences on accelerating data parallel training'', arXiv:2006.15704, 2020.
+\item P.~Goyal et coauteurs, ``Accurate, large minibatch SGD: training ImageNet in 1 hour'', arXiv:1706.02677, 2017.
+\item M.~Shoeybi et coauteurs, ``Megatron-LM: training multi-billion parameter language models using model parallelism'',
+arXiv:1909.08053, 2019.
+\item NVIDIA, H100 Tensor Core GPU specifications (web page, accessed September 2026).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:1}
+Quel est l'epsilon machine du \omterm{def:ml:training-infrastructure:mixed}{bfloat16}, du float16 et du float32~? Lequel d'entre eux peut-il représenter $10^{-30}$~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:2}
+Une session compte 1\,140 lignes~; les fenêtres font 20 lignes, avec un horizon cible de 10 lignes. Combien de fenêtres contient-elle~? Que se passe-t-il si
+un échantillonneur tire les débuts uniformément sur l'ensemble des sessions concaténées~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:training-infrastructure:3}
+D'après la \cref{fig:ml:train:time}, quelle accélération donnerait la division par deux du temps de calcul avec le chargeur bouclé, et avec la collecte~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:4}
+Pourquoi les pertes en float32 et en \omterm{def:ml:training-infrastructure:mixed}{bfloat16} diffèrent-elles jusqu'à 22~\% à certaines étapes alors que leurs moyennes concordent~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:5}
+Montrer que, avec une perte moyenne, accumuler $k$ micro-lots pondérés chacun par $1/k$ donne le gradient de la moyenne sur leur union.
+Qu'est-ce qui change avec la \omterm{def:ml:neural-networks-for-noisy-tabular-data:dropout}{normalisation par lot} (batch normalisation)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:training-infrastructure:6}
+\emph{Trouver la faille.} «~Nous reprenons les tâches préemptées à partir des derniers poids sauvegardés, de sorte que nos exécutions sont reproductibles.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:training-infrastructure:7}
+Estimer, à partir des débits mesurés, le temps de chargement par \omterm{def:ml:neural-networks-for-noisy-tabular-data:backprop}{époque} d'une année du tableau du chapitre dans chaque format (250
+sessions de six heures et demie de lignes d'une demi-seconde, 41 colonnes en float32, texte environ 1.5 fois plus volumineux que le binaire).
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:training-infrastructure:8}
+Dans un \omterm{def:ml:training-infrastructure:dist}{all-reduce} en anneau sur $p$ dispositifs détenant chacun $n$ nombres, chaque dispositif envoie et reçoit environ $2n(p-1)/p$ nombres. Expliquer
+pourquoi, et ce que cela implique pour la manière dont l'entraînement en \omterm{def:ml:training-infrastructure:dist}{parallélisme de données} passe à l'échelle avec le nombre de dispositifs.
+\end{exercise}
+
+\section{Problème~: Où passe le temps}
+
+\begin{problem}[{Problème du week-end --- mesurer avant d'acheter}]\label{pb:ml:training-infrastructure:1}
+Les sessions, les formats, le réseau et les exécutions du chapitre.
+
+\medskip\noindent\textbf{Partie I --- Le budget.}
+\begin{enumerate}
+\item Quelle est la taille des données dans chaque format~?
+\item Quels sont les temps de chargement, de traitement par lot et de calcul par étape~?
+\item Quelle part de l'étape est consacrée aux données pour chaque format de stockage, et avec le gather~?
+\item Que faudrait-il changer en premier, et pourquoi~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Précision.}
+\begin{enumerate}[resume]
+\item Quels sont les bits, la plage et l'epsilon de \omterm{def:ml:training-infrastructure:mixed}{bfloat16}~?
+\item Comment se comparent les exécutions en float32 et en \omterm{def:ml:training-infrastructure:mixed}{bfloat16}~?
+\item Pourquoi aucune mise à l'échelle de la perte (loss scaling) n'est-elle nécessaire avec \omterm{def:ml:training-infrastructure:mixed}{bfloat16}~?
+\item Où conserverait-on le float32 dans le pipeline d'un modèle de trading~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Parallélisme et points de reprise.}
+\begin{enumerate}[resume]
+\item Que montrent les contrôles d'accumulation et de \omterm{def:ml:training-infrastructure:dist}{parallélisme de données}~?
+\item Que doit contenir un \omterm{def:ml:training-infrastructure:ckpt}{point de reprise d'entraînement} (checkpoint), et que coûte l'omission d'une partie de celui-ci~?
+\item Quelle est la taille du point de reprise du chapitre~?
+\item Qu'exige un lot effectif plus grand du \omterm{def:ml:trees-and-boosting:boosting}{taux d'apprentissage}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la part du chargement des données dans le temps d'étape pour chaque format de stockage, et le plus grand écart de perte
+entre les entraînements en float32 et en \omterm{def:ml:training-infrastructure:mixed}{bfloat16} sur l'ensemble de l'exécution.
+\item L'équipe aurait-elle besoin d'un second \omterm{def:ml:training-infrastructure:accelerator}{accélérateur}~?
+\item Quand le \omterm{def:ml:training-infrastructure:dist}{parallélisme de modèle} devient-il nécessaire pour un modèle de trading~?
+\item Comment rendre reproductible, d'une machine à l'autre, une exécution d'entraînement~?
+\item Quel est le risque d'un échantillonneur qui chevauche des sessions~?
+\item Comment mesurer un \omterm{def:ml:training-infrastructure:loader}{chargeur de données} (data loader) sur une infrastructure partagée~?
+\item Que faudrait-il journaliser pour chaque exécution d'entraînement~?
+\item En une phrase~: quelle est la première chose à mesurer sur une tâche d'entraînement lente~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML}]\label{iq:ml:training-infrastructure:1}
+Qu'est-ce que \omterm{def:ml:training-infrastructure:mixed}{bfloat16} et pourquoi lui préfère-t-on float16 pour l'entraînement~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:training-infrastructure:2}
+Votre taux d'utilisation des GPU est de 30~\%. Comment en trouvez-vous la cause~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:training-infrastructure:3}
+Expliquez le \omterm{def:ml:training-infrastructure:dist}{parallélisme de données} et ce que fait un \omterm{def:ml:training-infrastructure:dist}{all-reduce}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, chercheur}]\label{iq:ml:training-infrastructure:4}
+Comment stockeriez-vous et échantillonneriez-vous une année de données de carnet d'ordres pour entraîner des modèles de séquences~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:training-infrastructure:5}
+Que doit contenir un \omterm{def:ml:training-infrastructure:ckpt}{point de reprise d'entraînement} (checkpoint) pour une reprise bit à bit~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:training-infrastructure:6}
+On considère souvent que l'\omterm{def:ml:training-infrastructure:dist}{accumulation de gradient} et le \omterm{def:ml:training-infrastructure:dist}{parallélisme de données} sont équivalents. Dans quels cas ne le sont-ils pas~?
+\end{interviewq}

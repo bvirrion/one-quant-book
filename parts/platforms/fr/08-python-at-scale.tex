@@ -1,0 +1,356 @@
+\chapter{Python à grande échelle}\label{ch:pl:python-at-scale}
+
+Une première version du signal d'un chercheur parcourt les événements de la journée un par un~: pour chaque enregistrement, il lit son côté et sa quantité,
+met à jour une moyenne mobile exponentielle, puis la stocke. Sur l'ordinateur portable, cela coûte 960~nanosecondes par événement, soit trois minutes pour une journée de
+deux cents millions de messages. Le même calcul, écrit comme une seule expression sur tableau, coûte 14~nanosecondes par événement, et, traité
+en flux par blocs de dix mille événements, il ne retient jamais plus d'un tiers de mégaoctet, quelle que soit la longueur de
+l'historique. Les mathématiques n'ont pas changé. Ce qui a changé, c'est le travail que l'interpréteur effectue par nombre, le nombre d'octets
+que coûte chaque représentation des données, et ce qui se trouve en mémoire à un instant donné. Ce chapitre mesure ces trois coûts sur des données de la
+\omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} et transpose ces enseignements dans l'outil de \omterm{def:pl:python-at-scale:chunked}{traitement par blocs} de la plateforme de recherche (\texttt{firm.pyscale}).
+
+\section{Ce que coûte l'interpréteur}
+
+Python est le langage de la plateforme de recherche parce qu'il est rapide à écrire et qu'il dispose des bibliothèques~; le prix à payer est que chaque
+opération écrite en Python est exécutée par un interpréteur qui manipule des objets.
+
+\begin{definition}[Surcoût de l'interpréteur]\label{def:pl:python-at-scale:overhead}
+Le \emph{surcoût de l'interpréteur}\index{surcoût de l'interpréteur} d'une opération est le travail que l'interpréteur Python effectue autour de l'arithmétique
+elle-même~: décodage du bytecode, recherche des noms et des attributs, vérification des types, création et destruction des objets
+qui portent les valeurs intermédiaires, et comptage des références. Pour une opération scalaire, il vaut de dix à cent fois le coût
+de l'arithmétique.
+\end{definition}
+
+Le \Cref{lst:pl:python-at-scale:loops} est la première version du signal, en deux exemplaires. La première boucle lit les enregistrements projetés en mémoire de
+la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}, un par un~; chaque accès à un champ de \texttt{rec[i]} crée un objet enregistrement, puis un objet scalaire. La seconde convertit
+une fois pour toutes les deux colonnes en listes Python, puis boucle sur des entiers ordinaires.
+
+\omcode{code/platforms/08-python-at-scale/python/pl_pyscale.py}{53}{73}{Le signal sous forme de boucle Python~: sur les enregistrements projetés, et
+sur des listes construites une fois à partir des colonnes.}\label{lst:pl:python-at-scale:loops}
+
+La \Cref{fig:pl:python-at-scale:methods} les mesure~: 960~nanosecondes par événement sur les enregistrements, 145 sur les listes. L'écart
+est le coût de la construction des objets que crée l'accès aux enregistrements~; ce qui reste, 150~nanosecondes pour une dizaine d'opérations de bytecode,
+c'est l'interpréteur lui-même. Aucun des deux n'est un bogue~; ce sont tous deux le prix du langage.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xbar,bar width=9pt,xmode=log,log origin=infty,xmin=5,xmax=3000,
+  xlabel={nanosecondes par événement (échelle logarithmique)},y dir=reverse,
+  ytick={0,1,2,3},yticklabels={boucle sur les enregistrements,boucle sur les listes,expression de tableau,par blocs~; 65\,536},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},point meta=explicit,
+  nodes near coords,nodes near coords style={font=\footnotesize,anchor=west,/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omDef!45,draw=omDef] table[x=ns_per_event,y expr=\coordindex,meta=ns_per_event]{figdata/platforms/08-python-at-scale/measured_methods.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Le coût par événement d'un même signal (la moyenne mobile exponentielle du volume signé) calculé de quatre façons sur des
+enregistrements de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}~: une boucle Python sur les enregistrements projetés, une boucle Python sur des listes, une expression
+sur tableau, et la même expression traitée en flux par blocs de 65\,536 événements. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution,
+machine par ailleurs inactive. Données~: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:methods}
+\end{omfigure}
+
+\section{Penser en tableaux}
+
+\begin{definition}[Programmation par tableaux]\label{def:pl:python-at-scale:array}
+La \emph{programmation par tableaux}\index{programmation par tableaux} exprime un calcul comme des opérations sur des tableaux entiers --- arithmétique
+élément par élément, réductions, sommes cumulées, filtres, tris --- de sorte que l'interpréteur n'est sollicité qu'une fois par opération et que la boucle
+sur les éléments s'exécute en code compilé sur une mémoire contiguë.
+\end{definition}
+
+La seule difficulté réelle est la récurrence. Une moyenne mobile exponentielle $y_t = (1-\alpha)\,y_{t-1} + \alpha\,x_t$ semble intrinsèquement
+séquentielle, mais c'est un filtre linéaire~: sa sortie est l'entrée convoluée avec $\alpha(1-\alpha)^k$, et une routine de filtrage la calcule
+en code compilé en un seul appel (le \cref{lst:pl:python-at-scale:ewma}). Sur l'ordinateur portable, cela fait 14~nanosecondes par événement, soit 70 fois
+plus vite que la boucle sur les enregistrements et 11 fois plus vite que la boucle sur les listes, et les résultats sont identiques jusqu'au dernier bit~:
+le filtre effectue les mêmes multiplications et additions, dans le même ordre.
+
+\omcode{code/firm/pyscale/firm_pyscale.py}{39}{50}{La moyenne récurrente sous forme de filtre linéaire~; l'état interne du filtre pour le
+premier élément provient de la dernière sortie du bloc précédent.}\label{lst:pl:python-at-scale:ewma}
+
+\begin{method}[De la boucle aux tableaux]\label{met:pl:python-at-scale:arrays}
+Repérer le motif dans la boucle~: une application élément par élément (arithmétique, \texttt{where})~; un total cumulé (\texttt{cumsum})~; une fenêtre
+(différences de sommes cumulées, ou vue glissante)~; une récurrence linéaire (un filtre)~; un regroupement (tri, puis réduction par segments)~;
+une recherche «~as-of~» (\texttt{searchsorted}, chapitre~4). Ce qui ne s'y prête pas --- un carnet d'ordres qui change à chaque événement, une machine
+à états aux nombreux embranchements --- relève du code compilé (chapitre~9), et non d'une boucle plus lente.
+\end{method}
+
+Un compilateur qui transforme la boucle Python en code machine à l'exécution est l'autre voie, la compilation à la volée du
+livre~13 (chapitre~10)~; l'environnement de la série n'en installe pas, et le chapitre~9 emprunte la voie explicite d'écrire le noyau
+en C++ ou en Rust.
+
+\section{Mémoire~: objets, tableaux et copies}
+
+Le second coût est l'espace. Un objet Python porte un en-tête (un pointeur de type et un compteur de références) avant sa valeur, et une liste de
+tels objets est un tableau de pointeurs vers des objets dispersés en mémoire. Un tableau de nombres machine, lui, ne contient que les nombres.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=4.8cm,xbar,bar width=9pt,xmin=0,xmax=72,xlabel={mégaoctets pour un million de symboles},y dir=reverse,
+  ytick={0,1,2,3},yticklabels={object,category,arrow string,numpy à largeur fixe},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=1},
+  table/col sep=comma]
+\addplot[fill=omMeth!45,draw=omMeth] table[x=mb,y=k]{figdata/platforms/08-python-at-scale/memory.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{La même colonne d'un million de symboles (cinquante codes boursiers distincts de quatre caractères) sous quatre représentations~: objets pandas
+(une chaîne Python par ligne), catégorielle pandas (codes entiers et cinquante chaînes), colonne de chaînes Arrow (décalages et octets), et
+tableau numpy à largeur fixe en Unicode. Données~: \texttt{fig\_pyscale.py}.}\label{fig:pl:python-at-scale:memory}
+\end{omfigure}
+
+La \Cref{fig:pl:python-at-scale:memory} mesure une colonne de symboles. Sous forme d'objets Python, elle occupe 61~Mo, soit un objet chaîne par ligne, dont
+quelques octets sont les caractères~; sous forme de catégorielle, 1.0~Mo, un petit entier par ligne et cinquante chaînes une seule fois~; en chaînes Arrow,
+8~Mo, un décalage et quatre octets par ligne~; sous forme de tableau numpy à largeur fixe en Unicode, 16~Mo, quatre caractères de quatre octets chacun.
+La catégorielle est 61 fois plus petite que les objets~: l'\omterm{def:pl:columnar-formats:encodings}{encodage par dictionnaire} du chapitre~3, en mémoire. Toute colonne
+d'un dataframe de recherche qui contient des chaînes répétées (symboles, plateformes, conditions, côtés) mérite la conversion.
+
+\begin{remark}[Copies]\label{rem:pl:python-at-scale:copies}
+La \omterm{def:pl:python-at-scale:array}{programmation par tableaux} a son propre piège~: chaque expression intermédiaire alloue un nouveau tableau.
+\texttt{np.where(side == B, 1.0, -1.0) * qty} sur une journée de deux cents millions d'événements alloue un tableau de booléens, deux tableaux de flottants et un produit, soit plusieurs gigaoctets de
+temporaires pour un résultat de 1.6~Go. Les remèdes consistent à calculer sur place là où la bibliothèque le permet, à choisir des types étroits et,
+surtout, à ne pas garder la journée entière en mémoire à la fois.
+\end{remark}
+
+\section{Blocs et boucles hors mémoire}
+
+\begin{definition}[Traitement par blocs, pic de mémoire résidente]\label{def:pl:python-at-scale:chunked}
+Le \emph{traitement par blocs}\index{traitement par blocs} exécute un calcul sur un jeu de données tranche par tranche, en ne transportant d'une tranche à l'autre
+que l'état nécessaire pour poursuivre le calcul à l'identique (la dernière valeur d'un filtre, la queue d'une fenêtre), de sorte que la mémoire utilisée
+soit fixée par la taille du bloc et non par la taille des données. Le \emph{pic de mémoire résidente}\index{pic de mémoire résidente} d'un processus est
+la plus grande quantité de mémoire physique qu'il a occupée à un instant donné~; c'est elle, et non la moyenne, qui décide si un travail tient sur une machine.
+\end{definition}
+
+Les fichiers plats du magasin de ticks sont projetés en mémoire (chapitre~4), si bien qu'une tranche du fichier est une vue~: rien n'est lu tant qu'elle n'est pas touchée,
+et rien n'a besoin d'être libéré. Le \Cref{lst:pl:python-at-scale:stream} fait défiler le signal à travers le fichier et ne conserve que son
+maximum courant~; l'état du filtre traverse les frontières entre blocs, de sorte que le résultat est égal à celui du calcul sur le tableau entier.
+
+\omcode{code/platforms/08-python-at-scale/python/pl_pyscale.py}{152}{159}{Le signal diffusé à travers le fichier projeté en mémoire~: les temporaires d'un bloc
+et l'état du filtre sont les seuls éléments jamais présents en mémoire.}\label{lst:pl:python-at-scale:stream}
+
+\begin{proposition}[Bloc par bloc égal au tout]\label{prop:pl:python-at-scale:exact}
+Si un calcul sur une suite peut s'écrire $y_t = f(y_{t-1}, x_t)$, ou comme une fonction d'une fenêtre des $w$ dernières entrées, alors
+traiter la suite par blocs, en transmettant la dernière sortie (ou les $w-1$ dernières entrées) de chaque bloc au suivant, donne les mêmes
+sorties que le traitement de la suite d'un seul tenant.
+\end{proposition}
+
+\begin{proof}
+Par récurrence sur les blocs~: la première sortie d'un bloc est $f$ appliquée à l'état transmis et à sa première entrée,
+ce que le calcul complet applique à cette position~; à l'intérieur d'un bloc, la récurrence est la même.
+\end{proof}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,ymode=log,xlabel={taille du bloc, événements},ylabel={pic de mémoire, Mo (échelle log)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},xmin=-0.8,xmax=4.4,ymin=0.01,ymax=300,
+  xtick={0,1,2,3,4},xticklabels={1\,000,10\,000,100\,000,1\,000\,000,entier},ytick={0.01,0.1,1,10,100},
+  yticklabels={0.01,0.1,1,10,100},
+  nodes near coords,point meta=explicit,nodes near coords style={font=\footnotesize,anchor=south east,
+  /pgf/number format/fixed,/pgf/number format/precision=3},table/col sep=comma]
+\addplot[thick,mark=*,omDef] table[x expr=\coordindex,y=peak_mb,meta=seconds]{figdata/platforms/08-python-at-scale/measured_chunks.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Pic de mémoire du signal diffusé sur un historique de deux millions d'événements en fonction de la taille du bloc, chaque point étiqueté avec
+sa durée en secondes~; le dernier point calcule le tableau entier d'un seul coup. La mémoire croît avec le bloc~; le temps est minimal pour des blocs de
+cent mille événements, et il reste à moins de dix pour cent de ce minimum de dix mille événements jusqu'au tableau entier, une fois le surcoût
+par bloc amorti. Mesuré sur un ordinateur portable
+(Intel Core Ultra 7 155H) sous WSL2, un seul fil d'exécution, machine par ailleurs inactive~; mémoire comptée par tracemalloc, l'entrée projetée
+non comprise. Données~: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:chunks}
+\end{omfigure}
+
+La \cref{fig:pl:python-at-scale:chunks} illustre le compromis. Des blocs de mille événements paient l'interpréteur une fois par mille et prennent
+0.048~s pour les deux millions d'événements~; des blocs de dix mille prennent 0.025~s avec un pic de 0.31~Mo, et des blocs de cent mille,
+les plus rapides ici, 0.023~s avec 2.5~Mo~; le tableau entier d'un seul coup prend 0.028~s avec un pic de 32~Mo, soit 16~octets par événement. À 16~octets par événement, la règle de la série, qui limite à 1.5~Go un processus, autorise environ
+94 millions d'événements d'un seul coup, une petite fraction d'une journée d'un grand flux~; en mode diffusé, la seule limite est le temps.
+
+\section{Processus, fils d'exécution et verrou de l'interpréteur}
+
+\begin{definition}[Verrou global de l'interpréteur]\label{def:pl:python-at-scale:gil}
+Le \emph{verrou global de l'interpréteur}\index{verrou global de l'interpréteur} (global interpreter lock) de l'interpréteur Python standard n'autorise qu'un seul fil d'exécution à la fois à
+exécuter du bytecode Python~; les fils d'exécution exécutent du code Python de façon concurrente mais non en parallèle, tandis que le code compilé qui libère le verrou (une grande partie
+de numpy, entrées-sorties) s'exécute en parallèle avec eux.
+\end{definition}
+
+Deux fils d'exécution faisant chacun une boucle Python pure de cinq millions d'additions prennent 0.20~s, contre 0.11~s pour un seul~: deux fois le travail en deux fois
+le temps, aucun parallélisme. Deux fils d'exécution triant chacun un tableau numpy de huit millions de valeurs prennent 0.094~s contre 0.086~s pour un seul~: le
+tri libère le verrou, et les deux s'exécutent en grande partie en parallèle. Le code Python qui doit utiliser plusieurs cœurs recourt donc à plusieurs processus.
+
+\begin{dated}{2026-09}{Un interpréteur sans verrou}\label{dat:pl:python-at-scale:freethreading}
+La PEP~703 (statut Final, consultée en septembre 2026) a ajouté une configuration de compilation de CPython qui exécute du code Python sans le
+\omterm{def:pl:python-at-scale:gil}{verrou global de l'interpréteur}~; à partir de la version 3.13, CPython prend en charge cette version free-threaded, et les installeurs officiels pour macOS et Windows
+peuvent l'installer en option. Le verrou reste l'option par défaut. L'environnement de la série (Python 3.10) possède le verrou.
+\end{dated}
+
+\begin{definition}[Parallélisme par processus, coût de sérialisation]\label{def:pl:python-at-scale:processes}
+Le \emph{parallélisme par processus}\index{parallélisme par processus} exécute le travail dans plusieurs processus du système d'exploitation, chacun avec son propre
+interpréteur et son propre verrou, de sorte que le code Python s'exécute sur plusieurs cœurs à la fois. Son \emph{coût de sérialisation}\index{coût de sérialisation} est
+le temps passé à convertir les données en octets puis à les reconvertir pour les déplacer d'un processus à l'autre (sérialisation par pickle, copie par un tube), coût que la mémoire partagée
+ou les fichiers projetés par les deux processus permettent d'éviter.
+\end{definition}
+
+Déplacer un tableau de 64~Mo vers un second processus et en sommer le contenu prend 0.14~s par pickle à travers un tube et 0.03~s par mémoire partagée,
+la copie dans le bloc partagé comprise~: la sérialisation domine dans le cas du tube, et une somme de huit millions de nombres est négligeable
+devant l'une ou l'autre. La règle de la plateforme de recherche en découle~: déplacer le travail vers les données, et non les données vers les processus de calcul. Confier à chaque processus une tranche
+d'un \omterm{def:pl:a-tick-store-on-open-formats:mmap}{fichier projeté en mémoire}, une liste de partitions Parquet ou un bloc partagé, et lui faire renvoyer un petit résultat.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5cm,xbar,bar width=9pt,xmin=0,xmax=0.27,xlabel={secondes},y dir=reverse,
+  xtick={0,0.05,0.10,0.15,0.20,0.25},xticklabels={0,0.05,0.10,0.15,0.20,0.25},
+  ytick={0,1,2,3,4,5},yticklabels={sérialisé par un tube,mémoire partagée,boucle Python~; 1 thread,boucle Python~; 2 threads,tri numpy~; 1 thread,tri numpy~; 2 threads},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},
+  nodes near coords,nodes near coords style={font=\footnotesize,/pgf/number format/fixed,/pgf/number format/precision=3},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=seconds,y expr=\coordindex]{figdata/platforms/08-python-at-scale/measured_parallel.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Déplacement d'un tableau de 64~Mo vers un second processus (sérialisé par pickle à travers un tube, ou placé en mémoire partagée), et exécution d'une boucle Python pure
+et d'un tri numpy sur un fil d'exécution puis sur deux (chaque fil exécutant la tâche entière). Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H)
+sous WSL2, machine par ailleurs inactive. Données~: \texttt{bench\_pyscale.py}.}\label{fig:pl:python-at-scale:parallel}
+\end{omfigure}
+
+\section{Tutoriel~: quatre façons de calculer un signal}\label{tut:pl:python-at-scale:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Calculer un signal sur des enregistrements de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} par une boucle, par des tableaux et par blocs, vérifier que les réponses concordent, et
+mesurer le temps et la mémoire. \textbf{État final~:} les \cref{fig:pl:python-at-scale:methods,fig:pl:python-at-scale:memory,fig:pl:python-at-scale:chunks}.
+\begin{tutsteps}
+\item \textbf{Historique}~: \texttt{pl\_pyscale.history(path, n)} écrit $n$ événements de version 1 sous forme de fichier plat de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}.
+\item \textbf{Concordance}~: \texttt{agree()} exécute les deux boucles (\cref{lst:pl:python-at-scale:loops}), l'expression sur tableaux et la
+version par blocs sur 20\,000 événements~: les écarts sont nuls.
+\item \textbf{Mesure}~: \texttt{bench\_pyscale.py} chronomètre les quatre méthodes, les tailles de bloc et les tâches parallèles.
+\item \textbf{Mémoire}~: \texttt{symbol\_memory()} pour les quatre représentations d'une colonne.
+\item \textbf{Fenêtres}~: \texttt{firm\_pyscale.rolling\_sum\_kernel(w)} transporte la queue d'une fenêtre d'un bloc à l'autre~; il faut en vérifier le résultat contre une
+somme cumulée calculée d'un seul tenant.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Diffuser le signal à partir des partitions Parquet de la semaine, décrites au chapitre~4, au lieu du fichier plat~; répartir le
+l'historique entre deux processus par moitiés et combiner leurs résultats, et repérer quel état franchit la frontière.
+\end{tutorial}
+
+\section{Construction~: le pipeline par blocs}\label{bld:pl:python-at-scale:pyscale}
+
+\begin{build}
+\bfield{Rôle} La manière dont la plateforme de recherche exécute tout calcul par événement sur des historiques plus grands que la mémoire, et mesure le coût
+en temps et en mémoire d'un calcul avant sa planification (chapitre~13).
+\bfield{Interface} \texttt{chunks(array, size)}~; \texttt{run(source, kernel, state) -> (outputs, state)}, un noyau étant
+\texttt{kernel(chunk, state) -> (output, state)}~; \texttt{ewma\_kernel(alpha)}, \texttt{rolling\_sum\_kernel(window)}~;
+\texttt{probe(fn, *args) -> (result, seconds, peak\_bytes)}.
+\bfield{Règles} Les blocs sont des vues, jamais des copies~; l'état transporté est le plus petit qui rend le résultat par blocs égal au
+résultat complet, et un test le prouve pour chaque noyau~; la mémoire se mesure comme un pic, la méthode étant énoncée.
+\bfield{Tests d'acceptation} \texttt{code/firm/pyscale/tests/}~: les blocs couvrent le tableau exactement~; les noyaux EWMA et de somme glissante donnent le
+résultat complet pour toute taille de bloc, y compris un et la longueur totale~; la sonde signale un pic qui croît avec l'allocation.
+\bfield{Pour aller plus loin} Un pool de processus de travail recevant chacun un intervalle d'un \omterm{def:pl:a-tick-store-on-open-formats:mmap}{fichier projeté en mémoire} (memory-mapped) (deux au plus ici, par la règle des ressources)~; un noyau
+pour un filtre de signe de la transaction qui exige une machine à états~; le \omterm{def:pl:python-at-scale:chunked}{pic de mémoire résidente} fourni par le système d'exploitation à côté du décompte de tracemalloc.
+\end{build}
+
+\begin{omsources}
+\item S.~Gross, \emph{PEP 703 -- Making the Global Interpreter Lock Optional in CPython} (Final)~; documentation Python,
+\emph{Python support for free threading}.
+\item Documentation Python, \texttt{multiprocessing.shared\_memory}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:1}
+À 960, 145 et 14 nanosecondes par événement, combien de temps chaque méthode met-elle pour une journée de deux cents millions d'événements~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:2}
+Pourquoi la boucle sur les enregistrements coûte-t-elle environ six fois la boucle sur les listes, alors que les deux exécutent la même arithmétique~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:python-at-scale:3}
+Un dataframe compte un million de lignes et trois colonnes de chaînes de cinquante valeurs distinctes chacune. Estimer sa mémoire de chaînes en objets et
+en catégories, à partir de la \cref{fig:pl:python-at-scale:memory}.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:4}
+Écrire la somme glissante des $w$ dernières valeurs comme une expression sur tableaux, et énoncer l'état qu'une version par blocs doit transporter.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:5}
+Deux threads ont exécuté la même boucle Python pure en deux fois le temps d'une seule. Qu'auraient fait deux processus, et que
+coûteraient-ils si chacun avait besoin d'une entrée de 64~Mo~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:python-at-scale:6}
+À 16 octets par événement pour le calcul sur le tableau entier, combien d'événements tiennent d'un coup dans un budget de 1.5~Go, et quelle fraction
+d'une journée du flux d'options prévu de 311 milliards de messages (chapitre~2) cela représente-t-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:python-at-scale:7}
+\emph{Programmation.} Vérifier \texttt{rolling\_sum\_kernel(50)} contre une version par somme cumulée sur le tableau entier, pour 100\,000 valeurs aléatoires,
+et des tailles de bloc 1, 7, 50, 1\,000 et la longueur totale. Quel est le plus grand écart~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:python-at-scale:8}
+\emph{Trouver la faille.} «~Notre tâche de variables est lente, alors nous avons découpé la journée en huit parties, avec un pool de huit threads, chacun exécutant
+la boucle Python de calcul des variables sur sa partie, puis nous avons concaténé les résultats.~»
+\end{exercise}
+
+\section{Problème~: trois minutes ou trois secondes}
+
+\begin{problem}[{Problème du week-end --- un signal sur une année d'événements}]\label{pb:pl:python-at-scale:1}
+Le signal du chapitre (une moyenne pondérée exponentiellement du volume signé), ses quatre implémentations et les mesures de
+\texttt{bench\_pyscale.py}.
+
+\medskip\noindent\textbf{Partie I --- L'interpréteur.}
+\begin{enumerate}
+\item Que fait l'interpréteur par événement dans la boucle sur les enregistrements qu'il ne fait pas dans l'expression sur tableaux~?
+\item Combien de nanosecondes par événement coûte chacune des quatre méthodes~?
+\item Quelle est l'accélération de l'expression sur tableaux par rapport à chaque boucle~?
+\item Pourquoi les réponses de la boucle et du filtre sont-elles identiques au dernier bit~?
+\item Quels types de boucle ne peuvent pas s'écrire comme des opérations sur tableaux, et où vont-elles~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Mémoire.}
+\begin{enumerate}[resume]
+\item Combien d'octets une ligne coûte-t-elle pour une colonne de symboles en objets, en catégorie, en chaînes Arrow et en unicode à largeur fixe~?
+\item Pourquoi la catégorie est-elle la plus petite~?
+\item Que coûte le calcul du signal sur le tableau entier en mémoire par événement, et d'où provient ce coût~?
+\item Combien d'événements tient un budget de 1.5~Go d'un coup~?
+\item Qu'est-ce que le \omterm{def:pl:python-at-scale:chunked}{pic de mémoire résidente}, et pourquoi c'est lui, et non la moyenne, qui décide si un travail tient~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Blocs et cœurs.}
+\begin{enumerate}[resume]
+\item Pourquoi le résultat par blocs est-il égal au résultat complet, et quel état est transporté~?
+\item Quelle taille de bloc est la plus rapide ici, et quel est son pic de mémoire~?
+\item Pourquoi les blocs de mille événements sont-ils plus lents~?
+\item Que gagnent deux threads sur une boucle Python et sur un tri numpy~?
+\item Que coûte le transfert de 64~Mo vers un autre processus par sérialisation pickle, et par mémoire partagée~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: l'accélération de l'expression sur tableaux par rapport aux boucles, la taille de bloc qui minimise le temps et
+son pic de mémoire, et le plus grand historique qui tient entier dans le budget.
+\item Combien de temps prendrait une année de 250 jours de deux cents millions d'événements par chaque méthode, sur un seul cœur~?
+\item Comment utiliser huit cœurs pour cette année sans payer le \omterm{def:pl:python-at-scale:processes}{coût de sérialisation}~?
+\item Parmi les leçons du chapitre, lesquelles un interpréteur sans verrou global modifierait-il, et lesquelles non~?
+\item En une phrase~: qu'est-ce qui rend Python assez rapide pour les \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick}~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{chercheur, développeur}]\label{iq:pl:python-at-scale:1}
+Pourquoi une boucle Python sur un tableau numpy est-elle lente, et que faites-vous à la place~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur, développeur}]\label{iq:pl:python-at-scale:2}
+Comment calculeriez-vous une moyenne mobile exponentielle sur un milliard de valeurs en Python~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:python-at-scale:3}
+Qu'est-ce que le \omterm{def:pl:python-at-scale:gil}{verrou global de l'interpréteur} (GIL), et quand n'a-t-il pas d'importance~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:pl:python-at-scale:4}
+Votre dataframe utilise 40~Go de mémoire. Où regardez-vous en premier~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:python-at-scale:5}
+Concevez un travail qui calcule des variables sur cinq ans de \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} sur une machine de 32~cœurs avec 128~Go de mémoire.
+\end{interviewq}

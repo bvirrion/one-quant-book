@@ -1,0 +1,398 @@
+\chapter{Observabilité et réponse aux incidents}\label{ch:pl:observability-and-incident-response}
+
+Le 22 août 2013, le système qui diffuse les cotations consolidées des actions cotées au Nasdaq commence à défaillir à 11~h~48 du matin, avec
+des interruptions intermittentes sur certains de ses canaux. À 12~h~03, il cesse complètement de diffuser des cotations~; une suspension réglementaire arrête la négociation de ces
+actions sur toutes les plateformes~; la panne technique est réparée à 12~h~24, et la cotation comme la négociation reprennent à 15~h~25. La supervision
+d'une société de trading ce matin-là pouvait sembler parfaite~: chaque processus était actif, chaque file vide, chaque heartbeat à l'heure~--- parce que rien n'arrivait. Ce chapitre construit la
+supervision qui aurait détecté le problème~: des signaux portant sur ce que reçoivent les utilisateurs de la plateforme plutôt que sur les processus qui les servent,
+des objectifs assortis de \omterm{def:pl:observability-and-incident-response:budget}{budgets d'erreur}, des alertes qui ne déclenchent un appel que lorsqu'une personne doit agir, et la pratique d'incident qui suit l'appel.
+
+\section{Métriques, journaux et traces}
+
+\begin{definition}[Observabilité]\label{def:pl:observability-and-incident-response:observability}
+L'\emph{observabilité}\index{observabilité} est le degré auquel l'état interne d'un système en fonctionnement peut être déduit de
+ce qu'il émet~--- ses \omterm{def:pl:observability-and-incident-response:metric}{métriques}, ses journaux et ses traces~--- sans déployer de nouveau code pour poser une nouvelle question.
+\end{definition}
+
+\begin{definition}[Métrique, journalisation structurée]\label{def:pl:observability-and-incident-response:metric}
+Une \emph{métrique}\index{métrique} est une mesure numérique nommée, munie d'étiquettes, échantillonnée ou agrégée dans le temps~: un compteur (messages reçus), une
+jauge (profondeur de file), un histogramme (latence, comme dans le livre~13, chapitre~5). La \emph{journalisation structurée}\index{journalisation structurée} écrit chaque événement de journal
+sous la forme d'un enregistrement de champs nommés~--- heure, niveau, service, événement, identifiants, valeurs~--- plutôt que sous la forme d'une phrase, de sorte que les journaux peuvent être interrogés
+comme des données.
+\end{definition}
+
+\begin{definition}[Traçage distribué, span]\label{def:pl:observability-and-incident-response:trace}
+Le \emph{traçage distribué}\index{traçage distribué} suit une unité de travail~--- une requête, un message de données de marché, un ordre~--- à travers
+les services qu'elle traverse. Chaque étape est un \emph{span}\index{span}, une unité de travail dotée d'un début, d'une fin, d'un identifiant de trace partagé par toutes les
+étapes et de l'identifiant de l'étape qui l'a causée, de sorte que le chemin peut être reconstruit sous forme d'arbre.
+\end{definition}
+
+La chaîne du chapitre est celle de la plateforme elle-même~: la capture (chapitre~\ref{ch:pl:capturing-and-storing-tick-data}), la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}, le \omterm{def:pl:position-and-pnl-services:service}{service de positions}
+(chapitre~\ref{ch:pl:position-and-pnl-services}) et le risque en temps réel (chapitre~\ref{ch:pl:real-time-risk}). \texttt{firm.observe} fournit
+à chacun un registre de \omterm{def:pl:observability-and-incident-response:metric}{métriques}, des enregistrements de journal structurés et des \omterm{def:pl:observability-and-incident-response:trace}{spans} au sens d'OpenTelemetry, transmis d'un service au suivant. Un message tracé
+montre où passe son temps (\cref{fig:pl:observability-and-incident-response:trace})~: une fraction de milliseconde dans la capture, le stockage et
+les positions, puis l'attente dans la file du service de risque~--- 50~millisecondes un jour normal, une minute lorsque le service de risque prend du retard.
+
+\omcode{code/firm/observe/firm_observe.py}{103}{123}{Spans~: un span racine démarre une trace, chaque enfant porte l'identifiant de la trace et celui de son
+parent, et une trace est reconstruite à partir d'eux dans l'ordre chronologique.}\label{lst:pl:observability-and-incident-response:tracer}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogxaxis}[width=11cm,height=5.2cm,xbar,bar width=6pt,xmin=0.005,xmax=200000,y dir=reverse,ytick={0,1,2,3,4},
+  yticklabels={capture,stockage,positions,file du risque,calcul de risque},xlabel={durée du span (ms, échelle logarithmique)},grid=major,grid style={gray!20},
+  tick label style={font=\small},label style={font=\small},table/col sep=comma,log origin=infty,
+  legend style={font=\small,at={(0.5,1.03)},anchor=south,legend columns=2,draw=none,
+    /tikz/every even column/.append style={column sep=4mm}}]
+\addplot[fill=omDef!40,draw=omDef] table[y=row,x=dur_ms]{figdata/platforms/28-observability-and-incident-response/trace_normal.csv};
+\addplot[fill=omThm!50,draw=omThm] table[y=row,x=dur_ms]{figdata/platforms/28-observability-and-incident-response/trace_slow.csv};
+\legend{journée normale,consommateur de risque lent}
+\end{semilogxaxis}
+\end{tikzpicture}
+
+\omcaption{Les \omterm{def:pl:observability-and-incident-response:trace}{spans} d'un message de données de marché tracé à travers la chaîne (échelle logarithmique). La capture, le stockage et les positions prennent 0.02, 0.2 et
+0.1~ms~; le service de risque calcule en 1~ms. Ce qui change lorsque le service de risque prend du retard, c'est sa file~: 50~ms un jour normal, 60~secondes
+au plus fort de l'incident du consommateur lent. Données~: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:trace}
+\end{omfigure}
+
+Chacun des trois répond à une question différente. Les \omterm{def:pl:observability-and-incident-response:metric}{métriques} disent que quelque chose ne va pas, à faible coût, pour tout, en permanence. Les journaux disent ce qui
+s'est passé dans un service. Les traces disent où le temps est passé à travers les services, pour les unités de travail échantillonnées. La plupart des sociétés de trading disposent des deux premiers
+et pas du troisième, et n'apprennent où un message a passé sa minute qu'en lisant les journaux de quatre services côte à côte, avec quatre horloges.
+
+\section{Niveaux de service et budgets d'erreur}
+
+\begin{definition}[Indicateur de niveau de service, objectif de niveau de service]\label{def:pl:observability-and-incident-response:sli}
+Un \emph{indicateur de niveau de service}\index{indicateur de niveau de service} (SLI) est une mesure soigneusement définie d'un aspect du service que reçoit un
+utilisateur~: ici, la part des secondes pendant lesquelles les données de marché utilisées par le service de risque ont au plus cinq secondes. Un \emph{objectif de
+niveau de service}\index{objectif de niveau de service} (SLO) est une cible fixée pour un SLI sur une période~: ici, 99.9~\% des secondes de négociation d'un mois de 30 jours.
+\end{definition}
+
+Le choix de l'indicateur se fait du côté de l'utilisateur. Un heartbeat du service de risque indique que le processus est vivant~; l'âge de ses données indique
+s'il fait son travail. Le matin de l'incident, chaque heartbeat était à l'heure et chaque âge augmentait d'une seconde par seconde. Un SLO se distingue
+de l'accord de niveau de service (SLA) du livre~14 par la partie qu'il engage~: un accord est une promesse faite à un client, assortie de pénalités, alors qu'un objectif est la cible propre de la société,
+fixée plus strictement que toute promesse qu'elle fait.
+
+\begin{definition}[Budget d'erreur]\label{def:pl:observability-and-incident-response:budget}
+Le \emph{budget d'erreur}\index{budget d'erreur} d'un SLO est la quantité de mauvais service qu'il autorise sur sa période~--- 1~moins la cible, multiplié par les
+événements~--- que le service consomme pour les incidents, la maintenance et les changements risqués~; lorsqu'il est épuisé, le travail de fiabilité prime sur
+les fonctionnalités.
+\end{definition}
+
+Un objectif de 99.9~\% sur 30 jours de négociation de 23\,400 secondes autorise 702 mauvaises secondes par mois. Les journées calmes du chapitre~--- la latence normale
+de la chaîne, de quelques dizaines de millisecondes, plus des pauses (une rafale, une collecte, un disque lent) qui surviennent 0.8 fois par heure et pendant lesquelles l'âge augmente
+d'une seconde par seconde~--- en consomment 115, soit 16~\% du budget, en 18 pauses de plus de cinq secondes
+(\cref{fig:pl:observability-and-incident-response:quiet}).
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{semilogyaxis}[width=11.5cm,height=5.2cm,xlabel={heure de la journée},ylabel={âge maximal (s, log)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=0,xmax=390,ymin=0.03,ymax=200,xtick={0,90,180,270,360},xticklabels={09~h~30,11~h~00,12~h~30,14~h~00,15~h~30}]
+\addplot[omDef,thin,const plot] table[x=minute,y=max_age]{figdata/platforms/28-observability-and-incident-response/quiet.csv};
+\draw[omThm,dashed] (axis cs:0,5) -- (axis cs:390,5) node[pos=0.02,above right,font=\scriptsize]{5 s~: la limite du SLI};
+\draw[gray,dashed] (axis cs:0,30) -- (axis cs:390,30) node[pos=0.98,below left,font=\scriptsize]{30 s};
+\draw[gray,dashed] (axis cs:0,60) -- (axis cs:390,60) node[pos=0.98,above left,font=\scriptsize]{60 s};
+\end{semilogyaxis}
+\end{tikzpicture}
+
+\omcaption{Une journée calme du modèle~: l'âge maximal des données de marché utilisées par le service de risque à chaque minute. Hors des pauses, l'âge maximal d'une minute
+reste d'environ 0.1 à 0.3~seconde, soit quelques fois les 50~ms typiques de la chaîne~; quelques pauses d'une ou deux secondes passent inaperçues~; une pause à 14~h~35 dure 56 secondes, dépassant la limite de cinq secondes du SLI et tout seuil statique
+inférieur à une minute. Données~: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:quiet}
+\end{omfigure}
+
+\section{Alerter pour que les personnes puissent agir}
+
+Un appel réveille une personne. Il doit signifier qu'une personne doit agir maintenant, et il doit arriver assez tôt pour que l'action compte. Des
+seuils statiques sur l'âge des données opposent les deux exigences~; une règle fondée sur le \omterm{def:pl:observability-and-incident-response:budget}{budget d'erreur} n'a pas à le faire.
+
+\begin{definition}[Alerte de vitesse de consommation]\label{def:pl:observability-and-incident-response:burn}
+Une \emph{alerte de vitesse de consommation}\index{alerte de vitesse de consommation} (burn-rate alert) déclenche un appel lorsque le \omterm{def:pl:observability-and-incident-response:budget}{budget d'erreur} est consommé plus vite qu'un multiple donné du rythme qui
+l'épuiserait exactement sur la période du SLO, mesurée sur une longue fenêtre et confirmée sur une courte~: pour un objectif de 99.9~\%, le
+SRE workbook de Google recommande de déclencher un appel à 14.4 fois la vitesse sur une heure (confirmée sur cinq minutes) ou à 6 fois la vitesse sur six heures (sur trente minutes).
+\end{definition}
+
+\omcode{code/firm/observe/firm_observe.py}{159}{176}{Alerte multi-fenêtres de vitesse de consommation~: la part des secondes défaillantes sur les fenêtres longue et
+courte de chaque règle, comparée au rythme multiplié par la part du budget d'erreur.}\label{lst:pl:observability-and-incident-response:burn}
+
+Trois incidents sont rejoués un jour calme, aux heures de l'horloge du crochet~: un arrêt du flux à partir de 12~h~03, qui dure 21 minutes~; des arrêts intermittents de 20
+secondes chaque minute à partir de 11~h~48, pendant un quart d'heure~; et un consommateur lent à partir de 14~h~00, un service de risque dont le retard croît de 0.05 seconde
+à chaque seconde. Cinq règles les surveillent (la \cref{tab:pl:observability-and-incident-response:rules}).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}@{}}
+\toprule
+règle & arrêt du flux & arrêts intermittents & consommateur lent & fausses alertes par mois\\
+\midrule
+heartbeat du processus & jamais & jamais & jamais & 0\\
+âge des données supérieur à 5~s & 5~s & 5~s & 100~s & 18\\
+âge des données supérieur à 30~s & 30~s & jamais & 600~s & 1\\
+âge des données supérieur à 60~s & 60~s & jamais & 1\,200~s & 0\\
+vitesse de consommation, règles à 1~h et 6~h & 56~s & 191~s & 151~s & 1\\
+\bottomrule
+\end{tabular}
+\caption{\omterm{def:pl:observability-and-incident-response:ttd}{Délai de détection} de chaque incident rejoué, et appels sur trente jours calmes, pour cinq règles d'alerte. Le heartbeat ne se déclenche
+jamais~; les seuils statiques achètent la rapidité au prix de fausses alertes ou manquent les arrêts intermittents~; les règles de vitesse de consommation détectent
+les trois incidents en environ trois minutes et ne déclenchent qu'un appel par mois les jours calmes, pour la pause de 56 secondes de la journée.}
+\label{tab:pl:observability-and-incident-response:rules}
+\end{table}
+
+\begin{definition}[Délai de détection, délai de rétablissement]\label{def:pl:observability-and-incident-response:ttd}
+Le \emph{délai de détection}\index{délai de détection} d'un incident est le temps écoulé entre son début et la première alerte ou le premier signalement sur lequel
+une personne agit~; son \emph{délai de rétablissement}\index{délai de rétablissement} est le temps écoulé entre son début et le moment où le service que reçoivent
+les utilisateurs est de nouveau dans son objectif.
+\end{definition}
+
+Le \omterm{def:pl:observability-and-incident-response:ttd}{délai de rétablissement} se mesure sur le service que reçoit un utilisateur, à partir du début de l'incident~; le temps moyen de réparation (MTTR) du livre~14 est une
+propriété d'un composant comme un circuit, moyennée sur ses pannes, depuis la panne jusqu'à la réparation.
+
+Les seuils statiques montrent le compromis (la \cref{tab:pl:observability-and-incident-response:rules}). À cinq secondes, ils détectent tout
+d'un coup et déclenchent 18 appels par mois pour des pauses qui se résorbent d'elles-mêmes~; en quelques semaines, personne n'y répond. À trente ou soixante secondes, les
+fausses alertes disparaissent, mais les arrêts intermittents --- la phase de 11~h~48 du crochet --- n'atteignent jamais le seuil, et un consommateur lent
+met dix ou vingt minutes à être repéré. Les règles de vitesse de consommation déclenchent un appel 56 secondes après le début de l'arrêt, 3 minutes après celui
+des arrêts intermittents et 2 minutes et demie après celui du consommateur lent (la \cref{fig:pl:observability-and-incident-response:slow}), avec un seul appel par mois les jours calmes~: la pause de 56 secondes,
+qui consomme bien une part réelle du budget et mérite un examen.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={minutes après le début de l'incident},ylabel={âge des données (s)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=-5,xmax=25,ymin=0,ymax=80,axis y line*=left]
+\addplot[omDef,thick] table[x=t_min,y=age]{figdata/platforms/28-observability-and-incident-response/incident_slow.csv};
+\draw[black,dashed] (axis cs:100/60,0) -- (axis cs:100/60,80) node[pos=0.97,left=3pt,font=\scriptsize]{5~s~: 1.7~min};
+\draw[omThm,thick] (axis cs:151/60,0) -- (axis cs:151/60,80) node[pos=0.85,right,font=\scriptsize]{vitesse de consommation~: 2.5~min};
+\draw[black,dashed] (axis cs:10,0) -- (axis cs:10,80) node[pos=0.97,left,font=\scriptsize]{30~s~: 10~min};
+\draw[black,dashed] (axis cs:20,0) -- (axis cs:20,80) node[pos=0.97,left,font=\scriptsize]{60~s~: 20~min};
+\node[omDef,font=\scriptsize,anchor=south east] at (axis cs:24.5,4) {âge des données du service de risque};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{L'incident du consommateur lent~: à partir de 14~h~00, le service de risque traite les messages moins vite qu'ils n'arrivent, et l'âge de ses
+données croît de 0.05 seconde à chaque seconde. Son processus reste vivant tout du long. Le seuil de cinq secondes se déclenche à 1.7 minute, la règle de vitesse de consommation
+à 2.5 minutes, les seuils de 30 et 60 secondes après 10 et 20 minutes. Données~: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:slow}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,xlabel={minutes après 11~h~48},ylabel={consommation (fois le budget)},
+  grid=major,grid style={gray!20},tick label style={font=\small},label style={font=\small},table/col sep=comma,
+  xmin=-5,xmax=15,ymin=0,ymax=270]
+\addplot[gray,thin] table[x=t_min,y=burn_5m]{figdata/platforms/28-observability-and-incident-response/incident_intermittent.csv};
+\addplot[omThm,thick] table[x=t_min,y=burn_1h]{figdata/platforms/28-observability-and-incident-response/incident_intermittent.csv};
+\draw[black,dashed] (axis cs:-5,14.4) -- (axis cs:15,14.4) node[pos=0.02,above right,font=\scriptsize]{14.4};
+\draw[omThm,dotted,thick] (axis cs:191/60,0) -- (axis cs:191/60,270) node[pos=0.3,right,font=\scriptsize]{appel~: 3.2~min};
+\node[gray,font=\scriptsize,anchor=north] at (axis cs:10,240) {fenêtre de 5 minutes};
+\node[omThm,font=\scriptsize,anchor=south] at (axis cs:11,66) {fenêtre d'une heure};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les arrêts intermittents~: 20 secondes sans données chaque minute à partir de 11~h~48. L'âge des données ne dépasse jamais 20 secondes, donc les seuils à 30
+et 60 secondes ne se déclenchent jamais~; la vitesse de consommation sur la dernière heure dépasse 14.4 --- un cinquantième du budget du mois en une heure --- après 3.2 minutes,
+la fenêtre de cinq minutes la confirmant. Données~: \texttt{fig\_observe.py}.}\label{fig:pl:observability-and-incident-response:intermittent}
+\end{omfigure}
+
+\section{Astreinte et commandement d'incident}
+
+\begin{definition}[Rotation d'astreinte, procédure d'exploitation]\label{def:pl:observability-and-incident-response:oncall}
+Une \emph{rotation d'astreinte}\index{rotation d'astreinte} désigne, selon un planning publié, les personnes qui répondent aux appels d'un service à chaque heure,
+avec un suppléant derrière le titulaire. Une \emph{procédure d'exploitation}\index{procédure d'exploitation} (runbook) est la procédure écrite pour une alerte ou une panne connue~: ce qu'elle signifie,
+comment la confirmer, quoi faire en premier, qui appeler.
+\end{definition}
+
+\begin{definition}[Responsable d'incident]\label{def:pl:observability-and-incident-response:ic}
+Le \emph{responsable d'incident}\index{responsable d'incident} (incident commander) tient l'état global d'un incident et structure la réponse --- en désignant
+qui modifie le système, qui communique, qui planifie --- sans effectuer lui-même le travail technique.
+\end{definition}
+
+Dans une société de trading, les premières minutes d'un incident concernent l'exposition, non le diagnostic~: la société opère-t-elle sur des données périmées, et faut-il arrêter
+les stratégies~? La \omterm{def:pl:observability-and-incident-response:oncall}{procédure d'exploitation} d'une alerte d'âge des données commence donc par les kill switches du livre~13 et les limites de risque du livre~11, puis par
+le diagnostic, et la première question du \omterm{def:pl:observability-and-incident-response:ic}{responsable d'incident} au desk de trading est de savoir ce que la société détient. Un seul groupe modifie le système pendant un
+incident, afin que les correctifs n'entrent pas en collision~; une seule personne communique, afin que le desk, le risque et la conformité entendent la même chose.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+heure & source & événement\\
+\midrule
+12:03:00 & log & tickcap~: dernier message sur les canaux de cotation\\
+12:03:05 & alerte & âge des données supérieur à 5~s~: appel\\
+12:03:30 & alerte & âge des données supérieur à 30~s~: appel\\
+12:03:56 & alerte & vitesse de consommation~: appel\\
+12:04:00 & alerte & âge des données supérieur à 60~s~: appel\\
+12:24:00 & log & tickcap~: reprise des canaux de cotation\\
+12:24:00 & log & rtrisk~: âge des données repassé sous 5~s\\
+\bottomrule
+\end{tabular}
+\caption{Chronologie de l'arrêt du flux rejoué, fusionnée à partir des alertes et des journaux structurés par \texttt{firm.observe.timeline}. \omterm{def:pl:observability-and-incident-response:ttd}{Délai de détection}~:
+56~secondes avec la règle de vitesse de consommation~; \omterm{def:pl:observability-and-incident-response:ttd}{délai de rétablissement}~: 21 minutes.}\label{tab:pl:observability-and-incident-response:timeline}
+\end{table}
+
+\section{Un incident rejoué, et la revue qui suit}
+
+\begin{definition}[Revue sans recherche de coupable]\label{def:pl:observability-and-incident-response:blameless}
+Une \emph{revue sans recherche de coupable}\index{revue sans recherche de coupable} (blameless review~; post-incident review, postmortem) reconstitue la chronologie d'un incident et ses causes contributives
+sans désigner aucun individu ni aucune équipe, en partant du principe que chacun a agi de bonne foi avec les informations dont il disposait, et
+se termine par des actions qui modifient le système plutôt que par des exhortations à la prudence.
+\end{definition}
+
+La revue de l'arrêt rejoué s'écrit presque d'elle-même à partir du \cref{tab:pl:observability-and-incident-response:timeline}. Les données se sont arrêtées à 12~h~03~; la
+\omterm{def:pl:observability-and-incident-response:burn}{alerte de vitesse de consommation} est arrivée à 12:03:56~; le flux est revenu à 12~h~24, et les données du service de risque étaient de nouveau fraîches dans la même seconde. Les questions qu'elle pose ne
+portent pas sur qui a failli, mais sur ce que le système a laissé se produire~: pourquoi les tableaux de bord de la société affichaient du vert (ils mesuraient les processus, non les données)~; ce que les stratégies
+ont fait des prix périmés pendant la première minute (le déclencheur du kill switch portait sur la santé des processus, non sur l'âge des données)~; pourquoi la phase intermittente à partir de
+11~h~48 est passée inaperçue (les seuils étaient supérieurs à ses vingt secondes). Ses actions sont des modifications~: un SLI sur l'âge des données pour chaque consommateur, le déclenchement des \omterm{def:pl:observability-and-incident-response:burn}{alertes de vitesse de consommation},
+un kill switch sur les données périmées, et le rejeu lui-même conservé comme test (chapitre~\ref{ch:pl:testing-and-continuous-delivery}) afin que la prochaine
+modification de l'alerte soit vérifiée contre lui. Un incident qui devient un événement de perte opérationnelle (livre~6, chapitre~28) entre aussi dans les données de
+pertes de la société~; c'est la revue qui rend ces données utiles.
+
+\begin{dated}{2026-09}{L'incident SIP de 2013 et les pratiques SRE}\label{dat:pl:observability-and-incident-response:sip}
+L'alerte fournisseur de Nasdaq sur le problème du SIP UTP du 22 août 2013 donne la chronologie~: des pannes intermittentes sur plusieurs canaux de cotation à partir de
+11~h~48, une panne sur tous les canaux de cotation à 12~h~03, le problème résolu et l'environnement stable à 12~h~24, la connectivité rétablie à partir de
+14~h~00, et toute la cotation et le trading des titres cotés sur Nasdaq ont repris à 15~h~25~; les flux de transactions n'ont pas été touchés, et un arrêt réglementaire a été
+décidé pour toutes les négociations de ces titres. \emph{Site Reliability Engineering} de Google définit les SLI, les SLO et le \omterm{def:pl:observability-and-incident-response:budget}{budget d'erreur}, et décrit
+le commandement d'incident et les revues post-mortem sans recherche de coupable~; son workbook recommande, pour un objectif de 99.9~\%, de déclencher des alertes sur des vitesses de consommation de 14.4 sur une heure et de 6
+sur six heures, chacune confirmée sur une fenêtre douze fois plus courte. OpenTelemetry définit un \omterm{def:pl:observability-and-incident-response:trace}{span} comme une unité de travail portant les identifiants de trace, de \omterm{def:pl:observability-and-incident-response:trace}{span}
+et de parent.
+\end{dated}
+
+\section{Tutoriel~: trois heures de silence}\label{tut:pl:observability-and-incident-response:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Instrumenter la chaîne, définir son SLO, rejouer trois incidents, comparer les règles d'alerte et construire la chronologie de l'incident.
+\textbf{État final~:} les \cref{tab:pl:observability-and-incident-response:rules,tab:pl:observability-and-incident-response:timeline}.
+\begin{tutsteps}
+\item \textbf{Traces}~: \texttt{pl\_observe.traced(ts, lag)} un jour normal et pendant le consommateur lent.
+\item \textbf{Jours calmes}~: \texttt{quiet\_day(seed)} et \texttt{budget()}, le \omterm{def:pl:observability-and-incident-response:budget}{budget d'erreur} consommé dans un mois.
+\item \textbf{Incidents}~: \texttt{incident(kind)} pour les trois types.
+\item \textbf{Règles}~: \texttt{compare()}~: \omterm{def:pl:observability-and-incident-response:ttd}{délai de détection} et fausses alertes pour chaque règle.
+\item \textbf{Chronologie}~: \texttt{stall\_timeline()} et la revue.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Ajouter une règle de ticket (vitesse de consommation de 1 sur trois jours) et compter ce qu'elle détecte et que les alertes ne détectent pas~; rendre les
+pauses deux fois plus fréquentes et voir quelles règles survivent.
+\end{tutorial}
+
+\section{Construction~: observabilité}\label{bld:pl:observability-and-incident-response:observe}
+
+\begin{build}
+\bfield{Rôle} Savoir ce que reçoivent les utilisateurs de la plateforme, n'appeler une personne que lorsqu'une action est nécessaire, et reconstituer tout incident à partir de
+ce que la plateforme a émis.
+\bfield{Interface} \texttt{Registry} (\texttt{counter}, \texttt{gauge}, \texttt{histogram}), \texttt{log}, \texttt{Tracer} (\texttt{start},
+\texttt{finish}, \texttt{trace}), \texttt{SLO}, \texttt{error\_budget\_used}, \texttt{threshold\_pages}, \texttt{burn\_rate\_pages},
+\texttt{timeline}.
+\bfield{Règles} SLI mesurés du côté de l'utilisateur~; chaque service émet des \omterm{def:pl:observability-and-incident-response:metric}{métriques}, des journaux structurés et des \omterm{def:pl:observability-and-incident-response:trace}{spans} avec des identifiants propagés~; des alertes
+déclenchées par les vitesses de consommation des SLO, des tickets pour les consommations lentes~; chaque alerte a une \omterm{def:pl:observability-and-incident-response:oncall}{procédure d'exploitation} (runbook)~; chaque incident a un \omterm{def:pl:observability-and-incident-response:ic}{responsable d'incident} et une \omterm{def:pl:observability-and-incident-response:blameless}{revue sans recherche de coupable} accompagnée
+de modifications.
+\bfield{Tests d'acceptation} \texttt{code/firm/observe/tests/}~: types et étiquettes du registre, une ligne de journal structuré~; une trace reconstruite à partir des liens parent
+liens~; budgets et vitesses de consommation~; alertes à seuil avec un écart minimal~; une \omterm{def:pl:observability-and-incident-response:burn}{alerte de vitesse de consommation} à la 52\up{e} seconde défaillante d'une panne, et aucune avant~; une
+chronologie fusionnée.
+\bfield{Pour aller plus loin} Exemplaires reliant un bucket d'histogramme à une trace~; échantillonnage de traces fondé sur la queue~; alertes sur le CUSUM d'un SLI (livre~7,
+chapitre~13).
+\end{build}
+
+\begin{omsources}
+\item Nasdaq, \emph{UTP Vendor Alert \#2013-9: UTP SIP Issue on Thursday, August 22, 2013}.
+\item B.~Beyer, C.~Jones, J.~Petoff et N.~R.~Murphy (dir.), \emph{Site Reliability Engineering}, O'Reilly, 2016 (chapitres 3, 4, 14, 15);
+\emph{The Site Reliability Workbook}, 2018 (\emph{Alerting on SLOs}).
+\item Documentation OpenTelemetry, \emph{Traces}.
+\item One Quant Book~13, chapitres~5 et~24 (histogrammes de latence, kill switches)~; livre~14, chapitre~15 (accords de niveau de service (SLA), temps moyen de
+réparation).
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:1}
+Combien de secondes défaillantes un objectif de 99.9~\% autorise-t-il sur trente jours de 23\,400 secondes, et combien le mois calme en a-t-il consommé~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:2}
+Pourquoi le heartbeat du processus ne se déclenche jamais dans aucun des trois incidents~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:observability-and-incident-response:3}
+Combien de temps la règle de vitesse de consommation met-elle à déclencher une alerte pour un arrêt complet, et d'où vient ce nombre~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:4}
+Pourquoi les seuils de trente et soixante secondes ne voient-ils jamais les arrêts intermittents~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:5}
+Qu'apporte la fenêtre courte d'une règle de vitesse de consommation à la fenêtre longue~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:observability-and-incident-response:6}
+Quel est le \omterm{def:pl:observability-and-incident-response:ttd}{délai de rétablissement} de l'arrêt rejoué, et pourquoi ce n'est pas un temps moyen de réparation (MTTR)~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:observability-and-incident-response:7}
+\emph{Programmation.} Rendre les pauses deux fois plus fréquentes (\texttt{pauses\_per\_hour=1.6}) et recompter les fausses alertes du seuil de cinq secondes et
+des règles de vitesse de consommation sur trente jours.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:observability-and-incident-response:8}
+\emph{Trouver la faille.} «~Notre supervision était correcte~: chaque service a signalé un état sain pendant toute la panne.~»
+\end{exercise}
+
+\section{Problème~: Trois heures de silence}
+
+\begin{problem}[{Problème du week-end --- trois heures de silence}]\label{pb:pl:observability-and-incident-response:1}
+La chaîne du chapitre, le SLO, les jours calmes, les incidents et les règles.
+
+\medskip\noindent\textbf{Part I --- Signals.}
+\begin{enumerate}
+\item Que répondent respectivement les \omterm{def:pl:observability-and-incident-response:metric}{métriques}, les journaux et les traces~?
+\item Où un message tracé passe-t-il son temps un jour normal, et pendant le consommateur lent~?
+\item Pourquoi le SLI est-il l'âge des données et non la santé du processus~?
+\item Que permet le SLO, et que consomment les jours calmes~?
+\item En quoi un SLO diffère-t-il d'un accord de niveau de service~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Règles.}
+\begin{enumerate}[resume]
+\item Quels sont les trois incidents rejoués~?
+\item Que détecte chaque seuil statique, et en combien de temps~?
+\item Combien de fausses alertes par mois envoie chaque règle~?
+\item Que détectent les règles de vitesse de consommation, et en combien de temps~?
+\item Pourquoi la fausse alerte mensuelle de la règle de vitesse de consommation est-elle acceptable~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Réponse.}
+\begin{enumerate}[resume]
+\item Que fait et que ne fait pas le \omterm{def:pl:observability-and-incident-response:ic}{responsable d'incident}~?
+\item Qu'est-ce qui vient en premier dans la \omterm{def:pl:observability-and-incident-response:oncall}{procédure d'exploitation} pour une alerte d'âge de données dans une société de trading~?
+\item Quelle est la chronologie de la panne rejouée~?
+\item Quels sont son \omterm{def:pl:observability-and-incident-response:ttd}{délai de détection} et son \omterm{def:pl:observability-and-incident-response:ttd}{délai de rétablissement}~?
+\item Que produit une \omterm{def:pl:observability-and-incident-response:blameless}{revue sans recherche de coupable}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le \omterm{def:pl:observability-and-incident-response:ttd}{délai de détection} d'un arrêt de flux et d'un consommateur lent sous un seuil statique et sous des \omterm{def:pl:observability-and-incident-response:burn}{alertes de vitesse de consommation} (burn rate), ainsi que les fausses alertes par mois que coûte chacun, sur l'incident rejoué et sur trente jours calmes.
+sur l'incident rejoué et sur trente jours calmes.
+\item Quelle règle déploieriez-vous, et avec quelle règle de ticket derrière~?
+\item Qu'est-ce qui aurait fait virer au rouge les tableaux de bord de la société le matin de l'accroche~?
+\item Quelles modifications la revue de l'arrêt rejoué exigerait-elle~?
+\item En une phrase~: que doit signifier une alerte~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:pl:observability-and-incident-response:1}
+Quelle est la différence entre surveiller un processus et surveiller un service~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:observability-and-incident-response:2}
+Qu'est-ce qu'un SLI, un SLO et un \omterm{def:pl:observability-and-incident-response:budget}{budget d'erreur}~? Donnez-en un pour une plateforme de données de marché.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:observability-and-incident-response:3}
+Votre équipe reçoit trente alertes par semaine et en ignore la plupart. Que changez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:observability-and-incident-response:4}
+Un message met une minute pour aller du flux jusqu'au système de risque. Comment trouvez-vous où~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:observability-and-incident-response:5}
+Concevez le processus d'\omterm{def:pl:observability-and-incident-response:observability}{observabilité} et de gestion des incidents pour la plateforme de données et de risque d'une société de trading.
+\end{interviewq}

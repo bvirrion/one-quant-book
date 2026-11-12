@@ -1,0 +1,431 @@
+\chapter{Cartes réseau et contournement du noyau}\label{ch:nw:network-cards-and-kernel-bypass}
+
+Entre le câble et le \texttt{recv} d'une socket UDP, un datagramme est copié par la carte dans la mémoire de l'hôte, signalé par une
+interruption, repris par le code réseau du noyau dans une interruption logicielle, rattaché à une socket, mis en file d'attente puis
+recopié dans le tampon que le programme a remis à \texttt{recv}~; le programme, entre-temps, dormait et doit être réveillé. Sur
+l'ordinateur portable où ce livre est rédigé, le datagramme médian passe moins d'une microseconde à entrer dans le noyau par la boucle locale, puis une quinzaine
+de microsecondes de plus pour en sortir à destination d'un lecteur endormi. Rien de tout cela ne décide de quoi que ce soit qui intéresse un programme de trading.
+
+Ce chapitre suit un paquet à travers la \omterm{def:nw:networking-for-trading:frame}{carte réseau} et le noyau, puis retire le noyau du chemin. Le
+livre~13 (chapitre~13) a réglé l'hôte pour que la scrutation active et le contournement du noyau puissent jouer leur rôle~; ce chapitre examine la même
+mécanique du côté de la carte~: anneaux de descripteurs, interruptions et leur regroupement, \omterm{def:nw:network-cards-and-kernel-bypass:rss}{aiguillage des flux} vers les files, piles
+qui s'exécutent en espace utilisateur, et horodatages que la carte elle-même peut prendre.
+
+\section{Le chemin d'un paquet à travers le noyau}
+
+Une \omterm{def:nw:networking-for-trading:frame}{carte réseau} et son pilote partagent une mémoire. La carte écrit les paquets qui arrivent dans les tampons que le pilote lui a
+confiés, et indique lesquels elle a remplis~; le pilote les prend, rend les tampons et remonte les paquets.
+
+\begin{definition}[Anneau de descripteurs]\label{def:nw:network-cards-and-kernel-bypass:ring}
+Un \emph{anneau de descripteurs}\index{anneau de descripteurs} est un tableau circulaire de descripteurs, chacun pointant vers un tampon de paquet dans la mémoire de l'hôte
+et portant un drapeau de propriété. Côté réception, la carte remplit le prochain descripteur qui lui appartient avec un paquet arrivant (par accès direct
+à la mémoire), le marque comme appartenant à l'hôte et avance sa tête~; l'hôte traite dans l'ordre les descripteurs qui lui appartiennent et les rend
+à la carte. Lorsque le descripteur suivant appartient encore à l'hôte, la carte n'a nulle part où placer le paquet et le rejette.
+\end{definition}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,b/.style={draw,rounded corners=2pt,minimum height=0.6cm,align=center,inner sep=3pt},>=Stealth]
+\node[b,fill=gray!10] (w) at (0,0) {câble};
+\node[b,fill=omDef!18] (n) at (2.0,0) {carte};
+\node[b,fill=omDef!10] (r) at (4.4,0) {anneau de\\ descripteurs (DMA)};
+\node[b,fill=omThm!12] (i) at (6.9,0.9) {interruption,\\ softirq};
+\node[b,fill=omThm!12] (s) at (9.2,0.9) {file de\\ socket};
+\node[b,fill=omThm!12] (c) at (11.4,0.9) {copie, réveil,\\ \texttt{recv}};
+\node[b,fill=omMeth!20] (u) at (8.1,-1.1) {scrutation de l'anneau en espace utilisateur (contournement)};
+\draw[->] (w) -- (n);
+\draw[->] (n) -- (r);
+\draw[->,omThm,thick] (r.north east) -- (i.west);
+\draw[->,omThm,thick] (i) -- (s);
+\draw[->,omThm,thick] (s) -- (c);
+\draw[->,omMeth,thick] (r.south east) -- (u.west);
+\node[font=\scriptsize,omThm] at (9.2,1.75) {chemin du noyau};
+\node[font=\scriptsize,omMeth] at (8.1,-1.75) {chemin de contournement~: le programme possède l'anneau};
+\end{tikzpicture}
+
+\omcaption{Deux sorties d'un \omterm{def:nw:network-cards-and-kernel-bypass:ring}{anneau de descripteurs}. Le chemin du noyau (en haut) prend une interruption, traite le paquet dans une
+interruption logicielle, le place dans une file de socket et le copie vers un programme qu'il faut réveiller. Une pile de contournement du noyau (en bas) projette l'anneau dans
+le programme, qui le scrute et lit le paquet à l'endroit où la carte l'a écrit.}\label{fig:nw:network-cards-and-kernel-bypass:path}
+\end{omfigure}
+
+Sous Linux, la partie noyau de ce mécanisme est NAPI, le mécanisme d'événements de la pile réseau~: la carte lève une interruption,
+le noyau planifie le traitement de l'anneau dans une interruption logicielle, et ce traitement se poursuit jusqu'à ce que l'anneau soit vide ou qu'un budget soit épuisé,
+les nouvelles interruptions de cet anneau étant désactivées entre-temps. Sous charge, le noyau scrute donc déjà~; ce qu'il ne fait pas par défaut, c'est
+épargner au programme la file de socket, la copie et le réveil.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \k in {0,...,11} {
+  \pgfmathsetmacro{\a}{90-30*\k}
+  \pgfmathtruncatemacro{\host}{(\k>=2 && \k<=6) ? 1 : 0}
+  \ifnum\host=1 \def\c{omThm!30}\else\def\c{omDef!15}\fi
+  \draw[fill=\c] (\a+15:1.3) arc (\a+15:\a-15:1.3) -- (\a-15:2.2) arc (\a-15:\a+15:2.2) -- cycle;
+}
+\draw[->,very thick,omMeth] (0,0) -- (30:1.2);
+\node[font=\scriptsize,omMeth] at (30:0.45) [above left] {queue};
+\draw[->,very thick,omDef] (0,0) -- (-120:1.2);
+\node[font=\scriptsize,omDef] at (-120:0.5) [left] {tête};
+\node[anchor=west,align=left] at (2.8,0.9) {\tikz\fill[omThm!30] (0,0) rectangle (0.3,0.2);\ possédé par l'hôte~: rempli par la carte,\\
+  \hphantom{\tikz\fill (0,0) rectangle (0.3,0.2);\ }en attente de traitement ou de restitution};
+\node[anchor=west,align=left] at (2.8,-0.3) {\tikz\fill[omDef!15] (0,0) rectangle (0.3,0.2);\ possédé par la carte~: tampons vides};
+\node[anchor=west,align=left] at (2.8,-1.2) {la carte remplit à la tête et avance dans le sens horaire,\\ l'hôte lit à la queue~;
+  lorsque la tête atteint\\ un descripteur possédé par l'hôte, le paquet suivant est rejeté};
+\end{tikzpicture}
+
+\omcaption{Un anneau de réception de douze descripteurs. Cinq appartiennent à l'hôte (remplis et pas encore rendus), sept à la carte. La carte
+écrit à la tête, l'hôte lit à la queue~; l'anneau est plein lorsque la tête rencontre un descripteur que l'hôte possède encore,
+qu'il l'ait lu ou qu'il ne l'ait pas encore rendu.}\label{fig:nw:network-cards-and-kernel-bypass:ring}
+\end{omfigure}
+
+\begin{proposition}[Quand un anneau déborde]\label{prop:nw:network-cards-and-kernel-bypass:full}
+Soit un anneau de $N$ descripteurs qui reçoit des paquets au débit $\lambda$ pendant que l'hôte n'en traite aucun pendant un temps $T$, à partir d'un anneau
+où l'hôte détient $H$ descripteurs. L'anneau rejette $\bigl(\lambda T - (N - H)\bigr)^{+}$ paquets. Un
+hôte qui rend les descripteurs par lots de taille $b$ en détient à tout instant jusqu'à $b - 1$ déjà traités, il doit donc
+dimensionner l'anneau pour la plus longue pause augmentée de $b - 1$.
+\end{proposition}
+
+\begin{proof}
+La carte dispose de $N - H$ descripteurs à remplir~; chaque arrivée en consomme un et aucun ne revient pendant la pause. Les descripteurs traités mais
+pas encore rendus restent à l'hôte jusqu'à ce que le lot soit complet.
+\end{proof}
+
+\section{Interruptions, regroupement et répartition côté réception (RSS)}
+
+Une interruption coûte à l'hôte un passage dans le noyau, le gestionnaire, et, pour un lecteur endormi, le réveil par l'ordonnanceur~: des microsecondes,
+payées à chaque interruption. Les cartes attendent donc avant d'interrompre.
+
+\begin{definition}[Regroupement des interruptions]\label{def:nw:network-cards-and-kernel-bypass:coalesce}
+Le \emph{regroupement des interruptions}\index{regroupement des interruptions} (interrupt coalescing) est la pratique d'une carte qui retarde l'interruption de réception après
+l'arrivée d'un paquet, jusqu'à ce qu'un délai donné soit écoulé ou qu'un nombre donné de paquets attendent, afin qu'une seule interruption serve plusieurs paquets.
+Sous Linux, les deux limites se règlent avec \texttt{ethtool -C} sous les noms \texttt{rx-usecs} et \texttt{rx-frames}~; zéro
+microseconde et une trame désactivent le regroupement.
+\end{definition}
+
+\begin{proposition}[Ce que le regroupement apporte et ce qu'il coûte]\label{prop:nw:network-cards-and-kernel-bypass:coalesce}
+Soit des paquets arrivant selon un processus de Poisson de taux $\lambda$, la carte interrompant $u$ après le premier paquet en attente (la limite en trames
+n'étant jamais atteinte), et soit $c_{\mathrm{irq}}$ le coût en CPU de chaque interruption et $c_{\mathrm{pkt}}$ celui de chaque paquet. Chaque interruption sert en
+moyenne $1 + \lambda u$ paquets, l'hôte consomme une fraction
+\[
+  \frac{\lambda\, c_{\mathrm{irq}}}{1 + \lambda u} + \lambda\, c_{\mathrm{pkt}}
+\]
+d'un cœur, et le premier paquet de chaque lot attend $u$ pour l'interruption. Sans regroupement ($u = 0$), l'hôte sature un cœur
+à $\lambda = 1/(c_{\mathrm{irq}} + c_{\mathrm{pkt}})$.
+\end{proposition}
+
+\begin{proof}
+Un lot s'ouvre avec un paquet et dure $u$~; par la propriété d'absence de mémoire du processus de Poisson, $\lambda u$ paquets supplémentaires arrivent
+en moyenne. Les interruptions surviennent donc au taux $\lambda/(1+\lambda u)$, chacune coûtant $c_{\mathrm{irq}}$, et chaque paquet coûte
+$c_{\mathrm{pkt}}$.
+\end{proof}
+
+\begin{definition}[Répartition côté réception, aiguillage des flux]\label{def:nw:network-cards-and-kernel-bypass:rss}
+La \emph{répartition côté réception}\index{répartition côté réception} (RSS) est la distribution, par une carte multi-files, des paquets arrivants sur plusieurs
+anneaux de réception, selon un hachage de leurs adresses et de leurs ports, afin que différents cœurs puissent traiter différents flux. \emph{Aiguillage
+des flux}\index{aiguillage des flux} est le placement par la carte de flux choisis (par correspondance exacte sur adresses et ports) sur un anneau choisi,
+en passant outre le hachage.
+\end{definition}
+
+Une machine de trading utilise les deux à rebours de l'intention de RSS. RSS répartit la charge uniformément, ce que veut un serveur web~; un feed handler veut que
+chaque paquet de la ligne A se trouve sur l'unique anneau que son cœur épinglé scrute, et rien d'autre. L'\omterm{def:nw:network-cards-and-kernel-bypass:rss}{aiguillage des flux} place les groupes de la plateforme sur les anneaux
+des cœurs qui les traitent, et le reste du trafic de la machine ailleurs, et le cœur qui scrute un anneau doit se trouver sur le socket
+auquel la carte est rattachée (livre~13, chapitre~4).
+
+\section{Pilotes en mode scrutation et piles réseau en espace utilisateur}
+
+\begin{definition}[Pilote en mode scrutation, pile réseau en espace utilisateur]\label{def:nw:network-cards-and-kernel-bypass:pmd}
+Un \emph{pilote en mode scrutation}\index{pilote en mode scrutation} s'exécute dans le processus de l'application~: il projette les anneaux d'une carte dans l'espace utilisateur et
+les lit et les remplit en boucle sur un cœur dédié, sans interruption ni appel système. Une \emph{pile réseau en espace
+utilisateur}\index{pile réseau en espace utilisateur} implémente IP, UDP et TCP dans le processus de l'application, par-dessus un tel accès à la carte,
+généralement derrière les appels de socket standard, de sorte qu'un programme non modifié s'y exécute.
+\end{definition}
+
+\begin{remark}[Les familles de contournement]\label{rem:nw:network-cards-and-kernel-bypass:families}
+Trois familles sont en usage, et une firme en utilise souvent deux. L'accès brut aux anneaux par l'interface d'un fabricant (le \texttt{ef\_vi} d'AMD pour ses
+cartes Solarflare) ou par un cadre de scrutation portable (DPDK) donne au programme des trames et rien d'autre~: il doit analyser son propre UDP et,
+pour les ordres, apporter son propre TCP. Une pile en espace utilisateur derrière les appels de socket (OpenOnload, libre, qui intercepte les appels de socket
+d'un binaire non modifié) conserve le code du programme et retire le noyau de son chemin. Et l'AF\_XDP propre à Linux déplace des trames de
+l'anneau d'une carte vers une zone de la mémoire du programme au moyen d'un filtre dans le noyau, en mode copie ou en mode zero-copy, le noyau restant
+chargé du périphérique. La \Cref{met:nw:network-cards-and-kernel-bypass:choose} indique lequel employer et où.
+\end{remark}
+
+\begin{method}[Choisir une voie de réception]\label{met:nw:network-cards-and-kernel-bypass:choose}
+\begin{enumerate}
+\item Données de marché sur le chemin critique (hot path)~: accès brut aux anneaux, scruté par un cœur épinglé sur le socket de la carte, le feed handler analysant lui-même l'UDP~; le
+  flux est en multicast UDP, qui ne nécessite aucun état de protocole.
+\item Envoi d'ordres~: une pile TCP en espace utilisateur, ou le TCP du fabricant de la carte implémenté en matériel (chapitre~7), car l'envoi d'ordres exige l'état de TCP et
+  la retransmission, et écrire son propre TCP est un projet à part entière.
+\item Tout le reste (drop copy, données de référence, supervision)~: le noyau, sur des cœurs et des anneaux qui lui sont propres, de sorte qu'il ne
+  partage jamais une file avec le chemin critique.
+\item Dans tous les cas, mesurer~: le gain dépend de la carte, du réglage de la machine et du trafic, et un scrutateur qui est un jour désordonnancé
+  perd davantage qu'il n'a gagné.
+\end{enumerate}
+\end{method}
+
+\omcode{code/firm/nicring/cpp/firm_nicring.hpp}{18}{37}{L'anneau de réception de \texttt{firm.nicring}~: la carte remplit les descripteurs qui lui appartiennent~;
+la boucle de scrutation traite ceux qui lui appartiennent et les rend par lots.}\label{lst:nw:network-cards-and-kernel-bypass:ring}
+
+\section{Réseau sans copie et côté émission}
+
+\begin{definition}[Réseau sans copie]\label{def:nw:network-cards-and-kernel-bypass:zerocopy}
+Le \emph{réseau sans copie}\index{réseau sans copie} est la remise d'un paquet au programme, ou son envoi par celui-ci, dans le tampon que la carte
+lit ou écrit par accès direct à la mémoire (DMA), sans que le processeur recopie ses octets entre un tampon du noyau et celui du programme.
+\end{definition}
+
+Une copie d'un datagramme de 100 octets représente quelques nanosecondes de trafic mémoire~; ce que le \omterm{def:nw:network-cards-and-kernel-bypass:zerocopy}{réseau sans copie} économise du côté
+réception tient moins à la copie qu'à la mécanique qui l'entoure (le tampon de socket, sa comptabilité, les lignes de cache d'un second
+emplacement). Côté émission, la même structure d'anneaux fonctionne à l'envers~: le programme écrit un ordre dans un tampon d'émission, remplit un descripteur et écrit dans le registre de sonnette
+de la carte, et la carte va chercher la trame par accès direct à la mémoire. Chacune de ces étapes traverse l'interconnexion du processeur vers
+la carte (livre~13, chapitre~4). Certaines cartes permettent au programme de pousser les octets de la trame dans leur propre mémoire par des écritures
+du processeur à la place~: le \texttt{ef\_vi} d'AMD documente une telle zone d'E/S programmées, qui «~évite la latence associée à une lecture DMA~»,
+peut être remplie avant le chemin critique et mise à jour sur celui-ci, et, dans un mode dit cut-through, commence à émettre pendant que la trame est encore
+en train de traverser le bus. L'émission la moins coûteuse est celle qui est préparée avant d'être nécessaire~: la trame de l'ordre
+construite à l'avance, avec seulement le prix, la taille et l'identifiant à renseigner, l'idée même que le chapitre~7 reprend dans le matériel.
+
+\section{Horodatages sur la carte}
+
+Le noyau peut horodater un paquet à son entrée dans le noyau (\texttt{SO\_TIMESTAMPING}, horodatages de réception logiciels), et une carte
+dotée de sa propre horloge peut l'horodater lorsqu'il atteint le port de la carte, un horodatage matériel au sens du livre~13, chapitre~5. La
+différence est le temps passé par le paquet dans la carte et dans son anneau, ce qu'une firme qui règle son chemin de réception veut justement voir et
+ce que les horodatages logiciels ne peuvent pas montrer. L'horloge de la carte n'est aussi bonne que sa synchronisation sur la
+référence de temps de la firme, sujet du chapitre~4, et les horodatages de toute la baie sont comparés au chapitre~5.
+
+\section{Tutoriel~: le chemin de réception du noyau, mesuré et modélisé}\label{tut:nw:network-cards-and-kernel-bypass:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Mesurer ce que coûte le chemin de réception du noyau sur l'ordinateur portable, modéliser ce que coûtent les interruptions et la scrutation sur une carte, et faire tourner
+l'\omterm{def:nw:network-cards-and-kernel-bypass:ring}{anneau de descripteurs} dans trois langages. \textbf{État final~:} le \cref{tab:nw:network-cards-and-kernel-bypass:measured},
+les \cref{fig:nw:network-cards-and-kernel-bypass:measured,fig:nw:network-cards-and-kernel-bypass:coalesce}, et le test de référence de l'anneau au vert
+en Python, C++ et Rust.
+\begin{tutsteps}
+\item \textbf{Trois façons de lire.} \texttt{cpp/nw\_rx.hpp} envoie des datagrammes de 64 octets sur la boucle locale, chacun portant son
+  heure d'envoi, et les lit par un \texttt{recvmsg} bloquant, par des lectures non bloquantes dans une boucle, et par \texttt{recvmmsg} par lots de 16, avec l'horodatage de réception logiciel
+  du noyau dans chacun (le \cref{lst:nw:network-cards-and-kernel-bypass:rx}). \texttt{python bench\_rx.py} exécute 20\,000 datagrammes par mode,
+  à 20 microsecondes d'intervalle, et écrit les quantiles.
+\item \textbf{Découper le chemin.} L'horodatage du noyau découpe la latence de chaque datagramme en son entrée dans le noyau et sa sortie
+  vers le programme.
+\item \textbf{Modéliser la carte.} \texttt{nw\_nic.coalesce} et \texttt{poll} simulent les interruptions d'une carte avec regroupement et un
+  cœur de scrutation, avec les coûts du modèle~; \texttt{python fig\_nic.py} écrit les données de la \cref{fig:nw:network-cards-and-kernel-bypass:coalesce}.
+\item \textbf{L'anneau.} \texttt{firm.nicring} fait passer le même flux d'arrivées et de scrutations par quatre configurations d'anneau en Python,
+  C++ et Rust, et vérifie les compteurs et les empreintes par rapport au test de référence commun.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Épingler le lecteur en attente active sur un cœur et l'expéditeur sur un autre (\texttt{taskset}), puis relire à nouveau sa queue
+de distribution~; dans le test de référence de l'anneau, trouver le plus petit anneau qui ne perd aucun paquet lorsque la machine rend ses descripteurs par lots de 32.
+\end{tutorial}
+
+\omcode{code/networks/03-network-cards-and-kernel-bypass/cpp/nw_rx.hpp}{100}{116}{Les trois lectures~: une lecture bloquante, une lecture non bloquante
+dans une boucle, et une lecture par lots~; chaque datagramme conserve ses heures d'envoi, du noyau et de l'application.}\label{lst:nw:network-cards-and-kernel-bypass:rx}
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.6cm}>{\centering\arraybackslash}p{2.1cm}>{\centering\arraybackslash}p{2.1cm}@{}}
+\toprule
+Méthode de lecture & Entrée dans le noyau, p50 & Du noyau au programme, p50 & Total, p50 & Total, p99 \\
+\midrule
+\texttt{recvmsg} bloquant & \qty{0.75}{\micro\second} & \qty{15.4}{\micro\second} & \qty{16.2}{\micro\second} & \qty{215}{\micro\second} \\
+Attente active (busy polling) & \qty{0.62}{\micro\second} & \qty{0.92}{\micro\second} & \qty{1.5}{\micro\second} & \qty{3\,457}{\micro\second} \\
+\texttt{recvmmsg} par lots & \qty{0.45}{\micro\second} & \qty{21.4}{\micro\second} & \qty{22.0}{\micro\second} & \qty{75}{\micro\second} \\
+\bottomrule
+\end{tabular}
+\caption{Le chemin de réception du noyau sur la boucle locale, 20\,000 datagrammes de 64 octets par méthode, à 20 microsecondes d'intervalle (le
+lecteur par lots reçoit des rafales de 16 envois). Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés~; g++~11,
+\texttt{-O2}. Données~: \texttt{bench\_rx.py}, \texttt{measured\_rx.csv}.}\label{tab:nw:network-cards-and-kernel-bypass:measured}
+\end{table}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.4cm,ymode=log,xmin=0,xmax=1,ymin=0.7,ymax=6000,
+  xlabel={quantile},ylabel={latence (\unit{\micro\second}, échelle logarithmique)},
+  ytick={1,10,100,1000},yticklabels={1,10,100,1\,000},xtick={0,0.25,0.5,0.75,0.9,1},
+  xticklabels={0,0.25,0.5,0.75,0.9,1},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  legend columns=3,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}},table/col sep=comma]
+\addplot[omThm,very thick,mark=*,mark size=1.3pt] table[x=q,y=blocking]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\addplot[omDef,very thick,mark=square*,mark size=1.3pt] table[x=q,y=busy]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\addplot[omMeth,very thick,mark=triangle*,mark size=1.6pt] table[x=q,y=batched]{figdata/networks/03-network-cards-and-kernel-bypass/measured_rx_q.csv};
+\legend{lecture bloquante,attente active,lecture par lots}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Quantiles du temps écoulé entre \texttt{sendto} et le programme qui détient le datagramme, sur la boucle locale de l'ordinateur portable, selon la méthode de lecture.
+L'attente active divise la médiane par dix~; sans cœur isolé, le thread de scrutation est parfois désordonnancé pendant des millisecondes, et chaque
+datagramme qui le suit attend~: à partir du 95\up{e} quantile, c'est la pire des trois méthodes. Mesuré sur un ordinateur portable (Intel Core Ultra 7 155H) sous
+WSL2, sans cœurs isolés. Données~: \texttt{bench\_rx.py}.}\label{fig:nw:network-cards-and-kernel-bypass:measured}
+\end{omfigure}
+
+La mesure fait apparaître les deux moitiés de l'argument de ce chapitre (\cref{tab:nw:network-cards-and-kernel-bypass:measured}). Faire entrer un
+datagramme dans le noyau coûte moins d'une microseconde~; le faire sortir vers un programme endormi en coûte quinze à la médiane, et des centaines de
+microsecondes au 99\up{e}~centile, parce que le programme doit être réveillé et ordonnancé. Un programme qui ne dort jamais s'en affranchit~: l'attente active
+ramène la médiane à \qty{1.5}{\micro\second}. Et un programme qui ne dort jamais ne doit jamais être interrompu~: sur un ordinateur portable
+dont les cœurs sont partagés avec tout le reste, le thread de scrutation est parfois désordonnancé, et les datagrammes qui arrivent entre-temps attendent
+pendant des millisecondes. Le traitement par lots amortit l'appel système, mais non le réveil, et il attend que son lot soit complet. La boucle locale ne fait intervenir aucune \omterm{def:nw:networking-for-trading:frame}{carte réseau}~:
+ces chiffres ne représentent donc que la part du noyau~; une carte réelle y ajoute son anneau, son interruption et son regroupement.
+
+\omcode{code/networks/03-network-cards-and-kernel-bypass/python/nw_nic.py}{24}{45}{Le modèle de regroupement~: une interruption au $m$-ième
+paquet en attente ou $u$ après le premier, puis le réveil, le coût de l'interruption et le coût par paquet.}\label{lst:nw:network-cards-and-kernel-bypass:model}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},width=6.6cm,height=5.0cm,xmin=0,xmax=66,
+  xlabel={temporisation du regroupement (\unit{\micro\second})},tick label style={font=\small},label style={font=\small},
+  grid=major,grid style={gray!25},table/col sep=comma,unbounded coords=jump]
+\nextgroupplot[ymin=0,ymax=48,ylabel={latence moyenne (\unit{\micro\second})},xtick={0,8,16,32,64},
+  legend columns=2,legend style={font=\footnotesize,at={(1.15,-0.32)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=8pt}}]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=timer_us,y=lat_01]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.3pt] table[x=timer_us,y=lat_05]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\legend{100\,000 paquets par seconde,500\,000 paquets par seconde}
+\nextgroupplot[ymin=0,ymax=0.7,ylabel={part d'un cœur},xtick={0,8,16,32,64}]
+\addplot[omDef,very thick,mark=*,mark size=1.3pt] table[x=timer_us,y=cpu_01]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\addplot[omThm,very thick,mark=square*,mark size=1.3pt] table[x=timer_us,y=cpu_05]{figdata/networks/03-network-cards-and-kernel-bypass/coalesce.csv};
+\end{groupplot}
+\end{tikzpicture}
+
+\omcaption{Modèle~: \omterm{def:nw:network-cards-and-kernel-bypass:coalesce}{regroupement des interruptions} à deux débits de paquets. Des temporisations plus longues coûtent de la latence et économisent du processeur. À 500\,000 paquets par seconde, une
+interruption par paquet sature le cœur (aucun point à zéro). Un cœur en scrutation, non tracé, maintient une latence voisine de
+\qty{0.4}{\micro\second} aux deux débits et occupe le cœur entier. Coûts du modèle~: \qty{2}{\micro\second} par interruption,
+\qty{3}{\micro\second} de réveil, \qty{0.3}{\micro\second} par paquet. Données~: \texttt{fig\_nic.py}.}\label{fig:nw:network-cards-and-kernel-bypass:coalesce}
+\end{omfigure}
+
+Le modèle (\cref{lst:nw:network-cards-and-kernel-bypass:model}) compte \qty{2}{\micro\second} de processeur par interruption,
+\qty{3}{\micro\second} de réveil et \qty{0.3}{\micro\second} par paquet~: ce sont des valeurs de l'ordre du réveil de l'ordinateur portable, et non celles
+d'une carte particulière. À 100\,000 paquets par seconde, une interruption par paquet donne une latence moyenne de \qty{5.6}{\micro\second} pour 23~\% d'un cœur~;
+une temporisation de \qty{8}{\micro\second} donne \qty{11.7}{\micro\second} pour 14~\%~; la scrutation donne \qty{0.4}{\micro\second} pour le cœur entier.
+À 500\,000 paquets par seconde, une interruption par paquet dépasse la capacité d'un cœur (le débit de saturation de la
+\cref{prop:nw:network-cards-and-kernel-bypass:coalesce} est de 435\,000 par seconde), et le regroupement est ce qui maintient l'hôte en service. Un hôte de trading
+résout ce compromis en ne le faisant pas~: le chemin critique (hot path) scrute sur des cœurs dédiés à cet usage, et tout le reste regroupe.
+
+\section{Construction~: l'anneau de descripteurs}\label{bld:nw:network-cards-and-kernel-bypass:nicring}
+
+\begin{build}
+\bfield{Rôle} Un modèle de l'anneau de réception d'une carte, assez précis pour raisonner sur les pertes, le traitement par lots et les budgets de scrutation, dans
+les trois langages des systèmes de la société.
+\bfield{Interface} Python \texttt{firm\_nicring.Ring(size, refill)} avec \texttt{nic\_rx(seq, length)}, \texttt{poll(budget)},
+\texttt{run(events)} et les compteurs \texttt{rx}, \texttt{drops}, \texttt{processed}, \texttt{doorbells}, \texttt{max\_owned},
+\texttt{hash}~; \texttt{make\_events}. C++20 \texttt{firm::nicring::Ring} (\texttt{cpp/firm\_nicring.hpp}) et Rust
+\texttt{firm\_nicring::Ring} avec les mêmes méthodes.
+\bfield{Règles} La taille de l'anneau est une puissance de deux~; la carte n'écrase jamais un descripteur que l'hôte détient~; l'hôte traite dans l'ordre,
+sans jamais dépasser son budget par scrutation, et rend les descripteurs par lots de \texttt{refill}, avec une sonnette par lot~; le hachage est FNV-1a calculé sur
+les numéros de séquence et les longueurs des paquets traités, dans l'ordre de traitement.
+\bfield{Tests d'acceptation} \texttt{code/firm/nicring/}~: le jeu de données partagé (20\,000 arrivées, quatre configurations) reproduit à l'identique en
+Python, C++ et Rust~; un anneau plein perd des paquets, et un descripteur traité mais non rendu reste compté comme plein~; sous des entrelacements aléatoires,
+chaque paquet accepté est traité une fois et dans l'ordre.
+\bfield{Pour aller plus loin} Un anneau d'émission avec une file de complétion~; plusieurs anneaux avec une fonction d'aiguillage, pour reproduire le déséquilibre d'un hachage qui place
+deux groupes actifs sur un même anneau.
+\end{build}
+
+\begin{omsources}
+\item Documentation du noyau Linux~: ``NAPI'', ``Scaling in the Linux Networking Stack'', ``Timestamping'', ``AF\_XDP'';
+\texttt{include/uapi/linux/ethtool.h} (\texttt{struct ethtool\_coalesce}); page de manuel \texttt{recvmmsg(2)}.
+\item DPDK Programmer's Guide, ``Poll Mode Driver''; AMD, \emph{ef\_vi User Guide}; README d'OpenOnload.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:1}
+Un anneau de 512 descripteurs, dont l'hôte en détient 40, reçoit 1.5 million de paquets par seconde pendant que son cœur est interrompu pendant
+\qty{400}{\micro\second}. Calculer le nombre de paquets perdus.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:2}
+Avec un regroupement de 20 microsecondes, et des paquets à 200\,000 par seconde, calculer le nombre moyen de paquets servis par une interruption, et
+le débit auquel arrivent les interruptions.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:network-cards-and-kernel-bypass:3}
+D'après le \cref{tab:nw:network-cards-and-kernel-bypass:measured}, calculer quelle part de la médiane de la lecture bloquante est consommée après
+l'entrée du datagramme dans le noyau.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:4}
+Expliquer pourquoi la répartition uniforme des flux par la \omterm{def:nw:network-cards-and-kernel-bypass:rss}{répartition côté réception} (RSS) joue contre un feed handler, et ce que change l'\omterm{def:nw:network-cards-and-kernel-bypass:rss}{aiguillage des flux} (flow steering).
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:5}
+Avec les coûts du modèle, à partir de quel débit de paquets une interruption par paquet occupe-t-elle un cœur entier~? Et si chaque interruption servait 16 paquets~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:6}
+Le busy polling a divisé la médiane par dix et a multiplié le 99\up{e}~centile par seize 
+(\cref{tab:nw:network-cards-and-kernel-bypass:measured}). Expliquer ces deux effets, et dire ce qu'il faut changer sur un hôte de production.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:7}
+\emph{Programmation.} Avec \texttt{firm.nicring} et les événements de la fixture, trouver la plus petite taille d'anneau qui ne perd aucun paquet lorsque les descripteurs sont
+rendus par lots de 32.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:network-cards-and-kernel-bypass:8}
+\emph{Trouver la faille.} «~Nous avons déplacé la saisie d'ordres sur une interface brute en mode scrutation et écrit notre propre TCP minimal~: pas de minuteur de retransmission, puisque
+les liaisons de colocation ne perdent pas de paquets. La latence a baissé de deux microsecondes.~»
+\end{exercise}
+
+\section{Problème~: Interruptions ou scrutation}
+
+\begin{problem}[{Problème du week-end --- le prix d'un lecteur endormi}]\label{pb:nw:network-cards-and-kernel-bypass:1}
+Un flux arrive à 200\,000 paquets par seconde sur un seul anneau de réception. Utiliser les coûts du modèle du chapitre~: \qty{2}{\micro\second} de CPU par
+interruption, \qty{3}{\micro\second} de réveil, \qty{0.3}{\micro\second} par paquet, et une boucle de scrutation qui vérifie l'anneau toutes les
+\qty{0.2}{\micro\second}.
+
+\medskip\noindent\textbf{Partie I --- Une interruption par paquet.}
+\begin{enumerate}
+\item Quelle part d'un cœur occupent les interruptions et les paquets~?
+\item Quelle est la plus petite latence qu'un paquet puisse avoir~?
+\item La latence moyenne du modèle est de \qty{6.3}{\micro\second}. Pourquoi est-elle supérieure au minimum~?
+\item À quel débit le cœur serait-il saturé~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Un minuteur de 10 microsecondes.}
+\begin{enumerate}[resume]
+\item Combien de paquets une interruption sert-elle en moyenne~?
+\item À quel débit les interruptions arrivent-elles~?
+\item Quelle part du cœur est utilisée~?
+\item La latence moyenne du modèle est de \qty{12.4}{\micro\second}. D'où vient la hausse~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La scrutation.}
+\begin{enumerate}[resume]
+\item Quelle est l'attente moyenne avant la prochaine vérification de l'anneau~?
+\item Quelle est la latence moyenne, et celle du modèle (\qty{0.41}{\micro\second})~?
+\item Quelle part d'un cœur est utilisée~?
+\item Que doit-il être vrai de ce cœur~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: la latence moyenne et le CPU du minuteur et de la scrutation à ce débit, ainsi que le débit auquel les seules interruptions occuperaient un cœur entier.
+  Il faut donner ces grandeurs pour les deux cas.
+\item Combien de microsecondes par paquet la scrutation économise-t-elle par rapport au minuteur~?
+\item À quel débit de paquets le CPU du minuteur atteint-il un quart de cœur~?
+\item Pourquoi les hôtes de trading scrutent-ils le chemin critique (hot path) et regroupent-ils le reste~?
+\item Que faudrait-il mesurer sur la carte réelle avant de se fier au modèle~?
+\item Que donne un \omterm{def:nw:network-cards-and-kernel-bypass:ring}{anneau de descripteurs} de 1\,024 entrées au cœur en scrutation, en temps, à ce débit~?
+\item En une phrase~: que coûte un lecteur endormi~?
+\item Laquelle des trois familles de contournement du chapitre utiliseriez-vous pour ce flux, et pourquoi~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:network-cards-and-kernel-bypass:1}
+Décrivez ce qui se passe entre l'arrivée d'un paquet sur la carte et le retour de \texttt{recv}.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:network-cards-and-kernel-bypass:2}
+Qu'est-ce que le \omterm{def:nw:network-cards-and-kernel-bypass:coalesce}{regroupement des interruptions} (interrupt coalescing)~? Comment le configureriez-vous sur un hôte de données de marché~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:network-cards-and-kernel-bypass:3}
+Qu'est-ce que le contournement du noyau (kernel bypass), quelles formes prend-il, et à quoi renonce-t-on~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:network-cards-and-kernel-bypass:4}
+Votre feed handler en busy polling a une excellente médiane et un très mauvais 99.9\up{e}~centile. Que vérifiez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:nw:network-cards-and-kernel-bypass:5}
+Un \omterm{def:nw:network-cards-and-kernel-bypass:ring}{anneau de descripteurs} perd des paquets alors que la charge moyenne du gestionnaire est de 30~\%. Expliquez comment cela se produit et comment dimensionneriez-vous l'anneau.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:network-cards-and-kernel-bypass:6}
+Pourquoi voudriez-vous des horodatages matériels de réception alors que vous horodatez déjà dans le noyau~?
+\end{interviewq}

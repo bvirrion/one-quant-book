@@ -1,0 +1,334 @@
+\chapter{Connectivité on-chain}\label{ch:nw:on-chain-connectivity}
+
+Une transaction envoyée à un nœud public d'une blockchain atteint le reste du réseau par gossip, saut après saut, et est visible de tous sur le
+chemin~; celle envoyée à un \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} situé dans la région du prochain producteur de blocs contourne entièrement le gossip. Sur une chaîne dont les leaders changent toutes les
+quelques centaines de millisecondes, et dont le logiciel attribue à chaque leader quatre créneaux consécutifs, la région d'envoi relève d'une question d'ordonnancement~: la
+réponse change avec le \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders}, et ce calendrier est publié à l'avance.
+
+Le livre~3 a décrit les acteurs du trading on-chain (nœuds, validateurs, constructeurs de blocs, relais, searchers). Ce chapitre porte sur leur réseau~: comment
+les nœuds se connectent entre pairs et diffusent par gossip, ce que changent les réseaux de propagation et les relais privés, où se trouvent les \omterm{def:nw:on-chain-connectivity:engine}{moteurs de blocs}, comment un \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders} se traduit en
+choix d'endpoint, et ce que vendent les \omterm{def:nw:on-chain-connectivity:engine}{fournisseurs de nœuds hébergés}. La documentation est citée et datée~; la propagation fait l'objet d'une simulation étiquetée sur
+la carte du livre.
+
+\section{Exploiter et interconnecter des nœuds}
+
+\begin{definition}[Protocole de bavardage (gossip)]\label{def:nw:on-chain-connectivity:gossip}
+Un \emph{protocole de bavardage}\index{protocole de bavardage} (gossip protocol) diffuse un message sur un réseau pair à pair en faisant en sorte que chaque nœud qui le reçoit pour la
+première fois le transmette (ou l'annonce) à certains ou à tous ses pairs, de sorte qu'il atteigne chaque nœud en un nombre de sauts croissant avec le logarithme de
+la taille du réseau.
+\end{definition}
+
+Un nœud rejoint le réseau d'une chaîne en se connectant à des pairs trouvés par le protocole de découverte de la chaîne~; dans le modèle de ce chapitre, ils sont choisis au
+hasard, sans égard à la géographie. Chaque saut coûte le délai du lien, auquel s'ajoute la validation du message par le nœud avant qu'il ne le transmette. La conséquence a été mesurée très tôt~:
+Decker et Wattenhofer ont établi en 2013 qu'un bloc Bitcoin atteignait le nœud médian au bout de 6.5 secondes et qu'après 40 secondes 5~\% des nœuds n'avaient
+pas encore vu ce bloc. Des messages plus petits et une validation plus rapide raccourcissent chaque saut, mais pas la structure~: une transaction atteint
+l'autre bout du monde par une suite de sauts entre des pairs qu'elle n'a pas choisis.
+
+\begin{proposition}[Temps de diffusion par gossip]\label{prop:nw:on-chain-connectivity:gossip}
+Sur un réseau dont chaque nœud transmet à tous ses pairs dès la première réception, un message atteint chaque nœud au bout de la longueur de son plus court chemin
+depuis la source, la longueur d'une liaison étant son délai augmenté du traitement par le nœud récepteur~; transmettre à un sous-ensemble et annoncer aux autres, qui
+la récupèrent (pull), allonge d'un aller-retour les liaisons annoncées et ne peut qu'allonger le délai d'arrivée.
+\end{proposition}
+
+\begin{proof}
+L'inondation explore tous les chemins en parallèle, si bien que chaque nœud reçoit le message en premier par son plus court chemin (argument de Dijkstra). Remplacer certaines
+transmissions (push) par des annonces ajoute un aller-retour à la longueur de ces liaisons, et les plus courts chemins ne peuvent pas devenir plus courts quand les longueurs croissent.
+\end{proof}
+
+\omcode{code/firm/chainnet/firm_chainnet.py}{54}{71}{Gossip comme plus courts chemins~: inondation, et diffusion en racine carrée avec annonces et récupérations.}\label{lst:nw:on-chain-connectivity:spread}
+
+Le modèle répartit 600 nœuds uniformément dans les huit villes listées dans l'\cref{dat:nw:on-chain-connectivity:engines}, relie chacun à huit pairs tirés au hasard, et
+facture à chaque liaison son plancher de fibre multiplié par 1.5, plus \qty{5}{\milli\second} de traitement (hypothèses). Une transaction émise depuis un nœud de Tokyo atteint
+la moitié des nœuds après \qty{85.0}{\milli\second} et les neuf dixièmes après \qty{99.5}{\milli\second} par inondation~; avec une diffusion en racine carrée, qui
+économise la bande passante, après 113.9 et \qty{149.0}{\milli\second}. Dans le modèle, le graphe aléatoire offre des chemins proches des liaisons directes,
+si bien que ce qu'ajoute le gossip, ce sont ses sauts supplémentaires~: trois à huit, de 15 à \qty{40}{\milli\second} de traitement, contre celui du moteur,
+\qty{1}{\milli\second} (hypothèse). Ce sont les queues qui diffèrent le plus~: le dernier nœud la reçoit après \qty{158.5}{\milli\second} par inondation et
+\qty{326.5}{\milli\second} avec une diffusion en racine carrée.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmin=0,xmax=180,ymin=0,ymax=1.02,xlabel={temps écoulé depuis le départ de la transaction de Tokyo (ms)},
+  ylabel={part des nœuds atteints},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omDef,thick,const plot] table[x=ms,y=flood]{figdata/networks/21-on-chain-connectivity/propagation.csv};
+\addplot[omThm,thick,dashed,const plot] table[x=ms,y=sqrt]{figdata/networks/21-on-chain-connectivity/propagation.csv};
+\addplot[gray,densely dotted] coordinates {(0,0.5) (180,0.5)};
+\addplot[gray,densely dotted] coordinates {(0,0.9) (180,0.9)};
+\legend{inondation,diffusion en racine carrée}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: part des 600 nœuds répartis dans huit villes, dotés chacun de huit pairs aléatoires, ayant reçu une transaction envoyée d'un nœud de Tokyo, en fonction
+du temps. L'inondation atteint la moitié à \qty{85.0}{\milli\second} et les neuf dixièmes à \qty{99.5}{\milli\second}~; la diffusion en racine carrée atteint 113.9 et
+\qty{149.0}{\milli\second}. Données~: \texttt{fig\_chain.py}, \texttt{firm\_chainnet.spread()}.}\label{fig:nw:on-chain-connectivity:propagation}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[xbar,width=11cm,height=6.2cm,bar width=6pt,xmin=0,xmax=110,ytick=data,
+  yticklabels={Amsterdam,Dublin,Francfort,Londres,New York,Salt Lake City,Singapour,Tokyo},y dir=reverse,
+  xlabel={arrivée chez un leader de la ville (ms), depuis Tokyo},tick label style={font=\footnotesize},label style={font=\small},
+  grid=major,grid style={gray!25},legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,legend columns=2},
+  table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[y expr=\coordindex,x=gossip]{figdata/networks/21-on-chain-connectivity/leaders.csv};
+\addplot[fill=omDef!55,draw=omDef] table[y expr=\coordindex,x=direct]{figdata/networks/21-on-chain-connectivity/leaders.csv};
+\legend{par gossip,par le moteur de blocs le plus proche}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: moment où une transaction envoyée depuis Tokyo atteint le leader suivant, par ville du leader~: par le graphe de gossip depuis un nœud public
+à Tokyo (médiane sur les nœuds de la ville), et directement par le \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} publié le plus proche du leader. Le gossip ajoute 14 à
+\qty{39}{\milli\second}. Données~: \texttt{fig\_chain.py}, \texttt{nw\_chain.to\_leader()}.}\label{fig:nw:on-chain-connectivity:leaders}
+\end{omfigure}
+
+\section{Réseaux de propagation des transactions et relais privés}
+
+\begin{definition}[Réseau de propagation des transactions]\label{def:nw:on-chain-connectivity:tpn}
+Un \emph{réseau de propagation des transactions}\index{réseau de propagation des transactions} (transaction propagation network) est un réseau de relais exploité en privé, interconnecté avec de nombreux nœuds
+et validateurs d'une chaîne, qui fait circuler transactions et blocs entre eux plus vite et avec moins de variance que le gossip propre à la chaîne sur
+l'internet public.
+\end{definition}
+
+Deux services modifient le trajet d'une transaction. Un réseau de propagation, tel que le Blockchain Distribution Network de bloXroute, remplace les sauts publics aléatoires
+par ses propres relais, que sa documentation décrit comme réduisant «~la latence et la variance~» dans la propagation. Un relais privé modifie qui voit
+la transaction~: Flashbots Protect, sur Ethereum, l'envoie vers un mempool privé où elle est «~cachée aux bots de frontrunning et de sandwich~» jusqu'à ce qu'un
+constructeur de blocs l'inclue. La première est un produit de latence~; la seconde un produit de visibilité~; un searcher peut avoir besoin des deux (le flux d'ordres privé du livre~3).
+
+\section{Endpoints des constructeurs de blocs et des moteurs de blocs par région}
+
+\begin{definition}[Moteur de blocs, fournisseur de nœuds hébergés]\label{def:nw:on-chain-connectivity:engine}
+Un \emph{moteur de blocs}\index{moteur de blocs} (block engine) est un service exploité à proximité des validateurs d'une chaîne, qui accepte les transactions et les bundles des traders et
+les transmet directement au producteur de blocs en cours ou au suivant, souvent à travers une enchère d'inclusion. Un
+\emph{fournisseur de nœuds hébergés}\index{fournisseur de nœuds hébergés} (hosted node provider) fait tourner les nœuds d'une chaîne et vend l'accès à leurs endpoints RPC, avec des limites de requêtes par forfait, si bien qu'une société n'a pas à les exploiter elle-même.
+\end{definition}
+
+\begin{dated}{2026-09}{Moteurs de blocs et relais, d'après leur documentation}\label{dat:nw:on-chain-connectivity:engines}
+\begin{itemize}
+\item Jito (Solana)~: \omterm{def:nw:on-chain-connectivity:engine}{moteurs de blocs} du mainnet à Amsterdam, Dublin, Francfort, Londres, New York, Salt Lake City, Singapour et Tokyo, chacun avec son propre
+  endpoint~; sa \texttt{sendTransaction} transmet une transaction directement au validateur~; les bundles exigent un pourboire d'au moins 1\,000 lamports.
+\item Flashbots Protect (Ethereum)~: un mempool privé à l'abri des bots de frontrunning et de sandwich, avec des remboursements.
+\item bloXroute~: un Blockchain Distribution Network de relais pour Solana, BNB Chain, Base, Ethereum, Hyperliquid et d'autres chaînes.
+\end{itemize}
+\end{dated}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\small,node distance=6mm,
+  nd/.style={circle,draw=omThm,fill=omThm!15,minimum size=5mm,inner sep=0pt},
+  box/.style={draw=omDef,fill=omDef!12,rounded corners,align=center,minimum height=8mm,inner sep=3pt}]
+\node[box] (firm) at (0,0) {société\\(Tokyo)};
+\node[nd] (a) at (2.2,1.3) {}; \node[nd] (b) at (3.8,1.9) {}; \node[nd] (c) at (5.4,1.2) {};
+\node[nd] (d) at (7.0,1.8) {}; \node[nd] (e) at (4.6,0.3) {};
+\node[box] (lead) at (9.4,0) {prochain leader\\(Francfort)};
+\node[box] (eng) at (7.4,-1.3) {moteur de blocs\\(Francfort)};
+\draw[omThm,->] (firm) -- (a); \draw[omThm,->] (a) -- (b); \draw[omThm,->] (b) -- (c); \draw[omThm,->] (c) -- (d);
+\draw[omThm,->] (d) -- (lead); \draw[omThm!50,->] (a) -- (e); \draw[omThm!50,->] (e) -- (c);
+\draw[omDef,->,thick] (firm) |- (eng); \draw[omDef,->,thick] (eng) -- (lead);
+\node[text=omThm,font=\footnotesize] at (4.6,2.5) {gossip public : chaque saut le voit et y ajoute son traitement};
+\node[text=omDef,font=\footnotesize] at (2.6,-2.0) {route propre jusqu'au moteur ; un dernier saut court};
+\end{tikzpicture}
+
+\omcaption{Deux chemins vers le prochain leader~: confier la transaction à un nœud public et laisser le gossip la transporter de proche en proche, visible de chaque nœud~; ou l'envoyer
+par la route propre de la société jusqu'au \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} le plus proche du leader, qui la transmet directement. Schéma.}\label{fig:nw:on-chain-connectivity:paths}
+\end{omfigure}
+
+Un \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} (block engine) est un \omterm{def:nw:the-european-map:pop}{point de présence} (chapitre~11) pour les producteurs de la chaîne. Envoyer au moteur le plus proche du producteur place la partie longue distance du trajet
+sur la route propre de la société et le dernier saut sur celle, courte, du moteur, au lieu de passer par une douzaine de sauts publics aléatoires.
+
+\section{Proximité des validateurs et calendrier des leaders}
+
+\begin{definition}[Calendrier des leaders]\label{def:nw:on-chain-connectivity:leader}
+Un \emph{calendrier des leaders}\index{calendrier des leaders} est l'affectation publiée par une chaîne des créneaux de production de blocs à venir aux validateurs, calculée à
+l'avance pour une époque, ce qui permet à chacun de savoir quel validateur produira chaque bloc à venir et, si sa position est connue, où envoyer
+les transactions.
+\end{definition}
+
+\begin{dated}{2026-09}{Créneaux et leaders, d'après les spécifications et le code des chaînes}\label{dat:nw:on-chain-connectivity:chains}
+La configuration du réseau principal d'Ethereum fixe des créneaux de 12~secondes. Solana calcule son \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders} une époque à l'avance~; la durée cible par défaut d'un créneau dans le SDK de Solana
+est de \qty{300}{\milli\second} (il définit aussi 400 et moins) et la cible effective est modifiée dynamiquement, si bien que les clients ne doivent pas supposer
+la valeur par défaut~; le validateur Agave attribue à chaque leader quatre créneaux consécutifs.
+\end{dated}
+
+Avec des créneaux de 12~secondes, la géographie ne compte pour Ethereum qu'aux extrémités d'un créneau. Avec des créneaux de quelques centaines de millisecondes et quatre d'affilée par
+leader, elle compte pour chaque transaction sur Solana~: la position du prochain leader est connue à l'avance, et une transaction qui l'atteint après ses
+quatre créneaux attend le leader suivant, peut-être sur un autre continent.
+
+\omcode{code/networks/21-on-chain-connectivity/python/nw_chain.py}{36}{44}{Arrivée au prochain leader~: par le graphe de gossip, et directement par
+le moteur publié le plus proche du leader.}\label{lst:nw:on-chain-connectivity:leader}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.6cm,xmin=0,xmax=150,ymin=0,ymax=1.05,xlabel={temps restant dans la fenêtre du leader au moment de l'envoi de la transaction (ms)},
+  ylabel={part des leaders atteints},tick label style={font=\footnotesize},label style={font=\small},grid=major,grid style={gray!25},
+  legend pos=north west,legend style={font=\footnotesize},table/col sep=comma]
+\addplot[omThm,thick,const plot] table[x=deadline,y=gossip]{figdata/networks/21-on-chain-connectivity/timely.csv};
+\addplot[omDef,thick,const plot] table[x=deadline,y=direct]{figdata/networks/21-on-chain-connectivity/timely.csv};
+\legend{par le gossip,moteur conscient du leader}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Simulation~: la part des prochains leaders, placés tour à tour dans chacune des huit villes des moteurs, atteints à temps depuis Tokyo, en fonction du temps restant
+dans la fenêtre du leader. Envoyer au moteur le plus proche du leader décale la courbe vers la gauche de 14 à \qty{39}{\milli\second}. Données~: \texttt{fig\_chain.py},
+\texttt{nw\_chain.timely\_rates()}.}\label{fig:nw:on-chain-connectivity:timely}
+\end{omfigure}
+
+Moyenne prise sur les huit villes des leaders et sur un temps restant uniforme entre zéro et \qty{150}{\milli\second}, le sélecteur conscient du leader fait parvenir à temps 61~\% des
+transactions contre 48~\% par le gossip~; sur \qty{300}{\milli\second}, 80.5~\% contre 74.0~\%. Pour un leader à Francfort, le
+problème du chapitre, le chemin direct prend \qty{69.5}{\milli\second} et le gossip \qty{83.5}{\milli\second}.
+
+\section{Fournisseurs de nœuds hébergés}
+
+Faire tourner correctement les nœuds d'une chaîne demande un travail important~: stockage, bande passante, mises à jour et peering. Les fournisseurs hébergés
+vendent à la place les endpoints de leurs nœuds, selon une formule et une limite de requêtes. Pour le trading, la question est celle des chapitres~16 à~18~: où se trouvent
+les nœuds du fournisseur, s'il s'agit de ceux par lesquels les transactions de la société doivent entrer, et comment leurs limites sont gouvernées (les limites de débit du livre~3). Un
+endpoint de fournisseur est un lieu commode pour lire la chaîne et un mauvais lieu pour y rivaliser.
+
+\begin{method}[Faire parvenir une transaction au bloc suivant]\label{met:nw:on-chain-connectivity:send}
+\begin{enumerate}
+\item Lire le temps de créneau et le \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders} de la chaîne~; situer les prochains leaders dans les régions où leur position est connue ou peut être mesurée
+  (triangulation du chapitre~17).
+\item Garder des connexions ouvertes vers les \omterm{def:nw:on-chain-connectivity:engine}{moteurs de blocs} ou les constructeurs de blocs dans chaque région utilisée par les leaders~; choisir pour chaque transaction celui le plus proche du prochain
+  leader avec assez de temps restant.
+\item Utiliser un réseau de propagation ou un relais privé lorsque la visibilité ou la variance comptent plus que les dernières millisecondes.
+\item Faire tourner ses propres nœuds pour lire l'état critique au trading~; utiliser les endpoints hébergés pour le reste, dans leurs limites.
+\item Mesurer les taux d'atterrissage par région et par leader~; le calendrier et les emplacements des moteurs changent.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: gossip et prochain leader}\label{tut:nw:on-chain-connectivity:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Simuler le gossip sur un graphe de pairs au-dessus de la carte du livre, et le comparer à l'envoi au \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} le plus proche du prochain leader.
+\textbf{État final~:} \cref{fig:nw:on-chain-connectivity:propagation,fig:nw:on-chain-connectivity:leaders,fig:nw:on-chain-connectivity:timely}.
+\begin{tutsteps}
+\item \textbf{Moteurs.} \texttt{firm\_chainnet.load\_engines} lit les endpoints régionaux datés.
+\item \textbf{Graphe.} \texttt{Graph} place 600 nœuds dans les villes des moteurs, avec huit pairs chacun~; \texttt{spread} (\cref{lst:nw:on-chain-connectivity:spread})
+  donne le temps d'arrivée de chaque nœud.
+\item \textbf{Leaders.} \texttt{nw\_chain.to\_leader} (\cref{lst:nw:on-chain-connectivity:leader}) compare le gossip avec le moteur le plus proche~;
+  \texttt{timely\_rates} et \texttt{mean\_timely} le convertissent en parts d'atterrissage.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Rendre le graphe sensible à la géographie (pairs choisis parmi les nœuds les plus proches) et voir ce que le gossip y gagne~; ajouter la file d'attente propre aux moteurs
+et leurs pourboires.
+\end{tutorial}
+
+\section{Construction~: le modèle de réseau de la chaîne}\label{bld:nw:on-chain-connectivity:chainnet}
+
+\begin{build}
+\bfield{Rôle} Comment les transactions circulent sur le réseau d'une chaîne et où les envoyer~: les lignes on-chain du plan du chapitre~29.
+\bfield{Interface} \texttt{firm\_chainnet}~: \texttt{Graph}, \texttt{spread}, \texttt{reach\_time}, \texttt{Engine}, \texttt{load\_engines},
+\texttt{one\_way\_ms}, \texttt{choose\_engine}, \texttt{timely}.
+\bfield{Règles} Les endpoints sont des lignes datées avec leurs sources~; les délais des liaisons sont le plancher de la fibre multiplié par un \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} déclaré, plus un traitement déclaré~; chaque résultat
+est étiqueté comme une simulation.
+\bfield{Tests d'acceptation} \texttt{code/firm/chainnet/tests/}~: les données des moteurs, l'inondation sur un graphe en ligne vérifiée à la main, la diffusion en racine carrée jamais plus rapide
+que l'inondation, et le contrôle du sélecteur et de l'échéance.
+\bfield{Pour aller plus loin} Lire un \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders} en direct et les positions mesurées des validateurs~; modéliser les enchères des moteurs.
+\end{build}
+
+\begin{omsources}
+\item C.~Decker et R.~Wattenhofer, «~Information propagation in the Bitcoin network~», IEEE P2P 2013.
+\item Ethereum consensus specifications (configuration mainnet)~; Anza documentation (rotation des leaders), Solana SDK et code source d'Agave.
+\item Jito Labs, low-latency transaction send~; Flashbots Protect~; bloXroute documentation.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:1}
+Calculer pendant combien de millisecondes un leader Solana garde la chaîne s'il dispose de quatre slots consécutifs à la cible par défaut du SDK.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:2}
+Expliquer la différence entre un \omterm{def:nw:on-chain-connectivity:tpn}{réseau de propagation des transactions} et un relais privé.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:nw:on-chain-connectivity:3}
+Expliquer pourquoi le gossip atteint plus tard un nœud situé dans la ville même de l'émetteur qu'un message direct le ferait.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:4}
+En utilisant la \cref{prop:nw:on-chain-connectivity:gossip}, expliquer pourquoi la diffusion en racine carrée n'est jamais plus rapide que l'inondation, et pourquoi l'utiliser.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:5}
+Le prochain leader se trouve à Singapour, et la machine à Tokyo~: indiquer quel moteur utiliser et quel gain le modèle annonce.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:nw:on-chain-connectivity:6}
+Expliquer pourquoi le choix de la région compte peu sur une chaîne aux slots de 12~secondes.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:on-chain-connectivity:7}
+\emph{Programmation.} Avec \texttt{firm.chainnet}, calculer de combien plus vite l'inondation atteint les neuf dixièmes des nœuds si chaque nœud a 16 pairs au lieu de 8.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:nw:on-chain-connectivity:8}
+\emph{Trouver la faille.} «~Nous envoyons chaque transaction au \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} le plus proche de nos serveurs, donc nous empruntons toujours le chemin le plus rapide.~»
+\end{exercise}
+
+\section{Problème~: Le leader est à Francfort}
+
+\begin{problem}[{Problème du week-end --- gossip contre le moteur attentif au leader}]\label{pb:nw:on-chain-connectivity:1}
+Une société de trading à Tokyo envoie des transactions sur une chaîne dont le prochain leader se trouve à Francfort. Elle peut les confier à un nœud public à Tokyo et laisser le gossip les acheminer,
+ou les envoyer au \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} le plus proche du leader. Utiliser le modèle de réseau du chapitre.
+
+\medskip\noindent\textbf{Partie I --- Gossip.}
+\begin{enumerate}
+\item Combien de temps l'inondation met-elle pour atteindre la moitié et les neuf dixièmes des nœuds à partir de Tokyo~?
+\item Et la diffusion en racine carrée~?
+\item Quand la transaction atteint-elle un leader à Francfort par le gossip~?
+\item Pourquoi cela dure-t-il plus longtemps que le chemin direct~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le moteur.}
+\begin{enumerate}[resume]
+\item Quel moteur est le plus proche du leader, et quand la transaction atteint-elle le leader par son intermédiaire~?
+\item Quel est le plancher de la fibre dans un sens entre Tokyo--Francfort, et quel \omterm{def:nw:the-north-american-map:factor}{facteur de tracé} le modèle retient-il~?
+\item Quelle part du chemin direct représente le temps propre du moteur~?
+\item Que voit le moteur que le gossip aurait révélé à tous~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Taux d'atteinte.}
+\begin{enumerate}[resume]
+\item Le temps restant étant uniforme entre zéro et \qty{150}{\milli\second}, quelle part des leaders des huit villes chaque méthode atteint-elle~?
+\item Et jusqu'à \qty{300}{\milli\second}~?
+\item Pourquoi le gain diminue-t-il quand la fenêtre s'élargit~?
+\item Comment quatre slots consécutifs par leader modifieraient-ils la planification de la société~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le temps de propagation jusqu'à la moitié et aux neuf dixièmes du réseau, et le gain d'arrivée à temps obtenu en envoyant au
+  \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs} le plus proche du prochain leader, comparé à une région fixe.
+\item Quelles entrées relèvent de la documentation et lesquelles des hypothèses~?
+\item Que changerait un graphe de pairs tenant compte de la géographie~?
+\item Où les machines de la société doivent-elles se trouver pour cette chaîne~?
+\item Qu'apporte un réseau de propagation en plus du moteur~?
+\item Comment la société doit-elle vérifier que son modèle correspond à la réalité~?
+\item Où cela se range-t-il dans le plan du chapitre~29~?
+\item En une phrase~: pourquoi la région est-elle une question de calendrier~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:nw:on-chain-connectivity:1}
+Comment une transaction se propage-t-elle sur le réseau pair à pair d'une blockchain, et pourquoi est-ce lent~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:on-chain-connectivity:2}
+Qu'est-ce qu'un \omterm{def:nw:on-chain-connectivity:engine}{moteur de blocs}, et pourquoi en existe-t-il plusieurs dans le monde~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:on-chain-connectivity:3}
+Comment utiliseriez-vous le \omterm{def:nw:on-chain-connectivity:leader}{calendrier des leaders} d'une chaîne pour acheminer les transactions~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:nw:on-chain-connectivity:4}
+Dans quels cas feriez-vous tourner votre propre nœud plutôt que de recourir à un \omterm{def:nw:on-chain-connectivity:engine}{fournisseur de nœuds hébergés}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{trader}]\label{iq:nw:on-chain-connectivity:5}
+Pourquoi un trader pourrait-il envoyer une transaction en privé plutôt qu'au mempool public~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:nw:on-chain-connectivity:6}
+Concevez la couche d'envoi des transactions d'une société de trading active sur une chaîne rapide dont les leaders se trouvent sur trois continents.
+\end{interviewq}

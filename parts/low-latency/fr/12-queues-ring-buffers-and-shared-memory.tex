@@ -1,0 +1,340 @@
+\chapter{Files d'attente, tampons circulaires et mémoire partagée}\label{ch:ll:queues-ring-buffers-and-shared-memory}
+
+En 2011, les ingénieurs d'une bourse de détail publièrent les chiffres qui les avaient conduits à repenser leur système. Faire transiter un
+événement par un pipeline à trois étapes, construit sur la file bloquante standard de Java, prenait 32\,757 nanosecondes par saut
+en moyenne, et son 99.99\up{e}~centile dépassait quatre millisecondes~; avec le \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{tampon circulaire} qu'ils construisirent à la place, 52
+nanosecondes en moyenne et sous 8\,192 au 99.99\up{e}~centile (Thompson et al., 2011). Le travail accompli dans chaque étape était le
+même~; ce sont les files qui faisaient la latence. Un processus de trading est un pipeline de threads (feed handler, carnet, stratégie, passerelle,
+journalisation), et la manière dont les données circulent entre eux détermine en grande partie sa queue de distribution. Ce chapitre construit les structures qui assurent ce transfert~:
+l'anneau à un producteur et un consommateur, l'anneau de diffusion du motif «~disruptor~», le \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence} pour les données où seule
+la dernière valeur compte, et ces mêmes structures entre processus en mémoire partagée, avec la conduite à tenir quand un
+consommateur ne peut pas suivre.
+
+\section{L'anneau à un producteur et un consommateur}
+
+\begin{definition}[Tampon circulaire, file à un producteur et un consommateur]\label{def:ll:queues-ring-buffers-and-shared-memory:ring}
+Un \emph{tampon circulaire}\index{tampon circulaire} est un tableau de cases de taille fixe, utilisé de manière circulaire~: la position d'écriture et la position de lecture
+croissent indéfiniment et indexent le tableau modulo sa taille, qui est une puissance de deux afin que le modulo soit un masque. Une \emph{file à un producteur et un
+consommateur}\index{file à un producteur et un consommateur} (SPSC) est un anneau ayant exactement un thread d'écriture et un
+thread de lecture~; chaque position n'est écrite que par un seul thread, de sorte qu'aucun \omterm{def:ll:lock-free-programming:cas}{compare-and-swap} n'est nécessaire.
+\end{definition}
+
+Le producteur écrit la case située à sa position, puis publie la nouvelle position par une écriture à sémantique release~; le consommateur charge
+la position du producteur avec une lecture acquire, lit toutes les cases qui la précèdent, et publie sa propre position de la même façon, en rendant les
+cases (chapitre~11). Les deux opérations sont \omterm{def:ll:lock-free-programming:progress}{sans attente} (wait-free). Lamport démontra la correction d'une telle file \omterm{def:ll:lock-free-programming:progress}{sans verrou} en 1983~; ce que
+des décennies de pratique y ont ajouté, ce sont les détails qui la rendent rapide. Les deux positions occupent des \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} distinctes, afin que les
+écritures du producteur n'invalident pas la position du consommateur (chapitre~3). Et chaque côté conserve une copie privée de la position de l'autre,
+qu'il ne rafraîchit que lorsque l'anneau paraît plein ou vide~: tant qu'il n'est ni l'un ni l'autre, un message ne coûte qu'un transfert de \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache}
+(la case) au lieu de trois.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\foreach \i/\c in {0/5,1/5,2/30,3/30,4/30,5/5,6/5,7/5} {
+  \pgfmathsetmacro{\a}{90 - 45*\i}
+  \draw[fill=omDef!\c,draw=omDef] (\a+22.5:1.3) arc (\a+22.5:\a-22.5:1.3) -- (\a-22.5:2.3) arc (\a-22.5:\a+22.5:2.3) -- cycle;
+  \node at (\a:1.8) {\i};
+}
+\node[align=center] at (0,0) {8 cases\\ (masque 7)};
+\draw[-Stealth,very thick,omThm] (3.9,0.9) node[right,align=left]{lecture = 2\\ (ligne du consommateur)} -- (0:2.4);
+\draw[-Stealth,very thick,omMeth] (-3.9,-2.3) node[left,align=right]{écriture = 5\\ (ligne du producteur)} -- (-135:2.4);
+\node[anchor=west,align=left] at (3.9,-1.0) {grisées~: cases 2, 3, 4,\\ écrites, pas encore lues};
+\node[anchor=west,align=left] at (3.9,-1.9) {plein lorsque écriture $-$ lecture $=$ 8};
+\end{tikzpicture}
+
+\omcaption{Un anneau de huit cases après que cinq messages ont été écrits et deux lus (l'état de l'implantation partagée de la construction).
+Les positions du producteur et du consommateur occupent chacune une \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} qui lui est propre et ne font que croître~; la case de la position $p$ est
+$p \bmod 8$.}\label{fig:ll:queues-ring-buffers-and-shared-memory:ring}
+\end{omfigure}
+
+La \Cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt} mesure un aller-retour entre deux threads épinglés~: l'un envoie un
+message de huit octets dans un anneau, l'autre le renvoie par un second anneau. Environ \qty{200}{\nano\second} à la
+médiane~: quatre transferts de \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} entre cœurs. Le même aller-retour par une file protégée par un mutex et une variable de condition
+coûte environ \qty{30}{\micro\second}, soit plus de cent fois davantage, car le thread en attente s'endort dans
+le noyau et doit être réveillé. Dans un seul sens, l'anneau débite environ 250 millions de messages de huit octets par seconde sur cet ordinateur portable.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,ybar,bar width=7pt,ymode=log,log origin y=infty,ymin=100,ymax=5000000,
+  symbolic x coords={threads,other-pair,processes,locked},
+  xtick=data,xticklabels={{anneau SPSC,\\ threads},{anneau SPSC,\\ autre paire de CPU},{anneau SPSC,\\ deux processus},{mutex et\\ variable de condition}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.15,
+  ylabel={ns par aller-retour (échelle log)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},legend columns=4,legend style={font=\footnotesize,at={(0.5,-0.33)},anchor=north,draw=none,fill=none,
+  /tikz/every even column/.append style={column sep=6pt}},table/col sep=comma]
+\addplot[fill=omDef!70,draw=omDef] table[x=key,y=p50]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=omDef!35,draw=omDef] table[x=key,y=p99]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=p999]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\addplot[fill=gray!40,draw=gray] table[x=key,y=max]{figdata/low-latency/12-queues-ring-buffers-and-shared-memory/measured_rtt.csv};
+\legend{p50,p99,p99.9,maximum}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Allers-retours d'un message de huit octets entre deux threads (ou processus) épinglés, par deux anneaux SPSC, et par
+deux files protégées par un mutex et une variable de condition~; 100\,000 allers-retours chacun. Mesuré sur un ordinateur portable (Intel Core Ultra 7
+155H) sous WSL2, sans cœurs isolés. Données~: \texttt{bench\_rings.py}.}\label{fig:ll:queues-ring-buffers-and-shared-memory:rtt}
+\end{omfigure}
+
+\section{Plusieurs lecteurs~: le motif disruptor}
+
+\begin{definition}[Motif disruptor]\label{def:ll:queues-ring-buffers-and-shared-memory:disruptor}
+Dans le \emph{motif disruptor}\index{motif disruptor}, un seul anneau transporte chaque événement vers plusieurs consommateurs, chacun lisant à sa
+propre position~; les consommateurs qui dépendent les uns des autres attendent les positions des autres plutôt que des files placées entre eux, si bien que
+un pipeline d'étapes devient un seul anneau à plusieurs curseurs, sans copies.
+\end{definition}
+
+Les données de marché en sont le cas naturel~: un feed handler, plusieurs consommateurs (le constructeur de carnet, une seconde stratégie, l'enregistreur,
+un moniteur de risque), dont chacun a besoin de chaque message. Deux politiques diffèrent quant à celui qui attend. Avec la \omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{contre-pression} (back-pressure, section suivante), le
+producteur attend le consommateur le plus lent, ce qui convient à une voie d'ordres, où rien ne doit être perdu. Pour les données de marché, le
+producteur ne doit pas attendre~: la bourse ne ralentira pas. L'anneau de diffusion de la construction ne bloque donc jamais son producteur~; chaque
+case porte le numéro de séquence du message qu'elle contient, de sorte qu'un lecteur qui a été dépassé voit une séquence plus récente que celle
+qu'il attendait et sait qu'il a perdu des messages, au lieu de lire un mélange.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize]
+\foreach \i/\c in {0/8,1/9,2/10,3/11,4/12,5/13,6/14,7/15} {
+  \draw[fill=omDef!10,draw=omDef] (1.3*\i,0) rectangle ++(1.2,0.8);
+  \node at (1.3*\i+0.6,0.52) {case \i};
+  \node[font=\scriptsize] at (1.3*\i+0.6,0.2) {msg \c};
+}
+\draw[-Stealth,very thick,omMeth] (0.6,1.6) node[above]{producteur~: suivant = 16, dans la case 0} -- (0.6,0.85);
+\draw[-Stealth,thick,omDef] (7.1,-0.8) -- (7.1,-0.05);
+\node[anchor=north east,align=right,omDef] at (7.0,-0.75) {enregistreur\\ à 13};
+\draw[-Stealth,thick,omDef] (9.7,-0.8) -- (9.7,-0.05);
+\node[anchor=north west,align=left,omDef] at (9.8,-0.75) {constructeur de carnet\\ à 15};
+\draw[-Stealth,thick,omThm] (8.4,-1.95) -- (8.4,-0.05);
+\node[anchor=north,align=center,omThm] at (8.4,-1.95) {moniteur lent à 6~: case 6\\ contient msg 14, dépassé};
+\end{tikzpicture}
+
+\omcaption{Un anneau de diffusion de huit cases après 16 messages. Chaque lecteur conserve sa propre position~; le producteur n'attend jamais. Un
+lecteur à la position 6 trouve dans la case 6 le message 14, dont la séquence est plus récente que celle attendue~: il a été dépassé (\omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{consommateur lent})
+et doit se resynchroniser.}\label{fig:ll:queues-ring-buffers-and-shared-memory:broadcast}
+\end{omfigure}
+
+\section{Verrous à séquence pour les données de dernière valeur}
+
+\begin{definition}[Verrou à séquence]\label{def:ll:queues-ring-buffers-and-shared-memory:seqlock}
+Un \emph{verrou à séquence}\index{verrou à séquence} (sequence lock) publie une petite valeur qu'un seul écrivain met à jour et que de nombreux lecteurs consultent~: l'écrivain
+incrémente un compteur jusqu'à une valeur impaire, écrit la valeur, puis l'incrémente à nouveau jusqu'à une valeur paire~; un lecteur lit le compteur, copie la valeur,
+relit le compteur, et recommence si les deux lectures diffèrent ou sont impaires.
+\end{definition}
+
+La documentation du noyau Linux décrit ce mécanisme comme reposant sur des lecteurs \omterm{def:ll:lock-free-programming:progress}{sans verrou}, avec des boucles de nouvelle tentative en lecture seule
+et sans famine de l'écrivain, pour des données écrites rarement par rapport à leur fréquence de lecture. En trading, ce motif convient au haut du carnet
+ou à un prix de référence, où les lecteurs veulent la dernière valeur cohérente, et non chacune des valeurs intermédiaires. Deux détails le rendent correct
+en C++ comme sur x86~: la valeur doit être copiée au moyen d'\omterm{def:ll:lock-free-programming:atomic}{opérations atomiques} (les opérations relâchées suffisent), car une copie en concurrence avec
+les écritures non atomiques de l'écrivain est une \omterm{def:ll:rust-for-low-latency:race}{course aux données} et un \omterm{def:ll:cpp-for-latency-iii-the-compiler:ub}{comportement indéfini} (Boehm, 2012)~; et la seconde lecture du compteur
+du lecteur doit être ordonnée après la copie par une barrière d'acquisition. Le test de la construction fait tourner un écrivain dans une boucle serrée
+face à un lecteur qui vérifie deux cent mille paires pour détecter les déchirures.
+
+\section{Mémoire partagée entre processus}
+
+\begin{definition}[Transport par mémoire partagée]\label{def:ll:queues-ring-buffers-and-shared-memory:shm}
+Un \emph{transport par mémoire partagée}\index{transport par mémoire partagée} (shared-memory transport) achemine des messages entre processus par l'intermédiaire d'une région de mémoire
+que chacun projette dans son espace d'adressage (sous Linux, un objet de mémoire partagée POSIX issu de \texttt{shm\_open}, ou un fichier sur un
+système de fichiers en mémoire), organisée en anneaux dont les positions sont des atomiques~; aucun appel système n'est effectué par message.
+\end{definition}
+
+Les processus isolent les défaillances~: une stratégie qui plante n'entraîne pas nécessairement le feed handler avec elle, et des composants écrits dans
+des langages différents peuvent partager un même flux. L'anneau s'en moque~: la \cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt} montre
+le même aller-retour entre deux processus que entre deux threads. Ce qui change, c'est le contrat entre les processus~: la disposition doit être spécifiée
+octet par octet et versionnée, puisque deux binaires compilés à des dates différentes la lisent~; chaque champ doit avoir une taille et un alignement fixes~;
+et rien dans la région ne peut être un pointeur, ce qui signifie que rien n'y est valable dans l'autre processus.
+La disposition retenue par la construction est un en-tête de 192~octets (nombre magique, version, taille des cases, capacité, puis les deux positions,
+chacune sur sa propre ligne), suivi des cases~; ses implémentations en C++ et en Rust reproduisent la même image binaire d'un anneau, écrites
+indépendamment à partir de la spécification par un script.
+
+\section{Contre-pression, consommateurs lents et conflation}
+
+\begin{definition}[Contre-pression, consommateur lent, conflation]\label{def:ll:queues-ring-buffers-and-shared-memory:bp}
+La \emph{contre-pression}\index{contre-pression} (back-pressure) est la propagation à son producteur de la lenteur d'un consommateur, lequel doit attendre ou
+refuser de nouveaux travaux lorsque la file qui les sépare est pleine. Un \emph{consommateur lent}\index{consommateur lent} (slow consumer) est un consommateur dont le débit
+est inférieur à celui de son entrée, de sorte que sa file s'allonge ou, sur un anneau qui n'attend pas, qu'il est dépassé. La \emph{conflation}\index{conflation}
+est la livraison délibérée de la seule dernière valeur de chaque élément (un niveau de prix, une cotation) à un consommateur qui ne peut pas absorber
+chaque mise à jour.
+\end{definition}
+
+La taille d'une file est un énoncé sur les rafales. Le livre~4, chapitre~8, donne la réponse de la file M/M/1 pour un étage dont les arrivées suivent un processus
+de Poisson de taux $\lambda$ et dont le service est exponentiel de taux $\mu$~: avec un taux d'utilisation $\rho = \lambda/\mu$, le nombre stationnaire
+dans le système dépasse $n$ avec une probabilité $\rho^n$. Un anneau qui doit déborder moins d'une fois sur un milliard de messages à $\rho = 0.9$
+a donc besoin de $n$ tel que $0.9^n < 10^{-9}$, soit environ 197 cases, 256 en puissance de deux. Les données de marché sont plus rafaleuses qu'un processus
+de Poisson~: le dimensionnement part de la valeur de la file M/M/1 et se vérifie sur des rafales enregistrées (chapitre~18).
+
+\begin{proposition}[Temps avant qu'un consommateur lent soit dépassé]\label{prop:ll:queues-ring-buffers-and-shared-memory:lap}
+Un anneau de diffusion de $N$ cases dont le producteur écrit au taux $\lambda_b$ pendant une rafale, lu par un consommateur au taux $\mu < \lambda_b$
+qui démarre la rafale avec un retard nul, dépasse le consommateur au bout de $N/(\lambda_b - \mu)$ secondes.
+\end{proposition}
+
+\begin{proof}
+Le retard du consommateur croît de $\lambda_b - \mu$ messages par seconde~; le producteur écrase la prochaine case non lue du consommateur lorsque
+le retard atteint $N$.
+\end{proof}
+
+Un anneau de 65\,536 cases, une rafale à 2 millions de messages par seconde et un moniteur qui lit 1.5 million donnent au moniteur 131
+millisecondes~; une rafale d'ouverture plus longue le dépasse. Les réponses de conception consistent à offrir à de tels consommateurs des vues
+conflatées (un \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence} par instrument au lieu de chaque message), à dimensionner leurs anneaux sur des rafales mesurées, ou à les laisser
+prendre du retard par choix et à se resynchroniser depuis un instantané, comme le fait le feed handler du chapitre~18 auprès de la bourse.
+
+\section{Tutoriel~: anneaux dans les threads, les processus et deux langages}\label{tut:ll:queues-ring-buffers-and-shared-memory:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Construire les anneaux, vérifier la disposition partagée en C++ et en Rust sur une même référence, et mesurer les aller-retours
+et le débit. \textbf{État final~:} \cref{fig:ll:queues-ring-buffers-and-shared-memory:rtt}, une figure de débit, et des tests au vert
+dans les deux langages.
+\begin{tutsteps}
+\item \textbf{Écrire et publier.} Le producteur copie le message dans sa case et publie sa position par une écriture release~;
+il ne lit la position du consommateur que lorsque l'anneau semble plein.
+\omcode{code/firm/ring/cpp/firm_ring.hpp}{68}{95}{Le producteur et le consommateur de l'anneau SPSC.}\label{lst:ll:queues-ring-buffers-and-shared-memory:spsc}
+\item \textbf{La même chose en Rust}, sur les mêmes octets~: une région de mots atomiques, écrite par l'intermédiaire de leur mutabilité intérieure.
+\omcode{code/firm/ring/rust/src/lib.rs}{80}{101}{Le producteur Rust, qui écrit la disposition attendue par le lecteur C++.}\label{lst:ll:queues-ring-buffers-and-shared-memory:rust}
+\item \textbf{Un \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence}} dont la valeur est copiée comme des mots atomiques relâchés.
+\omcode{code/firm/ring/cpp/firm_ring.hpp}{155}{179}{Écrivain et lecteur du verrou à séquence.}\label{lst:ll:queues-ring-buffers-and-shared-memory:seqlock}
+\item \textbf{Vérifier la disposition.} \texttt{make\_ring\_fixture.py} écrit l'image binaire d'un anneau à partir de la spécification~; les deux
+suites de tests construisent le même anneau et comparent, puis consomment la référence.
+\item \textbf{Mesurer} avec \texttt{python bench\_rings.py}~: aller-retours entre deux threads sur deux paires de CPU, entre deux
+processus, et par une file verrouillée, puis débit à sens unique.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Supprimer les copies en cache de la position de l'autre côté et mesurer à nouveau le débit~; placer les deux positions sur
+une même \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} et mesurer l'aller-retour.
+\end{tutorial}
+
+\section{Construction~: les anneaux de la firme}\label{bld:ll:queues-ring-buffers-and-shared-memory:ring}
+
+\begin{build}
+\bfield{Rôle} Le transport de chaque composant de la partie~IV~: le feed handler publie des événements normalisés sur un anneau de diffusion
+(chapitre~18), le moteur de stratégie les lit et transmet les ordres à la passerelle par un anneau SPSC (chapitres~20--21), le journaliseur binaire
+vide un anneau (chapitre~23), et le haut de chaque carnet est publié par un \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence}.
+\bfield{Interface} C++20 \texttt{firm::ring}~: \texttt{format(base, capacity, slot\_size)}, \texttt{region\_size},
+\texttt{Spsc(base)} avec \texttt{try\_write(msg, len)} et \texttt{try\_read(out, cap)}~; \texttt{Broadcast(base)} avec
+\texttt{write}, \texttt{read(pos, out, len)} renvoyant \texttt{Ok}, \texttt{Empty} ou \texttt{Overrun}, et \texttt{head()}~;
+\texttt{SeqLock<T>} avec \texttt{store} et \texttt{load}~; \texttt{Segment(name, bytes, create)}. Rust \texttt{firm\_ring}~:
+\texttt{Region}, \texttt{format}, \texttt{Spsc::attach} avec \texttt{try\_write} et \texttt{try\_read}, \texttt{SeqLock2}.
+\bfield{Règles} La disposition d'octets ci-dessus, en petit-boutiste, versionnée par un nombre magique et une version~; les capacités sont des puissances
+de deux~; les positions sur des \omterm{def:ll:memory-hierarchy-and-caches:line}{lignes de cache} distinctes~; l'anneau SPSC signale le plein et le vide, l'anneau de diffusion n'attend jamais et signale
+les dépassements~; aucune allocation après la construction.
+\bfield{Tests d'acceptation} \texttt{code/firm/ring/}~: les octets de la référence reproduits et consommés en C++ et en Rust~; 200\,000
+messages dans l'ordre entre deux threads dans les deux langages~; détection des dépassements de l'anneau de diffusion et resynchronisation~; aucune lecture déchirée sur 200\,000
+lectures de \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence} sous un écrivain dans une boucle serrée~; 1\,000 messages venant d'un processus enfant par mémoire partagée.
+\bfield{Pour aller plus loin} Un anneau de diffusion dont la politique déclarée pour le consommateur le plus lent est choisie (attendre, abandonner, conflater)~;
+un anneau dans un fichier sur un système de fichiers à \omterm{def:ll:memory-hierarchy-and-caches:tlb}{grandes pages}.
+\end{build}
+
+\begin{omsources}
+\item M.~Thompson, D.~Farley, M.~Barker, P.~Gee et A.~Stewart, \emph{Disruptor: high performance alternative to bounded queues
+for exchanging data between concurrent threads}, 2011.
+\item L.~Lamport, ``Specifying concurrent program modules'', \emph{ACM TOPLAS} 5(2), 1983.
+\item H.-J.~Boehm, ``Can seqlocks get along with programming language memory models?'', MSPC 2012~; documentation du noyau Linux,
+``Sequence counters and sequential locks''.
+\item Page de manuel Linux \texttt{shm\_open(3)}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:1}
+Un anneau compte 1\,024 cases~; le producteur est à la position 70\,001 et le consommateur à 69\,500. Combien de messages attendent, quelle case
+le producteur écrira-t-il ensuite, et combien peut-il encore écrire avant que l'anneau soit plein~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:2}
+À 250 millions de messages par seconde, combien de temps une position sur 64~bits met-elle à reboucler~? Et une position sur 32~bits~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:3}
+Un étage fonctionne à $\rho = 0.8$. Quelle taille d'anneau rend le débordement d'une file M/M/1 plus rare qu'une fois sur un million~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:4}
+Pourquoi chaque côté de l'anneau SPSC garde-t-il une copie privée de la position de l'autre~? Que coûte par message la suppression de ces copies~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:5}
+Un moniteur de risque lit l'anneau de diffusion à 400\,000 messages par seconde. Une rafale de 3 millions de messages par seconde dure 80
+millisecondes sur un anneau de 131\,072 cases. Le moniteur est-il rattrapé par le producteur, et si oui, quand~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:6}
+Pourquoi la valeur du \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence} doit-elle être copiée avec des \omterm{def:ll:lock-free-programming:atomic}{opérations atomiques} en C++, alors que le lecteur écarte toute copie prise pendant une
+écriture~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:7}
+\emph{Programmation.} Placer les positions du producteur et du consommateur sur la même \omterm{def:ll:memory-hierarchy-and-caches:line}{ligne de cache} (modifier les décalages d'en-tête dans une copie de
+\texttt{firm\_ring.hpp}) et relancer les bancs d'essai d'aller-retour et de débit. Qu'est-ce qui change, et pourquoi~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:queues-ring-buffers-and-shared-memory:8}
+\emph{Trouver la faille.} «~Notre anneau en mémoire partagée stocke, dans son en-tête, un pointeur vers le message de tête et une \texttt{std::string} pour le
+nom de l'instrument.~»
+\end{exercise}
+
+\section{Problème~: Trois stratégies, un seul flux}
+
+\begin{problem}[{Problème du week-end --- dimensionner un anneau de diffusion}]\label{pb:ll:queues-ring-buffers-and-shared-memory:1}
+Un feed handler publie des événements normalisés sur un anneau de diffusion de 65\,536 cases de 64 octets. Trois consommateurs le lisent~: un constructeur de carnet
+(book builder) à 4 millions d'événements par seconde au plus, une stratégie à 2.5 millions et un moniteur à 1.5 million. Un jour ordinaire, le flux
+fait en moyenne 300\,000 événements par seconde~; à l'ouverture, les rafales atteignent 2 millions par seconde pendant une demi-seconde au plus.
+
+\medskip\noindent\textbf{Partie I --- L'anneau.}
+\begin{enumerate}
+\item Quelle place occupe l'anneau en octets, et tient-il dans le cache de deuxième niveau du chapitre~3~?
+\item Quel est le taux d'utilisation de chaque consommateur un jour ordinaire~?
+\item Quels consommateurs peuvent accumuler du retard pendant une rafale~?
+\item Pourquoi le producteur n'attend-il jamais après eux~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- La rafale.}
+\begin{enumerate}[resume]
+\item Au bout de combien de temps le moniteur est-il rattrapé (\cref{prop:ll:queues-ring-buffers-and-shared-memory:lap})~?
+\item Est-il rattrapé pendant une rafale d'une demi-seconde~?
+\item Quelle taille d'anneau permettrait au moniteur de traverser la rafale~?
+\item Combien de mémoire cela coûterait-il~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les solutions de rechange.}
+\begin{enumerate}[resume]
+\item Le moniteur n'a besoin que du dernier prix de chacun des 5\,000 instruments. Que coûte en mémoire un \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence} par instrument,
+et quelle part des mises à jour le moniteur saute-t-il pendant la rafale~?
+\item Que fait le moniteur lorsqu'il détecte un dépassement sur l'anneau~?
+\item Pourquoi la \omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{contre-pression} (back-pressure) est-elle fausse pour ce producteur et juste pour la voie des ordres~?
+\item Que dit le modèle M/M/1 de l'anneau de la stratégie à 300\,000 événements par seconde, et pourquoi est-il optimiste~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le temps avant que le moniteur soit rattrapé pendant une rafale, et la part des mises à jour qu'un moniteur à
+\omterm{def:ll:queues-ring-buffers-and-shared-memory:bp}{conflation} saute.
+\item Que dit l'aller-retour mesuré du coût d'ajout d'un consommateur~?
+\item Pourquoi la disposition de l'anneau est-elle versionnée~?
+\item Que prédirait ici, pour une file bloquante, la comparaison publiée entre une file bloquante et un anneau~?
+\item Quelle règle de placement du chapitre~4 s'applique au feed handler et au constructeur de carnet~?
+\item Comment enregistrer les tailles de rafale que l'anneau doit porter~?
+\item Que doit faire la stratégie après un trou dans son entrée~?
+\item En une phrase~: la taille d'un \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{tampon circulaire} est une affirmation sur quoi~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:1}
+Implémentez un \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{tampon circulaire} à un producteur et un consommateur (SPSC). Quels \omterm{def:ll:lock-free-programming:ordering}{ordonnancements mémoire} lui faut-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:2}
+Pourquoi un \omterm{def:ll:queues-ring-buffers-and-shared-memory:ring}{tampon circulaire} est-il plus rapide qu'une file protégée par un mutex et une variable de condition~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:3}
+Qu'est-ce qu'un \omterm{def:ll:queues-ring-buffers-and-shared-memory:seqlock}{verrou à séquence}, quand l'utiliseriez-vous, et quels sont ses pièges~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:4}
+Un flux de données de marché, trois consommateurs de vitesses différentes. Concevez la distribution.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:5}
+Que doit éviter une structure de données partagée en mémoire entre deux processus~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:queues-ring-buffers-and-shared-memory:6}
+Comment dimensionneriez-vous la file placée devant un étage dont l'entrée est en rafales~? Qu'apporte la théorie des files d'attente, et ce
+qu'elle laisse échapper~?
+\end{interviewq}

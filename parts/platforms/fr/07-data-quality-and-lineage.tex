@@ -1,0 +1,388 @@
+\chapter{Qualité des données et lignage}\label{ch:pl:data-quality-and-lineage}
+
+Le 6 mai 2010, entre 14~h~40 et 15~h~00, plus de 20\,000 transactions portant sur plus de 300 titres américains ont été exécutées à
+des cours s'écartant de 60~\% ou plus de ceux qui avaient été affichés quelques minutes plus tôt, certaines à un cent, d'autres à 100\,000~\$. Après la clôture, les
+bourses et leur autorégulateur ont convenu d'annuler toutes ces transactions comme manifestement erronées. Une \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} qui avait enregistré ces
+transactions fidèlement, sans jamais apprendre qu'elles avaient été annulées, les a transmises à chaque backtest, à chaque estimation
+de volatilité et à chaque étude d'exécution portant sur cet après-midi, tant qu'elle a conservé ces données. Rien dans la base n'était corrompu~; les données étaient
+exactement ce que le flux avait transmis. Il manquait une couche qui confronte les données à ce qu'elles devraient être, signale ce qui
+échoue au lieu de la supprimer, applique les corrections qui arrivent plus tard sous forme de nouvelles versions, et sait quels résultats ont été
+construits à partir de quoi. Ce chapitre construit cette couche (\texttt{firm.dataqual}) et la mesure sur une journée simulée comportant des défauts introduits et,
+tout aussi important, de véritables événements de marché qu'une règle peu rigoureuse prend pour des défauts.
+
+\section{Contrôles~: complétude, validité, cohérence, ponctualité}
+
+\begin{definition}[Règle de qualité des données, contrat de données]\label{def:pl:data-quality-and-lineage:rule}
+Une \emph{règle de qualité des données}\index{règle de qualité des données} est un contrôle automatisé d'un jeu de données par rapport à une attente~--- qu'il est
+complet, que ses valeurs sont valides, qu'il est cohérent avec lui-même et avec d'autres sources, qu'il est ponctuel~--- exécutée
+à chaque fois que les données sont produites, avec une gravité et un responsable qui agit sur ses échecs. Un \emph{contrat de données}\index{contrat de données}
+est l'accord entre le producteur d'un jeu de données et ses consommateurs, qui en fixe le schéma, les règles et les délais de livraison, afin que
+une modification de l'un ou l'autre côté soit traitée comme une modification du contrat plutôt que comme une surprise.
+\end{definition}
+
+Quatre familles de contrôles couvrent l'essentiel des défauts des données de marché. La complétude~: aucun message ne manque (les numéros de séquence du flux ne présentent aucun
+trou, chapitre~2), aucun instrument silencieux alors qu'il devrait être coté. Validité~: chaque valeur reste dans son domaine (prix et tailles positifs,
+instruments connus, horodatages compris dans la séance). Cohérence~: les données concordent entre elles (aucun cours acheteur égal ou supérieur au cours vendeur, transactions
+à des prix proches des cotations) et avec d'autres sources (un autre flux, la copie d'un fournisseur, le cours de clôture officiel). Ponctualité~: les données sont arrivées
+au moment prévu par le contrat. Le \Cref{lst:pl:data-quality-and-lineage:rules} est la suite de règles du chapitre, écrite sous forme de données~: chaque règle a
+un type, une gravité, un responsable et des paramètres, et \texttt{firm.dataqual} exécute n'importe quelle suite sur n'importe quelle partition.
+
+\omcode{code/platforms/07-data-quality-and-lineage/python/pl_dataqual.py}{88}{110}{La suite de règles du chapitre, sous forme de données~: trous de séquence,
+bornes, carnets croisés, cotations périmées, pics de prix, transactions annulées et un décompte par rapport à la copie d'un fournisseur, chacun avec une gravité et un
+responsable.}\label{lst:pl:data-quality-and-lineage:rules}
+
+La journée est la deuxième de la semaine du chapitre~4~: deux instruments, 47\,472 événements, 9\,258 cotations et 1\,190 transactions. Deux
+événements réels en font partie~: SIM2 fait l'objet d'une suspension de cotation de 60 secondes à 40~\% de la séance, et le niveau de prix de SIM2 bondit de 3~\% à 60~\% de celle-ci,
+à la suite d'une annonce, et s'y maintient. Dans des copies de la journée, vingt fois avec vingt graines aléatoires, le chapitre introduit six types de défauts~: un trou de
+200 événements, trois cotations croisées, huit prix de transaction décalés d'un facteur dix (une erreur de virgule, à la hausse ou à la baisse), un silence de 90 secondes des cotations de
+SIM1, quatre transactions annulées par la plateforme après la clôture et, séparément, une \omterm{def:pl:data-quality-and-lineage:correction}{correction du fournisseur} portant sur un cours de clôture officiel.
+
+\section{Indicateurs d'anomalie plutôt que suppressions}
+
+\begin{definition}[Indicateur d'anomalie, quarantaine]\label{def:pl:data-quality-and-lineage:flag}
+Un \emph{indicateur d'anomalie}\index{indicateur d'anomalie} est un enregistrement rattaché à une ligne ou à une partition, qui désigne la règle en échec, la
+gravité et le détail, sans modifier la ligne elle-même~; les consommateurs décident s'ils excluent les lignes signalées. Une
+\emph{quarantaine}\index{quarantaine} est l'état d'une partition ayant échoué à une règle de gravité «~erreur~»~: elle est tenue
+à l'écart des lecteurs jusqu'à ce qu'une personne la libère, avec un motif, ou qu'elle soit reconstruite.
+\end{definition}
+
+Supprimer une mauvaise ligne est tentant et erroné. La ligne peut être juste (un saut réel de 3~\% ressemble à un pic pour une règle naïve)~; un autre
+consommateur peut en avoir besoin (un système de surveillance veut les transactions erronées, chapitre~30)~; et une suppression ne peut être ni auditée ni annulée.
+Un indicateur garde les trois options ouvertes~: le backtest exclut les lignes de gravité «~erreur~», le système de surveillance les lit et la règle
+peut être améliorée et relancée.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.7cm,inner sep=3pt,align=center}]
+\node[box] (p) at (0,0) {partition\\(date, table)};
+\node[box,fill=omMeth!15] (r) at (2.9,0) {suite de règles\\(données)};
+\node[box,fill=omThm!12] (f) at (5.7,0) {indicateurs\\(ligne, règle,\\gravité)};
+\node[box] (pub) at (9.0,1.0) {publié~:\\les consommateurs\\filtrent};
+\node[box,fill=omThm!20] (qz) at (9.0,-1.0) {en quarantaine~:\\retenue};
+\node[box,fill=gray!10] (rel) at (12.1,-1.0) {libérée\\par une personne};
+\node[box,fill=omProp!15] (cor) at (2.9,-1.8) {correction du fournisseur~:\\nouvelle version};
+\draw[->] (p) -- (r); \draw[->] (r) -- (f);
+\draw[->] (f) -- node[above,sloped,font=\tiny]{avertissements} (pub.west);
+\draw[->] (f) -- node[below,sloped,font=\tiny]{erreurs} (qz.west);
+\draw[->] (qz) -- (rel);
+\draw[->] (cor) -| (p);
+\end{tikzpicture}
+
+\omcaption{La couche de qualité des données~: chaque partition passe la suite de règles~; les indicateurs sont enregistrés à côté des lignes, jamais à leur place~;
+une partition portant un indicateur de gravité «~erreur~» est mise en \omterm{def:pl:data-quality-and-lineage:flag}{quarantaine} jusqu'à sa libération~; une \omterm{def:pl:data-quality-and-lineage:correction}{correction du fournisseur} arrive sous forme de nouvelle version des données,
+et les règles sont à nouveau exécutées.}\label{fig:pl:data-quality-and-lineage:pipeline}
+\end{omfigure}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.6cm,ymode=log,xlabel={numéro de transaction de SIM2, dans l'ordre de séquence},ylabel={prix de transaction (échelle logarithmique)},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!20},ymin=20,ymax=5000,
+  ytick={30,100,300,1000,3000},yticklabels={30,100,300,1\,000,3\,000},
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[only marks,mark=*,mark size=0.8pt,omDef] table[x=n,y=price]{figdata/platforms/07-data-quality-and-lineage/sim2_prices.csv};
+\addplot[only marks,mark=o,mark size=3pt,omThm,thick] table[x=n,y=price,restrict expr to domain={\thisrow{flagged}}{1:1}]{figdata/platforms/07-data-quality-and-lineage/sim2_prices.csv};
+\legend{transaction,signalée comme pic (erreur)}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les transactions de SIM2 sur la copie défectueuse de la graine~0, en échelle logarithmique~: deux erreurs de virgule (l'une dix fois trop haute, l'autre dix fois trop
+basse) ressortent et sont signalées~; le saut réel de 3~\% survenu en fin de journée est invisible à cette échelle et n'est pas signalé par la règle qui regarde aussi vers l'avant.
+Données~: \texttt{fig\_dataqual.py}.}\label{fig:pl:data-quality-and-lineage:prices}
+\end{omfigure}
+
+La première version de la suite a signalé les défauts introduits et bien davantage. La règle des pics comparait chaque prix de transaction avec la
+médiane des 50 transactions précédentes de son symbole, en unités robustes~: l'écart absolu médian des écarts précédents, avec un
+plancher de 0.1~\% afin qu'un mouvement d'un seul pas de cotation ne soit jamais un pic. Le jour du saut, elle a signalé chacune des quelques dizaines de transactions suivantes, jusqu'à ce que la médiane rétrospective rattrape le
+nouveau niveau (\cref{fig:pl:data-quality-and-lineage:jump}). Un pic et un changement de niveau se ressemblent vus de l'arrière~; vus de l'avant, ils
+ne se ressemblent plus, car un pic revient. L'exécution des contrôles de qualité a lieu après la clôture, elle peut donc regarder vers l'avant~:
+
+\begin{method}[Distinguer un pic d'un mouvement]\label{met:pl:data-quality-and-lineage:spike}
+Signaler une valeur lorsqu'elle s'écarte, de plus de $k$ unités robustes, à la fois de la médiane des valeurs qui la précèdent et de la médiane de
+les valeurs qui la suivent. Une erreur de virgule s'écarte des deux~; un mouvement réel du niveau ne s'écarte que des valeurs qui précèdent. Au
+début d'une série, où il n'y a pas d'historique, on ne compare qu'aux valeurs suivantes.
+\end{method}
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{78}{99}{La règle des pics~: écart à la médiane rétrospective en unités robustes, avec plancher,
+et, avec \texttt{confirm}, par rapport à la médiane prospective également.}\label{lst:pl:data-quality-and-lineage:spike}
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=12cm,height=5.8cm,xlabel={numéro de transaction de SIM2},ylabel={prix},tick label style={font=\small},
+  label style={font=\small},grid=major,grid style={gray!20},enlarge y limits=0.12,
+  legend columns=2,legend style={font=\footnotesize,at={(0.5,-0.3)},anchor=north,draw=none,/tikz/every even column/.append style={column sep=8pt}},
+  table/col sep=comma]
+\addplot[only marks,mark=*,mark size=1.2pt,omDef] table[x=n,y=price]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[thick,omMeth] table[x=n,y=behind]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[thick,omMeth,dashed] table[x=n,y=ahead]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\addplot[only marks,mark=o,mark size=2.6pt,omThm,thick] table[x=n,y=price,restrict expr to domain={\thisrow{naive_only}}{1:1}]{figdata/platforms/07-data-quality-and-lineage/jump.csv};
+\legend{prix de transaction,médiane des 50 précédentes,médiane des 50 suivantes,signalée par la seule règle naïve}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Les transactions de SIM2 autour de son véritable saut de 3~\%. Mesurée à partir de la médiane rétrospective, chaque transaction des quelques dizaines suivantes
+ressemble à un pic, et la règle naïve en signale 24 (entourées)~; mesurée aussi à partir de la médiane prospective, aucune ne l'est, puisque le nouveau niveau persiste.
+Données~: \texttt{fig\_dataqual.py} (graine 0).}\label{fig:pl:data-quality-and-lineage:jump}
+\end{omfigure}
+
+La règle de fraîcheur échoue de la même façon sur la suspension de cotation~: 60 secondes sans cotation de SIM2 est un défaut du flux que si le marché
+était ouvert. La règle doit connaître l'état du marché --- les messages d'état de la négociation émis par la plateforme (les événements du chapitre~2 les incluent) --- et
+ne pas compter le temps passé en suspension de cotation (le \cref{lst:pl:data-quality-and-lineage:stale}).
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{102}{117}{La règle de fraîcheur, qui ne compte pas le temps que le marché lui-même a
+passé en silence (suspension de cotation, pause programmée) dans un intervalle.}\label{lst:pl:data-quality-and-lineage:stale}
+
+Le \Cref{tab:pl:data-quality-and-lineage:detection} donne le résultat sur vingt graines. Chaque défaut injecté est trouvé par les deux versions de
+la batterie de tests~; la différence tient entièrement aux faux signalements~: 495 transactions signalées à tort comme pics et 20 suspensions de cotation signalées à tort comme
+flux périmés par la batterie naïve, aucun par la batterie consciente.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+règle & injectés & trouvés & faux signalements, naïve & faux signalements, consciente \\
+\midrule
+rupture de séquence & 20 & 20 & 0 & 0 \\
+carnet croisé & 60 & 60 & 0 & 0 \\
+pic de prix & 160 & 160 & 495 & 0 \\
+cotations périmées & 20 & 20 & 20 & 0 \\
+transactions invalidées & 80 & 80 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Défauts injectés, défauts trouvés et lignes signalées à tort par chaque règle sur vingt graines d'injection, avec la batterie naïve
+(règle de pic rétrospective, règle de fraîcheur aveugle aux suspensions) et la batterie consciente. Données~: \texttt{pl\_dataqual.detection}.}\label{tab:pl:data-quality-and-lineage:detection}
+\end{table}
+
+Un défaut injecté que toutes les règles trouvent ne teste pas les règles~; ce qui les éprouve, ce sont les facteurs de confusion. Un détecteur de
+surveillance du livre~9 a repéré tous ses spoofeurs injectés tant que des imitations légitimes n'ont pas été ajoutées (son chapitre~29), et la même leçon vaut ici~:
+il faut injecter les événements authentiques que comporte le marché réel, et mesurer les faux signalements.
+
+\section{Contrôles inter-sources}
+
+\begin{definition}[Contrôle inter-sources]\label{def:pl:data-quality-and-lineage:cross}
+Un \emph{contrôle inter-sources}\index{contrôle inter-sources} compare un jeu de données à une source indépendante des mêmes faits ---
+l'autre ligne de flux, un second fournisseur, le fichier de fin de journée de la plateforme, le cours de clôture officiel --- sur un agrégat que les deux peuvent calculer (un nombre, un
+volume, un dernier cours par intervalle), et signale les intervalles où elles diffèrent de plus d'une tolérance.
+\end{definition}
+
+Une source unique peut être complète selon ses propres numéros de séquence et rester fausse~: un normaliseur qui a écarté un type de message, un
+compactage qui a perdu un fichier. Le contrôle du chapitre compte les transactions par minute dans la base et dans une copie du jour fournie par un fournisseur, et signale
+les minutes qui diffèrent de plus de 2~\%~: sur les vingt graines, il a levé 16 signalements, dans les minutes où le trou injecté de 200 événements
+avait par hasard contenu des transactions. Il ne dit pas quelles transactions manquent, seulement où regarder~; c'est la bonne répartition du travail
+entre un contrôle peu coûteux qui tourne partout et une enquête coûteuse qui se déclenche là où il pointe.
+
+\section{Corrections du fournisseur et versions}
+
+\begin{definition}[Correction du fournisseur]\label{def:pl:data-quality-and-lineage:correction}
+Une \emph{correction du fournisseur}\index{correction du fournisseur} est une livraison ultérieure qui modifie une valeur déjà livrée (un cours de clôture, une
+condition de transaction, une opération sur le capital)~: elle est stockée comme une nouvelle version du même fait, avec son propre temps de connaissance, et n'écrase jamais
+la version antérieure.
+\end{definition}
+
+Le fournisseur du chapitre livre le cours de clôture officiel de SIM2 à 16~h~30 le jour même, et un cours de clôture corrigé à 7~h~10 le lendemain matin. Les deux sont
+des versions d'un même fait dans la base bitemporelle du livre~7~: interrogée à 23~h, la clôture est la première~; interrogée à 8~h, la seconde. Les
+transactions invalidées de l'accroche du chapitre suivent le même schéma~: une liste d'annulations, livrée après la clôture, appliquée sous forme d'indicateurs (\texttt{busted}) sur les
+transactions qu'elles désignent. Ce qu'une correction modifie n'est pas seulement le fait, mais tout ce qui en est calculé, et c'est précisément le lignage.
+
+\section{Lignage et provenance}
+
+\begin{definition}[Lignage des données, fiche de provenance]\label{def:pl:data-quality-and-lineage:lineage}
+Le \emph{lignage des données}\index{lignage des données} d'un résultat est le graphe des versions de jeux de données et des transformations dont il est issu, en remontant
+jusqu'à ses entrées brutes. Une \emph{fiche de provenance}\index{fiche de provenance} est la description enregistrée de la manière dont une version de jeu de données a été
+produite~: les versions de ses entrées (par empreinte de contenu), le code et sa version, ainsi que le moment de son exécution et son auteur.
+\end{definition}
+
+Le lignage de \texttt{firm.dataqual} enregistre chaque version de jeu de données comme un nœud, nommé par l'empreinte de contenu de ses données
+(calculée par \texttt{firm.workflow.content\_hash} du livre~7), avec une arête depuis chaque version d'entrée dont
+elle a été construite (le \cref{lst:pl:data-quality-and-lineage:lineage}). Une correction produit une nouvelle version de l'entrée~; tout nœud situé en aval de
+l'ancienne version devient périmé. Dans l'exemple du chapitre (la \cref{fig:pl:data-quality-and-lineage:lineage}), la clôture corrigée rend
+périmées les valorisations, le P\&L et les variables de recherche, et laisse intactes les barres à la minute, construites à partir des seules transactions.
+
+\omcode{code/firm/dataqual/firm_dataqual.py}{189}{203}{Lignage~: une version de jeu de données est son nom et son empreinte de contenu, avec les versions de ses entrées
+versions~; tout ce qui se trouve en aval d'une ancienne version devient périmé une fois celle-ci corrigée.}\label{lst:pl:data-quality-and-lineage:lineage}
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth,box/.style={draw,rounded corners=2pt,fill=omDef!10,minimum height=0.6cm,inner sep=3pt,align=center}]
+\node[box] (tr) at (0,0) {transactions\\2026-09-22};
+\node[box,fill=omMeth!25] (cl) at (3,0.9) {clôtures\\(corrigées)};
+\node[box] (ba) at (3,-0.9) {barres à la minute};
+\node[box,fill=omThm!12] (mk) at (6,1.5) {valorisations};
+\node[box,fill=omThm!12] (pn) at (9,1.5) {P\&L};
+\node[box,fill=omThm!12] (ft) at (6,-0.3) {variables};
+\draw[->] (tr) -- (cl); \draw[->] (tr) -- (ba);
+\draw[->] (cl) -- (mk); \draw[->] (mk) -- (pn);
+\draw[->] (cl) -- (ft); \draw[->] (ba) -- (ft);
+\node[omThm,anchor=west] at (7.2,-0.3) {périmé~: à reconstruire};
+\node[anchor=north] at (3,-1.25) {non touchées};
+\end{tikzpicture}
+
+\omcaption{Le lignage des résultats du jour. La \omterm{def:pl:data-quality-and-lineage:correction}{correction du fournisseur} sur la clôture rend périmée toute version construite à partir de l'ancienne clôture
+(en rouge)~: les valorisations, le P\&L et les variables de recherche~; les barres à la minute, construites à partir des seules transactions, ne sont pas touchées. Données~:
+\texttt{pl\_dataqual.correction\_and\_lineage}.}\label{fig:pl:data-quality-and-lineage:lineage}
+\end{omfigure}
+
+\begin{dated}{2026-09}{Une norme pour la provenance}\label{dat:pl:data-quality-and-lineage:prov}
+Le modèle de données PROV du World Wide Web Consortium (une recommandation du W3C du 30 avril 2013, consultée en septembre 2026) définit la provenance
+comme un enregistrement qui décrit les personnes, institutions, entités et activités impliquées dans la production, l'influence ou la livraison
+d'un élément de données~; le graphe de lignage de ce chapitre est une petite instance de ses entités (versions de jeux de données) et de ses activités (les travaux
+qui les dérivent).
+\end{dated}
+
+Ce que vaut la qualité se lit dans les chiffres du jour (graine~0). Les défauts injectés étant conservés, le VWAP de SIM1 est surévalué de 2.69~\% et
+celui de SIM2 de 1.08~\%, tandis que la variance réalisée des variations de prix des transactions de SIM2 vaut 24\,000 fois sa valeur réelle~: huit erreurs de décimale pèsent plus
+qu'une journée de négociation authentique. Une fois les lignes d'erreur graves exclues, les deux VWAP sont à moins de 0.03~\% de la vérité (le reliquat tient aux transactions
+perdues dans le trou, qu'aucun signalement ne peut restaurer) et la variance réalisée est égale à la vraie.
+
+\section{Tutoriel~: injecter, signaler, corriger}\label{tut:pl:data-quality-and-lineage:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Injecter des défauts et des facteurs de confusion dans une journée simulée, exécuter la suite de règles deux fois (naïve et avertie), mesurer la détection et
+les faux signalements, et suivre une correction à travers le lignage. \textbf{État final~:}
+le \cref{tab:pl:data-quality-and-lineage:detection}, la \cref{fig:pl:data-quality-and-lineage:jump} et les erreurs de VWAP et de variance de la
+dernière section.
+\begin{tutsteps}
+\item \textbf{La journée}~: \texttt{pl\_dataqual.base()} avec sa suspension de cotation et son saut.
+\item \textbf{Injection}~: \texttt{plant(seed)} renvoie les tables défectueuses et la vérité sur les lignes qui sont des défauts.
+\item \textbf{Lancement}~: \texttt{firm\_dataqual.run(rules(\dots), tables)} (le \cref{lst:pl:data-quality-and-lineage:rules})~; puis
+\texttt{score} et \texttt{detection} sur vingt graines, naïve et avertie.
+\item \textbf{Effet}~: \texttt{effect(0)}~: VWAP et variance réalisée avec les défauts conservés, avec les lignes signalées exclues, et la vérité.
+\item \textbf{Corriger}~: \texttt{correction\_and\_lineage()}~: deux versions du cours de clôture, et les résultats obsolètes.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Abaisser le seuil de saut $k$ de 8 à 4 et compter les faux signalements sur la journée naturelle~; injecter un
+saut de 2~\% au lieu d'une erreur de décimale, et trouver le plus petit que la règle détecte encore.
+\end{tutorial}
+
+\section{Construction~: la couche de qualité des données}\label{bld:pl:data-quality-and-lineage:dataqual}
+
+\begin{build}
+\bfield{Rôle} Les contrôles que passe chaque partition de la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} avant sa publication, les \omterm{def:pl:data-quality-and-lineage:flag}{indicateurs d'anomalie} sur lesquels filtrent les consommateurs, la
+\omterm{def:pl:data-quality-and-lineage:flag}{quarantaine} qui retient les partitions défectueuses, et le lignage qui indique ce qu'une correction invalide~; elle s'exécute sous forme de tâches de la
+map du chapitre~1 et du scheduler du chapitre~13.
+\bfield{Interface} \texttt{Rule(name, kind, severity, owner, params)}, \texttt{Flag(table, row, rule, severity, detail)}~;
+\texttt{run(rules\_by\_table, tables)}, \texttt{clean(df, flags, table, severities)}~; \texttt{Quarantine} avec \texttt{apply},
+\texttt{release}, \texttt{readable}, \texttt{log}~; \texttt{Lineage} avec \texttt{add}, \texttt{downstream}, \texttt{upstream},
+\texttt{stale\_after}~; natures \texttt{sequence}, \texttt{bounds}, \texttt{crossed}, \texttt{spike}, \texttt{stale},
+\texttt{cross\_source}, \texttt{busted}.
+\bfield{Règles} Les règles sont des données dotées d'un responsable~; les indicateurs ne modifient jamais les lignes~; un indicateur d'erreur met sa partition en \omterm{def:pl:data-quality-and-lineage:flag}{quarantaine}~; une libération nomme une
+personne et un motif~; les corrections sont des versions~; les versions de jeux de données sont désignées par le hachage de leur contenu.
+\bfield{Tests d'acceptation} \texttt{code/firm/dataqual/tests/}~: chaque nature détecte son défaut injecté et rien d'autre~; la règle de saut confirmée
+épargne un décalage de niveau et la règle d'obsolescence une suspension de cotation~; le décompte des \omterm{def:pl:data-quality-and-lineage:cross}{contrôles inter-sources} par tranche~; la \omterm{def:pl:data-quality-and-lineage:flag}{quarantaine} et la libération~; le lignage désigne les
+résultats obsolètes d'une correction.
+\bfield{Pour aller plus loin} Des règles générées à partir d'un \omterm{def:pl:data-quality-and-lineage:rule}{contrat de données}~; un score de qualité par partition publié avec lui~; des indicateurs stockés sous forme de table de
+la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}, interrogeable comme les données.
+\end{build}
+
+\begin{omsources}
+\item U.S. Commodity Futures Trading Commission and Securities and Exchange Commission, \emph{Findings regarding the market events
+of May~6, 2010}, 30 septembre 2010.
+\item W3C, \emph{PROV-DM: The PROV Data Model}, recommandation du W3C, 30 avril 2013.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:1}
+Les numéros de séquence d'un flux passent de 91\,686 à 91\,691. Combien de messages manquent, et que fait la capture du chapitre~2
+à leur sujet~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:2}
+Pourquoi la règle de saut a-t-elle un plancher sur son échelle~? Que se passerait-il sans lui sur un instrument à grand pas de cotation dont les transactions
+s'exécutent surtout au même prix~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:pl:data-quality-and-lineage:3}
+Une transaction s'exécute à 3\,000\,000 alors que les transactions précédentes étaient à 300\,000 et les suivantes aussi. Quel type de défaut cela est-il probablement
+et pourquoi la médiane prospective le confirme-t-elle~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:4}
+Pourquoi une règle doit-elle signaler plutôt que supprimer~? Citer un consommateur qui a besoin des lignes signalées.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:5}
+Les défauts étant conservés, le VWAP de SIM2 sur la graine~0 est surévalué de 1.08~\%~; après exclusion des lignes d'erreur, il est sous-évalué de 0.02~\%. D'où provient chaque
+erreur~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:pl:data-quality-and-lineage:6}
+Le cours de clôture officiel est corrigé à 07~h~10 le lendemain matin. Quels résultats de la journée doivent être reconstruits, lesquels n'ont pas à l'être, et comment le lignage
+le sait-il~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:data-quality-and-lineage:7}
+\emph{Programmation.} Lancer \texttt{score} pour la graine~0 avec la suite naïve et la suite avertie. Combien de faux signalements chaque règle déclenche-t-elle, et
+quel événement réel est à l'origine de chacun~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:pl:data-quality-and-lineage:8}
+\emph{Trouver la faille.} «~Notre tâche de contrôle de la qualité des données supprime toute transaction située à plus de 5~\% de la précédente, et tout trou dans les cotations de plus de
+30 secondes est comblé en répétant la dernière cotation. Les données nettoyées vont directement dans la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks}.~»
+\end{exercise}
+
+\section{Problème~: l'après-midi annulé}
+
+\begin{problem}[{Problème du week-end --- une journée, ses défauts et ses surprises authentiques}]\label{pb:pl:data-quality-and-lineage:1}
+La journée simulée du chapitre (une suspension de cotation et un saut de 3~\% de SIM2), ses six défauts injectés et les deux suites de règles.
+
+\medskip\noindent\textbf{Partie I --- Les contrôles.}
+\begin{enumerate}
+\item Nommer les quatre familles de contrôles et donner une règle de chacune tirée de la suite du chapitre.
+\item Qu'est-ce qu'un \omterm{def:pl:data-quality-and-lineage:rule}{contrat de données}, et qu'apporte-t-il aux règles~?
+\item Combien la journée compte-t-elle d'événements, de cotations et de transactions~?
+\item Lesquels des défauts injectés aucune règle ne peut-elle détecter, à partir des seules données de la journée, et qu'est-ce qui les détecte~?
+\item Pourquoi la \omterm{def:pl:data-quality-and-lineage:correction}{correction du fournisseur} sur le cours de clôture n'est-elle pas un \omterm{def:pl:data-quality-and-lineage:flag}{indicateur d'anomalie}~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Faux signalements.}
+\begin{enumerate}[resume]
+\item Pourquoi la règle de saut naïve signale-t-elle des transactions après le saut de 3~\%, et combien sur la graine~0~?
+\item Combien de faux signalements de saut sur vingt graines, pour les règles naïve et avertie~?
+\item Pourquoi la règle naïve d'obsolescence signale-t-elle la suspension de cotation, et comment la règle avertie l'évite-t-elle~?
+\item Qu'aurait fait à la journée du saut un pipeline qui aurait supprimé les lignes signalées~?
+\item Pourquoi un test des \omterm{def:pl:data-quality-and-lineage:rule}{règles de qualité des données} doit-il inclure des événements authentiques, et pas seulement des défauts injectés~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Ce que vaut la qualité.}
+\begin{enumerate}[resume]
+\item À quelle distance de la vérité se trouvent les deux VWAP, avec les défauts conservés, et avec les lignes d'erreur exclues~?
+\item De quel facteur la variance réalisée de SIM2 est-elle gonflée lorsque les défauts sont conservés~?
+\item Que trouve le \omterm{def:pl:data-quality-and-lineage:cross}{contrôle inter-sources} sur vingt graines, et que ne dit-il pas~?
+\item En quoi une \omterm{def:pl:data-quality-and-lineage:flag}{quarantaine} diffère-t-elle d'un \omterm{def:pl:data-quality-and-lineage:flag}{indicateur d'anomalie}, et qui la libère~?
+\item Quels résultats le cours de clôture corrigé rend-il obsolètes~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: les nombres de détections et de fausses alertes des deux suites sur vingt graines, ainsi que les erreurs de VWAP et de variance
+avec et sans indicateurs.
+\item Quelle modification unique de la suite naïve a supprimé le plus de fausses alertes~?
+\item Qu'aurait contenu la \omterm{def:pl:a-tick-store-on-open-formats:store}{base de ticks} pour l'après-midi du 6 mai 2010, avec et sans la règle sur les transactions défectueuses~?
+\item Que doit enregistrer le lignage pour qu'une correction désigne chaque résultat obsolète~?
+\item En une phrase~: qu'est-ce qui distingue une couche de qualité des données d'un script de nettoyage~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur, chercheur}]\label{iq:pl:data-quality-and-lineage:1}
+Quels contrôles effectueriez-vous sur une journée de \omterm{def:pl:capturing-and-storing-tick-data:tick}{données tick} avant que les chercheurs ne les utilisent~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, chercheur}]\label{iq:pl:data-quality-and-lineage:2}
+Comment distinguez-vous une mauvaise transaction d'un véritable mouvement de prix~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:pl:data-quality-and-lineage:3}
+Pourquoi signaler les mauvaises données plutôt que de les supprimer~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur, risque}]\label{iq:pl:data-quality-and-lineage:4}
+Un fournisseur corrige le cours de clôture de la veille. Que doit-il se passer dans les systèmes de la société~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:data-quality-and-lineage:5}
+Comment testeriez-vous un système de qualité des données, et comment sauriez-vous qu'il ne signale pas trop d'éléments~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:pl:data-quality-and-lineage:6}
+Concevez un lignage pour une plateforme de recherche de sorte que tout résultat publié puisse être remonté à ses données d'entrée et recalculé après une correction.
+\end{interviewq}

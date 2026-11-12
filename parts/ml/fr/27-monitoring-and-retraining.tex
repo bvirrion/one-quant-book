@@ -1,0 +1,396 @@
+\chapter{Surveillance et réentraînement}\label{ch:ml:monitoring-and-retraining}
+
+Un mardi, le modèle a cessé de trader~: chaque prédiction se trouvait à l'intérieur du seuil. Rien n'avait échoué. Un fournisseur en amont avait
+commencé à envoyer des volumes en lots plutôt qu'en actions, et le modèle les redimensionnait docilement. Aucun test n'avait cassé, car chaque
+nombre restait un nombre~; le seul signe était que le desk n'avait rien à faire. Ce chapitre construit les moniteurs qui auraient
+averti quelqu'un avant le déjeuner, et interrogent chacun sur la question qui décide de son utilité~: combien de temps faut-il pour
+détecter une vraie défaillance lorsqu'il n'est autorisé à crier au loup qu'une fois par mois~? Trois défaillances sont introduites dans une simulation de production~: un
+changement d'unité en amont, un renversement de l'effet de la variable la plus forte, et une variable dont l'effet s'estompe pendant que sa dispersion augmente.
+Les moniteurs des entrées voient la première le jour même où elle survient et sont aveugles au deuxième~; le moniteur des résultats voit le deuxième en un
+jour et ne voit pas la première avant des mois~; rien ne repère la perte de précision de la troisième, et les moniteurs des entrées ne la détectent que par son
+effet secondaire, au bout de six semaines.
+
+\section{Que surveiller~: entrées, sorties, résultats}
+
+\begin{definition}[Surveillance des modèles, dérive des prédictions]\label{def:ml:monitoring-and-retraining:monitoring}
+La \emph{surveillance des modèles}\index{surveillance des modèles} est la comparaison continue, pour un modèle en production, des entrées, des sorties et
+des résultats réalisés avec ce qui était attendu lors de sa validation, et des alarmes qui sollicitent une personne lorsque les écarts dépassent
+ce que le hasard permet. La \emph{dérive des prédictions}\index{dérive des prédictions} est un changement de la distribution des sorties du modèle par rapport
+à la période de validation, quelle qu'en soit la cause.
+\end{definition}
+
+Le chapitre~12 distingue le \omterm{def:ml:online-learning-and-drift:drift}{décalage des covariables} (covariate shift), qui touche les entrées, de la \omterm{def:ml:online-learning-and-drift:drift}{dérive conceptuelle} (concept drift), qui touche la manière dont les entrées se rapportent à la
+cible, et construit des \omterm{def:ml:online-learning-and-drift:detector}{détecteurs de dérive} fondés sur les erreurs d'un modèle. Un modèle en production est surveillé à trois niveaux, car chacun repère des défaillances
+que les autres manquent. Les entrées sont disponibles immédiatement et en masse~: chaque variable de chaque valeur, chaque jour, comparée à la
+référence d'entraînement, après les contrôles de schéma et de livraison du chapitre~15 et les contrôles de fraîcheur du chapitre~24. Les sorties sont accessibles
+tout aussi rapidement~: la distribution des prédictions, la part des valeurs dont la prévision franchit le seuil de trading, les positions et
+le taux de rotation qu'elles impliquent. Les résultats (le coefficient d'information réalisé, le P\&L) n'arrivent qu'après l'horizon de prévision, et ils
+sont bruités~: un modèle dont le coefficient d'information quotidien vrai vaut 0.10 présente un écart-type d'environ 0.07 d'un jour à
+l'autre. Ce sont les résultats qui comptent, et ce sont eux qui parlent le plus tard.
+
+Le modèle de production de ce chapitre est volontairement simple, afin que chaque défaillance soit connue exactement. Chaque jour, 200 valeurs portent cinq
+variables standardisées~; les rendements du lendemain dépendent des trois premières avec des coefficients 0.08, $-0.06$ et 0.05, plus un bruit de
+variance unitaire. Un modèle linéaire est ajusté sur 60 jours, puis tourne 400 jours de plus~; il trade les valeurs dont la prévision est supérieure en
+valeur absolue à la médiane d'entraînement, soit la moitié d'entre elles. (Le modèle de carnet d'ordres du chapitre~29 est surveillé avec le même code en fin de
+livre.) Trois défaillances commencent au jour 200, chacune dans 20 simulations indépendantes (\cref{lst:ml:mon:day})~:
+\begin{itemize}
+\item \emph{changement d'unité}~: la deuxième variable arrive cent fois plus petite, comme le feraient des volumes en lots~;
+\item \emph{renversement}~: l'effet de la première variable change de signe, un changement de régime que les entrées ne montrent pas~;
+\item \emph{érosion lente}~: sur 150 jours, l'effet de la troisième variable tombe à zéro pendant que sa dispersion augmente de moitié.
+\end{itemize}
+
+\section{Statistiques de dérive et conception des alarmes}
+
+\begin{definition}[Indice de stabilité de la population]\label{def:ml:monitoring-and-retraining:psi}
+On découpe un échantillon de référence d'une variable en $B$ classes (ici ses déciles) de parts $r_1,\dots,r_B$, et notons $q_1,\dots,q_B$ les
+parts d'un nouvel échantillon dans les mêmes classes. L'\emph{indice de stabilité de la population}\index{indice de stabilité de la population} (population stability index, PSI) est
+\[
+\mathrm{PSI}=\sum_{b=1}^{B}(q_b-r_b)\ln\frac{q_b}{r_b},
+\]
+la divergence de Kullback--Leibler symétrisée entre les deux distributions regroupées en classes (les classes vides sont ramenées à une petite part).
+\end{definition}
+
+Cet indice vient du scoring de crédit, où les règles empiriques veulent qu'en dessous de 0.10 une population ait peu changé et qu'au-dessus de 0.25
+elle a nettement changé~; Yurdakul et Naranjo soulignent que ces repères sont utilisés sans tenir compte de leurs
+taux d'erreur. La statistique de Kolmogorov--Smirnov du livre~4 (chapitre~12), le plus grand écart entre les deux fonctions de répartition
+empiriques, est l'autre outil de référence (\cref{lst:ml:mon:psi}). Les deux sont calculées chaque jour sur chaque variable par rapport à la
+référence d'entraînement, et le moniteur retient la plus grande sur les cinq variables. Avec beaucoup de variables, un test par variable multiplie les
+fausses alarmes~; Rabanser et ses coauteurs, en comparant les façons de détecter un décalage de jeu de données, ont trouvé que les tests à deux échantillons portant sur une version réduite
+des entrées étaient les plus efficaces~: un test multivarié unique, comme le \omterm{def:ml:generative-models-and-synthetic-data:tests}{test à deux échantillons par classifieur} du chapitre~16. Les moniteurs de sorties calculent l'indice sur les prédictions
+et suivent la part des valeurs à l'intérieur du seuil de trading, c'est-à-dire là où la défaillance du mardi se manifesterait en premier.
+
+Une alarme est un seuil, et un seuil est un taux de fausses alarmes. Le chapitre fixe une fausse alerte par mois, soit une journée de séance sur 21,
+et calibre chaque seuil sur 20 simulations de 400 jours sans défaillance (\cref{lst:ml:mon:calib}). Une alerte est comptée lorsqu'une alarme
+démarre, et non pour chaque jour où elle dure, car une statistique qui reste au-dessus de son seuil pendant une semaine ne sollicite la personne d'astreinte qu'une seule fois.
+Les seuils calibrés valent 0.115 pour l'indice maximal sur les variables, 0.115 pour la plus grande statistique de Kolmogorov--Smirnov, 0.089
+pour l'indice des prédictions et 0.07 pour la variation de la part située à l'intérieur du seuil. Le premier dépasse la règle empirique du
+scoring de crédit~: avec 200 valeurs par jour, chaque décile en contient 20, et le seul bruit d'échantillonnage porte le plus grand des cinq indices au-delà de
+0.10 plus d'un jour sur vingt. Un seuil recopié d'une règle empirique alerterait plus souvent que ce dont l'équipe était convenue, et
+une équipe trop souvent alertée cesse de lire les alertes.
+
+Deux nombres décrivent la réaction de chaque moniteur à une défaillance. La \emph{première alarme} est le nombre de jours écoulés entre la défaillance et la
+première alerte du moniteur~; comme chaque moniteur émet une fausse alerte par mois, un moniteur qui ne voit rien alerte encore après environ deux
+semaines, et une première alarme n'est une détection que si elle survient bien avant. La \emph{alarme persistante} est le nombre de jours
+jusqu'à la première fenêtre glissante de 21 jours comptant au moins cinq jours d'alarme, une alerte qui revient sans cesse~; sans défaillance, la médiane
+d'aucun moniteur n'atteint une telle fenêtre dans les 200 jours.
+
+\section{Alarmes de performance sur des résultats bruités}
+
+\begin{definition}[Alarme de performance]\label{def:ml:monitoring-and-retraining:performance-alarm}
+Une \emph{alarme de performance}\index{alarme de performance} est un moniteur portant sur les résultats réalisés (le coefficient d'information, le taux de réussite (hit rate),
+le P\&L ou les mark-outs des transactions du modèle) qui se déclenche lorsque leur niveau tombe sous ce que la validation avait conduit l'établissement à attendre, d'un écart plus grand
+que ne le permet le bruit propre aux résultats au taux de fausses alarmes choisi.
+\end{definition}
+
+L'\omterm{def:ml:monitoring-and-retraining:performance-alarm}{alarme de performance} du chapitre est le test CUSUM unilatéral du livre~7 (chapitre~13) appliqué au coefficient d'information quotidien
+(\cref{lst:ml:mon:cusum})~: il cumule le déficit du coefficient de chaque jour sous son niveau attendu de 0.103, moins une
+marge $k$ égale à la moitié de son écart-type quotidien (0.035), et déclenche lorsque la somme dépasse $h$, puis repart de zéro. Pour une fausse
+alerte par mois, $h$ vaut 0.11, soit environ un jour et demi d'écart-type~: le moniteur peut se permettre d'attendre très peu.
+
+Cela indique ce qu'il peut voir. Une baisse du coefficient moyen de $\Delta$, mesurée avec un bruit quotidien $\sigma$, il faut environ
+\[
+n\approx\Bigl(\frac{(z_{0.95}+z_{0.90})\,\sigma}{\Delta}\Bigr)^2
+\]
+jours pour être distingué du bruit avec un test unilatéral au niveau de 5~\% et une puissance de 90~\%. Après le renversement, le coefficient passe de 0.103 à
+0.003, et $n$ vaut environ 4 jours~; après le changement d'unité, il tombe à 0.087 et $n$ vaut environ 150 jours~; à la fin de l'érosion lente, il
+est tombé à 0.081, et $n$ vaut environ 80 jours, mais l'érosion met 150 jours à y parvenir. Les résultats ne voient pas de petites pertes de
+précision sur aucun horizon qu'un desk accepterait~; ils repèrent les grandes rapidement.
+
+\begin{table}[htbp]
+\centering\small
+\small\setlength{\tabcolsep}{4pt}%
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.0cm}ccccccc@{}}
+\toprule
+ & aucune & \multicolumn{2}{c}{changement d'unité} & \multicolumn{2}{c}{renversement} & \multicolumn{2}{c}{érosion lente}\\
+\cmidrule(lr){2-2}\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}
+moniteur & première & première & persistante & première & persistante & première & persistante\\
+\midrule
+PSI maximal sur les variables & 12 & 0 & 0 & 12 & jamais & 12 & 42\\
+KS maximal sur les variables & 10 & 0 & 0 & 10 & jamais & 8 & 60\\
+PSI des prédictions & 17 & 0 & 0 & 17 & jamais & 19.5 & jamais\\
+part à l'intérieur du seuil & 11 & 0 & 0 & 11 & jamais & 9.5 & jamais\\
+CUSUM sur l'IC & 13 & 9.5 & jamais & 1 & 0 & 13 & jamais\\
+\bottomrule
+\end{tabular}
+\caption{Jours écoulés depuis la défaillance (jour 200) jusqu'à la première alarme de chaque moniteur et jusqu'à une alarme persistante (cinq jours d'alarme sur 21), médianes
+sur 20 simulations, chaque moniteur étant calibré pour une fausse alerte par mois~; «~aucune~» désigne le même décompte sur les simulations sans défaillance, soit
+le score d'un moniteur aveugle~; «~jamais~» signifie l'absence d'alarme persistante dans les 200 jours qui suivent. Données~: \texttt{ml\_monitor.delays}.}
+\label{tab:ml:mon:delays}
+\end{table}
+
+Le \Cref{tab:ml:mon:delays} présente le résultat du chapitre. Le changement d'unité est repéré par chaque moniteur d'entrées et de sorties dès son premier jour~:
+le PSI de la deuxième variable vaut environ 7, soit soixante fois son seuil, et la part des valeurs situées à l'intérieur du seuil de négociation passe de
+50~\% à 63~\%, soit un quart de valeurs négociées en moins. Le moniteur de résultats ne déclenche qu'une alerte, après une médiane de 9.5 jours, et n'insiste jamais. Quant à
+l'inversion est invisible à chaque moniteur d'entrées et de sorties (leurs colonnes sont égales à la colonne «~aucune~»~: les entrées et la
+distribution des prédictions n'ont pas changé du tout), et le CUSUM déclenche une alerte en deux jours dans 13 simulations sur 20 et continue d'en déclencher. Enfin,
+la perte de précision de la dégradation lente n'est vue par rien~; sa dispersion croissante est repérée par les moniteurs d'entrées, en alarme persistante après une médiane de 42
+jours pour le PSI et 60 pour la statistique de Kolmogorov--Smirnov (la \cref{fig:ml:mon:fade}). Si la dégradation était survenue sans le changement
+de dispersion, rien dans le tableau ne l'aurait détectée.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=6cm,xlabel={jour de production},ylabel={jours d'alarme par mois},xmin=0,xmax=400,ymin=0,ymax=22,
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},legend pos=north west,
+  legend cell align=left,legend style={font=\small},table/col sep=comma]
+\addplot[omProp,very thick,mark=*,mark size=1.3pt] table[x=day,y=psi]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[omDef,very thick,dashed,mark=square*,mark size=1.3pt,mark options={solid}] table[x=day,y=ks]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[gray,thick,mark=triangle*,mark size=1.5pt] table[x=day,y=predpsi]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[omThm,very thick,dotted,mark=diamond*,mark size=1.6pt,mark options={solid}] table[x=day,y=cusum]{figdata/ml/27-monitoring-and-retraining/fade.csv};
+\addplot[black,thin,dashed,forget plot] coordinates {(200,0) (200,22)};
+\legend{PSI de la variable la plus forte,KS de la variable la plus forte,PSI des prédictions,CUSUM sur l'IC}
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Jours d'alarme par mois (21 jours) sous la dégradation lente, sur des fenêtres de 25 jours, moyennés sur 20 simulations~; la dégradation commence au jour
+200 (en tirets) et se termine au jour 350. Un moniteur aveugle déclenche une alarme environ un jour par mois. Données~:
+\texttt{ml\_monitor.alarm\_rates}.}\label{fig:ml:mon:fade}
+\end{omfigure}
+
+\begin{method}[Conception des moniteurs d'un modèle]\label{met:ml:mon:design}
+\begin{enumerate}
+\item Surveiller les entrées, les sorties et les résultats~: chaque couche détecte des défaillances que les autres ne peuvent pas voir.
+\item Choisir le taux de fausses alertes auquel l'équipe répondra effectivement, et calibrer chaque seuil en fonction de ce taux sur l'historique ou par simulation
+sans défaillance~; ne pas reprendre les seuils des règles empiriques.
+\item Compter les alertes au début d'une alarme, et distinguer une première alerte d'une alarme persistante.
+\item Mesurer le délai de chaque moniteur sur des défaillances introduites, et le comparer à celui d'un moniteur aveugle~; un moniteur qui ne bat jamais
+cette colonne n'est que du bruit.
+\item Admettre que les moniteurs de résultats ne voient rapidement que les grosses pertes~; couvrir les petites par une revalidation programmée.
+\end{enumerate}
+\end{method}
+
+\section{Déploiements fantôme, canari et champion--challenger}
+
+\begin{definition}[Déploiement fantôme, champion--challenger]\label{def:ml:monitoring-and-retraining:shadow}
+Dans un \emph{déploiement fantôme}\index{déploiement fantôme} (shadow deployment), un nouveau modèle reçoit les entrées de production et enregistre ses prédictions,
+mais ses décisions ne sont pas exécutées~; ses résultats sont calculés comme s'ils l'avaient été. Le \emph{champion--challenger}\index{champion--challenger}
+est la discipline qui consiste à garder en place le modèle de production (le champion) jusqu'à ce qu'un challenger, exécuté à ses côtés sur les mêmes données,
+ait montré, à l'aide d'un test choisi à l'avance, qu'il est meilleur.
+\end{definition}
+
+Une exécution en \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} ne coûte que du calcul et fournit une comparaison nette, car le champion et le challenger voient les mêmes valeurs
+aux mêmes jours. Après l'inversion, le CUSUM déclenche une alerte en quelques jours. Un challenger est réajusté sur les 40 jours
+qui suivent (son coefficient sur la première variable vaut $-0.081$ en moyenne sur les simulations, contre la vraie valeur $-0.08$) et fonctionne en \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme}
+à partir du jour 240. Son IC moyen vaut 0.105, celui du champion 0.003. La comparaison repose sur le test séquentiel toujours valide du livre~7
+(chapitre~21) sur les différences quotidiennes (le \cref{lst:ml:mon:shadow}), qu'on peut examiner chaque jour sans
+gonfler son taux d'erreur~; l'erreur type est estimée à partir des jours observés, si bien que le test ne donne aucun verdict pendant dix jours, car sur
+trois jours, un petit écart type d'échantillon rend toute différence certaine. Le challenger est promu dans les 20 simulations, après
+une médiane de 10 jours en \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} et au plus 19 jours (la \cref{fig:ml:mon:shadow}). Sans défaillance, un challenger réajusté sur 40 jours
+ordinaires est promu dans 2 simulations sur 100, dans la limite des 5~\% du test.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.8cm,xlabel={jour de déploiement fantôme},ylabel={valeur p toujours valide},ymode=log,xmin=1,xmax=20,
+  ymin=1e-7,ymax=2,tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[omProp,thick,mark=*,mark size=1.2pt] table[x=day,y=run0]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[omDef,thick,mark=square*,mark size=1.2pt] table[x=day,y=run1]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[omThm,thick,mark=triangle*,mark size=1.4pt] table[x=day,y=run2]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[gray,thick,mark=diamond*,mark size=1.4pt] table[x=day,y=run3]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[black,thick,mark=o,mark size=1.2pt] table[x=day,y=run4]{figdata/ml/27-monitoring-and-retraining/shadow.csv};
+\addplot[black,thin,dashed] coordinates {(1,0.05) (20,0.05)};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Valeurs p toujours valides de l'avantage du challenger sur le champion, jour par jour en \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} après l'inversion, pour cinq
+des 20 simulations~; le test ne donne aucun verdict pendant dix jours~; en tirets~: 0.05, seuil auquel le challenger est promu. Données~:
+\texttt{ml\_monitor.shadow\_run}.}\label{fig:ml:mon:shadow}
+\end{omfigure}
+
+Les comparaisons en \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} mesurent des prévisions, non la réaction du marché à leur exploitation~; un modèle dont les ordres font bouger les cours est comparé
+dans un déploiement canari (livre~7, chapitre~21), en négociant une petite part du capital. L'intérêt du déploiement canari tient à ce qu'il limite. Le
+chapitre promeut un challenger affecté d'une erreur de signe sur sa deuxième variable, un bogue qu'un \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} aurait détecté, mais supposons qu'il ne l'ait pas repéré~:
+le CUSUM le fait revenir en arrière après une médiane de 3 jours (au plus 18). L'IC sacrifié, cumulé sur ces jours
+et pondéré par le capital, vaut 0.26 IC-jours quand le challenger négocie tout le portefeuille et 0.026 quand il n'en négocie qu'un dixième. Le
+retour en arrière est lui-même une action de registre (le \cref{lst:ml:mon:rollback})~: la version qui était en production auparavant est de nouveau promue,
+avec sa raison, dans la \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} du chapitre~25.
+
+\section{Réentraîner, revenir en arrière ou retirer}
+
+Chaque alarme appelle une action différente, et la mauvaise cache la défaillance. Une alarme sur les entrées sans baisse des résultats (le changement
+d'unité) appelle la correction des données~: réentraîner sur des volumes par lots apprendrait au modèle une nouvelle échelle pour une variable et enfouirait
+l'erreur du fournisseur dans ses coefficients, jusqu'à ce que le fournisseur la corrige. Une alarme sur les résultats, avec des entrées calmes (l'inversion), signifie que la
+relation a changé~: réduire la taille du modèle ou l'arrêter (le kill switch du livre~11, chapitre~27, pour un modèle qui négocie à vitesse élevée),
+réajuster sur les données postérieures au changement, dès qu'il y en a assez, et le promouvoir par \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} puis par déploiement canari. Une perte lente qu'aucun moniteur
+ne voit appelle un réentraînement programmé (le \omterm{def:ml:online-learning-and-drift:schedule}{calendrier de réentraînement} du chapitre~12) et une revalidation périodique du modèle par rapport à un
+indice de référence simple. Un modèle est retiré lorsque ses challengers réajustés ne battent plus un modèle nul~: quand l'effet a disparu, réentraîner
+ne fait qu'ajuster du bruit plus vite. Sculley et ses coauteurs rangent les «~changements du monde extérieur~» parmi les dettes des
+systèmes d'apprentissage automatique, et Breck et ses coauteurs font de la surveillance la moitié de leur grille de préparation d'un modèle à la production. Dans les entretiens
+d'ingénieurs en apprentissage automatique menés par Shankar et ses coauteurs, les fausses alertes constituaient le point de friction le plus souvent évoqué, et
+la fatigue d'alerte qui s'ensuit conduit les équipes à faire taire les alertes et à manquer les vraies baisses~: c'est la raison de compter les alertes.
+
+\begin{method}[Après une alarme]\label{met:ml:mon:after}
+\begin{enumerate}
+\item Alarme sur les entrées ou les sorties~: vérifier d'abord le chemin des données (unités, schéma, changements de fournisseur)~; corriger les données, et non le modèle.
+\item Alarme sur les résultats avec des entrées calmes~: réduire ou arrêter la négociation, réajuster sur les données postérieures au changement, et ne promouvoir que par \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} et
+déploiement canari.
+\item Un challenger est promu grâce à un test séquentiel choisi à l'avance, et ramené en arrière par l'\omterm{def:ml:monitoring-and-retraining:performance-alarm}{alarme de performance}, deux opérations consignées dans
+le registre.
+\item Réentraîner selon un calendrier pour les pertes qu'aucun moniteur ne voit~; retirer le modèle lorsque le réentraînement ne bat plus un modèle nul.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: le mardi où le modèle s'est tu}\label{tut:ml:monitoring-and-retraining:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Injecter trois défaillances dans une simulation de production, calibrer cinq moniteurs à une fausse alerte par mois, mesurer
+leurs délais, promouvoir un challenger issu du \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} et ramener en arrière un challenger défaillant. \textbf{État final~:} le \cref{tab:ml:mon:delays},
+la \cref{fig:ml:mon:fade}, la \cref{fig:ml:mon:shadow}.
+\begin{tutsteps}
+\item \textbf{Les trois défaillances.}
+\omcode{code/ml/27-monitoring-and-retraining/python/ml_monitor.py}{44}{58}{Une journée de données de production, avec les défaillances injectées.}\label{lst:ml:mon:day}
+\item \textbf{Statistiques de dérive.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{49}{65}{L'indice de stabilité de la population et la statistique de Kolmogorov--Smirnov par rapport à une référence préparée.}\label{lst:ml:mon:psi}
+\item \textbf{Seuils pour un taux d'alertes donné.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{94}{110}{Débuts d'alarme, et seuil qui déclenche une alerte à un taux choisi.}\label{lst:ml:mon:calib}
+\item \textbf{L'\omterm{def:ml:monitoring-and-retraining:performance-alarm}{alarme de performance}.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{75}{86}{Un CUSUM unilatéral sur le coefficient d'information quotidien.}\label{lst:ml:mon:cusum}
+\item \textbf{Le test sur \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme}.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{118}{127}{Valeurs p toujours valides de l'avantage d'un challenger, sans verdict avant dix jours.}\label{lst:ml:mon:shadow}
+\item \textbf{Retour en arrière.}
+\omcode{code/firm/mlmonitor/firm_mlmonitor.py}{130}{143}{Remettre la version de production précédente en place via le registre.}\label{lst:ml:mon:rollback}
+\item \textbf{Exécuter} \texttt{ml\_monitor.thresholds()}, \texttt{delays()}, \texttt{shadow()}, \texttt{rollbacks()} et
+\texttt{fig\_monitor.py} (environ 15 secondes sur un cœur).
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Regrouper les 20 derniers jours de chaque variable en un seul indice et le calibrer de la même façon~: il repère plus tôt
+la dispersion de la lente érosion, mais ses fausses alarmes arrivent par salves, et une alerte par mois n'a pas le même sens pour lui
+(l'\cref{exo:ml:monitoring-and-retraining:7}).
+\end{tutorial}
+
+\section{Construction~: surveillance des modèles}\label{bld:ml:monitoring-and-retraining:mlmonitor}
+
+\begin{build}
+\bfield{Rôle} Moniteurs sur les entrées, les sorties et les résultats d'un modèle de production, calibrés à un taux de fausses alertes, et les
+décisions de promotion et de retour en arrière qu'ils alimentent.
+\bfield{Interface} \texttt{Reference(ref, bins)}~; \texttt{psi(ref, x)}~; \texttt{ks(ref, x)}~; \texttt{daily\_ic(pred, y)}~;
+\texttt{Cusum(target, k, h).update(v)}~; \texttt{calibrate\_daily(null, rate)}~; \texttt{onsets(alarms)}~;
+\texttt{calibrate\_pages(null, rate)}~; \texttt{first\_alarm(stats, threshold, start)}~;
+\texttt{shadow\_verdict(ic\_challenger, ic\_champion, tau, min\_days)} sur \texttt{firm.abtest}~; \texttt{rollback(registry, name, ts, reason)} sur \texttt{firm.exptrack}.
+\bfield{Règles} Chaque seuil est calibré sur des données sans défaillance à un taux énoncé~; les alertes sont comptées aux débuts d'alarme~; les promotions
+utilisent un test fixé à l'avance~; les retours en arrière passent par le registre, avec un motif.
+\bfield{Tests d'acceptation} \texttt{code/firm/mlmonitor/tests/}~: l'indice est nul sur sa propre référence et croît avec un décalage~; la
+statistique de Kolmogorov--Smirnov et le coefficient d'information concordent avec SciPy, ex aequo compris~; le CUSUM déclenche une alerte sur une baisse puis se réinitialise~;
+les seuils calibrés déclenchent des alertes à leur taux~; le test sur \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} ne rend aucun verdict avant dix jours, et ne promeut un challenger sans avantage que dans
+au plus 5~\% des simulations~; un retour en arrière rétablit la version précédente et préserve intacte la \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit}.
+\bfield{Pour aller plus loin} Dérive multivariée (un \omterm{def:ml:generative-models-and-synthetic-data:tests}{test à deux échantillons par classifieur}, chapitre~16) et moniteurs sur le P\&L et les mark-out, calibrés de la
+même façon.
+\end{build}
+
+\begin{omsources}
+\item S.~Rabanser, S.~Günnemann et Z.~C.~Lipton, ``Failing loudly: an empirical study of methods for detecting dataset
+shift'', \emph{NeurIPS}, 2019.
+\item E.~Breck, S.~Cai, E.~Nielsen, M.~Salib et D.~Sculley, ``The ML test score: a rubric for ML production readiness and
+technical debt reduction'', \emph{IEEE International Conference on Big Data}, 2017.
+\item B.~Yurdakul et J.~D.~Naranjo, ``Statistical properties of the population stability index'', \emph{Journal of Risk Model
+Validation}, 2020.
+\item D.~Sculley et coauteurs, ``Hidden technical debt in machine learning systems'', \emph{NeurIPS}, 2015.
+\item S.~Shankar, R.~Garcia, J.~M.~Hellerstein et A.~G.~Parameswaran, ``Operationalizing machine learning: an interview
+study'', arXiv:2209.09125, 2022~; publié dans \emph{Proceedings of the ACM on Human-Computer Interaction}, 2024.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:1}
+Pour chacune des trois couches (entrées, sorties, résultats), donner une défaillance qu'elle voit et que les deux autres ne voient pas, parmi
+les trois du chapitre.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:2}
+Expliquer pourquoi le seuil calibré sur le plus grand indice de variable (0.115) dépasse la règle empirique de 0.10 du scoring
+de crédit, et ce que donnerait un seuil de 0.10.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:monitoring-and-retraining:3}
+Expliquer pourquoi un moniteur aveugle, calibré à une fausse alerte par mois, signale tout de même une première alarme environ deux semaines après une défaillance.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:4}
+Vérifier le délai d'environ 150 jours que la figure du chapitre donne au moniteur de résultats pour voir le changement d'unité, à partir des coefficients d'information
+0.103 et 0.087 et de l'écart-type quotidien 0.071. Calculer le nombre de jours qu'il faudrait à une firme négociant 2\,000 valeurs.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:5}
+Expliquer pourquoi le test sur \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme} ne rend aucun verdict avant dix jours, et ce qui se passerait sans cette règle.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:monitoring-and-retraining:6}
+\emph{Trouver la faille.} «~L'alarme PSI s'est déclenchée après le changement de fournisseur, donc on a réentraîné le modèle sur les nouvelles données, et l'alarme
+s'est arrêtée.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:monitoring-and-retraining:7}
+\emph{Programmation.} Ajouter le moniteur regroupé de la dernière étape du tutoriel (le plus grand indice de variable sur les 20 derniers jours d'échantillons),
+calibrer à une alerte par mois, et donner ses délais. Expliquer pourquoi ses fausses alarmes arrivent par salves.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:monitoring-and-retraining:8}
+Concevoir les moniteurs pour une érosion sans changement de dispersion~: l'effet de la troisième variable tombe à zéro en 150 jours et sa
+distribution ne change pas. Indiquer quelle couche peut le voir, à quelle vitesse, et ce qu'on ferait à la place.
+\end{exercise}
+
+\section{Problème~: le mardi où le modèle s'est tu}
+
+\begin{problem}[{Problème du week-end --- le mardi où le modèle s'est tu}]\label{pb:ml:monitoring-and-retraining:1}
+La simulation de production du chapitre, trois défaillances injectées, cinq moniteurs.
+
+\medskip\noindent\textbf{Partie I --- Le modèle et ses moniteurs.}
+\begin{enumerate}
+\item Décrire le modèle de production et les trois défaillances.
+\item Indiquer ce que surveille chaque couche (entrées, sorties, résultats) et à partir de quel moment chacune est disponible.
+\item Définir l'\omterm{def:ml:monitoring-and-retraining:psi}{indice de stabilité de la population} (PSI) et donner les seuils calibrés.
+\item Expliquer pourquoi on compte les alertes au début d'une alarme.
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- \omterm{def:ml:monitoring-and-retraining:performance-alarm}{Alarmes de performance}.}
+\begin{enumerate}[resume]
+\item Comment le CUSUM sur le coefficient d'information est-il paramétré et calibré~?
+\item Combien de jours un moniteur de résultats met-il à voir chaque défaillance~?
+\item Pourquoi les résultats ne peuvent-ils pas voir le changement d'unité~?
+\item Quelle est la différence entre une première alarme et une alarme soutenue~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les délais.}
+\begin{enumerate}[resume]
+\item Quels moniteurs voient le changement d'unité, et à quel moment~?
+\item Lesquels voient le renversement~?
+\item Qu'est-ce qui voit la lente érosion, et par quel moyen~?
+\item Qu'est-ce qui aurait détecté l'érosion sans son changement de fourchette~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le délai de détection de chaque moniteur pour les trois défaillances injectées, à une fausse alarme par mois.
+\item Que se passe-t-il en fantôme après le renversement, et à quelle fréquence un challenger nul est-il promu~?
+\item Que permet d'économiser un canari lorsqu'un challenger défectueux est promu~?
+\item Qu'aurait dû faire le desk le mardi~?
+\item Quand un modèle doit-il être réentraîné, et quand doit-il être retiré~?
+\item Qui doit être appelé par chaque moniteur~?
+\item Que doit consigner la surveillance dans le registre~?
+\item En une phrase~: de quoi un moniteur a-t-il besoin pour valoir la peine d'exister~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML}]\label{iq:ml:monitoring-and-retraining:1}
+Que surveilleriez-vous pour un modèle en production, et pourquoi à plusieurs niveaux~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, chercheur}]\label{iq:ml:monitoring-and-retraining:2}
+Qu'est-ce que l'\omterm{def:ml:monitoring-and-retraining:psi}{indice de stabilité de la population}, et comment choisiriez-vous son seuil d'alarme~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:monitoring-and-retraining:3}
+Le CI quotidien de votre modèle est de 0.10 avec un écart type de 0.07. Au bout de combien de temps pourriez-vous affirmer qu'il est tombé à 0.08~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:monitoring-and-retraining:4}
+Expliquez le \omterm{def:ml:monitoring-and-retraining:shadow}{déploiement fantôme}, le canari et le \omterm{def:ml:monitoring-and-retraining:shadow}{champion--challenger}. Quand chacun est-il le bon outil~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:monitoring-and-retraining:5}
+Votre alarme de dérive des entrées se déclenche. Réentraînez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:monitoring-and-retraining:6}
+Vos moniteurs appellent l'équipe vingt fois par semaine et plus personne ne regarde. Que changez-vous~?
+\end{interviewq}

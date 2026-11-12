@@ -1,0 +1,391 @@
+\chapter{Protocoles I~: FIX}\label{ch:ll:protocols-i-fix}
+
+Un ordre envoyé ce matin par un fonds à son courtier a très probablement voyagé sous la forme d'une ligne de texte~: \texttt{35=D} pour un nouvel
+ordre, \texttt{55=ESZ6} pour l'instrument, \texttt{54=1} pour un achat, \texttt{38=5} pour la quantité, chaque couple terminé par un
+caractère de contrôle. Le format a été rédigé pour la première fois en 1992 afin que Fidelity Investments et Salomon Brothers puissent échanger
+des informations de négociation d'actions par voie électronique, et il est devenu le langage commun des ordres entre le buy side, les courtiers et
+de nombreuses plateformes de négociation~: le protocole Financial Information eXchange. Il est ancien, verbeux, lent à analyser naïvement, et omniprésent. Ce
+chapitre construit un \omterm{def:ll:protocols-i-fix:engine}{moteur FIX}~: le codec qui lit et écrit le texte sans le recopier, la couche session qui garde
+identiques les vues de deux sociétés sur une conversation malgré les déconnexions, et les mesures qui disent ce que coûte le protocole.
+
+\section{Encodage étiquette-valeur et le message}
+
+\begin{definition}[protocole FIX, encodage étiquette-valeur]\label{def:ll:protocols-i-fix:fix}
+Le \emph{protocole FIX}\index{protocole FIX} est une norme pour les messages relatifs au trading (ordres, exécutions, cotations, données
+de marché, allocations) échangés entre sociétés, maintenue par le FIX Trading Community, avec une couche session qui les délivre dans l'ordre
+et sans perte. Dans son \emph{encodage étiquette-valeur}\index{encodage étiquette-valeur} (tag-value), un message est une suite de champs
+\texttt{tag=value}, chacun terminé par l'octet SOH (valeur 1), où l'étiquette est un nombre tiré du dictionnaire du protocole et la
+valeur est du texte.
+\end{definition}
+
+Trois champs ouvrent chaque message, dans un ordre fixe~: BeginString (étiquette 8, la version du protocole), BodyLength (9) et MsgType (35).
+Un seul le referme~: CheckSum (10), dont le champ et le SOH final marquent la fin du message. Entre eux viennent le reste
+de l'en-tête standard (identifiants de l'émetteur et du destinataire 49 et 56, numéro de séquence 34, heure d'envoi 52 en UTC) et le
+corps. BodyLength compte les octets depuis le début du champ MsgType jusqu'au champ CheckSum non compris, délimiteurs
+inclus~; CheckSum est la somme de tous les octets qui le précèdent modulo 256, écrite sur trois chiffres.
+La \Cref{fig:ll:protocols-i-fix:anatomy} détaille l'exemple que la description habituelle du protocole développe, un logon
+dont le corps mesure 65 octets et dont la somme de contrôle vaut 062~; les tests de la construction reproduisent les deux nombres.
+
+\begin{omfigure}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[font=\scriptsize,f/.style={draw=gray!60,inner sep=2pt,minimum height=0.5cm,font=\ttfamily\scriptsize}]
+\node[f,fill=gray!10,anchor=west] (a) at (0,0) {8=FIX.4.2|};
+\node[f,fill=gray!10,anchor=west] (b) at (a.east) {9=65|};
+\node[f,fill=omDef!20,anchor=west] (c) at (b.east) {35=A|};
+\node[f,fill=omDef!12,anchor=west] (d) at (c.east) {49=SERVER|};
+\node[f,fill=omDef!12,anchor=west] (e) at (d.east) {56=CLIENT|};
+\node[f,fill=omDef!12,anchor=west] (g) at (e.east) {34=177|};
+\node[f,fill=omDef!12,anchor=west] (h) at (g.east) {52=20090107-18:15:16|};
+\node[f,fill=omThm!12,anchor=west] (i) at (h.east) {98=0|};
+\node[f,fill=omThm!12,anchor=west] (j) at (i.east) {108=30|};
+\node[f,fill=gray!10,anchor=west] (k) at (j.east) {10=062|};
+\draw[decorate,decoration={brace,amplitude=4pt},thick] (c.north west) ++(0,0.08) -- ([yshift=0.08cm]j.north east)
+  node[midway,above=5pt]{BodyLength~: 5 + 10 + 10 + 7 + 21 + 5 + 7 = 65 octets, de \texttt{35=} jusqu'à \texttt{10=}};
+\draw[decorate,decoration={brace,amplitude=4pt,mirror},thick] ([yshift=-0.08cm]a.south west) -- ([yshift=-0.08cm]j.south east)
+  node[midway,below=5pt]{CheckSum~: chaque octet avant \texttt{10=}, délimiteurs inclus, totalise 4\,158~; $4\,158 \bmod 256 = 62$};
+\node[anchor=north west,align=left,font=\footnotesize] at (0,-1.35) {gris~: encadrement (les deux premiers champs, dernier champ)~; bleu~:
+  MsgType et le reste de l'en-tête standard~; rouge~: le corps d'un logon (méthode de chiffrement 98, intervalle de heartbeat 108)};
+\end{tikzpicture}}
+
+\omcaption{Un logon FIX~4.2 sous forme de chaîne d'octets, où \texttt{|} désigne le délimiteur SOH. BodyLength et CheckSum sont
+calculés sur les plages représentées~; un récepteur les recalcule et rejette le message si l'un ou l'autre diffère.}\label{fig:ll:protocols-i-fix:anatomy}
+\end{omfigure}
+
+La somme de contrôle est un contrôle faible, et savoir à quel point il est faible dit au lecteur à quoi il sert.
+
+\begin{proposition}[Ce que détecte la somme de contrôle FIX]\label{prop:ll:protocols-i-fix:checksum}
+Modifier un seul octet d'un message change toujours sa somme de contrôle. Échanger deux octets, ou deux champs, ne la change jamais~;
+pas davantage tout ensemble de modifications dont les valeurs ont pour somme un multiple de 256.
+\end{proposition}
+
+\begin{proof}
+Remplacer l'octet $b$ par $b' \ne b$ modifie la somme de $b' - b$, avec $0 < |b' - b| < 256$, qui n'est pas un multiple de 256.
+Une somme ne dépend pas de l'ordre de ses termes, donc une permutation la laisse inchangée~; et des modifications $\delta_1, \dots, \delta_k$
+laissent la somme modulo 256 inchangée exactement lorsque $\sum_j \delta_j \equiv 0 \pmod{256}$.
+\end{proof}
+
+Le transport sous-jacent, TCP, porte déjà ses propres sommes de contrôle sur chaque segment. La somme de contrôle FIX et la longueur du corps sont
+donc moins une protection contre les altérations sur le réseau qu'un contrôle de l'encadrement~: un programme qui a perdu sa place dans un
+flux d'octets, ou un message tronqué ou recollé par une passerelle défaillante, est détecté au message suivant. L'encadrement lui-même
+repose sur les deux premiers champs~: une fois \texttt{8=} et \texttt{9=} lus, la longueur totale du message est connue, le corps plus les
+sept octets de \texttt{10=nnn} et de son délimiteur.
+
+\section{La couche session~: numéros de séquence, heartbeats, demandes de renvoi et comblement de trou}
+
+\begin{definition}[session FIX, heartbeat, demande de renvoi, comblement de trou]\label{def:ll:protocols-i-fix:session}
+Une \emph{session FIX}\index{session FIX} est la conversation bidirectionnelle entre deux parties identifiées par leurs identifiants d'émetteur et
+de destinataire, du logon au logout, au cours de laquelle chaque côté numérote les messages qu'il envoie 1, 2, 3, \dots\ et les conserve
+afin de pouvoir les renvoyer. Un \emph{heartbeat}\index{heartbeat} est un message envoyé lorsqu'un côté n'a rien émis pendant
+un intervalle convenu, afin que le silence puisse être distingué d'une connexion morte. Une \emph{demande de renvoi}\index{demande de renvoi} (resend request) demande à
+l'autre côté de renvoyer une plage de ses messages, après qu'un trou dans leurs numéros de séquence a été détecté. Un
+\emph{comblement de trou}\index{comblement de trou} (gap fill) est un message de réinitialisation de séquence, envoyé en réponse à une demande de renvoi, qui remplace une suite de messages
+administratifs qui ne seront pas renvoyés, en faisant avancer au-delà d'eux le numéro de séquence attendu par le récepteur.
+\end{definition}
+
+Les numéros de séquence (le livre~1, chapitre~28, pour les données de marché) constituent à eux seuls le mécanisme de la couche session. Chaque côté tient deux
+compteurs~: le numéro de son prochain message sortant et celui qu'il attend ensuite de l'autre côté. Un message portant le
+numéro attendu est traité et le compteur avance. Un numéro supérieur signifie que des messages ont été perdus~: le récepteur envoie une
+ResendRequest (MsgType 2) à partir du numéro attendu jusqu'à «~l'infini~» (EndSeqNo 0), et retient les messages suivants jusqu'à ce que le trou soit
+comblé. Un numéro inférieur est soit un doublon, marqué par PossDupFlag (43) et ignoré, soit une erreur fatale~: les deux côtés ne
+s'accordent plus, et le récepteur se déconnecte. La réponse à une \omterm{def:ll:protocols-i-fix:session}{demande de renvoi} contient de nouveau les messages applicatifs, marqués
+PossDupFlag avec leur heure d'envoi d'origine (122), et remplace les messages administratifs (\omterm{def:ll:protocols-i-fix:session}{heartbeats}, demandes de test, \omterm{def:ll:protocols-i-fix:session}{demandes de renvoi}
+elles-mêmes) par des messages SequenceReset avec GapFillFlag (123) positionné~: un \omterm{def:ll:protocols-i-fix:session}{heartbeat} datant d'une demi-heure ne signifie plus rien
+maintenant. La \Cref{fig:ll:protocols-i-fix:sequence} dessine la conversation de référence de la construction autour de son trou, et
+le \cref{lst:ll:protocols-i-fix:trace} reprend la même conversation telle que le moteur la trace.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\def\L{0}\def\R{7.5}
+\node[font=\footnotesize\bfseries] at (\L,0.45) {SOCIÉTÉ (nous)};
+\node[font=\footnotesize\bfseries] at (\R,0.45) {COURTIER};
+\draw[gray,thick] (\L,0.15) -- (\L,-9.6);
+\draw[gray,thick] (\R,0.15) -- (\R,-9.6);
+\newcommand{\msgR}[3]{\draw[->,#3] (\L,#1) -- node[above,sloped]{#2} (\R,#1-0.25);}
+\newcommand{\msgL}[3]{\draw[<-,#3] (\L,#1-0.25) -- node[above,sloped]{#2} (\R,#1);}
+\msgR{-0.1}{Logon, seq 1}{omDef}
+\msgL{-0.75}{Logon, seq 1}{omDef}
+\msgR{-1.4}{NewOrderSingle, seq 2}{omDef}
+\msgL{-2.05}{ExecutionReport (new), seq 2}{omDef}
+\msgL{-2.7}{Heartbeat, seq 3}{gray}
+\draw[omThm,dashed,->] (\R,-3.3) -- (5.6,-3.45) node[left,font=\scriptsize]{perdus~: seq 4 (exécution partielle), seq 5 (heartbeat)};
+\msgL{-4.0}{ExecutionReport (filled), seq 6}{omDef}
+\node[anchor=east,omThm,align=right] at (-0.15,-4.25) {trou~: attendu 4,\\ retient séq. 6};
+\msgR{-4.65}{ResendRequest 7=4 16=0, seq 3}{omThm,thick}
+\msgL{-5.3}{ExecutionReport (partial), seq 4, PossDup}{omDef}
+\msgL{-5.95}{SequenceReset-GapFill, seq 5, NewSeqNo 6}{omMeth}
+\node[anchor=east,omMeth,align=right] at (-0.15,-6.2) {livrer 4, puis le\\ 6 retenu~; attendre 7};
+\msgL{-6.6}{ExecutionReport, seq 6 again, PossDup: ignored}{gray}
+\msgR{-7.25}{OrderCancelRequest, seq 4}{omDef}
+\msgL{-7.9}{ResendRequest 7=3 16=0 (the broker lost ours)}{omThm}
+\msgR{-8.55}{GapFill seq 3 (our resend request), NewSeqNo 4}{omMeth}
+\msgR{-9.2}{OrderCancelRequest again, seq 4, PossDup}{omDef}
+\end{tikzpicture}
+
+\omcaption{La conversation de référence de la construction autour de son trou. Deux messages du courtier sont perdus~; le message suivant révèle le
+trou, que comble une \omterm{def:ll:protocols-i-fix:session}{demande de renvoi} (resend request)~: le message applicatif revient marqué comme doublon possible, le \omterm{def:ll:protocols-i-fix:session}{heartbeat} est remplacé par un \omterm{def:ll:protocols-i-fix:session}{comblement de trou} (gap fill), et le message retenu est livré
+dans l'ordre. Plus tard, le courtier réclame les nôtres, et notre message administratif est à son tour comblé par un \omterm{def:ll:protocols-i-fix:session}{comblement de trou}.
+est à son tour comblé.}\label{fig:ll:protocols-i-fix:sequence}
+\end{omfigure}
+
+\omcode{code/low-latency/15-protocols-i-fix/python/trace_short.txt}{7}{22}{La conversation de référence autour du trou, telle que
+\texttt{ll\_fix.short} affiche la trace du moteur (la trace complète est \texttt{expected\_trace.txt} dans les données de la construction).}\label{lst:ll:protocols-i-fix:trace}
+
+Les \omterm{def:ll:protocols-i-fix:session}{heartbeats} rendent le silence significatif. À l'ouverture de session, les deux parties conviennent d'un intervalle, HeartBtInt (108), ici de 30 secondes. Une partie qui n'a rien
+envoyé pendant cette durée émet un \omterm{def:ll:protocols-i-fix:session}{Heartbeat} (0). Une partie qui n'a rien reçu pendant un peu plus longtemps (la construction attend 1.2
+intervalle) émet un TestRequest (1) portant un identifiant que le \omterm{def:ll:protocols-i-fix:session}{heartbeat} de réponse doit reprendre~; si cette réponse n'arrive pas dans un
+intervalle supplémentaire, elle déclare la connexion morte. Le délai de détection est le prix d'un long intervalle~: avec 30 secondes, une connexion
+silencieusement morte est repérée après environ 66, pendant lesquelles les messages de la contrepartie ne vont nulle part et doivent être
+renvoyés.
+
+\omcode{code/firm/fixengine/cpp/firm_fixengine.hpp}{267}{289}{Le contrôle de séquence du moteur C++~: un trou demande un renvoi et retient le
+message~; un doublon est ignoré~; un numéro trop bas met fin à la session.}\label{lst:ll:protocols-i-fix:seq}
+
+\section{La couche applicative~: ordres et rapports d'exécution}
+
+Au-dessus de la session, chaque message applicatif porte un événement métier. Un NewOrderSingle (35=D) porte l'identifiant d'ordre de la société
+ClOrdID (11), l'instrument (55), le sens (54), la quantité (38), le type d'ordre (40) et, pour un ordre à cours limité, le prix (44)~; un OrderCancelRequest (35=F)
+désigne l'ordre à annuler par son identifiant d'origine (41) et donne à la demande son propre nouvel identifiant. La réponse à chacun est un rapport d'exécution (35=8),
+que la spécification utilise «~pour confirmer la réception d'un ordre~», pour confirmer les modifications, pour relayer le statut et les exécutions et pour rejeter des ordres~;
+le livre~10, chapitre~26, le décrit du côté de la plateforme. Son OrdStatus (39) parcourt le cycle de vie de l'ordre du livre~7, chapitre~17~:
+\texttt{0} nouvel, \texttt{1} partiellement exécuté, \texttt{2} exécuté, \texttt{4} annulé, \texttt{8} rejeté~; LastQty (32) et LastPx (31)
+décrivent la dernière exécution, CumQty (14) et LeavesQty (151) les totaux.
+Une exécution partielle de 2 contrats sur 5 à 5723.25 se lit donc
+\texttt{39=1}, \texttt{32=2}, \texttt{31=5723.25}, \texttt{14=2}, \texttt{151=3}.
+
+La couche session et la couche applicative se rencontrent en un point~: les messages renvoyés. Un rapport d'exécution qui arrive avec PossDupFlag
+peut avoir été traité ou non auparavant (l'original a pu arriver et seul son successeur avoir été perdu). L'application doit donc rendre le traitement idempotent,
+en reconnaissant une exécution déjà enregistrée à son identifiant d'exécution (17), faute de quoi elle enregistre deux fois la même exécution.
+La couche session livre chaque numéro de séquence une seule fois~; elle ne peut pas savoir ce que l'application
+a fait de l'original.
+
+\section{Analyser vite}
+
+\begin{definition}[moteur FIX]\label{def:ll:protocols-i-fix:engine}
+Un \emph{moteur FIX}\index{moteur FIX} est le logiciel qui implémente la couche \omterm{def:ll:protocols-i-fix:session}{session FIX} pour une application~: il encadre et valide les messages entrants,
+tient à jour les numéros de séquence, les \omterm{def:ll:protocols-i-fix:session}{heartbeats} et le stock des messages émis, répond aux \omterm{def:ll:protocols-i-fix:session}{demandes de renvoi}
+et remet les messages applicatifs au programme dans l'ordre.
+\end{definition}
+
+Un analyseur naïf découpe le message sur le SOH, convertit chaque étiquette en entier et copie chaque valeur dans une table associant étiquette et chaîne~: plusieurs allocations
+par champ (chapitre~6), une insertion dans un arbre par champ et une passe par octet. L'analyseur de la construction ne fait rien de tout cela. Il repère chaque délimiteur du message
+avec le balayage vectoriel du chapitre~14, analyse chaque étiquette sur place, et ne consigne pour chaque champ que son étiquette, son décalage et sa longueur dans un tableau de taille fixe~:
+les valeurs restent là où elles sont, dans le tampon de réception, et sont lues comme des vues de chaînes.
+La longueur du corps et la somme de contrôle sont vérifiées dans la même passe.
+
+\omcode{code/firm/fixengine/cpp/firm_fixengine.hpp}{40}{73}{L'analyse sans copie~: les délimiteurs issus du balayage vectoriel, les étiquettes analysées sur place, puis
+l'ordre des champs d'encadrement, la longueur du corps et la somme de contrôle.}\label{lst:ll:protocols-i-fix:parse}
+
+La \Cref{fig:ll:protocols-i-fix:parse} mesure les deux sur des rapports d'exécution d'environ 205 octets. La vue sans copie analyse l'un en
+environ \qty{80}{\nano\second}, soit une douzaine de millions par seconde sur un cœur~; l'analyseur à base de table prend environ \qty{900}{\nano\second},
+onze fois plus~; la référence Python environ \qty{5}{\micro\second}. La construction est symétrique~: le constructeur à tampon fixe, qui écrit lui-même les chiffres
+et calcule la longueur et la somme de contrôle sur place, produit un nouvel ordre en environ \qty{60}{\nano\second}, contre environ
+\qty{330}{\nano\second} pour le même message assemblé par concaténation de chaînes.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11.5cm,height=5.6cm,ybar,bar width=14pt,ymode=log,log origin y=infty,ymin=20,ymax=20000,
+  symbolic x coords={view,map,python,builder,concat},xtick=data,
+  xticklabels={{analyse~:\\ vue sans\\ copie},{analyse~:\\ std::map},{analyse~:\\ référence\\ Python},{construction~:\\ tampon fixe},{construction~:\\ concaté-\\nation}},
+  xticklabel style={align=center,font=\scriptsize},enlarge x limits=0.12,
+  ylabel={ns par message (échelle log)},tick label style={font=\small},label style={font=\small},grid=major,
+  grid style={gray!25},nodes near coords,every node near coord/.append style={font=\scriptsize},
+  point meta=explicit symbolic,table/col sep=comma]
+\addplot[fill=omDef!60,draw=omDef] table[x=key,y=ns_per_msg,meta=ns_per_msg]{figdata/low-latency/15-protocols-i-fix/measured_fix.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Analyse et construction de rapports d'exécution FIX d'environ 205 octets (1\,000 messages distincts, médiane de 40 passes).
+Mesuré sur un portable (Intel Core Ultra 7 155H) sous WSL2, sans cœurs isolés~; C++ avec GCC~11 en \texttt{-O2}, Python
+3.10. Données~: \texttt{bench\_fix.py}.}\label{fig:ll:protocols-i-fix:parse}
+\end{omfigure}
+
+L'analyse ne représente que rarement tout le coût d'une connexion FIX~: la couche session écrit chaque message émis dans son stock, souvent sur disque,
+avant ou après l'envoi, et le moteur de la contrepartie, le réseau et l'appariement prennent bien plus longtemps que \qty{80}{\nano\second}.
+Mais sur une passerelle qui porte tout le flux d'un courtier, ou sur le chemin d'ordres d'un teneur de marché passant par une plateforme qui ne parle que FIX,
+l'écart entre \qty{80}{\nano\second} et une microseconde par message sépare un composant qui disparaît du \omterm{def:ll:where-latency-comes-from:budget}{budget de latence} du chapitre~1
+d'un composant qui en occupe une part.
+
+\section{Où FIX reste utilisé}
+
+FIX est le langage du routage d'ordres entre sociétés~: des systèmes de gestion des ordres (OMS) des sociétés de gestion vers les courtiers,
+des algorithmes des courtiers vers les plateformes, et pour l'accès direct au marché (DMA, livre~1, chapitre~4), où les ordres d'un client
+atteignent la plateforme par l'infrastructure du courtier. Certaines plateformes l'acceptent pour la saisie d'ordres et les drop copy, comme le montre
+l'encadré daté ci-dessous pour l'une d'elles. Là où la vitesse est le produit, les plateformes sont passées à des protocoles binaires aux champs à décalage fixe (chapitre~16),
+et le FIX Trading Community a lui-même normalisé des alternatives binaires~: Simple Binary Encoding pour les messages, et FIXP, un «~protocole point à point léger~»
+pour la session, dont l'introduction cite pour base la couche \omterm{def:ll:protocols-i-fix:session}{session FIX}
+et des protocoles d'échange comme SoupBinTCP. Le moteur à étiquette-valeur reste
+celui dont chaque société de trading a besoin quelque part.
+
+\begin{dated}{2026-09}{La saisie d'ordres FIX aujourd'hui}\label{dat:ll:protocols-i-fix:today}
+Coinbase Exchange documente trois façons de négocier (consulté en septembre 2026)~: une interface REST «~pour un trading à plus faible fréquence~»,
+une interface de saisie d'ordres FIX «~pour un trading à plus haute fréquence~», et les données de marché en FIX et WebSocket. Sa référence FIX
+est FIX 5.0 SP2~; les sessions sont fermées chaque samedi~; et «~resend requests are not supported~»~: chaque connexion ouvre une nouvelle session
+avec de nouveaux numéros de séquence, si bien qu'un client qui perd sa connexion retrouve l'état de ses ordres par d'autres moyens,
+comme les sessions drop copy de la plateforme. La norme de session FIXP a atteint la version 1.0 en avril 2021.
+\end{dated}
+
+\section{Tutoriel~: un moteur FIX en trois langages}\label{tut:ll:protocols-i-fix:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Analyser et construire des messages FIX sans les copier, rejouer une conversation avec un trou à travers la couche session
+en Python et en C++, et mesurer les analyseurs. \textbf{État final~:} la \cref{fig:ll:protocols-i-fix:parse}, la trace du
+\cref{lst:ll:protocols-i-fix:trace}, et des tests au vert en Python, C++ et Rust.
+\begin{tutsteps}
+\item \textbf{Vérifier l'exemple publié.} Les tests décodent le logon de la \cref{fig:ll:protocols-i-fix:anatomy} et trouvent un
+corps de 65 octets et une somme de contrôle de 062, puis modifient un octet (erreur de somme de contrôle) et la longueur déclarée (erreur de longueur de corps).
+\item \textbf{Rejouer la conversation de référence.} \texttt{make\_fix\_fixtures.py} scénarise le côté du courtier (une exécution perdue et un
+\omterm{def:ll:protocols-i-fix:session}{heartbeat} perdu, une \omterm{def:ll:protocols-i-fix:session}{demande de renvoi} du courtier, un courtier silencieux)~; \texttt{firm\_fixengine.replay} fait passer notre session dans cette conversation
+et écrit la trace~; le test C++ fait passer la session C++ par la même conversation et compare sa trace à celle de Python,
+ligne à ligne~; les tests Rust analysent et reconstruisent chaque message, octet par octet.
+\item \textbf{Raccourcir la trace} avec \texttt{python ll\_fix.py}, qui affiche le \cref{lst:ll:protocols-i-fix:trace}.
+\item \textbf{Mesurer} avec \texttt{python bench\_fix.py}~: les analyseurs et constructeurs C++ sur 1\,000 rapports d'exécution,
+et la référence Python sur les mêmes messages.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Supprimer le \omterm{def:ll:protocols-i-fix:session}{comblement de trou} de la réponse du courtier dans la conversation et rejouer celle-ci~: la session
+attend le message 5 indéfiniment. Faire ensuite répondre la session à un message dont l'étiquette n'est pas un nombre par un Reject (35=3).
+\end{tutorial}
+
+\section{Construction~: le moteur FIX}\label{bld:ll:protocols-i-fix:fixengine}
+
+\begin{build}
+\bfield{Rôle} Les connexions FIX de la société~: saisie d'ordres auprès des courtiers et des plateformes où FIX est le protocole, drop copies, et les
+contreparties de test du chapitre~25. La passerelle d'ordres du chapitre~21 utilise son codec pour les plateformes FIX.
+\bfield{Interface} Référence Python \texttt{firm\_fixengine}~: \texttt{checksum}, \texttt{encode}, \texttt{decode},
+\texttt{frame}, \texttt{Session} (\texttt{logon}, \texttt{send}, \texttt{on\_bytes}, \texttt{on\_timer}, \texttt{logout},
+\texttt{trace}), \texttt{replay}. C++20 \texttt{firm::fix}~: \texttt{View::parse}, \texttt{get}, \texttt{frame},
+\texttt{Builder} (\texttt{start}, \texttt{add}, \texttt{finish}), \texttt{Session} avec les mêmes méthodes et la même trace. Rust
+\texttt{firm\_fixengine}~: \texttt{View::parse}, \texttt{get}, \texttt{frame}, \texttt{encode}, \texttt{checksum}.
+\bfield{Règles} L'analyseur ne copie rien et rejette tout message dont les champs de cadrage, la longueur du corps ou la somme de contrôle sont incorrects~; le
+constructeur n'alloue rien~; la session numérote chaque message, conserve chaque message qu'elle envoie, répond aux \omterm{def:ll:protocols-i-fix:session}{demandes de renvoi} par
+des messages applicatifs marqués PossDupFlag et par des \omterm{def:ll:protocols-i-fix:session}{comblements de trou} pour les messages d'administration, retient les messages reçus au-delà d'un trou, et
+met fin à la session sur un numéro de séquence trop bas sans PossDupFlag.
+\bfield{Tests d'acceptation} \texttt{code/firm/fixengine/}~: la longueur du corps et la somme de contrôle de l'exemple publié~; les corruptions de la somme de contrôle,
+de la longueur du corps et de l'ordre des champs détectées~; le cadrage de flux concaténés et partiels~; la trace de la conversation de référence
+reproduite par la référence Python et, ligne à ligne, par la session C++~; chaque message de cette trace analysé et reconstruit
+octet pour octet en Rust~; \omterm{def:ll:protocols-i-fix:session}{heartbeat}, demande de test et délai dépassé~; déconnexion sur un numéro de séquence trop bas~; mode de réinitialisation.
+\bfield{Pour aller plus loin} Un magasin de messages persistant (le journal binaire du chapitre~23), un Reject pour les messages mal formés, des sessions FIXT~1.1
+transportant des messages applicatifs FIX~5.0, et la couche session en Rust.
+\end{build}
+
+\begin{omsources}
+\item FIX Trading Community, dictionnaire des messages et des champs FIX Latest (Extension Pack 312), tel que publié par le
+navigateur Orchimate (champs 7, 8, 9, 10, 16, 34, 35, 36, 43, 49, 52, 56, 108, 112, 123~; messages 0, 1, 2, 4, 5, 8, A, D, 9).
+\item FIX Trading Community, spécification de la \emph{FIX Performance Session Layer (FIXP)} (GitHub, versions 1.0 et 1.1).
+\item Wikipédia, «~Financial Information eXchange~» (historique~; l'exemple travaillé de longueur du corps et de somme de contrôle).
+\item Coinbase Developer Documentation, Exchange FIX API~: connectivity.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:1}
+Calculer la longueur du corps et la somme de contrôle du \omterm{def:ll:protocols-i-fix:session}{heartbeat} \texttt{8=FIX.4.4|9=?|35=0|49=A|56=B|34=2|52=20260925-14:30:00.000|10=?|},
+où \texttt{|} est le SOH, puis vérifier le résultat avec \texttt{firm\_fixengine.encode}.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:2}
+Avec un intervalle de \omterm{def:ll:protocols-i-fix:session}{heartbeat} de 30 secondes et les règles de la construction, le courtier se tait à 10:00:00. Quand la session envoie-t-elle une
+demande de test, et quand déclare-t-elle la connexion morte si rien ne revient~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:protocols-i-fix:3}
+La session attend le numéro de séquence 52 et reçoit 57. Qu'envoie-t-elle, que fait-elle du message 57, et que doit
+renvoyer le courtier~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:4}
+Donner deux messages différents, bien formés, de même longueur et de même somme de contrôle, et expliquer à l'aide de la
+\cref{prop:ll:protocols-i-fix:checksum} pourquoi le protocole accepte ce risque.
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:5}
+Pourquoi les \omterm{def:ll:protocols-i-fix:session}{heartbeats} et les demandes de test sont-ils remplacés par un \omterm{def:ll:protocols-i-fix:session}{comblement de trou} au lieu d'être renvoyés~? Que se passerait-il s'ils étaient renvoyés~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:protocols-i-fix:6}
+Une passerelle reçoit 200\,000 rapports d'exécution par seconde en pointe. À partir des coûts mesurés, quelle fraction d'un cœur représente
+l'analyse avec la vue sans copie, avec l'analyseur fondé sur une table et avec la référence Python~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-i-fix:7}
+\emph{Programmation.} Faire en sorte que les sessions Python et C++ répondent à un message dont l'étiquette n'est pas un nombre par un Reject (35=3) portant
+RefSeqNum (45), sans avancer au-delà de ce message, puis ajouter ce cas à la conversation de référence pour que les deux traces restent concordantes.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:protocols-i-fix:8}
+\emph{Trouver la faille.} «~Pour garder les choses simples, notre moteur remet à 1 les deux numéros de séquence à chaque reconnexion, donc il n'a jamais
+besoin de logique de renvoi.~»
+\end{exercise}
+
+\section{Problème~: le trou du week-end}
+
+\begin{problem}[{Problème du week-end --- resynchronisation après une déconnexion}]\label{pb:ll:protocols-i-fix:1}
+Le moteur d'un courtier conserve dans son magasin les messages d'une session dont la connexion avec nous est coupée, et les renvoie quand
+nous nous reconnectons. Supposer des messages de 205 octets, une liaison de 1~Gb/s avec un aller-retour de \qty{1}{\milli\second}, un intervalle de \omterm{def:ll:protocols-i-fix:session}{heartbeat} de
+30 secondes, et les coûts d'analyse mesurés (\texttt{measured\_fix.csv}). Considérer deux déconnexions~: une déconnexion chargée, une liaison qui
+meurt silencieusement pendant que le courtier envoie 200 rapports d'exécution par seconde, et une déconnexion calme, 48 heures pendant le week-end avec un
+message applicatif par heure et un \omterm{def:ll:protocols-i-fix:session}{heartbeat} chaque fois que 30 secondes s'écoulent sans message.
+
+\medskip\noindent\textbf{Partie I --- La panne chargée.}
+\begin{enumerate}
+\item Combien de temps la session de la construction met-elle à remarquer la liaison morte, et pourquoi~?
+\item Combien de messages le courtier doit-il renvoyer (\texttt{ll\_fix.sender\_stream})~? Combien sont des \omterm{def:ll:protocols-i-fix:session}{heartbeats}~?
+\item Combien d'octets cela représente-t-il, et combien de temps prennent-ils sur le fil~?
+\item Combien de temps la resynchronisation prend-elle avec le moteur C++, et avec la référence Python~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Le week-end calme.}
+\begin{enumerate}[resume]
+\item Combien de messages attendent-ils pour nous dans le magasin du courtier au bout de 48 heures~? Combien sont des messages applicatifs~?
+\item Combien de messages contient la réponse à notre \omterm{def:ll:protocols-i-fix:session}{demande de renvoi}, avec \omterm{def:ll:protocols-i-fix:session}{comblement de trou} et sans~?
+\item Combien de temps la resynchronisation prend-elle avec la référence Python, dans chaque sens~?
+\item Pourquoi le \omterm{def:ll:protocols-i-fix:session}{comblement de trou} ne change-t-il rien dans le cas chargé~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- La conception.}
+\begin{enumerate}[resume]
+\item Pourquoi les messages d'administration ne peuvent-ils jamais être renvoyés tels quels~?
+\item Que doit faire l'application d'un rapport d'exécution renvoyé et marqué PossDupFlag~?
+\item Une plateforme qui ne prend en charge aucune \omterm{def:ll:protocols-i-fix:session}{demande de renvoi} ouvre une nouvelle session à chaque connexion. Comment apprend-on les exécutions qui
+se sont produites pendant qu'on était déconnecté~?
+\item Que doit persister le moteur pour survivre à son propre redémarrage sans trou~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: messages renvoyés et temps de resynchronisation dans les deux cas, avec et sans \omterm{def:ll:protocols-i-fix:session}{comblement de trou}.
+\item Un intervalle de \omterm{def:ll:protocols-i-fix:session}{heartbeat} de 1 seconde aiderait-il le cas chargé~? À quel coût~?
+\item Et si le magasin du courtier ne gardait que ses 10\,000 derniers messages~?
+\item La stratégie doit-elle agir sur les rapports d'exécution renvoyés comme s'ils venaient de se produire~?
+\item Comment tester la logique de renvoi avant de se connecter à un courtier~?
+\item La référence Python peut-elle suivre la session chargée en fonctionnement normal~?
+\item Pour lequel des deux cas faut-il concevoir le moteur~?
+\item En une phrase~: à quoi sert la couche session~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:1}
+Décrivez la structure d'un message FIX. Comment un récepteur sait-il où un message se termine~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:2}
+Décrivez ce qui se passe lorsqu'une \omterm{def:ll:protocols-i-fix:session}{session FIX} détecte un trou dans les numéros de séquence entrants.
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:3}
+Comment écririez-vous un analyseur FIX qui n'alloue pas~? Que renvoie-t-il~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:4}
+À quoi servent les \omterm{def:ll:protocols-i-fix:session}{heartbeats} et les demandes de test, et comment choisiriez-vous l'intervalle de \omterm{def:ll:protocols-i-fix:session}{heartbeat}~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:5}
+Pourquoi beaucoup de plateformes utilisent-elles des protocoles binaires pour la saisie d'ordres plutôt que le tag-value de FIX~? Que sacrifient-elles~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur}]\label{iq:ll:protocols-i-fix:6}
+Votre moteur a redémarré en pleine journée et le courtier vous dit que votre numéro de séquence est trop bas. Que s'est-il passé, et comment
+reprenez-vous sans perdre ni dupliquer d'exécutions~?
+\end{interviewq}

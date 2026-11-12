@@ -1,0 +1,285 @@
+\chapter{Suivi des expériences et reproductibilité}\label{ch:ml:experiment-tracking-and-reproducibility}
+
+Un régulateur demande à un établissement de montrer le modèle qui a servi au trading un matin donné, les données sur lesquelles il a été entraîné et chaque alternative
+à laquelle il a été préféré. L'établissement peut nommer le modèle~; il faut trois semaines pour réentraîner quelque chose de proche, et il ne sait pas dire combien
+d'alternatives il y en avait. Ce chapitre construit les enregistrements qui font de la réponse une requête~: un outil de suivi qui conserve chaque exécution
+avec tout ce qui l'a déterminée, un registre qui indique quel modèle était en production à quel moment et d'où il provient, et une
+\omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} qui ne peut pas être modifiée sans que la modification apparaisse. Sur l'étude du chapitre, 200 exécutions de réglage d'une prévision par boosting, le
+registre reproduit bit à bit le modèle de mars à partir de ses seules fiches~; si l'un quelconque des quatre champs manque, rien de proche
+ne ressort. L'outil de suivi répond aussi à la question que le régulateur n'a pas posée~: en comptant les 200 essais, le ratio de Sharpe en validation du champion
+vaut 2.22, et son ratio de Sharpe déflaté est de 0.15.
+
+\section{Ce qui doit être enregistré}
+
+\begin{definition}[Outil de suivi d'expériences, fiche d'exécution]\label{def:ml:experiment-tracking-and-reproducibility:tracker}
+Un \emph{outil de suivi d'expériences}\index{outil de suivi d'expériences} conserve la trace de chaque exécution d'entraînement lancée par une équipe, y compris les
+celles qui sont abandonnées. Une \emph{fiche d'exécution}\index{fiche d'exécution} rassemble
+tout ce qui détermine le résultat de l'exécution (paramètres, graines, instantané de données, version du code, environnement) et
+tout ce que l'exécution a produit (métriques, artefacts, journaux), avec l'heure et l'auteur.
+\end{definition}
+
+Le journal de recherche du livre~7 (chapitre~1) consignait les essais pour les compter~; l'outil les consigne pour les reconstruire. Dans le chapitre,
+l'outil (le \cref{lst:ml:exp:run}) écrit chaque exécution sous la forme d'un enregistrement JSON dont l'identifiant est le hachage de son contenu, range le modèle ajusté
+une seule fois sous le hachage de son contenu sérialisé (\texttt{firm.workflow} du livre~7), et enregistre l'exécution comme un essai dans
+\texttt{firm.researchlog}. Les horodatages sont fournis en argument, jamais lus sur l'horloge, afin que le contenu de l'outil
+lui-même soit reproductible.
+
+L'étude~: une prévision par \omterm{def:ml:trees-and-boosting:boosting}{gradient boosting} (chapitre~5) des rendements du lendemain, sur un panel synthétique de 40 titres et huit variables sur
+700 jours, entraînée sur les 400 premiers, évaluée par le ratio de Sharpe d'un portefeuille long-short quotidien sur les 150 suivants, et testée sur les
+150 derniers. Deux cents exécutions tirent au hasard cinq paramètres et une graine. Leurs ratios de Sharpe en validation vont de $-3.16$ à 2.22,
+avec une médiane de $-0.83$ (la \cref{fig:ml:exp:sharpes})~: le signal est faible, et la plupart des configurations ajustent du bruit.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.8cm,ybar,bar width=12pt,xlabel={ratio de Sharpe en validation (annualisé)},ylabel={exécutions},
+  tick label style={font=\small},label style={font=\small},xmin=-4,xmax=4,ymin=0,ymax=42,grid=major,grid style={gray!25},
+  table/col sep=comma]
+\addplot[fill=omProp!60,draw=none] table[x=x,y=runs]{figdata/ml/25-experiment-tracking-and-reproducibility/sharpes.csv};
+\addplot[ycomb,omThm,very thick,mark=*,restrict expr to domain={\coordindex}{0:0}] table[x=x,y expr=40]{figdata/ml/25-experiment-tracking-and-reproducibility/marks.csv};
+\addplot[ycomb,black,very thick,dashed,mark=none,restrict expr to domain={\coordindex}{1:1}] table[x=x,y expr=40]{figdata/ml/25-experiment-tracking-and-reproducibility/marks.csv};
+\addplot[ycomb,omDef,very thick,mark=square*,restrict expr to domain={\coordindex}{2:2}] table[x=x,y expr=40]{figdata/ml/25-experiment-tracking-and-reproducibility/marks.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Ratios de Sharpe en validation des 200 exécutions suivies~; cercle~: celui du champion (2.22)~; carré~: son ratio de Sharpe en test
+(0.91)~; tirets~: le maximum espéré de 200 stratégies indépendantes sans compétence sur 150 jours (3.58). Données~:
+\texttt{ml\_track.study}.}\label{fig:ml:exp:sharpes}
+\end{omfigure}
+
+Le ratio de Sharpe en test du champion vaut 0.91, soit moins de la moitié de son chiffre en validation. Son ratio de Sharpe probabiliste, c'est-à-dire la
+probabilité que son ratio de Sharpe réel soit positif comme s'il était la seule exécution, vaut 0.96~; son ratio de Sharpe déflaté (livre~4,
+chapitre~12), avec le nombre d'essais relevé dans l'outil, vaut 0.15. Le meilleur résultat espéré parmi 200 stratégies sans compétence sur 150 jours
+est de 3.58, au-dessus du champion~: la correction est ici conservatrice, car les exécutions sont corrélées et forment moins d'essais indépendants
+que 200, mais un résultat incapable de battre le meilleur de son propre bruit n'a pas mérité la mise en production sur la seule
+preuve issue de la validation.
+
+\section{Versionnage des données, du code et des modèles}
+
+\begin{definition}[Versionnage des données, artefact de modèle]\label{def:ml:experiment-tracking-and-reproducibility:versions}
+Le \emph{versionnage des données}\index{versionnage des données} identifie chaque jeu de données qu'une exécution lit au moyen d'un instantané immuable (un hachage du contenu ou une
+version datée et figée), de sorte que les corrections ultérieures créent de nouvelles versions au lieu de modifier les anciennes. Un \emph{artefact
+de modèle}\index{artefact de modèle} est le résultat stocké d'une exécution d'entraînement, les paramètres ajustés sous une forme portable, identifié par
+son hachage de contenu.
+\end{definition}
+
+Les versions existent parce que les données et le code changent sous un modèle. Dans l'étude, le fournisseur de données révise 1~\% des rendements de mars
+(l'instantané 2026-03 remplace 2026-01), et le code des variables modifie son écrêtage de trois écarts types à deux écarts types et demi
+(v2 remplace v1). Le champion a été entraîné sur 2026-01 avec v1. La fiche le précise~; sans elle, une équipe utiliserait ce qu'elle a sous la main.
+
+\section{Le registre et la piste d'audit}
+
+\begin{definition}[Registre de modèles, lignage du modèle, piste d'audit]\label{def:ml:experiment-tracking-and-reproducibility:registry}
+Un \emph{registre de modèles}\index{registre de modèles} recense les modèles de l'établissement par nom et version, avec leur étape (candidat,
+production, retiré) et l'historique des changements d'étape. Le \emph{lignage du modèle}\index{lignage du modèle} relie une version enregistrée à
+l'exécution, l'instantané des données et le code qui l'a produite. Une \emph{piste d'audit}\index{piste d'audit} est un journal d'actions
+en ajout seul (enregistrements, promotions, dérogations) indiquant qui, quand et pourquoi, protégé contre les modifications silencieuses~; ici chaque entrée porte le hachage
+de la précédente (le \cref{lst:ml:exp:audit}).
+\end{definition}
+
+\begin{dated}{2026-09}{Conservation des traces des modifications du trading algorithmique dans l'UE}\label{dat:ml:experiment-tracking-and-reproducibility:rts6}
+Commission Delegated Regulation (EU) 2017/589 (les normes techniques de réglementation relatives aux exigences organisationnelles
+du trading algorithmique, appelées RTS~6) oblige une société d'investissement à «~conserver les traces de toute modification substantielle apportée au logiciel
+utilisé pour le trading algorithmique~», ce qui lui permet de déterminer quand une modification a été faite, qui l'a faite, qui l'a approuvée et quelle en est la nature
+(article~5(7))~; les registres d'ordres des traders HFT sont conservés pendant cinq ans (article~28).
+\end{dated}
+
+Le registre répond à la première question du régulateur en fonction de la date (le \cref{lst:ml:exp:asof})~: la version en production le matin
+du 10 mars se retrouve à partir de l'historique des étapes, et son lignage mène à la \omterm{def:ml:experiment-tracking-and-reproducibility:tracker}{fiche d'exécution}. La \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} répond à «~qui l'a promue,
+et pourquoi~»~: la version 1 de \texttt{xs-gbdt}, promue le 2 mars comme champion de 200 exécutions.
+Modifier un seul caractère de n'importe quelle ligne de la piste rompt la chaîne de hachage à cette ligne.
+
+\section{Reproduire un modèle, et quand le bit à bit est trop exigeant}
+
+À partir de la seule entrée du registre, le chapitre relance l'entraînement (le \cref{lst:ml:exp:repro}) et obtient un modèle dont la sérialisation a le
+même hachage de contenu que l'artefact stocké~: bit à bit, le modèle qui a servi au trading. Il retire ensuite un champ de la fiche à la
+fois et le remplace par ce qu'une équipe supposerait sans ce champ (le \cref{tab:ml:exp:ablation}). Chaque retrait casse la reproduction, et
+aucun n'est anodin~: les ratios de Sharpe en test des modèles reproduits s'écartent de ceux de l'original de $-1.28$ avec les paramètres par défaut,
+$-1.25$ avec les données révisées, $-0.44$ avec le code actuel des variables, et $+0.85$ avec la graine par défaut.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.6cm}>{\raggedright\arraybackslash}p{4.6cm}>{\centering\arraybackslash}p{2.4cm}>{\centering\arraybackslash}p{3.4cm}@{}}
+\toprule
+champ manquant & valeur supposée à la place & reproduit bit à bit & variation du ratio de Sharpe en test\\
+\midrule
+aucun (la fiche du registre) & & oui & 0\\
+paramètres & valeurs par défaut de l'établissement & non & $-1.28$\\
+graine & 1 & non & $+0.85$\\
+instantané de données & la plus récente (2026-03) & non & $-1.25$\\
+version du code & la version courante (v2) & non & $-0.44$\\
+\bottomrule
+\end{tabular}
+\caption{Reproduction du modèle de production à partir de sa fiche, chaque champ étant tour à tour remplacé par une hypothèse. Données~:
+\texttt{ml\_track.reproduction}.}\label{tab:ml:exp:ablation}
+\end{table}
+
+La ligne de la graine apporte un second enseignement~: une graine différente pour une même configuration fait varier le ratio de Sharpe du test de 0.85, soit autant que
+l'écart entre deux configurations. Un résultat qui ne résiste pas à un changement de graine n'était pas un résultat, et rendre compte
+de la fourchette sur les graines (chapitre~7) fait partie de ce qu'un outil de suivi permet.
+
+Reproduire le modèle à l'identique, bit pour bit, est la bonne norme pour l'artefact propre d'un modèle, reconstruit sur le même logiciel et le même matériel~; les ajustements du chapitre
+sont déterministes parce que LightGBM tourne sur un seul fil avec son option déterministe. D'une version de bibliothèque à l'autre, d'un nombre de fils
+ou d'un matériel à l'autre (le \omterm{def:ml:training-infrastructure:mixed}{bfloat16} du chapitre~23), les sommes en virgule flottante changent d'ordre et les bits changent~; la norme est alors statistique~:
+les mêmes métriques, à l'intérieur de la fourchette sur les graines, vérifiées en relançant le calcul. Ce qui doit toujours être exact, c'est la fiche~: les données, le code,
+les paramètres et la graine qui ont produit l'artefact.
+
+\begin{method}[Suivre la recherche qui trade]\label{met:ml:exp:method}
+\begin{enumerate}
+\item Enregistrer chaque exécution, y compris celles qui ont été abandonnées, avec ses paramètres, sa graine, son instantané de données, sa version du code et son environnement, et
+stocker les artefacts par empreinte de contenu.
+\item Prendre le nombre d'essais pour la déflation dans l'outil de suivi, et non de mémoire.
+\item Enregistrer les modèles en production avec leur lignage et l'historique de leurs étapes~; ne les promouvoir et ne les retirer que par le registre, avec les motifs consignés dans
+une \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} en ajout seul.
+\item Tester la reproduction à partir du seul registre, régulièrement, et traiter tout échec comme un incident.
+\end{enumerate}
+\end{method}
+
+\section{Tutoriel~: reproduire le modèle de mars}\label{tut:ml:experiment-tracking-and-reproducibility:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Suivre 200 exécutions de calibration, enregistrer et promouvoir le champion, le retrouver à partir de sa date, le reproduire bit pour bit, puis casser
+la reproduction champ par champ. \textbf{État final~:} la \cref{fig:ml:exp:sharpes} et le \cref{tab:ml:exp:ablation}.
+\begin{tutsteps}
+\item \textbf{Une \omterm{def:ml:experiment-tracking-and-reproducibility:tracker}{fiche d'exécution}.}
+\omcode{code/firm/exptrack/firm_exptrack.py}{73}{85}{Enregistrement d'une exécution~: artefact par empreinte de contenu, fiche par sa propre empreinte, essai dans le journal de recherche.}\label{lst:ml:exp:run}
+\item \textbf{Une \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} en ajout seul.}
+\omcode{code/firm/exptrack/firm_exptrack.py}{48}{64}{Entrées d'audit chaînées par hachage et leur vérification.}\label{lst:ml:exp:audit}
+\item \textbf{Le modèle en production à une date donnée.}
+\omcode{code/firm/exptrack/firm_exptrack.py}{134}{144}{Interrogation du registre à un instant donné.}\label{lst:ml:exp:asof}
+\item \textbf{Reproduction.}
+\omcode{code/firm/exptrack/firm_exptrack.py}{151}{155}{Nouvelle exécution à partir d'une fiche et comparaison des empreintes.}\label{lst:ml:exp:repro}
+\item \textbf{Lancer} \texttt{ml\_track.summary()}, \texttt{reproduction()}, \texttt{null\_max()} et \texttt{fig\_track.py}
+(environ 45 secondes sur un seul cœur).
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Estimer le nombre effectif d'essais indépendants à partir de la corrélation des rendements de validation des exécutions
+puis recalculer le ratio de Sharpe déflaté avec ce nombre.
+\end{tutorial}
+
+\section{Construction~: suivi des expériences}\label{bld:ml:experiment-tracking-and-reproducibility:exptrack}
+
+\begin{build}
+\bfield{Rôle} Chaque modèle que la société trade est traçable jusqu'à son exécution, ses données et son code, et peut être reconstruit à partir d'eux.
+\bfield{Interface} \texttt{Tracker(root, log, family)} avec \texttt{run}, \texttt{get}, \texttt{artefact}, \texttt{runs},
+\texttt{best}~; \texttt{Registry(root, audit)} avec \texttt{register}, \texttt{promote}, \texttt{current}, \texttt{as\_of},
+\texttt{lineage}~; \texttt{AuditTrail(path)} avec \texttt{append} et \texttt{verify}~; \texttt{reproduce(record, train)}~; sur
+\texttt{firm.workflow} et \texttt{firm.researchlog}.
+\bfield{Règles} Les fiches ne sont écrites qu'une fois~; les artefacts sont adressés par leur contenu~; l'horloge n'entre jamais dans une fiche, sauf
+sous la forme d'un horodatage fourni~; les promotions sont accompagnées de motifs.
+\bfield{Tests d'acceptation} \texttt{code/firm/exptrack/tests/}~: des exécutions identiques partagent un artefact~; le registre renvoie la version
+en production à une date passée~; promouvoir une nouvelle version retire l'ancienne~; une ligne d'audit falsifiée est détectée~; la reproduction réussit
+à partir d'une fiche complète et échoue lorsqu'un champ change.
+\bfield{Pour aller plus loin} Capture de l'environnement (versions des paquets, matériel) et un contrôle qui refuse de reproduire dans un environnement
+différent~; instantanés de données sur \texttt{firm.pit}.
+\end{build}
+
+\begin{omsources}
+\item J.~Pineau et coauteurs, ``Improving reproducibility in machine learning research (a report from the NeurIPS 2019
+reproducibility program)'', arXiv:2003.12206, 2020.
+\item O.~E.~Gundersen et S.~Kjensmo, ``State of the art: reproducibility in artificial intelligence'', \emph{AAAI}, 2018.
+\item Commission Delegated Regulation (EU) 2017/589 du 19 juillet 2016 (RTS~6), \emph{Official Journal of the European Union}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ml:experiment-tracking-and-reproducibility:1}
+Lister les cinq champs d'une \omterm{def:ml:experiment-tracking-and-reproducibility:tracker}{fiche d'exécution} qui déterminent son résultat, et une chose que chacun peut modifier à son insu.
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:experiment-tracking-and-reproducibility:2}
+Pourquoi l'identifiant d'une exécution est-il l'empreinte de sa fiche plutôt qu'un compteur ou un horodatage~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ml:experiment-tracking-and-reproducibility:3}
+Que signifie le ratio de Sharpe déflaté de 0.15, et pourquoi diffère-t-il du ratio de Sharpe probabiliste de 0.96~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:experiment-tracking-and-reproducibility:4}
+Pourquoi le maximum espéré de 200 ratios de Sharpe nuls est-il une référence trop sévère pour ces 200 exécutions~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:experiment-tracking-and-reproducibility:5}
+Comment une chaîne de hachage rend-elle une \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} détectable en cas de falsification, et que ne protège-t-elle pas~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ml:experiment-tracking-and-reproducibility:6}
+\emph{Trouver la faille.} «~Nous sauvegardons les poids de chaque modèle en production, donc nous pouvons toujours reproduire nos modèles.~»
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:experiment-tracking-and-reproducibility:7}
+\emph{Programmation.} Réentraîner la configuration du champion avec dix graines différentes et rendre compte de la fourchette des ratios de Sharpe du test.
+Que dit-elle du champion~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ml:experiment-tracking-and-reproducibility:8}
+Concevoir ce que le registre et la \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit} doivent contenir pour qu'une société respecte la consignation des modifications substantielles prévue par le RTS~6 pour un modèle
+réentraîné chaque semaine.
+\end{exercise}
+
+\section{Problème~: reproduire le modèle de mars}
+
+\begin{problem}[{Problème du week-end --- le modèle qui a tradé}]\label{pb:ml:experiment-tracking-and-reproducibility:1}
+Les 200 exécutions du chapitre, le registre et la \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit}.
+
+\medskip\noindent\textbf{Partie I --- L'étude.}
+\begin{enumerate}
+\item Que contient la fiche de chaque exécution~?
+\item Quelle est la distribution des ratios de Sharpe de validation, et quels sont les chiffres du champion~?
+\item Quels sont ses ratios de Sharpe probabiliste et déflaté~?
+\item Quel est le meilleur espéré de 200 stratégies nulles, et pourquoi est-il supérieur au champion~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Versions et registre.}
+\begin{enumerate}[resume]
+\item Qu'est-ce qui a changé dans les données et le code après l'entraînement du champion~?
+\item Comment retrouve-t-on le modèle en production le 10 mars~?
+\item Que consigne la \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{piste d'audit}, et comment détecte-t-on une altération~?
+\item Que impose le RTS~6 à la société en matière d'enregistrement~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Reproduction.}
+\begin{enumerate}[resume]
+\item Que se passe-t-il lorsque le modèle est reconstruit à partir de sa fiche~?
+\item Que se passe-t-il lorsque chaque champ est absent~?
+\item Que montre la ligne de la graine~?
+\item Quand la reproduction bit à bit est-elle la mauvaise norme~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le nombre d'essais derrière le champion et son ratio de Sharpe déflaté, ainsi que le champ dont
+l'absence a fait échouer la reproduction.
+\item Auriez-vous promu le champion~? Qu'auriez-vous demandé~?
+\item Comment répondriez-vous à la demande du régulateur avec ces outils, et combien de temps cela prendrait-il~?
+\item Que faudrait-il ajouter au suivi pour satisfaire une règle de conservation de cinq ans~?
+\item Comment le suivi doit-il compter les essais qui ont été menés mais jamais enregistrés~?
+\item Que doit contenir le registre pour un modèle réentraîné automatiquement chaque semaine~?
+\item Qui doit être autorisé à promouvoir un modèle~?
+\item En une phrase~: que faut-il pour reproduire un modèle~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{ingénieur ML}]\label{iq:ml:experiment-tracking-and-reproducibility:1}
+Que enregistre un \omterm{def:ml:experiment-tracking-and-reproducibility:tracker}{outil de suivi d'expériences}, et pourquoi enregistrer les exécutions échouées~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:experiment-tracking-and-reproducibility:2}
+Comment rendez-vous un entraînement reproductible bit pour bit~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{chercheur}]\label{iq:ml:experiment-tracking-and-reproducibility:3}
+Comment le nombre d'essais modifie-t-il la signification du ratio de Sharpe d'un backtest~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:experiment-tracking-and-reproducibility:4}
+Concevez un \omterm{def:ml:experiment-tracking-and-reproducibility:registry}{registre de modèles} pour une société de trading. Quelles étapes et quels champs doit-il comporter~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{ingénieur ML, développeur}]\label{iq:ml:experiment-tracking-and-reproducibility:5}
+Pourquoi versionner les données, et comment versionneriez-vous un jeu de données corrigé a posteriori~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{ingénieur ML}]\label{iq:ml:experiment-tracking-and-reproducibility:6}
+Votre modèle en production ne peut pas être reproduit. Décrivez l'enquête pas à pas.
+\end{interviewq}

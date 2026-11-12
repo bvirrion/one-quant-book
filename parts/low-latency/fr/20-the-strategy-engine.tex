@@ -1,0 +1,340 @@
+\chapter{Le moteur de stratégies}\label{ch:ll:the-strategy-engine}
+
+Exécutez deux fois la même stratégie de cotation sur la même journée enregistrée et comparez ce qu'elle a envoyé. Si un composant horodate ses ordres
+par l'horloge murale, les deux exécutions ne concordent jamais~: cent relances donnent cent sorties différentes. Si un autre conserve ses cotations
+dans un ensemble de hachage dont la graine est tirée au démarrage et les parcourt dans l'ordre de l'ensemble, 93 relances sur cent diffèrent. Si deux
+threads alimentent sa file, 49 diffèrent. Supprimez les trois sources et les cent exécutions concordent jusqu'au dernier bit~; dès lors, tout bogue observé en
+production peut être rejoué sur un poste de travail. Ce chapitre construit le composant qui fait tourner les stratégies de la société~: un thread unique
+qui traite les événements de marché, les comptes rendus d'ordres, les temporisateurs et les changements de paramètres un à un, chacun jusqu'à complétion, dans un ordre
+fixé par des règles et non par le système d'exploitation, avec un temps injecté plutôt que lu, et sans rien sur son chemin critique (hot path) qui
+puisse attendre, allouer ou varier.
+
+\section{La boucle d'événements}
+
+\begin{definition}[Boucle d'événements, traitement jusqu'à complétion]\label{def:ll:the-strategy-engine:loop}
+Une \emph{boucle d'événements}\index{boucle d'événements} est un thread qui prend de façon répétée l'événement suivant parmi ses entrées et le confie au code
+qui le traite. Le \emph{traitement jusqu'à complétion}\index{traitement jusqu'à complétion} (run-to-completion) traite chaque événement entièrement, y compris
+tout ce qu'il provoque, avant de prendre l'événement suivant~: aucun gestionnaire n'est interrompu par un autre, de sorte qu'un gestionnaire ne voit jamais un état
+qu'un autre aurait modifié à moitié.
+\end{definition}
+
+Les entrées du moteur sont les anneaux du chapitre~12~: les événements de marché venant du \omterm{def:ll:the-feed-handler:handler}{feed handler} (par l'intermédiaire du \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet}
+du chapitre~19), les comptes rendus de la passerelle d'ordres (chapitre~21) et les messages de contrôle~; ses propres temporisateurs proviennent d'une \omterm{def:ll:the-strategy-engine:wheel}{roue de temporisateurs}. Ses
+sorties vont à l'anneau de la passerelle et au journal. Un seul thread possède tout l'état de la stratégie, si bien qu'aucun verrou n'est nécessaire, et
+l'ordre de traitement des événements est fixé par une seule règle~: avant de traiter un événement de temps $t$, tous les temporisateurs échus à
+$t$ ou avant se déclenchent, dans l'ordre des dates puis des identifiants~; les changements de paramètres prenant effet à $t$ ou avant sont appliqués~; puis
+l'événement. La \Cref{fig:ll:the-strategy-engine:loop} en donne le schéma, et le \cref{lst:ll:the-strategy-engine:run} présente la boucle entière.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\footnotesize,box/.style={draw,rounded corners=2pt,minimum height=0.7cm,align=center,inner sep=3pt},
+  >=Stealth]
+\node[box,fill=omDef!15] (mkt) at (0,1.2) {événements de marché\\ (constructeur de carnet)};
+\node[box,fill=omDef!15] (rep) at (0,0) {comptes rendus d'ordres\\ (passerelle)};
+\node[box,fill=omDef!15] (ctl) at (0,-1.2) {instantanés\\ de paramètres};
+\node[box,fill=omMeth!15] (wheel) at (3.6,-2.5) {roue de temporisateurs};
+\node[box,fill=omThm!12,minimum width=4.2cm,minimum height=2.4cm] (loop) at (4.6,0) {};
+\node[align=center] at (4.6,0.7) {\textbf{un seul thread}};
+\node[align=left,font=\scriptsize,anchor=north] at (4.6,0.35) {1. temporisateurs échus à $t$\\ 2. paramètres effectifs à $t$\\ 3. l'événement en $t$};
+\node[box,fill=omDef!15] (gw) at (9.0,0.6) {ordres\\ (anneau de la passerelle)};
+\node[box,fill=gray!10] (log) at (9.0,-0.6) {journal};
+\draw[->] (mkt) -- (loop);
+\draw[->] (rep) -- (loop);
+\draw[->] (ctl) -- (loop);
+\draw[->] (wheel.north) -- (wheel.north |- loop.south);
+\draw[->,dashed] ([xshift=0.9cm]loop.south) |- node[pos=0.25,right,font=\scriptsize]{planification} (wheel.east);
+\draw[->] (loop) -- (gw);
+\draw[->] (loop) -- (log);
+\node[font=\scriptsize,align=left,anchor=west] at (7.4,-2.0) {horloge~: injectée\\ (simulée ou réelle)};
+\end{tikzpicture}
+
+\omcaption{Le moteur de stratégies. Toutes les entrées atteignent un seul thread, qui traite chaque événement jusqu'à complétion dans un ordre fixé par
+une règle~: les temporisateurs échus à l'heure de l'événement, puis les paramètres en vigueur à ce moment, puis l'événement. Le temps est celui de l'horloge
+donnée au moteur~: celui d'une journée enregistrée en rejeu, celui de la machine en temps réel.}\label{fig:ll:the-strategy-engine:loop}
+\end{omfigure}
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{128}{136}{La boucle d'événements~: temporisateurs d'abord, puis paramètres, puis
+l'événement, chacun traité jusqu'à complétion.}\label{lst:ll:the-strategy-engine:run}
+
+La conception est ancienne et volontairement sobre. La plateforme de courtage dont Martin Fowler a décrit l'architecture en 2011 faisait tourner sa
+logique métier sur un seul thread, en mémoire, avec un état «~entièrement dérivable du traitement des événements d'entrée~» conservé dans un
+stockage durable~; et parce que «~la logique métier est déterministe~», ses sorties n'avaient même pas besoin d'être stockées. Un moteur de stratégies
+en retire les deux mêmes avantages~: la vitesse, car un thread unique dont les données se trouvent dans ses propres caches ne se coordonne avec
+personne, et le rejeu, car les mêmes entrées dans le même ordre produisent les mêmes sorties.
+
+\section{Déterminisme monothread}
+
+Un programme est reproductible bit à bit (la reproductibilité bit à bit du livre~4, chapitre~25) seulement dans son ensemble, et chacune
+de ses parties peut le rompre. La \Cref{fig:ll:the-strategy-engine:reruns} chiffre les dégâts sur le petit moteur de cotation de la construction, exécuté cent fois comme un nouveau
+processus sur les mêmes 6\,000 événements enregistrés, en n'activant qu'une source de non-déterminisme à la fois.
+
+\begin{itemize}
+\item \emph{Une lecture de l'horloge murale}, ici pour horodater chaque action et dater ses cotations~: chaque exécution lit des heures différentes, si bien que
+cent exécutions donnent cent sorties. Toute décision qui compare le temps réel à quelque chose (l'âge d'une cotation, un délai d'expiration) fait
+remonter la différence jusqu'aux ordres eux-mêmes.
+\item \emph{Parcours d'un conteneur de hachage avec une graine propre au processus}~: le moteur conserve ses dix cotations dans un ensemble de hachage dont la fonction de hachage
+est initialisée au démarrage et les recote dans l'ordre de l'ensemble, si bien que les identifiants et l'ordre des actions suivent la graine.
+La table de hachage standard de Rust fait exactement cela par construction (son algorithme «~est initialisé aléatoirement~»)~; 93 relances sur cent
+diffèrent.
+\item \emph{Deux threads alimentant une même file}, chacun en portant la moitié des événements~: l'ordre dans lequel le consommateur les voit dépend
+de l'ordonnancement, le carnet passe par des états qui n'ont jamais existé, et 49 relances sur cent diffèrent.
+\end{itemize}
+
+Désactivées, les trois sources donnent une seule sortie sur cent relances~; il en va de même pour le moteur de la société. Les règles qui le garantissent sont peu nombreuses. Le temps
+provient des événements, par une \omterm{def:ll:the-strategy-engine:wheel}{horloge injectée} (section suivante). Les conteneurs parcourus ont un ordre défini~: tableaux,
+tables ordonnées, ou tables de hachage dont l'ordre ne décide de rien. Un seul thread possède l'état~; les autres threads ne font que transmettre des données
+par les anneaux, et la fusion de plusieurs entrées suit une règle (par temps, puis par source, puis par numéro de séquence), et non l'ordre
+d'arrivée. Les sommes en virgule flottante se font dans un ordre fixé (chapitre~8), et la stratégie d'exemple reste en entiers, ce qui explique aussi que
+les moteurs C++ et Rust de la construction produisent le même condensat de sortie.
+
+\begin{omfigure}
+\begin{tikzpicture}
+\begin{axis}[width=11cm,height=5.4cm,ybar,bar width=16pt,ymin=0,ymax=115,
+  symbolic x coords={firm,none,wall_clock,hash_order,two_threads,all},xtick=data,
+  xticklabels={{moteur de\\ la société},{sans\\ défaut},{horloge\\ murale},{ordre de\\ hachage\\ à graine},{deux\\ threads},{les\\ trois}},
+  xticklabel style={align=center,font=\footnotesize},enlarge x limits=0.1,ylabel={sorties distinctes sur 100 relances},
+  tick label style={font=\small},label style={font=\small},grid=major,grid style={gray!25},
+  nodes near coords,every node near coord/.append style={font=\scriptsize},table/col sep=comma]
+\addplot[fill=omThm!45,draw=omThm] table[x=key,y=distinct]{figdata/low-latency/20-the-strategy-engine/measured_nondet.csv};
+\end{axis}
+\end{tikzpicture}
+
+\omcaption{Nombre de condensats de sortie distincts sur cent relances (chacune un nouveau processus) des mêmes 6\,000 événements enregistrés, pour le moteur de la société
+et pour le petit moteur de \texttt{ll\_nondet.hpp} avec chaque source de non-déterminisme activée. Mesuré sur un ordinateur portable
+(Intel Core Ultra 7 155H) sous WSL2. Données~: \texttt{bench\_engine.py}.}\label{fig:ll:the-strategy-engine:reruns}
+\end{omfigure}
+
+\section{Temporisateurs et horloge injectée}
+
+\begin{definition}[Roue de temporisateurs, horloge injectée]\label{def:ll:the-strategy-engine:wheel}
+Une \emph{roue de temporisateurs}\index{roue de temporisateurs} est un tableau circulaire de cases, chacune couvrant un intervalle de temps (sa granularité)~: un
+temporisateur est rangé dans la case de son instant d'échéance modulo l'étendue de la roue, et faire avancer la roue visite les cases du temps
+écoulé et déclenche les temporisateurs qui y sont échus~; programmer un temporisateur coûte un temps constant quel que soit leur nombre. Une \emph{horloge
+injectée}\index{horloge injectée} est une horloge passée au code qui a besoin du temps, au lieu d'être lue par lui~: le même code tourne
+sur l'horloge simulée d'une journée enregistrée (livre~7, chapitre~17) ou sur l'horloge réelle de la machine.
+\end{definition}
+
+Une stratégie est pleine de temporisateurs~: un ordre qui doit être acquitté dans un délai, une cotation qui doit être retirée si les données de marché
+s'arrêtent, un rafraîchissement toutes les quelques secondes, un \omterm{def:ll:protocols-i-fix:session}{heartbeat}. Une file de priorité suffirait, à un coût logarithmique par temporisateur~; la \omterm{def:ll:the-strategy-engine:wheel}{roue de temporisateurs} à hachage
+de Varghese et Lauck (1987) le fait en temps constant, ce qui compte lorsque chaque ordre programme et annule des temporisateurs.
+La roue du build compte 1\,024 cases de \qty{100}{\micro\second}~: un temporisateur va dans la case $\lfloor t/100\,\mu\text{s}\rfloor \bmod 1\,024$,
+et un temporisateur plus éloigné que l'étendue de la roue, soit environ \qty{0.1}{\second}, reste simplement dans sa case jusqu'à ce que son heure revienne.
+Deux détails la rendent déterministe~: les temporisateurs échus dans une case se déclenchent triés par instant puis par identifiant, jamais
+dans l'ordre d'insertion~; et un temporisateur programmé pendant qu'un autre se déclenche, s'il est échu dans la même case, se déclenche au même passage.
+
+\begin{omfigure}
+\begin{tikzpicture}[font=\scriptsize,>=Stealth]
+\foreach \i in {0,...,15} {
+  \pgfmathsetmacro{\a}{90 - 22.5*\i}
+  \pgfmathtruncatemacro{\busy}{(\i==2)||(\i==3)||(\i==7)||(\i==12)}
+  \ifnum\busy=1 \draw[fill=omMeth!25,draw=omMeth] (\a+11.25:1.4) arc (\a+11.25:\a-11.25:1.4) -- (\a-11.25:2.3) arc (\a-11.25:\a+11.25:2.3) -- cycle;
+  \else \draw[fill=gray!6,draw=gray!50] (\a+11.25:1.4) arc (\a+11.25:\a-11.25:1.4) -- (\a-11.25:2.3) arc (\a-11.25:\a+11.25:2.3) -- cycle; \fi
+  \node at (\a:1.85) {\i};
+}
+\draw[->,very thick,omThm] (0,0) -- (45:1.35);
+\node[align=center] at (0,-0.35) {maintenant~: case 2};
+\node[anchor=west,align=left] at (2.9,1.4) {case $= \lfloor t / g \rfloor \bmod 16$ ($g$~: granularité)};
+\node[anchor=west,align=left] at (2.9,0.7) {case 3~: acquittement de la cotation 41 à $t_0 + 50\,\mu$s;\\ contrôle de péremption à $t_0 + 20$ ms};
+\node[anchor=west,align=left] at (2.9,-0.2) {avancer à $t$~: visiter les cases 2, 3, \dots\ jusqu'à celle de $t$,\\ déclencher les temporisateurs échus avant $t$ dans l'ordre (instant, identifiant)~;};
+\node[anchor=west,align=left] at (2.9,-1.1) {un temporisateur à plus d'un tour\\ (le contrôle de péremption) attend dans sa case};
+\end{tikzpicture}
+
+\omcaption{Une \omterm{def:ll:the-strategy-engine:wheel}{roue de temporisateurs} à hachage de 16 cases (celle du build en compte 1\,024 de \qty{100}{\micro\second}). Programmer place un temporisateur
+dans la case de son instant d'échéance~; avancer visite les cases franchies et ne déclenche que les temporisateurs échus, triés~; un temporisateur situé au-delà
+d'un tour reste dans sa case jusqu'à ce que son heure revienne.}\label{fig:ll:the-strategy-engine:wheel}
+\end{omfigure}
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{82}{101}{Faire avancer la roue~: visiter les cases franchies, déclencher les temporisateurs
+échus, triés par instant puis par identifiant.}\label{lst:ll:the-strategy-engine:wheel}
+
+La roue ne connaît aucune horloge. Elle est avancée à l'instant de chaque événement, et le code du moteur demande à une \omterm{def:ll:the-strategy-engine:wheel}{horloge injectée} l'heure~:
+l'horloge simulée rend l'instant de l'événement, l'horloge réelle lit \texttt{CLOCK\_MONOTONIC} (chapitre~5) et la projette sur la
+journée. Rejouer une journée avec l'horloge simulée donne, événement par événement, ce que le moteur en direct aurait fait avec les mêmes entrées
+aux mêmes instants~; l'horloge réelle ne sert qu'en direct, et seulement là.
+
+\omcode{code/firm/stratengine/cpp/firm_stratengine.hpp}{46}{58}{Les deux horloges que le moteur peut recevoir.}\label{lst:ll:the-strategy-engine:clock}
+
+\section{Configuration et paramètres à l'exécution}
+
+\begin{definition}[Instantané de paramètres]\label{def:ll:the-strategy-engine:snapshot}
+Un \emph{instantané de paramètres} est un ensemble complet et versionné des paramètres d'une stratégie, qui prend effet à un instant déclaré, entre
+deux événements et jamais pendant un événement~; chaque action que la stratégie accomplit enregistre la version des paramètres sous lesquels elle a été accomplie.
+\end{definition}
+
+Les traders modifient les paramètres au cours de la journée~: une fourchette plus large avant une annonce, une taille plus petite sur un marché mince. Modifier un champ d'une
+structure vivante depuis un autre fil pendant que le moteur la lit est une \omterm{def:ll:rust-for-low-latency:race}{course aux données} (data race, chapitre~11), et même une mise à jour atomique correcte d'un
+seul champ laisse un instant où la moitié des paramètres sont neufs. Le build applique des instantanés entiers, dans la boucle, entre les événements~:
+le chemin de contrôle publie un instantané assorti d'un instant d'effet sur l'anneau de contrôle du moteur, et la boucle l'installe avant le
+premier événement à cet instant ou après. La version estampillée sur chaque action indique quels paramètres l'ont produite, et en rejeu les
+instantanés sont des entrées comme les autres événements~: le test du build en applique un à mi-journée et vérifie que chaque action
+antérieure est inchangée et que chaque action ultérieure porte la nouvelle version.
+
+\section{Discipline du chemin critique}
+
+Le chemin critique (hot path) du chapitre~1 traverse ce fil, et il est discipliné par des règles que les chapitres précédents ont mesurées. Aucune
+allocation par événement (chapitre~6)~: le test du build compte les allocations de tas pendant que le moteur rejoue sa fixture et n'en trouve aucune,
+parce que le journal des actions, les cases de la roue et le carnet sont dimensionnés au démarrage. Aucun appel système~: l'horloge simulée est un champ,
+et même l'horloge réelle se lit par le vDSO (chapitre~5). Aucun verrou ni aucune attente~: les entrées et les sorties sont des anneaux, et un
+anneau de sortie plein est une erreur à signaler, non une raison d'attendre. Aucune mise en forme de texte~: le journal reçoit des enregistrements binaires (chapitre~23). Aucun
+travail non borné dans un gestionnaire~: le travail de la roue est borné par les cases franchies, celui du carnet par sa structure.
+
+Le résultat sur le portable~: le moteur prend environ \qty{53}{\nano\second} par événement en médiane sur le flux à grand tick du
+chapitre~18, mise à jour du carnet comprise, et environ \qty{57}{\nano\second} sur celui à petit tick où il recote à presque chaque
+événement~; le p99 est d'environ \qty{130}{\nano\second} et \qty{200}{\nano\second}. Une décision en dizaines de nanosecondes laisse le
+\omterm{def:ll:where-latency-comes-from:budget}{budget de latence} au réseau et à la passerelle.
+
+\section{Tutoriel~: rejouer une journée, puis la casser}\label{tut:ll:the-strategy-engine:tut}
+
+\begin{tutorial}
+\textbf{Objectif.} Rejouer une entrée enregistrée dans le moteur jusqu'à obtenir la même sortie à chaque fois, puis activer chaque source de
+non-déterminisme et compter les issues. \textbf{État final~:} la \cref{fig:ll:the-strategy-engine:reruns}, le temps du moteur par
+événement, et des tests au vert en C++ et en Rust.
+\begin{tutsteps}
+\item \textbf{Rejeu.} Le test C++ fait tourner le moteur deux fois sur la fixture à petit tick du \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} et compare les
+empreintes de sortie, les actions et le profit, puis les confronte à \texttt{data/expected.txt}~; le moteur Rust, écrit selon les
+mêmes règles, reproduit la même empreinte.
+\item \textbf{Modifier les paramètres à mi-parcours} avec un instantané, et vérifier que seules les actions qui suivent changent.
+\item \textbf{Compter les zéros~:} le test compte les allocations de tas pendant le rejeu.
+\item \textbf{Casser le système} avec \texttt{python bench\_engine.py}~: cent nouveaux processus par configuration de \texttt{ll\_nondet},
+chacun affichant son empreinte de sortie, puis les empreintes distinctes sont comptées.
+\end{tutsteps}
+\textbf{Pour aller plus loin.} Remplacer l'ensemble de hachage à graine du petit moteur par un ensemble à graine fixe et recompter~; faire passer les
+événements des deux fils par une fusion par horodatage au lieu d'une file partagée.
+\end{tutorial}
+
+\section{Construction~: le moteur de stratégie}\label{bld:ll:the-strategy-engine:stratengine}
+
+\begin{build}
+\bfield{Rôle} Le fil sur lequel tournent les stratégies de la firme~: il consomme la vue du \omterm{def:ll:the-order-book-builder:builder}{constructeur de carnet} (chapitre~19), envoie des ordres
+par la passerelle (chapitre~21) en passant la barrière de risque (chapitre~22), et journalise tout ce qu'il fait (chapitre~23).
+\bfield{Interface} C++20 \texttt{firm::strat}~: \texttt{Engine<Clock>(tick, Params, clock)} avec \texttt{run(events, snapshots)},
+\texttt{actions}, \texttt{hash}, \texttt{position}, \texttt{cash}, \texttt{pnl()}~; \texttt{TimerWheel(granularity, slots)} avec
+\texttt{schedule} et \texttt{advance}~; \texttt{SimClock}, \texttt{RealClock}~; \texttt{Params}, \texttt{Snapshot},
+\texttt{Action}. Rust \texttt{firm\_stratengine}~: \texttt{Engine}, \texttt{TimerWheel}, \texttt{Params}, \texttt{Action},
+\texttt{read\_events}.
+\bfield{Règles} Un seul fil possède l'état~; chaque événement est traité jusqu'à complétion~; les temporisateurs échus avant un événement se déclenchent avant lui, dans l'ordre (instant,
+identifiant)~; les instantanés de paramètres s'appliquent entre les événements~; le temps vient de l'\omterm{def:ll:the-strategy-engine:wheel}{horloge injectée}~; la stratégie d'exemple calcule
+en entiers~; aucune allocation par événement.
+\bfield{Tests d'acceptation} \texttt{code/firm/stratengine/}~: deux rejeux aux actions, à l'empreinte et au profit identiques, égaux
+à l'empreinte validée~; le moteur Rust égal à celle-ci~; un instantané ne modifiant que ce qui le suit~; zéro allocation pendant le rejeu~; la
+roue se déclenchant dans l'ordre à travers les cases et les tours.
+\bfield{Pour aller plus loin} Une roue hiérarchique pour les longs temporisateurs~; des rapports d'ordres issus du simulateur du livre~10 à la place du
+bouchon de la plateforme~; plusieurs stratégies sur un même moteur avec un ordre de programmation fixe.
+\end{build}
+
+\begin{omsources}
+\item G.~Varghese et T.~Lauck, ``Hashed and hierarchical timing wheels: data structures for the efficient implementation of a
+timer facility'', \emph{Proceedings of the 11th ACM Symposium on Operating Systems Principles}, 1987.
+\item M.~Fowler, \emph{The LMAX Architecture}, 2011.
+\item The Rust standard library, \texttt{std::collections::HashMap}.
+\end{omsources}
+
+\section{Exercices}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:1}
+Une roue comporte 1\,024 créneaux de \qty{100}{\micro\second}. Dans quel créneau tombe un temporisateur échéant à 34\,200.012345 secondes après minuit,
+et à combien de révolutions se trouve un temporisateur échéant dans 5 secondes~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:2}
+Trois temporisateurs échéent dans le même créneau à 120, 121 et 120 microsecondes, avec les identifiants 7, 3 et 9. Dans quel ordre se déclenchent-ils~?
+\end{exercise}
+
+\begin{exercise}[$\star$]\label{exo:ll:the-strategy-engine:3}
+Pourquoi l'instant d'un événement est-il le bon «~maintenant~» pour une stratégie en rejeu, et que doit-il être vrai du système
+en production pour que le rejeu lui corresponde~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:4}
+Si un résultat dépend de l'un des $k$ ordres de parcours également probables qu'un ensemble à hachage peut produire,
+combien de résultats distincts une centaine de relances devrait-elle montrer en moyenne~? Que suggère le 93 mesuré quant à $k$~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:5}
+Un trader fait passer la fourchette de deux ticks à quatre à 10:30:00.000. Un événement arrive à 10:29:59.999 et le suivant à
+10:30:00.004. Sous quels paramètres chacun est-il traité, et que montre le journal~?
+\end{exercise}
+
+\begin{exercise}[$\star\star$]\label{exo:ll:the-strategy-engine:6}
+Le moteur consomme \qty{53}{\nano\second} par événement à la médiane. À l'ouverture, les événements arrivent à 2 millions par seconde pendant 50
+millisecondes. Suit-il le rythme, et quel est son taux d'utilisation~?
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-strategy-engine:7}
+\emph{Programmation.} Ajouter au moteur un temporisateur de rafraîchissement~: chaque cotation vieille de plus de \qty{5}{\second} est renvoyée au même prix. Vérifier
+que deux rejeux concordent toujours et que le moteur Rust, modifié de la même façon, produit toujours le hachage du moteur C++.
+\end{exercise}
+
+\begin{exercise}[$\star\star\star$]\label{exo:ll:the-strategy-engine:8}
+\emph{Trouver la faille.} «~Notre moteur est déterministe~: il est mono-thread et n'utilise aucun aléa. Il estampille chaque ordre avec
+\texttt{std::chrono::system\_clock::now()} pour la piste d'audit.~»
+\end{exercise}
+
+\section{Problème~: Deux exécutions, deux profits}
+
+\begin{problem}[{Problème du week-end --- compter les façons dont un programme peut être en désaccord avec lui-même}]\label{pb:ll:the-strategy-engine:1}
+Une équipe de recherche rejoue la même journée enregistrée dans son moteur de cotation à deux reprises et obtient deux profits. Utiliser les mesures de la
+\cref{fig:ll:the-strategy-engine:reruns} (\texttt{measured\_nondet.csv}).
+
+\medskip\noindent\textbf{Partie I --- Les sources.}
+\begin{enumerate}
+\item Lister les trois sources mesurées et le nombre de résultats distincts que chacune a donnés sur une centaine d'exécutions.
+\item Pourquoi l'horloge murale en donne-t-elle une centaine~?
+\item Pourquoi l'ensemble à hachage initialisé avec une graine en donne-t-il moins d'une centaine~?
+\item Pourquoi le flux à deux threads en donne-t-il encore moins, et qu'est-ce qui pourrait en donner davantage~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie II --- Les repérer.}
+\begin{enumerate}[resume]
+\item Comment on trouverait la première action à laquelle deux exécutions divergent~?
+\item Que laisse chacune des sources comme indice à ce point~?
+\item Pourquoi chaque relance doit-elle être un nouveau processus pour faire apparaître l'effet du hachage initialisé avec une graine~?
+\item Laquelle des trois sources ne se manifesterait jamais dans une seule exécution sous débogueur~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie III --- Les correctifs.}
+\begin{enumerate}[resume]
+\item Corriger l'horloge murale.
+\item Corriger l'ordre de parcours du hachage sans renoncer aux tables de hachage.
+\item Corriger le flux à deux threads.
+\item Après les correctifs, combien de résultats distincts une centaine de relances devraient-elles donner, et combien le moteur de la société en a-t-il donné~?
+\end{enumerate}
+
+\medskip\noindent\textbf{Partie IV --- Le verdict.}
+\begin{enumerate}[resume]
+\item Énoncer le \emph{résultat nommé}~: le nombre de résultats distincts sur une centaine de relances avec chaque source activée, puis après
+les correctifs.
+\item Pourquoi «~le profit diffère légèrement~» n'est-il pas une raison d'accepter le non-déterminisme dans un backtest~?
+\item Qu'est-ce qui peut encore rompre la reproductibilité bit à bit entre deux machines, même avec les trois correctifs~?
+\item Pourquoi l'arithmétique entière de la stratégie fait-elle concorder les moteurs C++ et Rust~?
+\item Que doit exécuter le pipeline d'intégration continue pour préserver le déterminisme~?
+\item Qu'apporte le déterminisme à l'équipe de support de production~?
+\item Quand un composant non déterministe est-il acceptable dans un système de trading~?
+\item En une phrase~: qu'est-ce qui rend un moteur rejouable~?
+\end{enumerate}
+\end{problem}
+
+\section{Questions d'entretien}
+
+\begin{interviewq}[$\star$ \iqroles{développeur}]\label{iq:ll:the-strategy-engine:1}
+Pourquoi exécuter une stratégie sur un seul thread~? Quel en est le coût~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-strategy-engine:2}
+Comment implémenteriez-vous des temporisateurs pour des milliers d'ordres, chacun avec ses propres délais d'expiration~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-strategy-engine:3}
+Votre backtest et votre exécution en production divergent le même jour. Où regardez-vous~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-strategy-engine:4}
+Comment changez-vous les paramètres d'une stratégie pendant qu'elle tourne, en toute sécurité~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star$ \iqroles{développeur}]\label{iq:ll:the-strategy-engine:5}
+Que ne doit jamais se produire sur le chemin critique (hot path) d'un moteur de stratégie, et comment le vérifie-t-on~?
+\end{interviewq}
+
+\begin{interviewq}[$\star\star\star$ \iqroles{développeur, chercheur}]\label{iq:ll:the-strategy-engine:6}
+Concevez un moteur de stratégie à la fois en production et rejouable bit à bit~: quelles sont les règles, et comment les fait-on appliquer~?
+\end{interviewq}
