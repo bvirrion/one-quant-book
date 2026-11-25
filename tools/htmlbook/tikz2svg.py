@@ -227,10 +227,14 @@ def build_svg(tikz):
         preamble, engine = PREAMBLE, "pdflatex"
         if GUILLEMETS.search(tikz):
             # « » only exist in T1 (the books load [T1]{fontenc}); opt in
-            # per figure so every other SVG stays byte-stable on OT1
+            # per figure so every other SVG stays byte-stable on OT1.
+            # lmodern with it, as the books do: without it T1 text is set
+            # in bitmap (Type 3) EC fonts, which dvisvgm drops — the figure
+            # came out with its lines and no label at all.
             preamble = PREAMBLE.replace(
                 "\\begin{document}",
-                "\\usepackage[T1]{fontenc}\n\\begin{document}")
+                "\\usepackage[T1]{fontenc}\n\\usepackage{lmodern}\n"
+                "\\begin{document}")
         if DEVANAGARI.search(tikz):
             preamble = PREAMBLE.replace(
                 "\\begin{document}", FONTSPEC_BLOCK + "\\begin{document}")
@@ -241,6 +245,13 @@ def build_svg(tikz):
             engine = "lualatex"
             for face in ARABIC_FACES:
                 shutil.copy(FONTS_DIR / face, tmp / face)
+        if "\\up{" in tikz:
+            # \up{e}: babel-french's superscript in a French label
+            # (99\up{e} centile); defined per figure, like T1 above
+            preamble = preamble.replace(
+                "\\begin{document}",
+                "\\providecommand{\\up}[1]{\\textsuperscript{#1}}\n"
+                "\\begin{document}")
         has_raster = bool(RASTER_RE.search(tikz))
         if has_raster:
             tikz = stage_rasters(tikz, tmp)
@@ -268,6 +279,9 @@ def build_svg(tikz):
                     "both dvisvgm and pdftocairo failed to convert a "
                     f"figure:\n{res.stderr[-2000:]}")
         svg = svg_path.read_text(encoding="utf-8")
+        if "<g id='page1'/>" in svg:
+            # dvisvgm wrote an empty page (0pt x 0pt): never publish it
+            raise ParseError("a figure converted to an empty SVG")
         return svg, *_svg_size(svg)
 
 
@@ -399,12 +413,26 @@ class FigureBuilder:
             # Arabic pictures (lualatex) stay serial: under concurrent
             # load luaotfload shapes their labels differently run to run
             if not is_raster(tikz) and not ARABIC.search(tikz):
-                todo.setdefault(tikz_hash(tikz), tikz)
+                h = tikz_hash(tikz)
+                if not self.published(h):
+                    todo.setdefault(h, tikz)
         if jobs < 2 or len(todo) < 2:
             return
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             for h, result in zip(todo, pool.map(build_svg, todo.values())):
                 self.built[h] = result
+
+    def published(self, h):
+        """OM_FIG_REUSE=1: the figure already in the output directory, for a
+        rebuild that changes text only (a converter fix in the fragments).
+        The file name is the hash of the picture's source, so a published
+        file is that picture — unless the style file or the figure toolchain
+        changed since, which the hash does not see: leave the variable unset
+        for those."""
+        path = self.svg_dir / f"fig-{h}.svg"
+        if os.environ.get("OM_FIG_REUSE") == "1" and path.exists():
+            return path
+        return None
 
     def figure_info(self, tikz):
         if tikz in self.cache:
@@ -417,10 +445,14 @@ class FigureBuilder:
             if info["hash"] == h:
                 self.cache[tikz] = info
                 return info
-        svg, width, height = self.built.pop(h, None) or build_svg(tikz)
-        self.svg_dir.mkdir(parents=True, exist_ok=True)
         filename = f"fig-{h}.svg"
-        (self.svg_dir / filename).write_text(svg, encoding="utf-8")
+        if self.published(h):
+            width, height = _svg_size(
+                self.published(h).read_text(encoding="utf-8"))
+        else:
+            svg, width, height = self.built.pop(h, None) or build_svg(tikz)
+            self.svg_dir.mkdir(parents=True, exist_ok=True)
+            (self.svg_dir / filename).write_text(svg, encoding="utf-8")
         info = {"hash": h, "file": filename, "width": width,
                 "height": height, "url": f"{self.url_prefix}/{filename}"}
         self.cache[tikz] = info
